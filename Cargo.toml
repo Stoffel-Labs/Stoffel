@@ -1,0 +1,9 @@
+[package]
+name = "stoffel"
+version = "0.1.0"
+edition = "2021"
+authors = ["Stoffel Labs Inc"]
+description = "Stoffel is a framework for building MPC applications"
+
+[dependencies]
+clap = { version = "4.4", features = ["derive"] } 
