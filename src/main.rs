@@ -1,4 +1,4 @@
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 
 /// Stoffel - A framework for building privacy-preserving applications using multiparty computation
 #[derive(Parser, Debug)]
@@ -44,13 +44,25 @@ enum Commands {
 
     /// Start development server with hot reloading
     Dev {
-        /// Number of parties for simulation
-        #[arg(long, default_value = "3")]
+        /// Number of parties for simulation (minimum 5 for HoneyBadger)
+        #[arg(long, default_value = "5")]
         parties: u8,
 
         /// Port to run on
         #[arg(short, long, default_value = "8080")]
         port: u16,
+
+        /// MPC protocol to use
+        #[arg(long, default_value = "honeybadger")]
+        protocol: MpcProtocol,
+
+        /// Security threshold (max corrupted parties, auto-calculated if not provided)
+        #[arg(long)]
+        threshold: Option<u8>,
+
+        /// Field type for computation
+        #[arg(long, default_value = "bls12-381")]
+        field: MpcField,
     },
 
     /// Build the current project
@@ -74,9 +86,21 @@ enum Commands {
         #[arg(long)]
         test: Option<String>,
 
-        /// Number of parties for testing
-        #[arg(long, default_value = "3")]
+        /// Number of parties for testing (minimum 5 for HoneyBadger)
+        #[arg(long, default_value = "5")]
         parties: u8,
+
+        /// MPC protocol to use for testing
+        #[arg(long, default_value = "honeybadger")]
+        protocol: MpcProtocol,
+
+        /// Security threshold (max corrupted parties, auto-calculated if not provided)
+        #[arg(long)]
+        threshold: Option<u8>,
+
+        /// Field type for computation
+        #[arg(long, default_value = "bls12-381")]
+        field: MpcField,
 
         /// Run integration tests
         #[arg(long)]
@@ -87,6 +111,26 @@ enum Commands {
     Run {
         /// Arguments to pass to the program
         args: Vec<String>,
+
+        /// Number of parties for execution (minimum 5 for HoneyBadger)
+        #[arg(long, default_value = "5")]
+        parties: u8,
+
+        /// MPC protocol to use for execution
+        #[arg(long, default_value = "honeybadger")]
+        protocol: MpcProtocol,
+
+        /// Security threshold (max corrupted parties, auto-calculated if not provided)
+        #[arg(long)]
+        threshold: Option<u8>,
+
+        /// Field type for computation
+        #[arg(long, default_value = "bls12-381")]
+        field: MpcField,
+
+        /// VM optimization level
+        #[arg(long, default_value = "standard")]
+        vm_opt: VmOptLevel,
     },
 
     /// Deploy the current project
@@ -162,6 +206,41 @@ enum PluginCommands {
     },
 }
 
+/// Available MPC protocols
+#[derive(ValueEnum, Debug, Clone)]
+enum MpcProtocol {
+    /// HoneyBadger MPC protocol (default, production-ready)
+    Honeybadger,
+}
+
+/// Available finite fields for MPC computation
+#[derive(ValueEnum, Debug, Clone)]
+enum MpcField {
+    /// BLS12-381 scalar field (default, recommended)
+    #[value(name = "bls12-381")]
+    Bls12_381,
+    /// BN254 scalar field
+    #[value(name = "bn254")]
+    Bn254,
+    /// Secp256k1 scalar field
+    #[value(name = "secp256k1")]
+    Secp256k1,
+    /// Prime field with 61-bit modulus (for testing)
+    #[value(name = "prime61")]
+    Prime61,
+}
+
+/// VM optimization levels
+#[derive(ValueEnum, Debug, Clone)]
+enum VmOptLevel {
+    /// No optimizations (debugging)
+    None,
+    /// Standard optimizations (default)
+    Standard,
+    /// Aggressive optimizations (maximum performance)
+    Aggressive,
+}
+
 fn display_honeybadger() {
     println!(r#"
     Stoffel is a honeybadger that helps you build MPC applications.
@@ -224,13 +303,13 @@ fn display_honeybadger() {
 "#);
 }
 
-fn main() {
+fn main() -> Result<(), String> {
     let cli = Cli::parse();
 
     // If no subcommand is provided, show the honeybadger
     if std::env::args().len() == 1 {
         display_honeybadger();
-        return;
+        return Ok(());
     }
 
     if cli.verbose {
@@ -260,11 +339,21 @@ fn main() {
             println!("   [TODO: Implement initialization logic]");
         }
 
-        Commands::Dev { parties, port } => {
+        Commands::Dev { parties, port, protocol, threshold, field } => {
             println!("🔧 Starting development server...");
             println!("   Parties: {}", parties);
             println!("   Port: {}", port);
-            println!("   [TODO: Implement dev server with hot reloading]");
+            println!("   Protocol: {:?}", protocol);
+            println!("   Field: {:?}", field);
+
+            let threshold = threshold.unwrap_or_else(|| calculate_threshold(parties, &protocol));
+            println!("   Threshold: {}", threshold);
+
+            validate_mpc_params(parties, threshold, &protocol)?;
+
+            println!("   [TODO: Initialize StoffelVM with {} parties]", parties);
+            println!("   [TODO: Setup {} protocol with threshold {}]", format!("{:?}", protocol).to_lowercase(), threshold);
+            println!("   [TODO: Start hot reloading server on port {}]", port);
         }
 
         Commands::Build { target, optimize, release } => {
@@ -283,24 +372,45 @@ fn main() {
             println!("   [TODO: Implement build logic]");
         }
 
-        Commands::Test { test, parties, integration } => {
+        Commands::Test { test, parties, protocol, threshold, field, integration } => {
             println!("🧪 Running tests...");
             println!("   Parties: {}", parties);
+            println!("   Protocol: {:?}", protocol);
+            println!("   Field: {:?}", field);
+
+            let threshold = threshold.unwrap_or_else(|| calculate_threshold(parties, &protocol));
+            println!("   Threshold: {}", threshold);
+
+            validate_mpc_params(parties, threshold, &protocol)?;
+
             if let Some(test) = test {
                 println!("   Specific test: {}", test);
             }
             if integration {
                 println!("   Type: Integration tests");
             }
-            println!("   [TODO: Implement MPC testing framework]");
+            println!("   [TODO: Initialize test environment with {} parties]", parties);
+            println!("   [TODO: Setup {} protocol for testing]", format!("{:?}", protocol).to_lowercase());
         }
 
-        Commands::Run { args } => {
+        Commands::Run { args, parties, protocol, threshold, field, vm_opt } => {
             println!("▶️  Running project...");
+            println!("   Parties: {}", parties);
+            println!("   Protocol: {:?}", protocol);
+            println!("   Field: {:?}", field);
+            println!("   VM Optimization: {:?}", vm_opt);
+
+            let threshold = threshold.unwrap_or_else(|| calculate_threshold(parties, &protocol));
+            println!("   Threshold: {}", threshold);
+
+            validate_mpc_params(parties, threshold, &protocol)?;
+
             if !args.is_empty() {
                 println!("   Args: {:?}", args);
             }
-            println!("   [TODO: Implement run logic]");
+            println!("   [TODO: Initialize StoffelVM with {:?} optimization]", vm_opt);
+            println!("   [TODO: Setup {} MPC network with {} parties]", format!("{:?}", protocol).to_lowercase(), parties);
+            println!("   [TODO: Execute program with args: {:?}]", args);
         }
 
         Commands::Deploy { environment, tee, k8s } => {
@@ -370,4 +480,40 @@ fn main() {
             println!("   [TODO: Implement dependency updates]");
         }
     }
+
+    Ok(())
+}
+
+/// Calculate appropriate threshold based on number of parties and protocol
+fn calculate_threshold(parties: u8, protocol: &MpcProtocol) -> u8 {
+    match protocol {
+        MpcProtocol::Honeybadger => {
+            // HoneyBadger requires n >= 5 and t < n/3
+            if parties < 5 {
+                // Return a reasonable threshold anyway, validation will catch this
+                return 1;
+            }
+            (parties - 1) / 3
+        }
+    }
+}
+
+/// Validate MPC parameters for the given protocol
+fn validate_mpc_params(parties: u8, threshold: u8, protocol: &MpcProtocol) -> Result<(), String> {
+    match protocol {
+        MpcProtocol::Honeybadger => {
+            if parties < 5 {
+                return Err("HoneyBadger protocol requires at least 5 parties".to_string());
+            }
+            if threshold >= (parties + 2) / 3 {
+                return Err(format!(
+                    "HoneyBadger protocol requires threshold < n/3. For {} parties, max threshold is {}",
+                    parties,
+                    (parties + 2) / 3 - 1
+                ));
+            }
+        }
+    }
+
+    Ok(())
 } 

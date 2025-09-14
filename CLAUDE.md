@@ -52,10 +52,41 @@ The main CLI is structured using `clap::Parser` and `clap::Subcommand`:
 
 ## Key Features
 
-- CLI supports verbose output via `-v/--verbose` flag
-- Optional path parameter via `-p/--path`
+- **MPC Protocol Support**: HoneyBadger protocol implementation
+- **Cryptographic Fields**: BLS12-381, BN254, Secp256k1, Prime61 support
+- **Automatic Parameter Calculation**: Smart defaults for non-cryptographers
+- **Parameter Validation**: Ensures protocol security requirements are met
+- **StoffelVM Integration**: Multiple optimization levels and party configuration
 - ASCII art honeybadger display when run without arguments
-- Framework designed for secure, scalable, and efficient MPC applications
+- CLI supports verbose output via `-v/--verbose` flag
+
+## MPC Configuration
+
+**Protocol Selection:**
+- `--protocol honeybadger` - HoneyBadger protocol (default, minimum 5 parties)
+
+**Security Parameters:**
+- `--parties N` - Number of MPC parties (auto-validates based on protocol)
+- `--threshold T` - Max corrupted parties (auto-calculated if not provided)
+- `--field FIELD` - Cryptographic field (bls12-381, bn254, secp256k1, prime61)
+
+**Examples:**
+```bash
+# Easy mode - reasonable defaults for non-cryptographers
+stoffel dev
+
+# Advanced - specify all parameters
+stoffel dev --parties 7 --protocol honeybadger --threshold 2 --field bls12-381
+
+# Testing with different field
+stoffel test --field prime61 --parties 5
+```
+
+## Related Components
+
+This CLI integrates with:
+- **StoffelVM** (`../StoffelVM`) - Register-based MPC virtual machine
+- **mpc-protocols** (`../mpc-protocols`) - HoneyBadger MPC protocol implementation
 
 ## Dependencies
 
