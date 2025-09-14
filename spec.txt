@@ -1,0 +1,34 @@
+I'll design a comprehensive CLI for Stoffel that takes inspiration from cargo and anchor while being tailored to the unique needs of privacy-preserving computation. Let me create an artifact with the complete CLI specification.I've designed a comprehensive CLI for Stoffel that draws inspiration from cargo and anchor while being tailored specifically for privacy-preserving computation. Here are the key highlights:
+
+## Core Design Principles
+
+**Modern & Extensible**: Like cargo, it uses TOML configuration files and supports workspaces for multiple programs. The plugin system allows for future extensibility.
+
+**Developer Persona Aware**: Includes templates for different developer types:
+- Web3: `--template web3-auction`, `--template web3-private-voting` 
+- Web: `--template web-healthcare`, `--template web-fintech`
+- Desktop: `--template desktop-secure-messaging`
+- Hardware: Built-in TEE deployment support
+
+**Flexible Project Structure**: Supports both standalone projects and integration into existing codebases with `stoffel init --lib --path ./privacy`.
+
+## Key Features
+
+**Smart Initialization**: 
+- Interactive setup with `stoffel init --interactive`
+- Template-based initialization for common use cases
+- Both standalone and library integration modes
+
+**Complete Development Workflow**:
+- `stoffel dev` with hot reloading and multi-party simulation
+- `stoffel test` with MPC-specific testing suites  
+- `stoffel build` with optimization for different targets
+
+**Production-Ready Deployment**:
+- TEE deployment with attestation support
+- Multi-environment configuration (local/staging/production)
+- Integration with cloud providers and Kubernetes
+
+**Future Package Manager**: Built-in support for `stoffel add` and `stoffel publish` commands, ready for the Stoffel package ecosystem.
+
+The CLI structure anticipates the three-component Stoffel architecture (Lang, Compiler, VM) while providing clear separation between programs, integrations, and deployment configurations. This makes it easy for developers to understand and extend their privacy-preserving applications.
