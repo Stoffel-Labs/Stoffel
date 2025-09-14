@@ -1,5 +1,7 @@
 use clap::{Parser, Subcommand, ValueEnum};
 
+mod init;
+
 /// Stoffel - A framework for building privacy-preserving applications using multiparty computation
 #[derive(Parser, Debug)]
 #[command(
@@ -318,25 +320,18 @@ fn main() -> Result<(), String> {
 
     match cli.command {
         Commands::Init { name, lib, path, interactive, template } => {
-            println!("🚀 Initializing Stoffel project...");
-            if lib {
-                println!("   Mode: Library");
-            } else {
-                println!("   Mode: Standalone project");
+            let init_options = init::InitOptions {
+                name,
+                lib,
+                path,
+                interactive,
+                template,
+            };
+
+            if let Err(e) = init::initialize_project(init_options) {
+                eprintln!("❌ Initialization failed: {}", e);
+                std::process::exit(1);
             }
-            if let Some(template) = template {
-                println!("   Template: {}", template);
-            }
-            if let Some(path) = path {
-                println!("   Path: {}", path);
-            }
-            if let Some(name) = name {
-                println!("   Name: {}", name);
-            }
-            if interactive {
-                println!("   Interactive setup enabled");
-            }
-            println!("   [TODO: Implement initialization logic]");
         }
 
         Commands::Dev { parties, port, protocol, threshold, field } => {

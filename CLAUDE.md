@@ -70,6 +70,72 @@ The main CLI is structured using `clap::Parser` and `clap::Subcommand`:
 - `--threshold T` - Max corrupted parties (auto-calculated if not provided)
 - `--field FIELD` - Cryptographic field (bls12-381, bn254, secp256k1, prime61)
 
+## Project Initialization
+
+**Basic Initialization:**
+```bash
+# Create new standalone project
+stoffel init my-project
+
+# Create library for integration
+stoffel init my-lib --lib
+
+# Initialize in specific directory
+stoffel init my-project --path ./projects
+```
+
+**Interactive Mode:**
+```bash
+# Interactive setup with prompts
+stoffel init my-project --interactive
+```
+
+**Language Ecosystem Templates:**
+```bash
+# Python SDK integration (fully implemented)
+stoffel init my-project --template python
+
+# Rust FFI integration (skeleton)
+stoffel init my-project --template rust
+
+# TypeScript/Node.js integration (skeleton)
+stoffel init my-project --template typescript
+
+# Solidity smart contract integration (skeleton)
+stoffel init my-project --template solidity
+
+# Pure StoffelLang (default)
+stoffel init my-project --template stoffel
+```
+
+**Generated Project Structure:**
+
+**Python Template:**
+- `pyproject.toml` - Poetry configuration with Stoffel Python SDK
+- `src/main.py` - Python integration with StoffelClient and StoffelProgram
+- `secure_computation.stfl` - StoffelLang program file
+- `tests/test_main.py` - PyTest integration tests
+
+**Rust Template:**
+- `Cargo.toml` - Rust dependencies with StoffelVM FFI
+- `src/main.rs` - Direct FFI integration with StoffelVM
+- `tests/` - Rust unit tests
+
+**TypeScript Template:**
+- `package.json` - Node.js dependencies and scripts
+- `tsconfig.json` - TypeScript configuration
+- `src/main.ts` - TypeScript SDK skeleton
+
+**Solidity Template:**
+- `contracts/StoffelMPC.sol` - Smart contracts for MPC verification
+- `hardhat.config.js` - Hardhat development environment
+- `scripts/deploy.js` - Contract deployment scripts
+
+**StoffelLang Template:**
+- `Stoffel.toml` - Project configuration (like Cargo.toml)
+- `src/main.stfl` - Pure StoffelLang MPC code
+- `tests/integration.stfl` - Integration tests
+
 **Examples:**
 ```bash
 # Easy mode - reasonable defaults for non-cryptographers
