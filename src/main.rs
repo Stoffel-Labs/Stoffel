@@ -29,6 +29,24 @@ enum Commands {
         #[command(subcommand)]
         kind: InitCommands,
     },
+    /// Build the current project
+    Build,
+
+    /// Compile the current project
+    Compile,
+
+    /// Run the current project
+    Run,
+
+    /// Test the current project
+    Test,
+
+    /// Deploy the current project
+    Deploy, 
+
+    /// Display version information
+    Version,
+
     /// Check the status of the current project
     Status,
 }
