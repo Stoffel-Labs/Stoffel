@@ -392,7 +392,7 @@ enum VmOptLevel {
     Aggressive,
 }
 
-fn show_template_help() {
+fn show_init_template_help() {
     println!(r#"
 HELP: stoffel init --template (-t)
 
@@ -455,6 +455,531 @@ INTERACTIVE MODE:
 For more help: stoffel init --help
 "#);
 }
+
+fn show_init_interactive_help() {
+    println!(r#"
+HELP: stoffel init --interactive (-i)
+
+DESCRIPTION:
+    The --interactive (-i) flag enables guided setup with step-by-step prompts
+    for configuring your new Stoffel project.
+
+USAGE:
+    stoffel init --interactive [PROJECT_NAME]
+    stoffel init -i [PROJECT_NAME]
+
+INTERACTIVE FEATURES:
+    ├─ Project Configuration
+    │  ├─ Project name (with validation)
+    │  ├─ Description
+    │  └─ Author (auto-detected from git config)
+    │
+    ├─ MPC Configuration
+    │  ├─ Number of parties (minimum 5 for HoneyBadger)
+    │  ├─ Cryptographic field selection
+    │  └─ Security threshold (auto-calculated)
+    │
+    └─ Template Selection
+       ├─ Detailed explanations of each template
+       ├─ Recommendations based on use case
+       └─ Preview of files that will be created
+
+EXAMPLES:
+    stoffel init -i                           # Interactive setup in current directory
+    stoffel init -i my-secure-app             # Interactive setup with project name
+    stoffel init --interactive --path /tmp    # Interactive setup at specific path
+
+WHEN TO USE:
+    ✅ First-time users learning Stoffel
+    ✅ When you want to explore all configuration options
+    ✅ Setting up complex MPC configurations
+    ✅ When unsure which template to choose
+
+For more help: stoffel init --help
+"#);
+}
+
+fn show_init_lib_help() {
+    println!(r#"
+HELP: stoffel init --lib
+
+DESCRIPTION:
+    The --lib flag creates a library project instead of a standalone application.
+    Libraries are designed for reuse and distribution as dependencies.
+
+USAGE:
+    stoffel init --lib [PROJECT_NAME]
+
+LIBRARY PROJECT STRUCTURE:
+    my-library/
+    ├── Stoffel.toml              # Package configuration
+    ├── src/
+    │   └── lib.stfl              # Library entry point with exported functions
+    └── README.md                 # Documentation
+
+LIBRARY FEATURES:
+    ├─ Reusable MPC Functions
+    │  ├─ Exportable secure computation functions
+    │  ├─ Composable privacy-preserving algorithms
+    │  └─ Well-defined interfaces for integration
+    │
+    ├─ Distribution Ready
+    │  ├─ Proper package metadata
+    │  ├─ Dependency management
+    │  └─ Version compatibility
+    │
+    └─ Testing Infrastructure
+       ├─ Unit tests for individual functions
+       ├─ Integration tests for MPC workflows
+       └─ Benchmarking for performance validation
+
+EXAMPLES:
+    stoffel init --lib crypto-utils           # Create cryptographic utilities library
+    stoffel init --lib --path ./libs mpc-ml  # Create ML library in specific directory
+    stoffel init --lib -i secure-stats       # Interactive library setup
+
+USE CASES:
+    ✅ Cryptographic primitives and utilities
+    ✅ Domain-specific MPC algorithms (ML, finance, healthcare)
+    ✅ Reusable privacy-preserving building blocks
+    ✅ Third-party integrations and connectors
+
+For more help: stoffel init --help
+"#);
+}
+
+fn show_init_path_help() {
+    println!(r#"
+HELP: stoffel init --path
+
+DESCRIPTION:
+    The --path flag specifies where to create the new Stoffel project.
+    If the directory doesn't exist, it will be created.
+
+USAGE:
+    stoffel init --path <DIRECTORY> [PROJECT_NAME]
+
+PATH BEHAVIOR:
+    ├─ Absolute Paths: /home/user/projects/my-app
+    ├─ Relative Paths: ./my-project, ../parent-dir/project
+    ├─ Auto-creation: Creates directories if they don't exist
+    └─ Validation: Ensures write permissions and valid path
+
+EXAMPLES:
+    stoffel init --path /tmp/test-project              # Absolute path
+    stoffel init --path ./secure-apps my-app           # Relative path
+    stoffel init --path ~/Development/MPC secure-calc  # Home directory
+    stoffel init --path . existing-dir                 # Current directory
+
+PATH RESOLUTION:
+    Without --path:    Uses current directory or creates subdirectory with project name
+    With --path:       Creates project at specified location
+
+COMBINED WITH OTHER FLAGS:
+    stoffel init --path /tmp --lib my-library          # Library at specific path
+    stoffel init --path ./apps -t python webapp        # Python template at path
+    stoffel init --path ~/projects -i                  # Interactive at path
+
+VALIDATION:
+    ✅ Checks directory write permissions
+    ✅ Warns if directory is not empty
+    ✅ Creates parent directories as needed
+    ⚠️  Fails if path exists and contains Stoffel.toml
+
+For more help: stoffel init --help
+"#);
+}
+
+// Dev command help functions
+fn show_dev_parties_help() {
+    println!(r#"
+HELP: stoffel dev --parties
+
+DESCRIPTION:
+    The --parties flag specifies the number of parties in the simulated MPC network.
+    For HoneyBadger protocol, minimum is 5 parties.
+
+USAGE:
+    stoffel dev --parties <NUMBER>
+
+PARTY CONFIGURATION:
+    Minimum:    5 parties (HoneyBadger protocol requirement)
+    Typical:    5-7 parties (good balance of security and performance)
+    Maximum:    No hard limit, but performance decreases with more parties
+
+SECURITY IMPLICATIONS:
+    ├─ More parties = Higher security against corruption
+    ├─ Threshold = (parties - 1) / 3 for HoneyBadger
+    ├─ Can tolerate up to threshold corrupted parties
+    └─ Example: 7 parties can tolerate 2 corrupted parties
+
+PERFORMANCE CONSIDERATIONS:
+    ├─ More parties = More network communication
+    ├─ More parties = Slower computation
+    ├─ Development typically uses 5-7 parties
+    └─ Production may use 10+ parties for higher security
+
+EXAMPLES:
+    stoffel dev --parties 5                   # Minimum configuration (fast)
+    stoffel dev --parties 7                   # Balanced security/performance
+    stoffel dev --parties 10                  # Higher security (slower)
+
+For more help: stoffel dev --help
+"#);
+}
+
+fn show_dev_port_help() {
+    println!(r#"
+HELP: stoffel dev --port (-p)
+
+DESCRIPTION:
+    The --port (-p) flag specifies which port the development server listens on.
+    The server provides a web interface for monitoring MPC execution.
+
+USAGE:
+    stoffel dev --port <PORT>
+    stoffel dev -p <PORT>
+
+PORT REQUIREMENTS:
+    ├─ Range: 1024-65535 (avoid privileged ports < 1024)
+    ├─ Available: Port must not be in use by another service
+    ├─ Firewall: Ensure port is not blocked by firewall
+    └─ Default: 8080 if not specified
+
+DEVELOPMENT SERVER FEATURES:
+    ├─ Web Dashboard: Real-time MPC execution monitoring
+    ├─ Log Viewer: Detailed logs from all simulated parties
+    ├─ Performance Metrics: Computation time, network stats
+    ├─ Debug Interface: Inspect MPC state and variables
+    └─ Hot Reload Status: File change detection and recompilation
+
+EXAMPLES:
+    stoffel dev -p 3000                       # Run on port 3000
+    stoffel dev --port 8080                   # Default port (explicit)
+    stoffel dev --port 9000 --parties 7       # Custom port with more parties
+
+COMMON PORTS:
+    3000    Often used for React/Node.js development
+    8080    Default for many development servers
+    8000    Alternative development port
+    5000    Common for Flask/Python applications
+
+For more help: stoffel dev --help
+"#);
+}
+
+fn show_dev_protocol_help() {
+    println!(r#"
+HELP: stoffel dev --protocol
+
+DESCRIPTION:
+    The --protocol flag specifies which MPC protocol to use for development.
+    Currently only HoneyBadger is supported.
+
+USAGE:
+    stoffel dev --protocol <PROTOCOL>
+
+AVAILABLE PROTOCOLS:
+    honeybadger (default)
+    ├─ Byzantine Fault Tolerant (BFT)
+    ├─ Asynchronous network model
+    ├─ Threshold: Can tolerate up to (n-1)/3 corrupted parties
+    ├─ Minimum parties: 5
+    ├─ Security: Production-ready, formally verified
+    └─ Performance: Good for most applications
+
+PROTOCOL FEATURES:
+    ├─ Robustness
+    │  ├─ Works even with network delays and failures
+    │  ├─ No synchronization assumptions
+    │  └─ Guaranteed termination under honest majority
+    │
+    ├─ Security
+    │  ├─ Information-theoretic security
+    │  ├─ Protects against adaptive adversaries
+    │  └─ Secure against Byzantine corruption
+    │
+    └─ Practical
+       ├─ Efficient for real-world deployments
+       ├─ Scales to reasonable party numbers
+       └─ Well-tested implementation
+
+EXAMPLES:
+    stoffel dev --protocol honeybadger        # Explicit protocol selection
+    stoffel dev                               # Uses honeybadger by default
+
+FUTURE PROTOCOLS:
+    Additional protocols may be added in future versions based on:
+    ├─ Research advances in MPC protocols
+    ├─ Specific use case requirements (speed vs security)
+    └─ Community feedback and requests
+
+For more help: stoffel dev --help
+"#);
+}
+
+fn show_dev_threshold_help() {
+    println!(r#"
+HELP: stoffel dev --threshold
+
+DESCRIPTION:
+    The --threshold flag sets the maximum number of parties that can be corrupted
+    while maintaining security. Auto-calculated if not specified.
+
+USAGE:
+    stoffel dev --threshold <NUMBER>
+
+THRESHOLD CALCULATION:
+    For HoneyBadger protocol: threshold = (parties - 1) / 3
+
+    Examples:
+    ├─ 5 parties → threshold 1 (can tolerate 1 corrupted party)
+    ├─ 7 parties → threshold 2 (can tolerate 2 corrupted parties)
+    ├─ 10 parties → threshold 3 (can tolerate 3 corrupted parties)
+    └─ 16 parties → threshold 5 (can tolerate 5 corrupted parties)
+
+SECURITY IMPLICATIONS:
+    ├─ Higher threshold = More fault tolerance
+    ├─ Lower threshold = Less fault tolerance but faster
+    ├─ Threshold must be < parties/3 for HoneyBadger
+    └─ Invalid thresholds will cause initialization to fail
+
+WHEN TO CUSTOMIZE:
+    ├─ Testing specific threat models
+    ├─ Simulating network with known number of adversaries
+    ├─ Performance testing with different security levels
+    └─ Research and experimentation
+
+EXAMPLES:
+    stoffel dev --parties 7 --threshold 1     # Lower security, faster
+    stoffel dev --parties 7                   # Auto: threshold = 2
+    stoffel dev --parties 10 --threshold 3    # Explicit threshold
+
+VALIDATION:
+    ✅ threshold < (parties + 2) / 3
+    ⚠️  Too high threshold will fail with security error
+    ⚠️  Too low threshold reduces security unnecessarily
+
+For more help: stoffel dev --help
+"#);
+}
+
+fn show_dev_field_help() {
+    println!(r#"
+HELP: stoffel dev --field
+
+DESCRIPTION:
+    The --field flag specifies the finite field used for MPC computations.
+    Different fields offer different performance and compatibility characteristics.
+
+USAGE:
+    stoffel dev --field <FIELD>
+
+AVAILABLE FIELDS:
+
+  bls12-381 (default)
+    ├─ Security: ~128-bit security level
+    ├─ Performance: Good balance of speed and security
+    ├─ Compatibility: Works with BLS signatures and pairings
+    ├─ Size: ~381-bit prime field
+    └─ Best for: General-purpose MPC applications
+
+  bn254
+    ├─ Security: ~100-bit security level
+    ├─ Performance: Faster than BLS12-381
+    ├─ Compatibility: Ethereum's alt_bn128 precompiles
+    ├─ Size: ~254-bit prime field
+    └─ Best for: Ethereum integration, when speed matters
+
+  secp256k1
+    ├─ Security: ~128-bit security level
+    ├─ Performance: Good, widely optimized
+    ├─ Compatibility: Bitcoin/Ethereum ECDSA curve
+    ├─ Size: ~256-bit prime field
+    └─ Best for: Cryptocurrency applications
+
+  prime61
+    ├─ Security: ⚠️ Testing only (not secure)
+    ├─ Performance: Very fast
+    ├─ Compatibility: Simple operations
+    ├─ Size: 61-bit prime field
+    └─ Best for: Development, testing, benchmarking
+
+SELECTION CRITERIA:
+    ├─ Security Requirements: Choose field with adequate security level
+    ├─ Performance Needs: Smaller fields are faster but less secure
+    ├─ Integration: Match field to existing cryptographic infrastructure
+    └─ Development Phase: Use prime61 for fast iteration, production fields for release
+
+EXAMPLES:
+    stoffel dev --field bls12-381             # Default, good for most use cases
+    stoffel dev --field bn254                 # Ethereum-compatible
+    stoffel dev --field prime61               # Fast development/testing
+    stoffel dev --field secp256k1             # Bitcoin/crypto compatibility
+
+For more help: stoffel dev --help
+"#);
+}
+
+// Build command help functions
+fn show_build_target_help() {
+    println!(r#"
+HELP: stoffel build --target
+
+DESCRIPTION:
+    The --target flag specifies the platform to build for.
+    Different targets enable deployment to different environments.
+
+USAGE:
+    stoffel build --target <TARGET>
+
+AVAILABLE TARGETS:
+
+  native (default)
+    ├─ Native MPC execution on the current platform
+    ├─ Best performance for local and server deployment
+    ├─ Full feature support
+    └─ Direct integration with system resources
+
+  wasm
+    ├─ WebAssembly for browser-based MPC
+    ├─ Cross-platform compatibility
+    ├─ Sandboxed execution environment
+    └─ Web application integration
+
+  tee
+    ├─ Trusted Execution Environment (Intel SGX, ARM TrustZone)
+    ├─ Hardware-based security guarantees
+    ├─ Additional protection against side-channel attacks
+    └─ Cloud deployment with confidential computing
+
+  gpu
+    ├─ GPU-accelerated computation
+    ├─ Parallel processing for large-scale MPC
+    ├─ Optimized for computationally intensive operations
+    └─ Requires CUDA or OpenCL support
+
+EXAMPLES:
+    stoffel build --target native             # Default native build
+    stoffel build --target wasm               # Browser deployment
+    stoffel build --target tee                # Confidential computing
+    stoffel build --target gpu                # High-performance computing
+
+For more help: stoffel build --help
+"#);
+}
+
+fn show_build_optimize_help() {
+    println!(r#"
+HELP: stoffel build --optimize
+
+DESCRIPTION:
+    The --optimize flag enables advanced compiler optimizations for better performance.
+    This may increase build time but improves runtime performance.
+
+USAGE:
+    stoffel build --optimize
+
+OPTIMIZATION FEATURES:
+    ├─ Dead Code Elimination: Removes unused functions and variables
+    ├─ Constant Folding: Pre-computes constant expressions
+    ├─ Loop Optimization: Improves loop performance and memory usage
+    ├─ MPC-Specific: Optimizations for secure computation patterns
+    └─ Bytecode Optimization: Generates more efficient VM instructions
+
+PERFORMANCE IMPACT:
+    ├─ Runtime Speed: 20-50% faster execution typical
+    ├─ Memory Usage: Reduced memory footprint
+    ├─ Network Traffic: Optimized communication patterns
+    └─ Build Time: Increased compilation time
+
+WHEN TO USE:
+    ✅ Production builds
+    ✅ Performance testing
+    ✅ Final deployment artifacts
+    ⚠️  Not recommended for debug builds (harder to debug)
+
+EXAMPLES:
+    stoffel build --optimize                  # Optimized debug build
+    stoffel build --optimize --release        # Full optimization
+    stoffel build --optimize --target wasm    # Optimized WebAssembly
+
+OPTIMIZATION LEVELS:
+    Without --optimize:    Fast compilation, basic optimizations
+    With --optimize:       Advanced optimizations, slower compilation
+    With --release:        Maximum optimizations (implies --optimize)
+
+For more help: stoffel build --help
+"#);
+}
+
+fn show_build_release_help() {
+    println!(r#"
+HELP: stoffel build --release (-r)
+
+DESCRIPTION:
+    The --release (-r) flag builds in release mode with maximum optimizations
+    and no debug information. This is the recommended mode for production.
+
+USAGE:
+    stoffel build --release
+    stoffel build -r
+
+RELEASE BUILD FEATURES:
+    ├─ Maximum Optimizations: All optimization passes enabled
+    ├─ No Debug Info: Smaller binary size, faster loading
+    ├─ Production Ready: Suitable for deployment
+    ├─ Security Hardening: Additional security measures
+    └─ Performance Tuned: Optimized for runtime performance
+
+DIFFERENCES FROM DEBUG:
+    Debug Build:
+    ├─ Fast compilation
+    ├─ Debug symbols included
+    ├─ Assertions enabled
+    ├─ Larger binary size
+    └─ Easier debugging
+
+    Release Build:
+    ├─ Slower compilation
+    ├─ No debug symbols
+    ├─ Assertions disabled
+    ├─ Smaller binary size
+    └─ Maximum performance
+
+BUILD ARTIFACTS:
+    ├─ Optimized bytecode in target/release/
+    ├─ Deployment manifests
+    ├─ Production configuration templates
+    └─ Performance reports
+
+EXAMPLES:
+    stoffel build -r                          # Standard release build
+    stoffel build --release --target wasm     # Release WebAssembly build
+    stoffel build --release --target tee      # Release TEE build
+
+DEPLOYMENT CHECKLIST:
+    ✅ Build with --release flag
+    ✅ Test on target environment
+    ✅ Verify performance requirements
+    ✅ Security audit if required
+
+For more help: stoffel build --help
+"#);
+}
+
+// Placeholder functions for other commands to avoid compile errors
+fn show_test_test_help() { println!("Help for --test flag coming soon"); }
+fn show_test_parties_help() { println!("Help for --parties flag coming soon"); }
+fn show_test_protocol_help() { println!("Help for --protocol flag coming soon"); }
+fn show_test_threshold_help() { println!("Help for --threshold flag coming soon"); }
+fn show_test_field_help() { println!("Help for --field flag coming soon"); }
+fn show_test_integration_help() { println!("Help for --integration flag coming soon"); }
+fn show_run_parties_help() { println!("Help for --parties flag coming soon"); }
+fn show_run_protocol_help() { println!("Help for --protocol flag coming soon"); }
+fn show_run_threshold_help() { println!("Help for --threshold flag coming soon"); }
+fn show_run_field_help() { println!("Help for --field flag coming soon"); }
+fn show_run_vm_opt_help() { println!("Help for --vm-opt flag coming soon"); }
 
 fn display_honeybadger() {
     println!(r#"
@@ -522,16 +1047,118 @@ fn main() -> Result<(), String> {
     // Handle special flag-specific help cases before clap parsing
     let args: Vec<String> = std::env::args().collect();
 
-    // Check for flag-specific help patterns like "stoffel init -t -h" or "stoffel init --template --help"
+    // Check for flag-specific help patterns like "stoffel init -t -h" or "stoffel dev --parties --help"
     if args.len() >= 4 {
-        match (args.get(1).map(|s| s.as_str()), args.get(2).map(|s| s.as_str())) {
-            (Some("init"), Some("-t" | "--template")) => {
-                if args.get(3).map(|s| s.as_str()) == Some("-h") || args.get(3).map(|s| s.as_str()) == Some("--help") {
-                    show_template_help();
+        let command = args.get(1).map(|s| s.as_str());
+        let flag = args.get(2).map(|s| s.as_str());
+        let help_flag = args.get(3).map(|s| s.as_str());
+
+        if help_flag == Some("-h") || help_flag == Some("--help") {
+            match (command, flag) {
+                // Init command flags
+                (Some("init"), Some("-t" | "--template")) => {
+                    show_init_template_help();
                     return Ok(());
                 }
+                (Some("init"), Some("-i" | "--interactive")) => {
+                    show_init_interactive_help();
+                    return Ok(());
+                }
+                (Some("init"), Some("--lib")) => {
+                    show_init_lib_help();
+                    return Ok(());
+                }
+                (Some("init"), Some("--path")) => {
+                    show_init_path_help();
+                    return Ok(());
+                }
+
+                // Dev command flags
+                (Some("dev"), Some("--parties")) => {
+                    show_dev_parties_help();
+                    return Ok(());
+                }
+                (Some("dev"), Some("-p" | "--port")) => {
+                    show_dev_port_help();
+                    return Ok(());
+                }
+                (Some("dev"), Some("--protocol")) => {
+                    show_dev_protocol_help();
+                    return Ok(());
+                }
+                (Some("dev"), Some("--threshold")) => {
+                    show_dev_threshold_help();
+                    return Ok(());
+                }
+                (Some("dev"), Some("--field")) => {
+                    show_dev_field_help();
+                    return Ok(());
+                }
+
+                // Build command flags
+                (Some("build"), Some("--target")) => {
+                    show_build_target_help();
+                    return Ok(());
+                }
+                (Some("build"), Some("--optimize")) => {
+                    show_build_optimize_help();
+                    return Ok(());
+                }
+                (Some("build"), Some("-r" | "--release")) => {
+                    show_build_release_help();
+                    return Ok(());
+                }
+
+                // Test command flags
+                (Some("test"), Some("--test")) => {
+                    show_test_test_help();
+                    return Ok(());
+                }
+                (Some("test"), Some("--parties")) => {
+                    show_test_parties_help();
+                    return Ok(());
+                }
+                (Some("test"), Some("--protocol")) => {
+                    show_test_protocol_help();
+                    return Ok(());
+                }
+                (Some("test"), Some("--threshold")) => {
+                    show_test_threshold_help();
+                    return Ok(());
+                }
+                (Some("test"), Some("--field")) => {
+                    show_test_field_help();
+                    return Ok(());
+                }
+                (Some("test"), Some("--integration")) => {
+                    show_test_integration_help();
+                    return Ok(());
+                }
+
+                // Run command flags
+                (Some("run"), Some("--parties")) => {
+                    show_run_parties_help();
+                    return Ok(());
+                }
+                (Some("run"), Some("--protocol")) => {
+                    show_run_protocol_help();
+                    return Ok(());
+                }
+                (Some("run"), Some("--threshold")) => {
+                    show_run_threshold_help();
+                    return Ok(());
+                }
+                (Some("run"), Some("--field")) => {
+                    show_run_field_help();
+                    return Ok(());
+                }
+                (Some("run"), Some("--vm-opt")) => {
+                    show_run_vm_opt_help();
+                    return Ok(());
+                }
+
+                _ => {}
             }
-            _ => {}
         }
     }
 
