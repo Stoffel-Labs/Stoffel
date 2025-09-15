@@ -179,6 +179,103 @@ MPC CONFIGURATION:
         field: MpcField,
     },
 
+    /// Compile StoffelLang source files to bytecode
+    #[command(
+        long_about = "Compile StoffelLang (.stfl) source files into executable MPC bytecode.
+
+DEFAULT BEHAVIOR:
+    Without specifying a file, compiles all .stfl files in src/ directory.
+    With a file specified, compiles only that specific file.
+
+EXAMPLES:
+    stoffel compile                                    # Compile all files in src/
+    stoffel compile src/main.stfl                      # Compile specific file
+    stoffel compile src/main.stfl -o output.bin        # Specify output file
+    stoffel compile --binary                          # Compile all files as binaries
+    stoffel compile -O3                               # Compile all with optimization
+    stoffel compile --disassemble compiled.bin         # Disassemble compiled binary
+
+BATCH COMPILATION:
+    When compiling multiple files from src/:
+    - Each file is compiled independently
+    - Output files are generated in the same directory structure
+    - Compilation continues even if individual files fail
+    - Summary report shows success/failure for each file
+
+COMPILATION PROCESS:
+    1. Lexical analysis: Tokenizes StoffelLang source
+    2. Parsing: Builds Abstract Syntax Tree (AST)
+    3. Semantic analysis: Type checking and validation
+    4. Code generation: Converts to StoffelVM bytecode
+    5. Optimization: Applies requested optimization level
+    6. Output: Generates executable bytecode file
+
+OPTIMIZATION LEVELS:
+    -O0    No optimization (fastest compilation)
+    -O1    Basic optimizations
+    -O2    Standard optimizations (good balance)
+    -O3    Maximum optimization (slowest compilation)
+
+DEBUGGING:
+    Use --print-ir to see intermediate representations during compilation"
+    )]
+    Compile {
+        /// StoffelLang source file to compile (optional - defaults to all files in src/)
+        #[arg(
+            help = "Path to specific .stfl file to compile (optional)",
+            long_help = "Path to the StoffelLang source file (.stfl) to compile. If not specified, compiles all .stfl files in the src/ directory. Can be relative or absolute path. The file must contain valid StoffelLang syntax."
+        )]
+        file: Option<String>,
+
+        /// Output file path
+        #[arg(
+            short,
+            long,
+            help = "Output file path for compiled bytecode",
+            long_help = "Specify the output file path for the compiled bytecode. If not provided, uses the input filename with appropriate extension (.bin for binary, .bc for bytecode)."
+        )]
+        output: Option<String>,
+
+        /// Generate VM-compatible binary
+        #[arg(
+            short = 'b',
+            long,
+            help = "Generate VM-compatible binary format",
+            long_help = "Generate a VM-compatible binary format suitable for execution on StoffelVM. This is the recommended format for production deployment."
+        )]
+        binary: bool,
+
+        /// Disassemble compiled binary instead of compiling
+        #[arg(
+            long,
+            help = "Disassemble a compiled binary file",
+            long_help = "Disassemble a previously compiled Stoffel binary (.bin) file to show the bytecode instructions. Useful for debugging and understanding compilation output."
+        )]
+        disassemble: bool,
+
+        /// Print intermediate representations
+        #[arg(
+            long,
+            help = "Print intermediate representations (tokens, AST, etc.)",
+            long_help = "Print intermediate representations during compilation including tokens, Abstract Syntax Tree (AST), and other debug information. Useful for compiler development and debugging complex compilation issues."
+        )]
+        print_ir: bool,
+
+        /// Optimization level (0-3)
+        #[arg(
+            short = 'O',
+            long = "opt-level",
+            default_value = "0",
+            help = "Set optimization level (0-3)",
+            long_help = "Set the optimization level for compilation:
+  0  No optimization (fastest compilation, good for development)
+  1  Basic optimizations (dead code elimination, constant folding)
+  2  Standard optimizations (good balance of speed and size)
+  3  Maximum optimization (aggressive optimization, slowest compilation)"
+        )]
+        opt_level: u8,
+    },
+
     /// Build the current project
     #[command(
         long_about = "Compile the current Stoffel project into executable MPC bytecode.
@@ -968,6 +1065,275 @@ For more help: stoffel build --help
 "#);
 }
 
+// Compile command help functions
+fn show_compile_output_help() {
+    println!(r#"
+HELP: stoffel compile --output (-o)
+
+DESCRIPTION:
+    The --output (-o) flag specifies the output file path for compiled bytecode.
+    If not provided, uses the input filename with appropriate extension.
+
+USAGE:
+    stoffel compile src/main.stfl --output compiled.bin
+    stoffel compile src/main.stfl -o output.bc
+
+OUTPUT FILE EXTENSIONS:
+    .bin    VM-compatible binary (use with --binary flag)
+    .bc     Bytecode format (default)
+    .stfl   Source file extension (input files)
+
+FILE PATH RESOLUTION:
+    ├─ Absolute paths: /path/to/output.bin
+    ├─ Relative paths: ./output.bin, ../compiled/main.bc
+    ├─ Automatic extension: Adds .bc if no extension provided
+    └─ Directory creation: Creates parent directories if needed
+
+EXAMPLES:
+    stoffel compile main.stfl -o compiled.bin          # Specific output file
+    stoffel compile main.stfl --output release.bc     # Bytecode output
+    stoffel compile main.stfl -o /tmp/test.bin         # Absolute path
+    stoffel compile main.stfl                          # Auto: main.bc
+
+INTEGRATION WITH OTHER FLAGS:
+    stoffel compile main.stfl -o app.bin --binary     # Binary format output
+    stoffel compile main.stfl -o debug.bc --print-ir  # Debug output with IR
+    stoffel compile main.stfl -o opt.bin -O3 --binary # Optimized binary
+
+For more help: stoffel compile --help
+"#);
+}
+
+fn show_compile_binary_help() {
+    println!(r#"
+HELP: stoffel compile --binary (-b)
+
+DESCRIPTION:
+    The --binary (-b) flag generates VM-compatible binary format suitable
+    for execution on StoffelVM. This is the recommended format for production.
+
+USAGE:
+    stoffel compile src/main.stfl --binary
+    stoffel compile src/main.stfl -b
+
+BINARY FORMAT FEATURES:
+    ├─ VM Compatibility: Direct execution on StoffelVM
+    ├─ Optimized Loading: Faster startup times
+    ├─ Compact Size: Efficient binary representation
+    ├─ Production Ready: Suitable for deployment
+    └─ Platform Independent: Runs on any StoffelVM instance
+
+BINARY VS BYTECODE:
+    Bytecode (.bc):
+    ├─ Human-readable representation
+    ├─ Debugging friendly
+    ├─ Larger file size
+    └─ Requires additional processing
+
+    Binary (.bin):
+    ├─ VM-optimized format
+    ├─ Faster execution
+    ├─ Smaller file size
+    └─ Production deployment
+
+EXAMPLES:
+    stoffel compile main.stfl --binary                 # Generate binary
+    stoffel compile main.stfl -b -o release.bin        # Binary with custom name
+    stoffel compile main.stfl --binary -O3             # Optimized binary
+
+DEPLOYMENT WORKFLOW:
+    1. Development: Compile without --binary for debugging
+    2. Testing: Use --binary for performance testing
+    3. Production: Always use --binary for deployment
+
+For more help: stoffel compile --help
+"#);
+}
+
+fn show_compile_disassemble_help() {
+    println!(r#"
+HELP: stoffel compile --disassemble
+
+DESCRIPTION:
+    The --disassemble flag disassembles a compiled binary file to show
+    bytecode instructions. Useful for debugging and understanding compilation.
+
+USAGE:
+    stoffel compile compiled.bin --disassemble
+
+DISASSEMBLY FEATURES:
+    ├─ Bytecode Instructions: Shows VM opcodes and operands
+    ├─ Memory Layout: Displays data section and constants
+    ├─ Jump Targets: Shows labels and branch destinations
+    ├─ Debug Information: Includes source line mappings (if available)
+    └─ Human Readable: Formatted output for analysis
+
+INPUT FILE TYPES:
+    .bin    VM-compatible binary files
+    .bc     Bytecode files (also supported)
+
+DISASSEMBLY OUTPUT:
+    ├─ Instruction listing with addresses
+    ├─ Register usage and data flow
+    ├─ Function boundaries and call sites
+    └─ Constant pool and literal values
+
+EXAMPLES:
+    stoffel compile app.bin --disassemble              # Disassemble binary
+    stoffel compile debug.bc --disassemble             # Disassemble bytecode
+    stoffel compile app.bin --disassemble > dump.txt   # Save to file
+
+DEBUGGING WORKFLOW:
+    1. Compile with debug info: stoffel compile main.stfl --print-ir
+    2. Generate binary: stoffel compile main.stfl --binary -o app.bin
+    3. Disassemble: stoffel compile app.bin --disassemble
+    4. Analyze output for optimization opportunities
+
+COMMON USE CASES:
+    ✅ Debugging compilation issues
+    ✅ Understanding compiler optimizations
+    ✅ Reverse engineering binary files
+    ✅ Performance analysis and profiling
+
+For more help: stoffel compile --help
+"#);
+}
+
+fn show_compile_print_ir_help() {
+    println!(r#"
+HELP: stoffel compile --print-ir
+
+DESCRIPTION:
+    The --print-ir flag prints intermediate representations during compilation,
+    including tokens, AST, and other debug information.
+
+USAGE:
+    stoffel compile src/main.stfl --print-ir
+
+INTERMEDIATE REPRESENTATIONS:
+    ├─ Tokens: Lexical analysis output (keywords, identifiers, literals)
+    ├─ Abstract Syntax Tree (AST): Parsed program structure
+    ├─ Symbol Table: Variable and function declarations
+    ├─ Type Information: Inferred and declared types
+    ├─ Semantic Analysis: Type checking and validation results
+    └─ Code Generation: Bytecode generation steps
+
+DEBUG OUTPUT SECTIONS:
+    1. LEXICAL ANALYSIS
+       ├─ Token stream with positions
+       ├─ Keyword recognition
+       └─ Literal parsing
+
+    2. SYNTAX ANALYSIS
+       ├─ Parse tree structure
+       ├─ Grammar rule applications
+       └─ Error recovery attempts
+
+    3. SEMANTIC ANALYSIS
+       ├─ Type checking results
+       ├─ Symbol resolution
+       └─ Scope analysis
+
+    4. CODE GENERATION
+       ├─ Bytecode instruction selection
+       ├─ Register allocation
+       └─ Optimization passes
+
+EXAMPLES:
+    stoffel compile main.stfl --print-ir               # Full IR output
+    stoffel compile main.stfl --print-ir > debug.log   # Save to file
+    stoffel compile main.stfl --print-ir -O2           # IR with optimizations
+
+DEBUGGING WORKFLOW:
+    1. Basic compilation: Check for syntax errors
+    2. Add --print-ir: Examine parse tree and types
+    3. Fix issues: Use IR to identify problems
+    4. Optimize: Compare IR before/after optimization
+
+WHEN TO USE:
+    ✅ Debugging compilation errors
+    ✅ Understanding compiler behavior
+    ✅ Learning StoffelLang internals
+    ✅ Contributing to compiler development
+    ⚠️  Produces verbose output (use redirection)
+
+For more help: stoffel compile --help
+"#);
+}
+
+fn show_compile_opt_level_help() {
+    println!(r#"
+HELP: stoffel compile --opt-level (-O)
+
+DESCRIPTION:
+    The --opt-level (-O) flag sets the optimization level for compilation.
+    Higher levels improve performance but increase compilation time.
+
+USAGE:
+    stoffel compile src/main.stfl --opt-level 2
+    stoffel compile src/main.stfl -O3
+
+OPTIMIZATION LEVELS:
+
+  -O0 (default)
+    ├─ No optimization
+    ├─ Fastest compilation
+    ├─ Best for development and debugging
+    ├─ Preserves all debug information
+    └─ Larger bytecode size
+
+  -O1
+    ├─ Basic optimizations
+    ├─ Dead code elimination
+    ├─ Constant folding
+    ├─ Fast compilation
+    └─ Good balance for development
+
+  -O2
+    ├─ Standard optimizations
+    ├─ Loop optimizations
+    ├─ Function inlining (small functions)
+    ├─ Register optimization
+    └─ Recommended for production
+
+  -O3
+    ├─ Aggressive optimizations
+    ├─ Advanced loop transformations
+    ├─ Extensive function inlining
+    ├─ Cross-function optimizations
+    └─ Maximum performance (slowest compilation)
+
+OPTIMIZATION TECHNIQUES:
+    ├─ Dead Code Elimination: Removes unused code
+    ├─ Constant Folding: Pre-computes constant expressions
+    ├─ Loop Optimization: Reduces loop overhead
+    ├─ Function Inlining: Eliminates function call overhead
+    ├─ Register Allocation: Optimizes register usage
+    └─ MPC-Specific: Optimizes secure computation patterns
+
+PERFORMANCE IMPACT:
+    Level    Compile Time    Runtime Speed    Binary Size
+    -O0      Fastest        Slowest          Largest
+    -O1      Fast           Good             Medium
+    -O2      Medium         Better           Smaller
+    -O3      Slowest        Fastest          Smallest
+
+EXAMPLES:
+    stoffel compile main.stfl -O0                      # Debug build
+    stoffel compile main.stfl -O2                      # Production build
+    stoffel compile main.stfl -O3 --binary             # Maximum optimization
+    stoffel compile main.stfl --opt-level 1            # Explicit level 1
+
+WHEN TO USE EACH LEVEL:
+    -O0: Development, debugging, rapid iteration
+    -O1: Testing builds, continuous integration
+    -O2: Production releases, performance testing
+    -O3: Performance-critical applications, benchmarking
+
+For more help: stoffel compile --help
+"#);
+}
+
 // Placeholder functions for other commands to avoid compile errors
 fn show_test_test_help() { println!("Help for --test flag coming soon"); }
 fn show_test_parties_help() { println!("Help for --parties flag coming soon"); }
@@ -1135,6 +1501,28 @@ fn main() -> Result<(), String> {
                     return Ok(());
                 }
 
+                // Compile command flags
+                (Some("compile"), Some("-o" | "--output")) => {
+                    show_compile_output_help();
+                    return Ok(());
+                }
+                (Some("compile"), Some("-b" | "--binary")) => {
+                    show_compile_binary_help();
+                    return Ok(());
+                }
+                (Some("compile"), Some("--disassemble")) => {
+                    show_compile_disassemble_help();
+                    return Ok(());
+                }
+                (Some("compile"), Some("--print-ir")) => {
+                    show_compile_print_ir_help();
+                    return Ok(());
+                }
+                (Some("compile"), Some("-O" | "--opt-level")) => {
+                    show_compile_opt_level_help();
+                    return Ok(());
+                }
+
                 // Run command flags
                 (Some("run"), Some("--parties")) => {
                     show_run_parties_help();
@@ -1187,6 +1575,117 @@ fn main() -> Result<(), String> {
             if let Err(e) = init::initialize_project(init_options) {
                 eprintln!("❌ Initialization failed: {}", e);
                 std::process::exit(1);
+            }
+        }
+
+        Commands::Compile { file, output, binary, disassemble, print_ir, opt_level } => {
+            // Validate optimization level
+            if opt_level > 3 {
+                eprintln!("❌ Invalid optimization level: {}. Must be 0-3.", opt_level);
+                std::process::exit(1);
+            }
+
+            // Build the path to the Stoffel-Lang compiler
+            let exe_path = std::env::current_exe()
+                .map_err(|e| format!("Failed to get executable path: {}", e))?;
+            let exe_dir = exe_path.parent()
+                .ok_or("Failed to get executable directory")?;
+
+            // Navigate to parent directory to find Stoffel-Lang
+            let stoffel_lang_path = exe_dir.parent()
+                .and_then(|p| p.parent())
+                .and_then(|p| p.parent())
+                .map(|p| p.join("Stoffel-Lang"))
+                .ok_or("Could not locate Stoffel-Lang directory")?;
+
+            let compiler_path = stoffel_lang_path.join("target").join("debug").join("stoffellang");
+
+            // Check if Stoffel-Lang compiler exists
+            if !compiler_path.exists() {
+                eprintln!("❌ Stoffel-Lang compiler not found at: {}", compiler_path.display());
+                eprintln!("   Please build Stoffel-Lang first:");
+                eprintln!("   cd {} && cargo build", stoffel_lang_path.display());
+                std::process::exit(1);
+            }
+
+            match file {
+                Some(specific_file) => {
+                    // Compile specific file
+                    if disassemble {
+                        println!("🔧 Disassembling file: {}", specific_file);
+                    } else {
+                        println!("🔧 Compiling StoffelLang file: {}", specific_file);
+                    }
+
+                    let success = compile_single_file(&compiler_path, &specific_file, &output, binary, disassemble, print_ir, opt_level)?;
+                    if !success {
+                        std::process::exit(1);
+                    }
+                }
+                None => {
+                    // Compile all files in src/ directory
+                    println!("🔧 Compiling all StoffelLang files in src/ directory...");
+
+                    // Check if src/ directory exists
+                    if !std::path::Path::new("src").exists() {
+                        eprintln!("❌ No src/ directory found. Please run this command from a Stoffel project root,");
+                        eprintln!("   or specify a specific file to compile.");
+                        std::process::exit(1);
+                    }
+
+                    // Find all .stfl files in src/
+                    let stfl_files = find_stfl_files("src")?;
+
+                    if stfl_files.is_empty() {
+                        println!("ℹ️  No .stfl files found in src/ directory.");
+                        return Ok(());
+                    }
+
+                    println!("   Found {} StoffelLang file(s) to compile:", stfl_files.len());
+                    for file in &stfl_files {
+                        println!("     - {}", file);
+                    }
+                    println!();
+
+                    // Compile each file
+                    let mut successful = 0;
+                    let mut failed = 0;
+
+                    for stfl_file in &stfl_files {
+                        println!("🔧 Compiling: {}", stfl_file);
+
+                        // For batch compilation, don't use custom output names (they would conflict)
+                        let file_output = if output.is_some() && stfl_files.len() > 1 {
+                            eprintln!("⚠️  Custom output path ignored for batch compilation");
+                            None
+                        } else {
+                            output.clone()
+                        };
+
+                        let success = compile_single_file(&compiler_path, stfl_file, &file_output, binary, disassemble, print_ir, opt_level)?;
+
+                        if success {
+                            successful += 1;
+                            println!("✅ {}", stfl_file);
+                        } else {
+                            failed += 1;
+                            println!("❌ {}", stfl_file);
+                        }
+                        println!();
+                    }
+
+                    // Summary
+                    println!("📊 Compilation Summary:");
+                    println!("   ✅ Successful: {}", successful);
+                    println!("   ❌ Failed: {}", failed);
+                    println!("   📁 Total: {}", stfl_files.len());
+
+                    if failed > 0 {
+                        std::process::exit(1);
+                    } else {
+                        println!("🎉 All files compiled successfully!");
+                    }
+                }
             }
         }
 
@@ -1333,6 +1832,88 @@ fn main() -> Result<(), String> {
     }
 
     Ok(())
+}
+
+/// Find all .stfl files recursively in a directory
+fn find_stfl_files(dir: &str) -> Result<Vec<String>, String> {
+    let mut stfl_files = Vec::new();
+    find_stfl_files_recursive(std::path::Path::new(dir), &mut stfl_files)?;
+    stfl_files.sort(); // Sort for consistent ordering
+    Ok(stfl_files)
+}
+
+/// Recursively find .stfl files in a directory
+fn find_stfl_files_recursive(dir: &std::path::Path, files: &mut Vec<String>) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("Failed to read directory {}: {}", dir.display(), e))?;
+
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read directory entry: {}", e))?;
+        let path = entry.path();
+
+        if path.is_dir() {
+            // Recursively search subdirectories
+            find_stfl_files_recursive(&path, files)?;
+        } else if let Some(extension) = path.extension() {
+            if extension == "stfl" {
+                files.push(path.to_string_lossy().to_string());
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Compile a single StoffelLang file
+fn compile_single_file(
+    compiler_path: &std::path::Path,
+    file: &str,
+    output: &Option<String>,
+    binary: bool,
+    disassemble: bool,
+    print_ir: bool,
+    opt_level: u8,
+) -> Result<bool, String> {
+    // Build arguments for the Stoffel-Lang compiler
+    let mut args = vec![file.to_string()];
+
+    if let Some(output) = output {
+        args.push("-o".to_string());
+        args.push(output.clone());
+    }
+
+    if binary {
+        args.push("--binary".to_string());
+    }
+
+    if disassemble {
+        args.push("--disassemble".to_string());
+    }
+
+    if print_ir {
+        args.push("--print-ir".to_string());
+    }
+
+    if opt_level > 0 {
+        args.push(format!("-O{}", opt_level));
+    }
+
+    // Execute the Stoffel-Lang compiler
+    let output = std::process::Command::new(compiler_path)
+        .args(&args)
+        .output()
+        .map_err(|e| format!("Failed to execute compiler: {}", e))?;
+
+    // Print compiler output
+    if !output.stdout.is_empty() {
+        print!("{}", String::from_utf8_lossy(&output.stdout));
+    }
+
+    if !output.stderr.is_empty() {
+        eprint!("{}", String::from_utf8_lossy(&output.stderr));
+    }
+
+    Ok(output.status.success())
 }
 
 /// Calculate appropriate threshold based on number of parties and protocol
