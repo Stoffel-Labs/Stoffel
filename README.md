@@ -1,194 +1,63 @@
-# Stoffel : A framework for building applications using multiparty computation
+# Stoffel
 
-Stoffel is a comprehensive CLI framework for developing privacy-preserving applications using secure multiparty computation (MPC). It provides tools for project initialization, compilation, development, and deployment of MPC applications using the StoffelLang programming language.
-
-## Features
-
-- **Project Management**: Initialize new MPC projects with language-specific templates
-- **StoffelLang Compilation**: Compile `.stfl` source files to executable MPC bytecode
-- **Development Tools**: Hot-reloading development server with MPC simulation
-- **Multiple Language Support**: Templates for Python, Rust, TypeScript, Solidity, and pure StoffelLang
-- **MPC Protocol Integration**: Built-in support for HoneyBadger MPC protocol
-- **Comprehensive Help**: Flag-specific help system for all commands and options
+A Stoffel MPC application
 
 ## Quick Start
 
-### Installation
-
-Build from source:
 ```bash
-git clone <repository-url>
-cd Stoffel
-cargo build --release
-```
+# Run the application
+stoffel run
 
-### Create Your First MPC Project
-
-```bash
-# Create a new project with Python SDK integration
-stoffel init my-mpc-app --template python
-
-# Or create a pure StoffelLang project
-stoffel init my-secure-app
-
-# Interactive setup with guided prompts
-stoffel init --interactive
-```
-
-### Compile Your Project
-
-```bash
-# Compile all StoffelLang files in src/
-stoffel compile
-
-# Compile a specific file
-stoffel compile src/main.stfl
-
-# Generate optimized binary
-stoffel compile --binary -O3
-```
-
-### Development Server
-
-```bash
-# Start development server with MPC simulation
+# Development mode with hot reloading
 stoffel dev
 
-# Custom configuration
-stoffel dev --parties 7 --port 3000 --field bn254
+# Run tests
+stoffel test
+
+# Build optimized version
+stoffel build --release
 ```
 
-## Commands
+## Configuration
 
-### `stoffel init`
-Initialize new Stoffel projects with proper MPC configuration.
+- **Protocol**: honeybadger (HoneyBadger MPC)
+- **Parties**: 5 (minimum 5 for HoneyBadger)
+- **Field**: bls12-381 (cryptographic field)
+- **Threshold**: 1 (max corrupted parties)
 
-**Templates:**
-- `python` - Full Python SDK integration with StoffelProgram and StoffelClient
-- `rust` - Rust FFI integration with StoffelVM (development skeleton)
-- `typescript` - TypeScript/Node.js client integration (development skeleton)
-- `solidity` - Smart contracts with MPC result verification
-- `stoffel` - Pure StoffelLang implementation (default)
+## Language Ecosystem
 
-**Examples:**
-```bash
-stoffel init my-project                    # Default StoffelLang template
-stoffel init --lib my-library              # Create a library project
-stoffel init -t python webapp              # Python template
-stoffel init -i                           # Interactive setup
-```
+This project was generated for the **basic** ecosystem.
 
-### `stoffel compile`
-Compile StoffelLang source files to executable MPC bytecode.
+## StoffelLang Implementation
 
-**Examples:**
-```bash
-stoffel compile                            # Compile all files in src/
-stoffel compile src/main.stfl              # Compile specific file
-stoffel compile --binary                   # Generate VM-compatible binaries
-stoffel compile -O3                        # Maximum optimization
-stoffel compile --disassemble app.bin      # Disassemble compiled binary
-```
+This project uses pure StoffelLang for MPC computations:
 
-### `stoffel dev`
-Start development server with hot reloading and MPC simulation.
+- **Native MPC**: Built-in secret sharing and secure computation
+- **Type Safety**: Strong typing with SecretInt and PublicInt
+- **Performance**: Optimized for the StoffelVM execution environment
 
-**Examples:**
-```bash
-stoffel dev                                # Default: 5 parties, port 8080
-stoffel dev --parties 7 --port 3000       # Custom configuration
-stoffel dev --field bn254                 # Different cryptographic field
-```
+## StoffelLang Features
 
-### `stoffel build`
-Build the current project for deployment.
+- Secret integer types with automatic MPC operations
+- Built-in functions for secure computation (add, multiply, reveal)
+- Support for complex data structures (vectors, structs)
+- Privacy-preserving algorithms
 
-**Examples:**
-```bash
-stoffel build                              # Debug build
-stoffel build --release                    # Production build
-stoffel build --target wasm               # WebAssembly target
-```
+## MPC Features
 
-## MPC Configuration
+This application demonstrates:
 
-Stoffel uses the HoneyBadger MPC protocol with configurable parameters:
+- **Secure Computation**: Private inputs from multiple parties
+- **Privacy Preservation**: Individual data never revealed
+- **Result Reconstruction**: Only final results are disclosed
+- **Healthcare Analytics**: Privacy-preserving medical statistics
+- **Financial Risk**: Confidential portfolio risk assessment
 
-- **Parties**: Minimum 5 parties required for security
-- **Threshold**: Maximum corrupted parties = `(parties - 1) / 3`
-- **Cryptographic Fields**: BLS12-381 (default), BN254, Secp256k1, Prime61
+## Learn More
 
-## Project Structure
-
-```
-my-mpc-project/
-├── Stoffel.toml              # Project configuration
-├── src/                      # StoffelLang source files
-│   ├── main.stfl            # Main program entry point
-│   └── lib.stfl             # Library functions (for --lib projects)
-├── tests/                   # Test files
-│   └── integration.stfl     # Integration tests
-└── README.md               # Project documentation
-```
-
-## Language-Specific Projects
-
-### Python Template
-Full SDK integration with Poetry and pytest:
-```
-my-python-project/
-├── pyproject.toml           # Poetry configuration
-├── src/
-│   ├── main.py             # Python implementation
-│   └── secure_computation.stfl  # StoffelLang program
-└── tests/
-    └── test_main.py        # Python tests
-```
-
-### Library Projects
-Reusable MPC components:
-```bash
-stoffel init --lib crypto-utils
-```
-
-## Getting Help
-
-Stoffel provides comprehensive help for all commands and flags:
-
-```bash
-stoffel --help                    # Main help
-stoffel init --help               # Command help
-stoffel init -t -h               # Flag-specific help
-stoffel compile --binary --help  # Detailed flag documentation
-```
-
-## Development
-
-### Building Stoffel
-
-```bash
-cargo build                       # Debug build
-cargo build --release            # Release build
-```
-
-### Running Tests
-
-```bash
-cargo test                        # Run Rust tests
-```
-
-### Dependencies
-
-Stoffel integrates with:
-- **Stoffel-Lang**: StoffelLang compiler for `.stfl` files
-- **StoffelVM**: Virtual machine for MPC execution
-- **mpc-protocols**: HoneyBadger MPC protocol implementation
-- **stoffel-python-sdk**: Python SDK for MPC applications
-
-## License
-
-This project is licensed under the Apache License, Version 2.0. See the [LICENSE](LICENSE) file for details.
-
-## Contributing
-
-We welcome meaningful contributions to Stoffel! Please read our [Contributing Guidelines](CONTRIBUTING.md) before submitting pull requests.
+- [Stoffel Documentation](https://docs.stoffel.dev)
+- [MPC Introduction](https://docs.stoffel.dev/mpc-intro)
+- [HoneyBadger Protocol](https://docs.stoffel.dev/honeybadger)
+- [StoffelLang Guide](https://docs.stoffel.dev/language)
+- [Python SDK](https://docs.stoffel.dev/python-sdk)

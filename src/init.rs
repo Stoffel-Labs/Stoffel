@@ -248,16 +248,15 @@ fn create_library_structure(path: &Path, config: &StoffelConfig, _template: Opti
     fs::create_dir_all(path.join("src")).map_err(|e| format!("Failed to create src directory: {}", e))?;
 
     // Create lib.stfl
-    let lib_content = r#"// Stoffel Library
-// This library provides privacy-preserving computation functions
+    let lib_content = r#"# Stoffel Library
+# This library provides privacy-preserving computation functions
 
-// Example function for secure computation
-fn secure_add(a: SecretInt, b: SecretInt) -> SecretInt {
-    return a + b;
-}
+# Example function for secure computation
+proc secure_add(a: secret int64, b: secret int64): secret int64 =
+  return a + b
 
-// Export main functions
-export { secure_add };
+# Note: Export syntax is still under development
+# export { secure_add }
 "#;
     fs::write(path.join("src").join("lib.stfl"), lib_content)
         .map_err(|e| format!("Failed to write lib.stfl: {}", e))?;
@@ -1036,17 +1035,15 @@ proc secure_computation(x: secret int64, y: secret int64): secret int64 =
 
 # Main entry point
 proc main() =
-  print("StoffelLang MPC Demo")
-
-  # Get secret inputs from parties
-  let input_a: secret int64 = get_input(0)
-  let input_b: secret int64 = get_input(1)
+  # Example secret inputs (in real MPC, these would come from different parties)
+  let input_a: secret int64 = 15
+  let input_b: secret int64 = 25
 
   # Perform secure computation
   let result = secure_computation(input_a, input_b)
 
-  print("Computation finished")
-  return result
+  # In a real application, you might reveal the result or use it in further computations
+  discard result
 "#,
         config.package.name,
         config.package.description.as_deref().unwrap_or("Stoffel MPC application"),
@@ -1061,14 +1058,21 @@ proc main() =
     // Create test file
     let test_content = r#"# Integration tests for StoffelLang MPC
 #
-# TODO: Update this example when StoffelLang frontend has stabilized
-# Current syntax is based on test files and may change
+# This file contains basic tests for StoffelLang functionality
+
+# Define a simple secure computation function for testing
+proc secure_computation(x: secret int64, y: secret int64): secret int64 =
+  let sum = x + y
+  let product = x * y
+  let result = sum + product
+  return result
 
 # Test the secure computation function
 proc test_secure_computation() =
   let x: secret int64 = 10
   let y: secret int64 = 5
   let result = secure_computation(x, y)
+  discard result
   print("Secure computation test completed")
 
 # Test with different values
@@ -1076,6 +1080,7 @@ proc test_computation_variants() =
   let a: secret int64 = 20
   let b: secret int64 = 3
   let output = secure_computation(a, b)
+  discard output
   print("Computation variant test completed")
 
 # Run all tests
