@@ -23,62 +23,211 @@ struct Cli {
 #[derive(Subcommand, Debug)]
 enum Commands {
     /// Initialize a new Stoffel project or library
+    #[command(
+        long_about = "Initialize a new Stoffel project with proper MPC configuration and project structure.
+
+EXAMPLES:
+    stoffel init my-project                    # Create a new project with default StoffelLang template
+    stoffel init --lib my-library              # Create a library project
+    stoffel init -i                           # Interactive setup with prompts
+    stoffel init -t python my-mpc-app         # Create project with Python SDK integration
+    stoffel init --path /tmp/test --lib       # Create library at specific path
+
+AVAILABLE TEMPLATES:
+    python      - Python SDK integration with StoffelProgram and StoffelClient
+    rust        - Rust FFI integration with StoffelVM (skeleton)
+    typescript  - TypeScript/Node.js MPC client (skeleton)
+    solidity    - Smart contracts with MPC result verification
+    stoffel     - Pure StoffelLang implementation (default)
+
+INTERACTIVE MODE:
+    Use -i/--interactive to get guided setup with prompts for:
+    - Project configuration (name, description, author)
+    - MPC parameters (parties, protocol, field type)
+    - Template selection with explanations"
+    )]
     Init {
-        /// Project name
+        /// Project name (if not provided, uses current directory name)
+        #[arg(
+            help = "Name of the project to create",
+            long_help = "Project name to use for initialization. If not provided, the current directory name will be used. The name should be a valid package identifier (lowercase, hyphens allowed)."
+        )]
         name: Option<String>,
 
         /// Initialize as a library instead of standalone project
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Create a library project instead of an application",
+            long_help = "Initialize as a library project suitable for publishing and use as a dependency. Libraries include src/lib.stfl and focus on reusable MPC functions rather than executable applications."
+        )]
         lib: bool,
 
         /// Path to initialize in
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Directory path where the project should be created",
+            long_help = "Path where the new project should be initialized. If not specified, creates the project in the current directory. The path will be created if it doesn't exist."
+        )]
         path: Option<String>,
 
         /// Use interactive mode for setup
-        #[arg(short, long)]
+        #[arg(
+            short,
+            long,
+            help = "Enable interactive setup with guided prompts",
+            long_help = "Interactive mode provides step-by-step setup with prompts for project details, MPC configuration, and template selection. Recommended for first-time users or when you want to customize all settings."
+        )]
         interactive: bool,
 
         /// Template to use for initialization
-        #[arg(short, long)]
+        #[arg(
+            short,
+            long,
+            help = "Template for project initialization",
+            long_help = "Language-specific template to use for project structure:
+
+TEMPLATES:
+  python      - Full Python SDK integration with StoffelProgram and StoffelClient
+                Creates: src/main.py, pyproject.toml, Poetry configuration
+
+  rust        - Rust FFI integration with StoffelVM (development skeleton)
+                Creates: src/main.rs, Cargo.toml with FFI dependencies
+
+  typescript  - TypeScript/Node.js client integration (development skeleton)
+                Creates: src/main.ts, package.json, tsconfig.json
+
+  solidity    - Smart contracts with MPC result verification
+                Creates: contracts/StoffelMPC.sol, Hardhat configuration
+
+  stoffel     - Pure StoffelLang implementation (default if not specified)
+                Creates: src/main.stfl, tests/integration.stfl
+
+The Python template is fully implemented with working SDK integration. Other templates provide development skeletons for their respective ecosystems."
+        )]
         template: Option<String>,
     },
 
     /// Start development server with hot reloading
+    #[command(
+        long_about = "Start a development server with hot reloading for rapid MPC application development.
+
+EXAMPLES:
+    stoffel dev                                # Start dev server with default settings (5 parties, port 8080)
+    stoffel dev --parties 7 --port 3000       # Custom party count and port
+    stoffel dev --field bn254                 # Use different cryptographic field
+    stoffel dev --threshold 2                 # Set custom corruption threshold
+
+DEVELOPMENT FEATURES:
+    - Hot reloading: Automatically recompiles and restarts on file changes
+    - Local MPC simulation: Simulates distributed computation locally
+    - Debug mode: Enhanced logging and debugging information
+    - Interactive console: REPL for testing MPC functions
+
+MPC CONFIGURATION:
+    The development server simulates a full MPC network locally with the specified
+    number of parties. Changes to StoffelLang files trigger automatic recompilation
+    and deployment to the simulated network."
+    )]
     Dev {
         /// Number of parties for simulation (minimum 5 for HoneyBadger)
-        #[arg(long, default_value = "5")]
+        #[arg(
+            long,
+            default_value = "5",
+            help = "Number of MPC parties to simulate",
+            long_help = "Number of parties in the simulated MPC network. For HoneyBadger protocol, minimum is 5 parties. More parties increase security but reduce performance. Typical development uses 5-7 parties."
+        )]
         parties: u8,
 
         /// Port to run on
-        #[arg(short, long, default_value = "8080")]
+        #[arg(
+            short,
+            long,
+            default_value = "8080",
+            help = "Port for the development server",
+            long_help = "Port where the development server will listen for connections. The server provides a web interface for monitoring MPC execution and logs."
+        )]
         port: u16,
 
         /// MPC protocol to use
-        #[arg(long, default_value = "honeybadger")]
+        #[arg(
+            long,
+            default_value = "honeybadger",
+            help = "MPC protocol for simulation",
+            long_help = "Multiparty computation protocol to use for development. Currently only HoneyBadger is supported, which provides Byzantine fault tolerance and is production-ready."
+        )]
         protocol: MpcProtocol,
 
         /// Security threshold (max corrupted parties, auto-calculated if not provided)
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Maximum number of corrupted parties (auto-calculated if not specified)",
+            long_help = "Security threshold: maximum number of parties that can be corrupted while maintaining security. For HoneyBadger, must be < n/3. If not specified, automatically calculated as (parties-1)/3."
+        )]
         threshold: Option<u8>,
 
         /// Field type for computation
-        #[arg(long, default_value = "bls12-381")]
+        #[arg(
+            long,
+            default_value = "bls12-381",
+            help = "Cryptographic field for MPC operations",
+            long_help = "Finite field used for MPC computations:
+  bls12-381  - BLS12-381 scalar field (recommended, good performance and security)
+  bn254      - BN254 scalar field (alternative pairing-friendly curve)
+  secp256k1  - Secp256k1 scalar field (Ethereum/Bitcoin compatibility)
+  prime61    - Small prime field for testing (fast but not secure)"
+        )]
         field: MpcField,
     },
 
     /// Build the current project
+    #[command(
+        long_about = "Compile the current Stoffel project into executable MPC bytecode.
+
+EXAMPLES:
+    stoffel build                              # Debug build with default settings
+    stoffel build --release                    # Optimized release build
+    stoffel build --target wasm               # Build for WebAssembly target
+    stoffel build --optimize --release         # Maximum optimizations for production
+
+BUILD PROCESS:
+    1. Compiles StoffelLang (.stfl) files to MPC bytecode
+    2. Validates MPC protocol compatibility
+    3. Optimizes for the target execution environment
+    4. Generates deployment artifacts
+
+OUTPUT:
+    - Compiled bytecode in target/ directory
+    - Deployment manifests for MPC networks
+    - Debug symbols (if debug build)"
+    )]
     Build {
         /// Target to build for
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Build target platform",
+            long_help = "Target platform for compilation:
+  native     - Native MPC execution (default)
+  wasm       - WebAssembly for browser MPC
+  tee        - Trusted Execution Environment
+  gpu        - GPU-accelerated computation"
+        )]
         target: Option<String>,
 
         /// Enable optimizations
-        #[arg(long)]
+        #[arg(
+            long,
+            help = "Enable compiler optimizations",
+            long_help = "Enable advanced compiler optimizations for better performance. This includes dead code elimination, constant folding, and MPC-specific optimizations. May increase build time."
+        )]
         optimize: bool,
 
         /// Release build
-        #[arg(short, long)]
+        #[arg(
+            short,
+            long,
+            help = "Build in release mode with full optimizations",
+            long_help = "Release mode enables all optimizations and removes debug information for maximum performance. Use for production deployments. Debug builds are faster to compile and include debugging symbols."
+        )]
         release: bool,
     },
 
@@ -243,6 +392,70 @@ enum VmOptLevel {
     Aggressive,
 }
 
+fn show_template_help() {
+    println!(r#"
+HELP: stoffel init --template (-t)
+
+DESCRIPTION:
+    The --template (-t) flag specifies which programming language ecosystem
+    template to use when initializing a new Stoffel project.
+
+USAGE:
+    stoffel init --template <TEMPLATE> [PROJECT_NAME]
+    stoffel init -t <TEMPLATE> [PROJECT_NAME]
+
+AVAILABLE TEMPLATES:
+
+  python
+    ├─ Full Python SDK integration with StoffelProgram and StoffelClient
+    ├─ Creates: src/main.py, src/secure_computation.stfl, pyproject.toml
+    ├─ Dependencies: Poetry, stoffel-python-sdk
+    ├─ Status: ✅ Fully implemented with working MPC examples
+    └─ Best for: Python developers, data science, rapid prototyping
+
+  rust
+    ├─ Rust FFI integration with StoffelVM (development skeleton)
+    ├─ Creates: src/main.rs, Cargo.toml with FFI dependencies
+    ├─ Dependencies: libc, tokio (StoffelVM crates when available)
+    ├─ Status: 🚧 Development skeleton, FFI integration pending
+    └─ Best for: Performance-critical applications, systems programming
+
+  typescript
+    ├─ TypeScript/Node.js client integration (development skeleton)
+    ├─ Creates: src/main.ts, package.json, tsconfig.json
+    ├─ Dependencies: @stoffel/sdk (when available)
+    ├─ Status: 🚧 Development skeleton, SDK implementation pending
+    └─ Best for: Web applications, JavaScript ecosystem integration
+
+  solidity
+    ├─ Smart contracts with MPC result verification
+    ├─ Creates: contracts/StoffelMPC.sol, hardhat.config.js, deployment scripts
+    ├─ Dependencies: Hardhat, OpenZeppelin contracts
+    ├─ Status: 🚧 Development skeleton, on-chain verification concepts
+    └─ Best for: Blockchain integration, DeFi applications
+
+  stoffel (default)
+    ├─ Pure StoffelLang implementation
+    ├─ Creates: src/main.stfl, tests/integration.stfl
+    ├─ Dependencies: None (native StoffelLang)
+    ├─ Status: ✅ Fully supported with proper syntax
+    └─ Best for: Learning StoffelLang, pure MPC applications
+
+EXAMPLES:
+    stoffel init -t python my-mpc-app          # Python template
+    stoffel init --template rust secure-calc   # Rust template
+    stoffel init -t solidity mpc-auction       # Solidity template
+    stoffel init my-project                    # Default (stoffel) template
+
+INTERACTIVE MODE:
+    Use -i/--interactive to get guided template selection with explanations:
+
+    stoffel init -i                           # Guided setup with template help
+
+For more help: stoffel init --help
+"#);
+}
+
 fn display_honeybadger() {
     println!(r#"
     Stoffel is a honeybadger that helps you build MPC applications.
@@ -306,6 +519,22 @@ fn display_honeybadger() {
 }
 
 fn main() -> Result<(), String> {
+    // Handle special flag-specific help cases before clap parsing
+    let args: Vec<String> = std::env::args().collect();
+
+    // Check for flag-specific help patterns like "stoffel init -t -h" or "stoffel init --template --help"
+    if args.len() >= 4 {
+        match (args.get(1).map(|s| s.as_str()), args.get(2).map(|s| s.as_str())) {
+            (Some("init"), Some("-t" | "--template")) => {
+                if args.get(3).map(|s| s.as_str()) == Some("-h") || args.get(3).map(|s| s.as_str()) == Some("--help") {
+                    show_template_help();
+                    return Ok(());
+                }
+            }
+            _ => {}
+        }
+    }
+
     let cli = Cli::parse();
 
     // If no subcommand is provided, show the honeybadger
