@@ -6,4 +6,7 @@ authors = ["Stoffel Labs Inc"]
 description = "Stoffel is a framework for building MPC applications"
 
 [dependencies]
-clap = { version = "4.4", features = ["derive"] } 
+clap = { version = "4.4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+toml = "0.8"
+dirs = "5.0" 

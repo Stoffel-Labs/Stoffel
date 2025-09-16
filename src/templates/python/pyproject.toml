@@ -1,0 +1,20 @@
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
+
+[tool.poetry]
+name = "{{package_name}}"
+version = "{{package_version}}"
+description = "{{package_description}}"
+authors = [{{package_authors}}]
+packages = [{include = "src"}]
+
+[tool.poetry.dependencies]
+python = "^3.8"
+stoffel-python-sdk = {path = "../stoffel-python-sdk", develop = true}
+
+[tool.poetry.group.dev.dependencies]
+pytest = "^7.0"
+pytest-asyncio = "^0.21"
+black = "^23.0"
+isort = "^5.0"
