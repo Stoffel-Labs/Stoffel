@@ -1240,7 +1240,7 @@ async fn collect_hb_coordinator_inputs<F, G>(
     node_rpc: &OffChainNodeRPCServer,
     execution_id: CoordinatorExecutionId,
     input_ids: &[Vec<u8>],
-    client_input_total: usize,
+    client_input_total: Option<usize>,
     client_input_count: usize,
     client_input_slots: &[usize],
     client_input_types: &std::collections::BTreeMap<usize, Vec<ShareType>>,
@@ -1257,8 +1257,8 @@ where
         return Ok(());
     }
 
-    let total_input_count = if client_input_total > 0 {
-        client_input_total
+    let total_input_count = if client_input_total.is_some() {
+        client_input_total.unwrap()
     } else {
         input_ids.len().saturating_mul(client_input_count)
     };
@@ -4298,7 +4298,7 @@ async fn run_avss_coordinated_party_for_curve<F, G>(
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
     expected_clients: &[String],
-    client_input_total: usize,
+    client_input_total: Option<usize>,
     client_input_count: usize,
     client_input_slots: &[usize],
     client_input_types: &std::collections::BTreeMap<usize, Vec<ShareType>>,
@@ -4317,6 +4317,8 @@ where
         .iter()
         .map(|path| extract_pubkey_from_cert(&fs::read(path).expect("read client cert")))
         .collect();
+    let client_input_total = client_input_total
+        .unwrap_or_else(|| input_ids.len().saturating_mul(client_input_count));
     let (mux, execution_inbox, _execution_registration, _execution_scanner) =
         start_party_execution_transport(&net, execution_id)
             .map_err(|error| format!("Failed to start AVSS execution transport: {error}"))?;
@@ -4549,7 +4551,7 @@ async fn run_avss_coordinated_party(
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
     expected_clients: &[String],
-    client_input_total: usize,
+    client_input_total: Option<usize>,
     client_input_count: usize,
     client_input_slots: &[usize],
     client_input_types: &std::collections::BTreeMap<usize, Vec<ShareType>>,
@@ -5390,7 +5392,7 @@ impl StandingRunnerExecutionHandler {
             self.node_rpc.as_ref(),
             execution_id,
             &admission.expected_client_public_keys,
-            input_total,
+            Some(input_total),
             client_input_count,
             &client_slots,
             client_input_types,
@@ -6180,7 +6182,7 @@ async fn main() {
     // Actual TOTAL number of client input values across all clients (sum of each
     // client's count). 0 = unset, in which case we fall back to the uniform
     // `num_clients * client_input_count`. Lets clients provide different counts.
-    let mut client_input_total: usize = 0;
+    let mut client_input_total: Option<usize> = None;
     let mut _enable_nat: bool = false;
     let mut _stun_servers: Vec<SocketAddr> = Vec::new();
     let mut server_addrs: Vec<SocketAddr> = Vec::new();
@@ -6326,7 +6328,7 @@ async fn main() {
             }
             "--client-input-total" => {
                 if let Some(v) = args_iter.next() {
-                    client_input_total = v.parse().expect("Invalid --client-input-total");
+                    client_input_total = Some(v.parse().expect("Invalid --client-input-total"));
                 }
             }
             "--stun-servers" => {
