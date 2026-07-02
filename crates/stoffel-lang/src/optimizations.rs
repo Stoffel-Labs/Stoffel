@@ -3359,6 +3359,19 @@ fn optimize_all_inner(node: AstNode, optimization_level: u8) -> AstNode {
     let node = optimize_reveals(node);
     let node = optimize_multiplies(node);
     let node = reorder_for_reveal_batching(node);
+    // SROA / scalarization (-O3): after the batchers settled the block shape,
+    // replace constant-index reads of locally-built lists with direct element
+    // references and delete the corresponding build calls, rematerializing a
+    // real array snapshot only where a list escapes into a read-only builtin
+    // consumer (`Share.batch_mul` operands etc.). Runs before LICM/CSE/GVN so
+    // they see the plumbing-free form, and before dead-binding elimination so
+    // the emptied builds are swept. -O3 only: below -O3 loops stay rolled, so
+    // indices are rarely constant and the pass would only add walk time.
+    let node = if optimization_level >= 3 {
+        scalarize_local_arrays(node)
+    } else {
+        node
+    };
     let node = optimize_licm_cse(node);
     let node = optimize_gvn(node);
     // Finally, drop bindings whose value is never used (a pure dead store). This
@@ -4212,10 +4225,27 @@ pub fn eliminate_dead_bindings(mut node: AstNode) -> AstNode {
     // same counts snapshot the old per-round recount gave it.
     let mut counts: HashMap<String, usize> = HashMap::new();
     count_identifier_uses(&node, &mut counts);
+    // Plain-identifier assignment TARGETS, counted separately: an occurrence
+    // that only WRITES a variable is not a read, so a variable whose every
+    // occurrence is a write is dead — its pure assignments are removable.
+    // (Leaving such dead stores in place is not just waste: their defs write a
+    // physical register, and a def with no consumer is exactly the shape that
+    // used to escape the liveness intervals — see `analyze_liveness_cfg_dense`.)
+    let mut target_counts: HashMap<String, usize> = HashMap::new();
+    count_assignment_targets(&node, &mut target_counts);
     loop {
         let mut changed = false;
         let mut removed_uses: HashMap<String, usize> = HashMap::new();
-        node = drop_dead_bindings(node, &counts, &pure_fns, &mut changed, &mut removed_uses);
+        let mut removed_targets: HashMap<String, usize> = HashMap::new();
+        node = drop_dead_bindings(
+            node,
+            &counts,
+            &target_counts,
+            &pure_fns,
+            &mut changed,
+            &mut removed_uses,
+            &mut removed_targets,
+        );
         if !changed {
             break;
         }
@@ -4224,8 +4254,31 @@ pub fn eliminate_dead_bindings(mut node: AstNode) -> AstNode {
                 *c -= n;
             }
         }
+        for (name, n) in removed_targets {
+            if let Some(c) = target_counts.get_mut(&name) {
+                *c -= n;
+            }
+        }
     }
     node
+}
+
+/// Count plain-identifier assignment targets (descending into nested function
+/// bodies, mirroring `count_identifier_uses`).
+fn count_assignment_targets(node: &AstNode, counts: &mut HashMap<String, usize>) {
+    if let AstNode::Assignment { target, .. } = node {
+        if let AstNode::Identifier(name, _) = target.as_ref() {
+            if let Some(c) = counts.get_mut(name) {
+                *c += 1;
+            } else {
+                counts.insert(name.clone(), 1);
+            }
+        }
+    }
+    match node {
+        AstNode::FunctionDefinition { body, .. } => count_assignment_targets(body, counts),
+        _ => for_each_child(node, &mut |c| count_assignment_targets(c, counts)),
+    }
 }
 
 /// Count every identifier occurrence in the whole tree (descending into nested
@@ -4254,12 +4307,25 @@ fn count_identifier_uses(node: &AstNode, counts: &mut HashMap<String, usize>) {
 fn drop_dead_bindings(
     node: AstNode,
     counts: &HashMap<String, usize>,
+    target_counts: &HashMap<String, usize>,
     pure_fns: &HashSet<String>,
     changed: &mut bool,
     removed_uses: &mut HashMap<String, usize>,
+    removed_targets: &mut HashMap<String, usize>,
 ) -> AstNode {
-    let recurse = |n: AstNode, changed: &mut bool, removed_uses: &mut HashMap<String, usize>| {
-        drop_dead_bindings(n, counts, pure_fns, changed, removed_uses)
+    let recurse = |n: AstNode,
+                   changed: &mut bool,
+                   removed_uses: &mut HashMap<String, usize>,
+                   removed_targets: &mut HashMap<String, usize>| {
+        drop_dead_bindings(
+            n,
+            counts,
+            target_counts,
+            pure_fns,
+            changed,
+            removed_uses,
+            removed_targets,
+        )
     };
     match node {
         AstNode::Block(stmts) => {
@@ -4276,7 +4342,27 @@ fn drop_dead_bindings(
                         continue;
                     }
                 }
-                kept.push(recurse(stmt, changed, removed_uses));
+                // A pure assignment to a variable that is never READ (every
+                // remaining occurrence is itself an assignment target) is a
+                // dead store: drop it. Once all its stores are gone, the
+                // declaration's count reaches zero and the arm above sweeps
+                // it on a later round of the fixpoint loop.
+                if let AstNode::Assignment { target, value, .. } = &stmt {
+                    if let AstNode::Identifier(name, _) = target.as_ref() {
+                        let uses = counts.get(name).copied().unwrap_or(0);
+                        let writes = target_counts.get(name).copied().unwrap_or(0);
+                        if uses == writes && expr_is_pure(value, pure_fns) {
+                            *changed = true;
+                            count_identifier_uses(value, removed_uses);
+                            // The target identifier occurrence disappears from
+                            // both tallies.
+                            *removed_uses.entry(name.clone()).or_default() += 1;
+                            *removed_targets.entry(name.clone()).or_default() += 1;
+                            continue;
+                        }
+                    }
+                }
+                kept.push(recurse(stmt, changed, removed_uses, removed_targets));
             }
             AstNode::Block(kept)
         }
@@ -4295,7 +4381,7 @@ fn drop_dead_bindings(
             type_params,
             parameters,
             return_type,
-            body: Box::new(recurse(*body, changed, removed_uses)),
+            body: Box::new(recurse(*body, changed, removed_uses, removed_targets)),
             is_secret,
             pragmas,
             location,
@@ -4307,7 +4393,7 @@ fn drop_dead_bindings(
             location,
         } => AstNode::WhileLoop {
             condition,
-            body: Box::new(recurse(*body, changed, removed_uses)),
+            body: Box::new(recurse(*body, changed, removed_uses, removed_targets)),
             location,
         },
         AstNode::ForLoop {
@@ -4318,7 +4404,7 @@ fn drop_dead_bindings(
         } => AstNode::ForLoop {
             variables,
             iterable,
-            body: Box::new(recurse(*body, changed, removed_uses)),
+            body: Box::new(recurse(*body, changed, removed_uses, removed_targets)),
             location,
         },
         AstNode::IfExpression {
@@ -4327,8 +4413,14 @@ fn drop_dead_bindings(
             else_branch,
         } => AstNode::IfExpression {
             condition,
-            then_branch: Box::new(recurse(*then_branch, changed, removed_uses)),
-            else_branch: else_branch.map(|e| Box::new(recurse(*e, changed, removed_uses))),
+            then_branch: Box::new(recurse(
+                *then_branch,
+                changed,
+                removed_uses,
+                removed_targets,
+            )),
+            else_branch: else_branch
+                .map(|e| Box::new(recurse(*e, changed, removed_uses, removed_targets))),
         },
         AstNode::TryCatch {
             try_block,
@@ -4336,21 +4428,24 @@ fn drop_dead_bindings(
             finally_block,
             location,
         } => AstNode::TryCatch {
-            try_block: Box::new(recurse(*try_block, changed, removed_uses)),
+            try_block: Box::new(recurse(*try_block, changed, removed_uses, removed_targets)),
             catch_clauses: catch_clauses
                 .into_iter()
                 .map(|c| crate::ast::CatchClause {
                     body: Box::new(drop_dead_bindings(
                         *c.body,
                         counts,
+                        target_counts,
                         pure_fns,
                         changed,
                         removed_uses,
+                        removed_targets,
                     )),
                     ..c
                 })
                 .collect(),
-            finally_block: finally_block.map(|b| Box::new(recurse(*b, changed, removed_uses))),
+            finally_block: finally_block
+                .map(|b| Box::new(recurse(*b, changed, removed_uses, removed_targets))),
             location,
         },
         other => other,
@@ -5569,8 +5664,13 @@ fn builtin_effect_uncached(name: &str) -> BuiltinEffect {
         | "contains" | "to_string" | "type" => e(true, false, false, true, false),
         // Pure value read, but deliberately NOT len-safe (audit-flagged asymmetry).
         "get_field" => e(true, false, false, false, false),
-        // Effectful, but len-safe (they don't invalidate a tracked list argument).
-        "open" | "reveal" | "print" | "assert" => e(false, false, false, true, false),
+        // Effectful, but len-safe (they don't invalidate a tracked list
+        // argument). `copy` and `batch_open`/`batch_open_fixed` only READ
+        // their list arguments; they are deliberately NOT `pure` so CSE/GVN
+        // never dedup them (`copy` mints a distinct object, opens are rounds).
+        "open" | "reveal" | "print" | "assert" | "copy" | "batch_open" | "batch_open_fixed" => {
+            e(false, false, false, true, false)
+        }
         // Unknown: safe-by-default (impure / mutates-unknown / not-len-safe).
         _ => BuiltinEffect::default(),
     }
@@ -9317,6 +9417,1110 @@ pub fn optimize_gvn(node: AstNode) -> AstNode {
     node
 }
 
+// ===========================================================================
+// SROA / scalarization of locally-built arrays (-O3)
+//
+// Post-unroll, most list traffic is compile-time plumbing: a local list is
+// built element-by-element (`var out = []; append(out, e0); ...`) or bound to
+// a list literal, and every read is a constant index. This pass tracks such
+// lists symbolically and
+//   (a) replaces constant-index reads with the captured element (always an
+//       identifier or literal — never a re-evaluated computation),
+//   (b) deletes the `append`/`array_push` build calls of fully-tracked lists,
+//       binding non-trivial operands to fresh single-assignment temps in
+//       place (no call is moved, duplicated, or reordered), and
+//   (c) rematerializes a `ListLiteral` snapshot bound to a fresh temp at each
+//       escape into a read-only, length-safe builtin consumer (cached and
+//       reused until the next mutation), so whole-array consumers such as
+//       `Share.batch_mul` still receive a real array — call structure and the
+//       MPC round fingerprint are untouched.
+// Anything unprovable (dynamic index, read beyond the built prefix, aliasing
+// into unknown code, element stores, mutation from nested control flow,
+// rebinding of a captured element source) conservatively demotes the whole
+// tracked group, keeping the original code. `Share.batch_mul` results stay
+// opaque: they are call-initialized, so they are never candidates.
+//
+// The pass is two replays of ONE deterministic forward walk per block (no
+// whole-AST fixpoint): an ANALYZE replay simulates the walk and collects the
+// demoted state set (plus demotion dependency edges, propagated transitively
+// afterwards), then a REWRITE replay runs the identical walk against that
+// final set and emits the transformed statements. States are numbered by
+// creation order, which is identical across the replays by construction.
+// ===========================================================================
+
+/// A symbolically tracked local list.
+struct SroaState {
+    id: usize,
+    /// `Some(expr)` = substitutable element (always an `Identifier` or
+    /// `Literal`); `None` = opaque element (literal-backed states only, whose
+    /// reads fall back to the real emitted array).
+    elems: Vec<Option<AstNode>>,
+    /// Literal-backed: created from a non-empty list literal whose (emitted)
+    /// declaration still builds the real, faithful array — unsubstituted reads
+    /// and read-only escapes can keep using the variable itself, and the state
+    /// is demoted on any mutation. Scalar-backed (empty-init + captured
+    /// appends): the appends are deleted, so every read must substitute and
+    /// every escape passes a rematerialized snapshot.
+    literal_backed: bool,
+    /// Literal-backed only: some captured element names a scalar-backed (or
+    /// husk-tainted) list, so the EMITTED literal holds that list's empty
+    /// husk. Substituted reads are still exact, but any event that would
+    /// observe the real array (unsubstituted read, own-name escape) must
+    /// demote this state — which, via the capture edges, also demotes the
+    /// fragile element sources back to real arrays.
+    husk: bool,
+    /// Cached snapshot temp holding the current elements (scalar-backed only),
+    /// invalidated on mutation.
+    snapshot: Option<String>,
+}
+
+struct Sroa {
+    /// ANALYZE replay when true (collect demotions), REWRITE replay when false
+    /// (demotion set is final; emit transformed statements).
+    analyze: bool,
+    next_id: usize,
+    env: HashMap<String, Rc<RefCell<SroaState>>>,
+    /// Demoted state ids. Grows during ANALYZE; fixed input during REWRITE.
+    demoted: HashSet<usize>,
+    /// Element-source name -> states that captured it. A later rebind of the
+    /// name invalidates those states' substitutions, so it demotes them.
+    captured_by: HashMap<String, Vec<usize>>,
+    /// (a, b): if state `a` ends up demoted, `b` must be demoted too
+    /// (extend prefixes copied from `a`, or `a`'s real array holding an alias
+    /// of `b` that unknown code could then observe or mutate through).
+    demote_edges: Vec<(usize, usize)>,
+    /// Known clear-integer constants (unrolled loop counters such as
+    /// `k += 1`), used ONLY to prove indices constant — never to rewrite
+    /// them. Values are computed from the ORIGINAL (pre-substitution)
+    /// expressions so both replays agree by construction.
+    ints: HashMap<String, i128>,
+    /// `STOFFEL_SROA_TRACE=1` diagnostics: (cause, state debug name) per
+    /// ANALYZE-phase demotion.
+    trace: Option<Vec<(&'static str, String)>>,
+    /// First bound name per state id (diagnostics only; populated when
+    /// tracing).
+    state_names: Vec<String>,
+    out: Vec<AstNode>,
+}
+
+fn sroa_trace_enabled() -> bool {
+    thread_local! {
+        static ON: Cell<Option<bool>> = const { Cell::new(None) };
+    }
+    ON.with(|c| {
+        if let Some(v) = c.get() {
+            return v;
+        }
+        let v = std::env::var("STOFFEL_SROA_TRACE").is_ok_and(|s| s != "0" && !s.is_empty());
+        c.set(Some(v));
+        v
+    })
+}
+
+/// Best-effort constant fold of a clear-integer expression over the tracked
+/// counter environment (literals, tracked names, `+ - * / %`, unary `-`).
+fn sroa_eval_int(node: &AstNode, ints: &HashMap<String, i128>) -> Option<i128> {
+    match node {
+        AstNode::Literal {
+            value: crate::ast::Value::Int { value, .. },
+            ..
+        } => i128::try_from(*value).ok(),
+        AstNode::Identifier(name, _) => ints.get(name).copied(),
+        AstNode::UnaryOperation { op, operand, .. } if op == "-" => {
+            sroa_eval_int(operand, ints).map(|v| -v)
+        }
+        AstNode::BinaryOperation {
+            op, left, right, ..
+        } => {
+            let l = sroa_eval_int(left, ints)?;
+            let r = sroa_eval_int(right, ints)?;
+            match op.as_str() {
+                "+" => l.checked_add(r),
+                "-" => l.checked_sub(r),
+                "*" => l.checked_mul(r),
+                "/" => (r != 0).then(|| l / r),
+                "%" => (r != 0).then(|| l % r),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Whether a hoisted element temp must be declared `secret`: true only when
+/// the element's resolved type IS a secret scalar. A collection *containing*
+/// secrets (e.g. `list[secret bool]`) must NOT count — its value is an array
+/// HANDLE, and declaring the temp secret would make codegen move that handle
+/// into a secret register, where the VM lifts clear values into shares
+/// (crashing on `Array`). `contains_secret` is therefore the wrong predicate
+/// here.
+fn sroa_elem_is_secret(node: &AstNode) -> bool {
+    match node {
+        AstNode::FunctionCall {
+            resolved_return_type,
+            ..
+        }
+        | AstNode::CommandCall {
+            resolved_return_type,
+            ..
+        } => resolved_return_type
+            .as_ref()
+            .is_some_and(|ty| ty.is_secret()),
+        _ => false,
+    }
+}
+
+/// Read-only, length-safe builtin consumers: safe to hand a rematerialized
+/// snapshot (they read the argument during the call and retain no alias).
+fn sroa_readonly_len_safe(name: &str) -> bool {
+    let eff = builtin_effect(name);
+    eff.len_safe && !eff.mutates_receiver
+}
+
+impl Sroa {
+    fn new(analyze: bool, demoted: HashSet<usize>) -> Self {
+        Sroa {
+            analyze,
+            next_id: 0,
+            env: HashMap::new(),
+            demoted,
+            captured_by: HashMap::new(),
+            demote_edges: Vec::new(),
+            ints: HashMap::new(),
+            trace: (analyze && sroa_trace_enabled()).then(Vec::new),
+            state_names: Vec::new(),
+            out: Vec::new(),
+        }
+    }
+
+    fn run(&mut self, stmts: &[AstNode]) -> Vec<AstNode> {
+        for stmt in stmts {
+            self.stmt(stmt);
+        }
+        std::mem::take(&mut self.out)
+    }
+
+    /// The tracked (non-demoted) state bound to `name`, if any.
+    fn tracked(&self, name: &str) -> Option<Rc<RefCell<SroaState>>> {
+        self.env
+            .get(name)
+            .filter(|st| !self.demoted.contains(&st.borrow().id))
+            .cloned()
+    }
+
+    fn demote_id(&mut self, id: usize, cause: &'static str) {
+        // The REWRITE replay must never discover a NEW demotion: ANALYZE saw
+        // the identical walk and already recorded it (REWRITE captures only a
+        // subset of ANALYZE's element-source names, so its demote triggers are
+        // a subset too).
+        debug_assert!(
+            self.analyze || self.demoted.contains(&id),
+            "SROA replay divergence: rewrite-phase demotion of state {id} ({cause})"
+        );
+        if let Some(trace) = &mut self.trace {
+            if !self.demoted.contains(&id) {
+                let name = self.state_names.get(id).cloned().unwrap_or_default();
+                trace.push((cause, name));
+            }
+        }
+        self.demoted.insert(id);
+    }
+
+    fn demote(&mut self, st: &Rc<RefCell<SroaState>>, cause: &'static str) {
+        let (id, demoted) = {
+            let s = st.borrow();
+            (s.id, self.demoted.contains(&s.id))
+        };
+        if let Some(trace) = &mut self.trace {
+            if !demoted {
+                let name = self.state_names.get(id).cloned().unwrap_or_default();
+                trace.push((cause, name));
+            }
+        }
+        debug_assert!(
+            self.analyze || demoted,
+            "SROA replay divergence: rewrite-phase demotion of state {id} ({cause})"
+        );
+        self.demoted.insert(id);
+    }
+
+    /// `name` is (re)bound to a new value: its old binding stops being tracked
+    /// and every state that captured the old `name` as an element loses its
+    /// substitutions (whole-state demotion, v1 granularity).
+    fn rebind(&mut self, name: &str) {
+        if let Some(ids) = self.captured_by.get(name) {
+            for id in ids.clone() {
+                self.demote_id(id, "captured-rebind");
+            }
+        }
+        self.env.remove(name);
+        self.ints.remove(name);
+    }
+
+    /// Conservative handling for a subtree we do not model (nested control
+    /// flow, closures, unknown statement kinds): demote every tracked list it
+    /// references, and treat every name it writes as rebound.
+    fn note_opaque(&mut self, node: &AstNode) {
+        let mut refs = HashSet::new();
+        collect_identifiers(node, &mut refs);
+        for r in &refs {
+            if let Some(st) = self.tracked(r) {
+                self.demote(&st, "opaque-ref");
+            }
+        }
+        let mut written = HashSet::new();
+        collect_written_vars(node, &mut written);
+        for w in &written {
+            if let Some(st) = self.tracked(w) {
+                self.demote(&st, "opaque-write");
+            }
+            self.rebind(w);
+        }
+    }
+
+    // ---- element capture ------------------------------------------------
+
+    /// Record `elem` (already substituted) as the next element of `st`,
+    /// emitting a fresh single-assignment temp for non-trivial operands. The
+    /// temp replaces the original build statement in place, so the operand is
+    /// still evaluated exactly once, at the same program point.
+    fn capture_elem(&mut self, st: &Rc<RefCell<SroaState>>, elem: AstNode, loc: &SourceLocation) {
+        let captured = match elem {
+            AstNode::Identifier(ref name, _) => {
+                self.note_identifier_capture(st, name);
+                elem
+            }
+            AstNode::Literal { .. } => elem,
+            other => {
+                let temp = generate_named_temp_name("sroa_elem");
+                if !self.analyze {
+                    // Element temps inherit the element's resolved secrecy so
+                    // the secret/clear register-bank classification holds even
+                    // when codegen cannot infer it from the value alone.
+                    let is_secret = sroa_elem_is_secret(&other);
+                    self.out.push(AstNode::VariableDeclaration {
+                        name: temp.clone(),
+                        type_annotation: None,
+                        value: Some(Box::new(other)),
+                        is_mutable: false,
+                        is_secret,
+                        location: loc.clone(),
+                    });
+                }
+                AstNode::Identifier(temp, loc.clone())
+            }
+        };
+        let mut s = st.borrow_mut();
+        s.elems.push(Some(captured));
+        s.snapshot = None;
+    }
+
+    /// Bookkeeping for capturing an identifier element into `st`.
+    fn note_identifier_capture(&mut self, st: &Rc<RefCell<SroaState>>, name: &str) {
+        let st_id = st.borrow().id;
+        self.captured_by
+            .entry(name.to_string())
+            .or_default()
+            .push(st_id);
+        if let Some(other) = self.tracked(name) {
+            if Rc::ptr_eq(&other, st) {
+                return; // self-alias: same object either way
+            }
+            // Aliasing a tracked list into `st` is fine while `st` stays
+            // symbolic: every read/mutation path through `st` substitutes
+            // down to `name` and is handled there. But if `st` ends up
+            // demoted, its REAL array holds the alias, and unknown code could
+            // observe an empty husk or mutate the element behind our back —
+            // so the captured list must be demoted with it.
+            let fragile = {
+                let o = other.borrow();
+                !o.literal_backed || o.husk
+            };
+            self.demote_edges.push((st_id, other.borrow().id));
+            if fragile && st.borrow().literal_backed {
+                // The capturer's emitted literal now holds a husk element.
+                st.borrow_mut().husk = true;
+            }
+        }
+    }
+
+    // ---- snapshots --------------------------------------------------------
+
+    /// A variable currently holding a real array with `st`'s element values,
+    /// for read-only consumers. Cached until the next mutation.
+    fn snapshot(&mut self, st: &Rc<RefCell<SroaState>>, loc: &SourceLocation) -> String {
+        if let Some(name) = st.borrow().snapshot.clone() {
+            return name;
+        }
+        // The snapshot MATERIALIZES the captured element identifiers: any of
+        // them naming a still-tracked scalar-backed list would materialize
+        // that list's empty husk, so such element sources must stay real.
+        // (During REWRITE these are already demoted: ANALYZE ran the same
+        // walk, so this loop is a no-op then.)
+        let elem_names: Vec<String> = st
+            .borrow()
+            .elems
+            .iter()
+            .filter_map(|e| match e {
+                Some(AstNode::Identifier(n, _)) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+        for n in &elem_names {
+            if let Some(other) = self.tracked(n) {
+                let fragile = {
+                    let o = other.borrow();
+                    !o.literal_backed || o.husk
+                };
+                if fragile && !Rc::ptr_eq(&other, st) {
+                    self.demote(&other, "snapshot-elem");
+                }
+            }
+        }
+        let name = generate_named_temp_name("sroa_snap");
+        if !self.analyze {
+            let elements: Vec<AstNode> = st
+                .borrow()
+                .elems
+                .iter()
+                .map(|e| e.clone().expect("scalar-backed SROA elements are captured"))
+                .collect();
+            self.out.push(AstNode::VariableDeclaration {
+                name: name.clone(),
+                type_annotation: None,
+                value: Some(Box::new(AstNode::ListLiteral {
+                    elements,
+                    location: loc.clone(),
+                })),
+                is_mutable: false,
+                is_secret: false,
+                location: loc.clone(),
+            });
+        }
+        st.borrow_mut().snapshot = Some(name.clone());
+        name
+    }
+
+    /// An argument position that only READS a whole list: pass a tracked
+    /// scalar-backed list as a snapshot; a literal-backed one is already real
+    /// and faithful, so it passes through unchanged.
+    fn escape_arg(&mut self, arg: &AstNode, loc: &SourceLocation) -> AstNode {
+        let r = self.subst_value(arg);
+        if let AstNode::Identifier(name, iloc) = &r {
+            if let Some(st) = self.tracked(name) {
+                if !st.borrow().literal_backed {
+                    return AstNode::Identifier(self.snapshot(&st, loc), iloc.clone());
+                }
+                if st.borrow().husk {
+                    // The consumer would observe husk elements through the
+                    // real literal: demote (the capture edges then restore
+                    // the fragile element sources to real arrays too).
+                    self.demote(&st, "husk-escape");
+                }
+            }
+        }
+        r
+    }
+
+    // ---- expression substitution ------------------------------------------
+
+    /// Substitute inside `expr` for a position whose RESULT the caller
+    /// inspects and handles (declaration/assignment values, capture elements,
+    /// escape arguments, mutator receivers). May return an identifier that
+    /// names a tracked list.
+    fn subst_value(&mut self, expr: &AstNode) -> AstNode {
+        match expr {
+            AstNode::Identifier(_, _) | AstNode::Literal { .. } => expr.clone(),
+            AstNode::IndexAccess {
+                base,
+                index,
+                location,
+            } => {
+                // Constness is judged on the ORIGINAL index (plus the tracked
+                // clear-int counters, which are replay-independent) so both
+                // replays agree regardless of what substitution does elsewhere.
+                let k = sroa_eval_int(index, &self.ints).and_then(|v| usize::try_from(v).ok());
+                let base2 = self.subst_value(base);
+                if let AstNode::Identifier(name, _) = &base2 {
+                    if let Some(st) = self.tracked(name) {
+                        let (hit, literal_backed, husk) = {
+                            let s = st.borrow();
+                            let hit = match k {
+                                Some(k) if k < s.elems.len() => s.elems[k].clone(),
+                                _ => None,
+                            };
+                            (hit, s.literal_backed, s.husk)
+                        };
+                        if let Some(elem) = hit {
+                            return elem;
+                        }
+                        // Unprovable read: a literal-backed list is still
+                        // real, so the read stands unless the literal holds
+                        // husk elements; a scalar-backed one must bail (never
+                        // clamp) — keep its original build.
+                        if !literal_backed || husk {
+                            self.demote(&st, "read-unprovable");
+                        }
+                    }
+                }
+                AstNode::IndexAccess {
+                    base: Box::new(base2),
+                    index: Box::new(self.subst_generic(index)),
+                    location: location.clone(),
+                }
+            }
+            AstNode::FunctionCall {
+                function,
+                arguments,
+                location,
+                resolved_return_type,
+            } => {
+                if let AstNode::Identifier(fname, _) = function.as_ref() {
+                    let eff = builtin_effect(fname);
+                    let is_extend = builtin_base_name(fname) == "extend";
+                    let new_args: Vec<AstNode> = if eff.mutates_receiver {
+                        arguments
+                            .iter()
+                            .enumerate()
+                            .map(|(i, a)| {
+                                if i == 0 {
+                                    // Expression-position mutation of a tracked
+                                    // list (statement-level growth is handled
+                                    // before substitution): keep it real.
+                                    let r = self.subst_value(a);
+                                    if let AstNode::Identifier(n, _) = &r {
+                                        if let Some(st) = self.tracked(n) {
+                                            self.demote(&st, "mutator-expr");
+                                        }
+                                    }
+                                    r
+                                } else if is_extend && i == 1 {
+                                    // extend's source is read-only.
+                                    self.escape_arg(a, location)
+                                } else {
+                                    self.subst_generic(a)
+                                }
+                            })
+                            .collect()
+                    } else if sroa_readonly_len_safe(fname) {
+                        // `len()` of a tracked list folds to its known length
+                        // (a snapshot materialized just to be measured would
+                        // needlessly demote captured element lists). Sound in
+                        // both replays: a list tracked here is tracked during
+                        // ANALYZE too, and a demoted one keeps its real build
+                        // with the identical length.
+                        if eff.is_len_builtin && arguments.len() == 1 {
+                            let a0 = self.subst_value(&arguments[0]);
+                            if let AstNode::Identifier(n, _) = &a0 {
+                                if let Some(st) = self.tracked(n) {
+                                    let len = st.borrow().elems.len() as u128;
+                                    return make_int_literal(len, location);
+                                }
+                            }
+                            vec![a0]
+                        } else {
+                            arguments
+                                .iter()
+                                .map(|a| self.escape_arg(a, location))
+                                .collect()
+                        }
+                    } else {
+                        // Unknown/unsafe consumer: bare tracked identifiers in
+                        // the arguments are demoted by `subst_generic`.
+                        arguments.iter().map(|a| self.subst_generic(a)).collect()
+                    };
+                    AstNode::FunctionCall {
+                        function: function.clone(),
+                        arguments: new_args,
+                        location: location.clone(),
+                        resolved_return_type: resolved_return_type.clone(),
+                    }
+                } else {
+                    AstNode::FunctionCall {
+                        function: Box::new(self.subst_generic(function)),
+                        arguments: arguments.iter().map(|a| self.subst_generic(a)).collect(),
+                        location: location.clone(),
+                        resolved_return_type: resolved_return_type.clone(),
+                    }
+                }
+            }
+            AstNode::BinaryOperation {
+                op,
+                left,
+                right,
+                location,
+            } => AstNode::BinaryOperation {
+                op: op.clone(),
+                left: Box::new(self.subst_generic(left)),
+                right: Box::new(self.subst_generic(right)),
+                location: location.clone(),
+            },
+            AstNode::UnaryOperation {
+                op,
+                operand,
+                location,
+            } => AstNode::UnaryOperation {
+                op: op.clone(),
+                operand: Box::new(self.subst_generic(operand)),
+                location: location.clone(),
+            },
+            AstNode::ListLiteral { elements, location } => AstNode::ListLiteral {
+                elements: elements.iter().map(|e| self.subst_generic(e)).collect(),
+                location: location.clone(),
+            },
+            AstNode::TupleLiteral(elements) => {
+                AstNode::TupleLiteral(elements.iter().map(|e| self.subst_generic(e)).collect())
+            }
+            AstNode::SetLiteral(elements) => {
+                AstNode::SetLiteral(elements.iter().map(|e| self.subst_generic(e)).collect())
+            }
+            AstNode::DictLiteral { pairs, location } => AstNode::DictLiteral {
+                pairs: pairs
+                    .iter()
+                    .map(|(k, v)| (self.subst_generic(k), self.subst_generic(v)))
+                    .collect(),
+                location: location.clone(),
+            },
+            AstNode::FieldAccess {
+                object,
+                field_name,
+                location,
+            } => AstNode::FieldAccess {
+                object: Box::new(self.subst_generic(object)),
+                field_name: field_name.clone(),
+                location: location.clone(),
+            },
+            AstNode::NamedArgument {
+                name,
+                value,
+                location,
+            } => AstNode::NamedArgument {
+                name: name.clone(),
+                value: Box::new(self.subst_generic(value)),
+                location: location.clone(),
+            },
+            // Anything else (nested blocks/ifs used as expressions, command
+            // calls, ...) is not modeled: fail closed.
+            other => {
+                self.note_opaque(other);
+                other.clone()
+            }
+        }
+    }
+
+    /// Substitute inside `expr` for a position that treats the result as an
+    /// ordinary value: an identifier of a tracked list surviving here would
+    /// leak an alias (or, scalar-backed, an empty husk) into unknown code, so
+    /// it demotes the list.
+    fn subst_generic(&mut self, expr: &AstNode) -> AstNode {
+        let r = self.subst_value(expr);
+        if let AstNode::Identifier(name, _) = &r {
+            if let Some(st) = self.tracked(name) {
+                self.demote(&st, "bare-id");
+            }
+        }
+        r
+    }
+
+    // ---- statements ---------------------------------------------------------
+
+    fn stmt(&mut self, stmt: &AstNode) {
+        match stmt {
+            AstNode::VariableDeclaration {
+                name,
+                type_annotation,
+                value,
+                is_mutable,
+                is_secret,
+                location,
+            } => {
+                let rebuilt = self.bind(name, value.as_deref(), location);
+                self.out.push(AstNode::VariableDeclaration {
+                    name: name.clone(),
+                    type_annotation: type_annotation.clone(),
+                    value: rebuilt.map(Box::new),
+                    is_mutable: *is_mutable,
+                    is_secret: *is_secret,
+                    location: location.clone(),
+                });
+            }
+            AstNode::Assignment {
+                target,
+                value,
+                location,
+            } => match target.as_ref() {
+                AstNode::Identifier(name, _) => {
+                    let rebuilt = self.bind(name, Some(value), location);
+                    self.out.push(AstNode::Assignment {
+                        target: target.clone(),
+                        value: Box::new(rebuilt.expect("assignment value present")),
+                        location: location.clone(),
+                    });
+                }
+                _ => {
+                    // Element/field store: substitute down to the mutated
+                    // object and demote it (its element set changes underneath
+                    // any captured substitutions).
+                    let target2 = self.subst_store_target(target);
+                    let value2 = self.subst_generic(value);
+                    self.out.push(AstNode::Assignment {
+                        target: Box::new(target2),
+                        value: Box::new(value2),
+                        location: location.clone(),
+                    });
+                }
+            },
+            AstNode::FunctionCall { .. } => {
+                if !self.growth_stmt(stmt) {
+                    let call2 = self.subst_value(stmt);
+                    self.out.push(call2);
+                }
+            }
+            AstNode::DiscardStatement {
+                expression,
+                location,
+            } => {
+                if !self.growth_stmt(expression) {
+                    let expr2 = self.subst_generic(expression);
+                    self.out.push(AstNode::DiscardStatement {
+                        expression: Box::new(expr2),
+                        location: location.clone(),
+                    });
+                }
+            }
+            AstNode::Return { value, location } => {
+                let value2 = value.as_ref().map(|v| Box::new(self.subst_generic(v)));
+                self.out.push(AstNode::Return {
+                    value: value2,
+                    location: location.clone(),
+                });
+            }
+            AstNode::Yield(value) => {
+                let value2 = value.as_ref().map(|v| Box::new(self.subst_generic(v)));
+                self.out.push(AstNode::Yield(value2));
+            }
+            AstNode::Break | AstNode::Continue => self.out.push(stmt.clone()),
+            // Control flow, nested definitions, and anything unmodeled: the
+            // inner blocks were already scalarized independently by the
+            // structural recursion; at this level they are opaque.
+            other => {
+                self.note_opaque(other);
+                self.out.push(other.clone());
+            }
+        }
+    }
+
+    /// Handle `name = <value>` / `var name = <value>`: track fresh list
+    /// literals, join aliases, and otherwise substitute. Returns the rebuilt
+    /// value expression (the caller re-attaches it to the original statement).
+    fn bind(
+        &mut self,
+        name: &str,
+        value: Option<&AstNode>,
+        location: &SourceLocation,
+    ) -> Option<AstNode> {
+        let Some(value) = value else {
+            self.rebind(name);
+            return None;
+        };
+        match value {
+            AstNode::Identifier(rhs, _) => {
+                // Potential alias join. Resolve the RHS state BEFORE the
+                // rebind (`x = x` must keep working).
+                let rhs_state = self.tracked(rhs);
+                let rhs_int = self.ints.get(rhs).copied();
+                self.rebind(name);
+                if let Some(st) = rhs_state {
+                    self.env.insert(name.to_string(), st);
+                }
+                if let Some(v) = rhs_int {
+                    self.ints.insert(name.to_string(), v);
+                }
+                Some(value.clone())
+            }
+            AstNode::ListLiteral { elements, .. } => {
+                // Substitute the elements against the PRE-rebind environment
+                // (the literal may read the old value of `name`).
+                let (st, new_elements) = self.track_literal(Some(name), elements, location);
+                self.rebind(name);
+                self.env.insert(name.to_string(), st);
+                Some(AstNode::ListLiteral {
+                    elements: new_elements,
+                    location: location.clone(),
+                })
+            }
+            other => {
+                // Fold the ORIGINAL expression (replay-independent) so
+                // unrolled counters like `k = k + 1` keep indices provable.
+                let folded = sroa_eval_int(other, &self.ints);
+                let v2 = self.subst_value(other);
+                self.rebind(name);
+                if let Some(v) = folded {
+                    self.ints.insert(name.to_string(), v);
+                }
+                if let AstNode::Identifier(rhs, _) = &v2 {
+                    // Substitution resolved the value to a tracked list (e.g.
+                    // `var q = z[0]` -> `var q = g`): join the alias group so
+                    // later hazards through `q` demote the whole group.
+                    if let Some(st) = self.tracked(rhs) {
+                        self.env.insert(name.to_string(), st);
+                    }
+                }
+                Some(v2)
+            }
+        }
+    }
+
+    /// Track a list-literal binding: substitute each element and hoist every
+    /// non-trivial one into a fresh single-assignment temp (the element was
+    /// evaluated at exactly this program point anyway, so hoisting is
+    /// order-preserving) — leaving every element a substitutable identifier
+    /// or literal. `avoid_name` forces a hoist for self-references
+    /// (`x = [x, ...]` captures the OLD binding, so substituting the name
+    /// later would read the new one).
+    fn track_literal(
+        &mut self,
+        avoid_name: Option<&str>,
+        elements: &[AstNode],
+        location: &SourceLocation,
+    ) -> (Rc<RefCell<SroaState>>, Vec<AstNode>) {
+        let id = self.next_id;
+        self.next_id += 1;
+        if self.trace.is_some() {
+            self.state_names
+                .push(avoid_name.unwrap_or("<list-elem>").to_string());
+        }
+        let st = Rc::new(RefCell::new(SroaState {
+            id,
+            elems: Vec::with_capacity(elements.len()),
+            literal_backed: !elements.is_empty(),
+            husk: false,
+            snapshot: None,
+        }));
+        let mut new_elements = Vec::with_capacity(elements.len());
+        for e in elements {
+            let e2 = self.subst_value(e);
+            let e2 = match e2 {
+                AstNode::Identifier(ref n, _) if Some(n.as_str()) != avoid_name => {
+                    self.note_identifier_capture(&st, n);
+                    e2
+                }
+                AstNode::Literal { .. } => e2,
+                other => {
+                    let temp = generate_named_temp_name("sroa_elem");
+                    if !self.analyze {
+                        let is_secret = sroa_elem_is_secret(&other);
+                        self.out.push(AstNode::VariableDeclaration {
+                            name: temp.clone(),
+                            type_annotation: None,
+                            value: Some(Box::new(other)),
+                            is_mutable: false,
+                            is_secret,
+                            location: location.clone(),
+                        });
+                    }
+                    AstNode::Identifier(temp, location.clone())
+                }
+            };
+            st.borrow_mut().elems.push(Some(e2.clone()));
+            new_elements.push(e2);
+        }
+        (st, new_elements)
+    }
+
+    /// Capture a RAW (not yet substituted) growth operand into `st`. A
+    /// list-literal operand becomes its own tracked, literal-backed temp so
+    /// nested constant-index reads through the outer list substitute too.
+    fn capture_operand(
+        &mut self,
+        st: &Rc<RefCell<SroaState>>,
+        raw: &AstNode,
+        loc: &SourceLocation,
+    ) {
+        if let AstNode::ListLiteral { elements, location } = raw {
+            let (sub_st, new_elements) = self.track_literal(None, elements, location);
+            let temp = generate_named_temp_name("sroa_elem");
+            if !self.analyze {
+                self.out.push(AstNode::VariableDeclaration {
+                    name: temp.clone(),
+                    type_annotation: None,
+                    value: Some(Box::new(AstNode::ListLiteral {
+                        elements: new_elements,
+                        location: location.clone(),
+                    })),
+                    is_mutable: false,
+                    is_secret: false,
+                    location: location.clone(),
+                });
+            }
+            self.env.insert(temp.clone(), sub_st);
+            let elem = AstNode::Identifier(temp, location.clone());
+            self.capture_elem(st, elem, loc);
+        } else {
+            let elem = self.subst_value(raw);
+            self.capture_elem(st, elem, loc);
+        }
+    }
+
+    /// Substitute an element/field store target down to the object actually
+    /// mutated, demoting it.
+    fn subst_store_target(&mut self, target: &AstNode) -> AstNode {
+        match target {
+            AstNode::IndexAccess {
+                base,
+                index,
+                location,
+            } => {
+                let base2 = self.subst_value(base);
+                if let AstNode::Identifier(n, _) = &base2 {
+                    if let Some(st) = self.tracked(n) {
+                        self.demote(&st, "store-target");
+                    }
+                }
+                AstNode::IndexAccess {
+                    base: Box::new(base2),
+                    index: Box::new(self.subst_generic(index)),
+                    location: location.clone(),
+                }
+            }
+            AstNode::FieldAccess {
+                object,
+                field_name,
+                location,
+            } => {
+                let object2 = self.subst_value(object);
+                if let AstNode::Identifier(n, _) = &object2 {
+                    if let Some(st) = self.tracked(n) {
+                        self.demote(&st, "store-target");
+                    }
+                }
+                AstNode::FieldAccess {
+                    object: Box::new(object2),
+                    field_name: field_name.clone(),
+                    location: location.clone(),
+                }
+            }
+            other => self.subst_generic(other),
+        }
+    }
+
+    /// Statement-level `append`/`array_push`/`extend` on a tracked
+    /// scalar-backed list: capture the element(s) and consume the statement.
+    /// Returns false (and possibly demotes) when the call must stay real; the
+    /// caller then re-processes it generically.
+    fn growth_stmt(&mut self, call: &AstNode) -> bool {
+        let AstNode::FunctionCall {
+            function,
+            arguments,
+            location,
+            ..
+        } = call
+        else {
+            return false;
+        };
+        let AstNode::Identifier(fname, _) = function.as_ref() else {
+            return false;
+        };
+        if arguments.len() != 2 {
+            return false;
+        }
+        let AstNode::Identifier(recv, _) = &arguments[0] else {
+            return false;
+        };
+        let Some(st) = self.tracked(recv) else {
+            return false;
+        };
+        match builtin_base_name(fname) {
+            "append" | "array_push" => {
+                if st.borrow().literal_backed {
+                    // v1 keeps literal-backed arrays real and immutable.
+                    self.demote(&st, "literal-mutated");
+                    return false;
+                }
+                self.capture_operand(&st, &arguments[1], location);
+                true
+            }
+            "extend" => {
+                if st.borrow().literal_backed {
+                    self.demote(&st, "literal-mutated");
+                    return false;
+                }
+                match &arguments[1] {
+                    AstNode::Identifier(src_name, _) => {
+                        let Some(src) = self.tracked(src_name) else {
+                            self.demote(&st, "extend-unknown");
+                            return false;
+                        };
+                        if src.borrow().literal_backed || Rc::ptr_eq(&src, &st) {
+                            self.demote(&st, "extend-unknown");
+                            return false;
+                        }
+                        let src_elems: Vec<AstNode> = src
+                            .borrow()
+                            .elems
+                            .iter()
+                            .map(|e| e.clone().expect("scalar-backed SROA elements are captured"))
+                            .collect();
+                        // The copied prefix is only known if `src` really was
+                        // tracked; if `src` ends up demoted, so must we.
+                        let edge = (src.borrow().id, st.borrow().id);
+                        self.demote_edges.push(edge);
+                        for e in src_elems {
+                            if let AstNode::Identifier(n, _) = &e {
+                                self.note_identifier_capture(&st, n);
+                            }
+                            let mut s = st.borrow_mut();
+                            s.elems.push(Some(e));
+                            s.snapshot = None;
+                        }
+                        true
+                    }
+                    AstNode::ListLiteral { elements, .. } => {
+                        for e in elements {
+                            self.capture_operand(&st, e, location);
+                        }
+                        true
+                    }
+                    _ => {
+                        self.demote(&st, "extend-unknown");
+                        false
+                    }
+                }
+            }
+            _ => false,
+        }
+    }
+}
+
+/// Scalarize one block's statement list: ANALYZE replay, transitive demotion
+/// propagation, then the REWRITE replay against the final demotion set.
+fn scalarize_block(stmts: Vec<AstNode>) -> Vec<AstNode> {
+    let mut analyzer = Sroa::new(true, HashSet::new());
+    let _ = analyzer.run(&stmts);
+    if analyzer.next_id == 0 {
+        return stmts; // no candidates: nothing to rewrite
+    }
+    let mut demoted = analyzer.demoted;
+    let edges = analyzer.demote_edges;
+    let direct_demotions = demoted.len();
+    loop {
+        let mut changed = false;
+        for (a, b) in &edges {
+            if demoted.contains(a) && demoted.insert(*b) {
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    if let Some(trace) = &analyzer.trace {
+        if analyzer.next_id >= 100 {
+            let mut counts: HashMap<(&str, String), usize> = HashMap::new();
+            for (cause, name) in trace {
+                let pat: String = name
+                    .chars()
+                    .map(|c| if c.is_ascii_digit() { '#' } else { c })
+                    .collect();
+                *counts.entry((cause, pat)).or_default() += 1;
+            }
+            let mut rows: Vec<_> = counts.into_iter().collect();
+            rows.sort_by_key(|r| std::cmp::Reverse(r.1));
+            eprintln!(
+                "[sroa] block: {} states, {} demoted directly, {} after edge propagation",
+                analyzer.next_id,
+                direct_demotions,
+                demoted.len()
+            );
+            for ((cause, pat), n) in rows.into_iter().take(40) {
+                eprintln!("[sroa]   {n:6}  {cause:<20} {pat}");
+            }
+        }
+    }
+    let mut rewriter = Sroa::new(false, demoted);
+    rewriter.run(&stmts)
+}
+
+/// -O3 entry point: structurally recurse, scalarizing each block's local
+/// non-escaping arrays. Nested blocks are scalarized first and are then
+/// opaque to the enclosing block's walk.
+pub fn scalarize_local_arrays(node: AstNode) -> AstNode {
+    match node {
+        AstNode::Block(stmts) => {
+            let stmts: Vec<AstNode> = stmts.into_iter().map(scalarize_local_arrays).collect();
+            AstNode::Block(scalarize_block(stmts))
+        }
+        AstNode::FunctionDefinition {
+            name,
+            type_params,
+            parameters,
+            return_type,
+            body,
+            is_secret,
+            pragmas,
+            location,
+            node_id,
+        } => AstNode::FunctionDefinition {
+            name,
+            type_params,
+            parameters,
+            return_type,
+            body: Box::new(scalarize_local_arrays(*body)),
+            is_secret,
+            pragmas,
+            location,
+            node_id,
+        },
+        AstNode::ForLoop {
+            variables,
+            iterable,
+            body,
+            location,
+        } => AstNode::ForLoop {
+            variables,
+            iterable,
+            body: Box::new(scalarize_local_arrays(*body)),
+            location,
+        },
+        AstNode::WhileLoop {
+            condition,
+            body,
+            location,
+        } => AstNode::WhileLoop {
+            condition,
+            body: Box::new(scalarize_local_arrays(*body)),
+            location,
+        },
+        AstNode::IfExpression {
+            condition,
+            then_branch,
+            else_branch,
+        } => AstNode::IfExpression {
+            condition,
+            then_branch: Box::new(scalarize_local_arrays(*then_branch)),
+            else_branch: else_branch.map(|e| Box::new(scalarize_local_arrays(*e))),
+        },
+        AstNode::TryCatch {
+            try_block,
+            catch_clauses,
+            finally_block,
+            location,
+        } => AstNode::TryCatch {
+            try_block: Box::new(scalarize_local_arrays(*try_block)),
+            catch_clauses: catch_clauses
+                .into_iter()
+                .map(|c| crate::ast::CatchClause {
+                    body: Box::new(scalarize_local_arrays(*c.body)),
+                    ..c
+                })
+                .collect(),
+            finally_block: finally_block.map(|b| Box::new(scalarize_local_arrays(*b))),
+            location,
+        },
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -11571,6 +12775,328 @@ mod tests {
         assert!(
             try_vectorize_for(&reduction).is_none(),
             "a loop-carried reduction must NOT be vectorized (fail-closed)"
+        );
+    }
+
+    // ---- SROA / scalarize_local_arrays ----
+
+    fn sroa_decl(name: &str, value: AstNode) -> AstNode {
+        AstNode::VariableDeclaration {
+            name: name.into(),
+            type_annotation: None,
+            value: Some(Box::new(value)),
+            is_mutable: true,
+            is_secret: false,
+            location: make_loc(),
+        }
+    }
+
+    fn sroa_empty_list_decl(name: &str) -> AstNode {
+        sroa_decl(
+            name,
+            AstNode::ListLiteral {
+                elements: vec![],
+                location: make_loc(),
+            },
+        )
+    }
+
+    fn sroa_index_read(base: &str, index: u128) -> AstNode {
+        AstNode::IndexAccess {
+            base: Box::new(make_identifier(base)),
+            index: Box::new(make_int_literal(index)),
+            location: make_loc(),
+        }
+    }
+
+    fn sroa_stmts(node: &AstNode) -> &[AstNode] {
+        let AstNode::Block(stmts) = node else {
+            panic!("expected block, got {node:?}")
+        };
+        stmts
+    }
+
+    fn sroa_count_calls(stmts: &[AstNode], name: &str) -> usize {
+        fn count(node: &AstNode, name: &str) -> usize {
+            let mut n = usize::from(matches!(call_name(node), Some(c) if c == name));
+            for_each_child(node, &mut |c| n += count(c, name));
+            n
+        }
+        stmts.iter().map(|s| count(s, name)).sum()
+    }
+
+    fn sroa_decl_value<'a>(stmts: &'a [AstNode], name: &str) -> Option<&'a AstNode> {
+        stmts.iter().find_map(|s| match s {
+            AstNode::VariableDeclaration {
+                name: n,
+                value: Some(v),
+                ..
+            } if n == name => Some(v.as_ref()),
+            _ => None,
+        })
+    }
+
+    #[test]
+    fn sroa_scalarizes_constant_reads_and_deletes_appends() {
+        // var out = []; append(out, a); var r = out[0]  ->  var r = a
+        let block = AstNode::Block(vec![
+            sroa_empty_list_decl("out"),
+            make_append("out", make_identifier("a")),
+            sroa_decl("r", sroa_index_read("out", 0)),
+        ]);
+        let out = scalarize_local_arrays(block);
+        let stmts = sroa_stmts(&out);
+        assert_eq!(sroa_count_calls(stmts, "append"), 0, "append not deleted");
+        assert!(
+            matches!(sroa_decl_value(stmts, "r"), Some(AstNode::Identifier(n, _)) if n == "a"),
+            "read must substitute the captured element, got {:?}",
+            sroa_decl_value(stmts, "r")
+        );
+    }
+
+    #[test]
+    fn sroa_read_before_append_bails() {
+        // A read past the built prefix AT THAT PROGRAM POINT is unprovable:
+        // the whole list must be demoted (bail, never clamp).
+        let block = AstNode::Block(vec![
+            sroa_empty_list_decl("out"),
+            sroa_decl("r", sroa_index_read("out", 0)),
+            make_append("out", make_identifier("a")),
+        ]);
+        let out = scalarize_local_arrays(block);
+        let stmts = sroa_stmts(&out);
+        assert_eq!(
+            sroa_count_calls(stmts, "append"),
+            1,
+            "demoted list's build must stay real"
+        );
+        assert!(
+            matches!(
+                sroa_decl_value(stmts, "r"),
+                Some(AstNode::IndexAccess { .. })
+            ),
+            "read of demoted list must stay an index access"
+        );
+    }
+
+    #[test]
+    fn sroa_alias_group_demotes_whole_group() {
+        // `var y = out` joins the alias group; passing `y` to an unmodeled
+        // call demotes the group, so `out`'s build and reads stay real.
+        let block = AstNode::Block(vec![
+            sroa_empty_list_decl("out"),
+            make_append("out", make_identifier("a")),
+            sroa_decl("y", make_identifier("out")),
+            make_call("mystery_fn", vec![make_identifier("y")]),
+            sroa_decl("r", sroa_index_read("out", 0)),
+        ]);
+        let out = scalarize_local_arrays(block);
+        let stmts = sroa_stmts(&out);
+        assert_eq!(
+            sroa_count_calls(stmts, "append"),
+            1,
+            "aliased-then-escaped list must keep its build"
+        );
+        assert!(
+            matches!(
+                sroa_decl_value(stmts, "r"),
+                Some(AstNode::IndexAccess { .. })
+            ),
+            "read of demoted alias group must stay an index access"
+        );
+    }
+
+    #[test]
+    fn sroa_escape_snapshot_is_cached_until_mutation() {
+        // Two consecutive escapes reuse ONE snapshot; a mutation invalidates
+        // it, so the next escape mints a new one.
+        let block = AstNode::Block(vec![
+            sroa_empty_list_decl("out"),
+            make_append("out", make_identifier("a")),
+            make_append("out", make_identifier("b")),
+            sroa_decl(
+                "p",
+                make_call(
+                    "Share.batch_mul",
+                    vec![make_identifier("out"), make_identifier("out")],
+                ),
+            ),
+            sroa_decl(
+                "q",
+                make_call(
+                    "Share.batch_mul",
+                    vec![make_identifier("out"), make_identifier("out")],
+                ),
+            ),
+            make_append("out", make_identifier("c")),
+            sroa_decl(
+                "r",
+                make_call(
+                    "Share.batch_mul",
+                    vec![make_identifier("out"), make_identifier("out")],
+                ),
+            ),
+        ]);
+        let out = scalarize_local_arrays(block);
+        let stmts = sroa_stmts(&out);
+        assert_eq!(sroa_count_calls(stmts, "append"), 0, "appends not deleted");
+        let snap_decls: Vec<&str> = stmts
+            .iter()
+            .filter_map(get_var_decl_name)
+            .filter(|n| n.starts_with("__sroa_snap"))
+            .collect();
+        assert_eq!(
+            snap_decls.len(),
+            2,
+            "expected one cached snapshot per mutation epoch, got {snap_decls:?}"
+        );
+        let arg_of = |decl: &str| -> String {
+            match sroa_decl_value(stmts, decl) {
+                Some(AstNode::FunctionCall { arguments, .. }) => match &arguments[0] {
+                    AstNode::Identifier(n, _) => n.clone(),
+                    other => panic!("expected identifier arg, got {other:?}"),
+                },
+                other => panic!("expected batch_mul call, got {other:?}"),
+            }
+        };
+        assert_eq!(arg_of("p"), arg_of("q"), "consecutive escapes must share");
+        assert_ne!(arg_of("p"), arg_of("r"), "mutation must invalidate cache");
+        assert_eq!(arg_of("p"), snap_decls[0]);
+        assert_eq!(arg_of("r"), snap_decls[1]);
+    }
+
+    #[test]
+    fn sroa_element_temp_inherits_secrecy() {
+        // A non-trivial append operand is bound to a fresh temp that inherits
+        // the operand's resolved secrecy (register-bank classification).
+        let secret_add = AstNode::FunctionCall {
+            function: Box::new(make_identifier("Share.add")),
+            arguments: vec![make_identifier("a"), make_identifier("b")],
+            location: make_loc(),
+            resolved_return_type: Some(crate::symbol_table::SymbolType::Secret(Box::new(
+                crate::symbol_table::SymbolType::Bool,
+            ))),
+        };
+        let block = AstNode::Block(vec![
+            sroa_empty_list_decl("out"),
+            make_append("out", secret_add),
+            sroa_decl("r", sroa_index_read("out", 0)),
+        ]);
+        let out = scalarize_local_arrays(block);
+        let stmts = sroa_stmts(&out);
+        let temp = stmts
+            .iter()
+            .find_map(|s| match s {
+                AstNode::VariableDeclaration {
+                    name,
+                    is_secret,
+                    value: Some(v),
+                    ..
+                } if name.starts_with("__sroa_elem") => Some((name.clone(), *is_secret, v)),
+                _ => None,
+            })
+            .expect("append operand must be bound to an __sroa_elem temp");
+        assert!(temp.1, "element temp must inherit the operand's secrecy");
+        assert!(
+            matches!(temp.2.as_ref(), AstNode::FunctionCall { .. }),
+            "temp must bind the ORIGINAL operand call (evaluated once, in place)"
+        );
+        assert!(
+            matches!(sroa_decl_value(stmts, "r"), Some(AstNode::Identifier(n, _)) if n == &temp.0),
+            "read must substitute the element temp"
+        );
+    }
+
+    #[test]
+    fn dbe_sweeps_pure_assignments_to_never_read_vars() {
+        // `x` is declared and reassigned but never READ: both stores and the
+        // declaration must go. Leaving the dead stores would emit register
+        // writes with no consumer (the dead-def clobber class). `y` is read,
+        // so its assignment must stay.
+        let block = AstNode::Block(vec![
+            sroa_decl("x", make_int_literal(1)),
+            sroa_decl("y", make_int_literal(2)),
+            make_assignment("x", make_identifier("y")),
+            make_assignment("y", make_int_literal(3)),
+            make_call("print", vec![make_identifier("y")]),
+        ]);
+        let out = eliminate_dead_bindings(block);
+        let stmts = sroa_stmts(&out);
+        assert!(
+            !stmts.iter().any(|s| matches!(s,
+                AstNode::Assignment { target, .. }
+                    if matches!(target.as_ref(), AstNode::Identifier(n, _) if n == "x"))),
+            "dead store to never-read `x` must be swept"
+        );
+        assert!(
+            sroa_decl_value(stmts, "x").is_none(),
+            "never-read `x`'s declaration must be swept once its stores are gone"
+        );
+        assert!(
+            stmts.iter().any(|s| matches!(s,
+                AstNode::Assignment { target, .. }
+                    if matches!(target.as_ref(), AstNode::Identifier(n, _) if n == "y"))),
+            "store to the READ variable `y` must stay"
+        );
+    }
+
+    #[test]
+    fn sroa_rebind_of_captured_source_demotes() {
+        // `t` is captured, then rebound: substituting `out[0] -> t` afterwards
+        // would read the NEW `t`, so the list must be demoted.
+        let block = AstNode::Block(vec![
+            sroa_empty_list_decl("out"),
+            make_append("out", make_identifier("t")),
+            make_assignment("t", make_identifier("u")),
+            sroa_decl("r", sroa_index_read("out", 0)),
+        ]);
+        let out = scalarize_local_arrays(block);
+        let stmts = sroa_stmts(&out);
+        assert_eq!(sroa_count_calls(stmts, "append"), 1);
+        assert!(
+            matches!(
+                sroa_decl_value(stmts, "r"),
+                Some(AstNode::IndexAccess { .. })
+            ),
+            "read after captured-source rebind must stay an index access"
+        );
+    }
+
+    #[test]
+    fn sroa_literal_backed_substitutes_reads_and_keeps_array() {
+        // A literal-bound list substitutes constant reads but stays real (its
+        // declaration is the faithful array for anything unmodeled).
+        let block = AstNode::Block(vec![
+            sroa_decl(
+                "lst",
+                AstNode::ListLiteral {
+                    elements: vec![make_identifier("a"), make_identifier("b")],
+                    location: make_loc(),
+                },
+            ),
+            sroa_decl("r", sroa_index_read("lst", 1)),
+            make_call(
+                "Share.batch_mul",
+                vec![make_identifier("lst"), make_identifier("lst")],
+            ),
+        ]);
+        let out = scalarize_local_arrays(block);
+        let stmts = sroa_stmts(&out);
+        assert!(
+            matches!(sroa_decl_value(stmts, "r"), Some(AstNode::Identifier(n, _)) if n == "b"),
+            "constant read of literal-backed list must substitute"
+        );
+        // The escape passes the (real) literal variable itself — no snapshot.
+        assert!(
+            !stmts
+                .iter()
+                .filter_map(get_var_decl_name)
+                .any(|n| n.starts_with("__sroa_snap")),
+            "literal-backed escape must not mint a snapshot"
+        );
+        assert!(
+            sroa_decl_value(stmts, "lst").is_some(),
+            "literal-backed declaration must remain"
         );
     }
 }

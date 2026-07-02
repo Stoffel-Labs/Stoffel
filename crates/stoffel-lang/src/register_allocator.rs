@@ -498,11 +498,22 @@ pub fn analyze_liveness_cfg_dense(
     // with the instruction count) and dominated allocation time for very large
     // fully-unrolled/inlined functions; the sparse walk removes it.
     let mut def_first = vec![usize::MAX; num_vrs];
+    // Last def per VR: a def is a WRITE to the assigned physical register, so
+    // the interval must cover it even when no use follows (a dead tail store —
+    // e.g. a reassignment of a variable whose reads were all optimized away).
+    // Without this, the register given to a dead def can simultaneously be
+    // assigned to a live value, and the dead store CLOBBERS it at runtime (the
+    // legacy `analyze_liveness_with_liveins` counts defs as uses for exactly
+    // this reason).
+    let mut def_last = vec![usize::MAX; num_vrs];
     for (i, ops) in inst_ops.iter().enumerate() {
         if ops.def != NO_REG {
             let di = ops.def as usize;
             if i < def_first[di] {
                 def_first[di] = i;
+            }
+            if def_last[di] == usize::MAX || i > def_last[di] {
+                def_last[di] = i;
             }
         }
     }
@@ -569,8 +580,9 @@ pub fn analyze_liveness_cfg_dense(
             0
         };
         let mut end = end_idx[vi];
-        if def_first[vi] != usize::MAX {
-            let d = def_first[vi];
+        if def_last[vi] != usize::MAX {
+            // Cover every def point, including dead tail stores (see above).
+            let d = def_last[vi];
             if end < d + 1 {
                 end = d + 1;
             }
