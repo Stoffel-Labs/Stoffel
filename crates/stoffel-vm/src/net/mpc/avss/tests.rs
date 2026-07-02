@@ -10,7 +10,6 @@ use ark_std::test_rng;
 use std::sync::Arc;
 use stoffel_vm_types::core_types::{ClearShareValue, ShareType, F64};
 use stoffelmpc_mpc::common::share::avss::verify_feldman;
-use stoffelmpc_mpc::common::ProtocolSessionId;
 use stoffelnet::transports::quic::QuicNetworkManager;
 
 #[test]
@@ -1042,7 +1041,10 @@ fn test_bn254_input_share_reconstruction() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn test_avss_input_share_session_allocation_is_consistent_across_parties() {
+async fn test_avss_input_share_is_local_constant_sharing() {
+    // A clear input must NOT run a network AVSS dealing (runtime dealings
+    // collide with preprocessing session slots and hang); it is a local
+    // degree-t constant sharing that reconstructs to the constant.
     let n = 4usize;
     let t = 1usize;
     let instance_id = 77u64;
@@ -1068,24 +1070,35 @@ async fn test_avss_input_share_session_allocation_is_consistent_across_parties()
     .await
     .expect("engine1");
 
-    let (dealer0, sid0) = e0.allocate_input_share_session().expect("session0");
-    let (dealer1, sid1) = e1.allocate_input_share_session().expect("session1");
-    assert_eq!(dealer0, dealer1, "dealer selection must be deterministic");
-    assert_eq!(
-        sid0.as_u128(),
-        sid1.as_u128(),
-        "session ids must match across parties for the same input_share round"
+    let value = Fr::from(123459u64);
+    let s0 = e0
+        .local_constant_share(value)
+        .await
+        .expect("constant share party 0");
+    let s1 = e1
+        .local_constant_share(value)
+        .await
+        .expect("constant share party 1");
+
+    assert_eq!(s0.feldmanshare.share[0], value);
+    assert_eq!(s1.feldmanshare.share[0], value);
+    assert_ne!(
+        s0.feldmanshare.id, s1.feldmanshare.id,
+        "parties evaluate at distinct share ids"
+    );
+    assert!(
+        stoffelmpc_mpc::common::share::avss::verify_feldman(s0.clone()),
+        "constant share must pass Feldman verification"
+    );
+    assert!(
+        stoffelmpc_mpc::common::share::avss::verify_feldman(s1.clone()),
+        "constant share must pass Feldman verification"
     );
 
-    let (dealer0_next, sid0_next) = e0.allocate_input_share_session().expect("session0-next");
-    let (dealer1_next, sid1_next) = e1.allocate_input_share_session().expect("session1-next");
+    let recovered = AvssMpcEngine::<Fr, G1>::reconstruct_secret(&[s0, s1], n, t)
+        .expect("reconstruct constant sharing");
     assert_eq!(
-        dealer0_next, dealer1_next,
-        "dealer selection must stay aligned across rounds"
-    );
-    assert_eq!(
-        sid0_next.as_u128(),
-        sid1_next.as_u128(),
-        "session ids must stay aligned across rounds"
+        recovered, value,
+        "constant sharing reconstructs to the constant"
     );
 }

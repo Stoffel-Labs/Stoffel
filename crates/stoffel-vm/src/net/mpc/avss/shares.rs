@@ -137,7 +137,15 @@ where
             let notified = self.share_notify.notified();
 
             {
-                let node = self.clone_avss_node().await;
+                let mut node = self.clone_avss_node().await;
+                // Drain any pending RBC completions before checking: the AVID
+                // completion send races the per-message drain in
+                // `AvssMPCNode::process`, and once the last message of a round
+                // has been processed no further traffic would ever drain it —
+                // a waiter must pump the queue itself or hang until timeout.
+                if let Err(e) = node.share_gen_avss.avss.drain_rbc_output().await {
+                    tracing::warn!("wait_for_share: drain_rbc_output failed: {e:?}");
+                }
                 let shares = node.share_gen_avss.avss.shares.lock().await;
                 if let Some(Some(share_vec)) = shares.get(&session_id) {
                     if let Some(share) = share_vec.first() {
