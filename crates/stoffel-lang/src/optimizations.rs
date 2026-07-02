@@ -3273,6 +3273,22 @@ fn references_var(node: &AstNode, name: &str) -> bool {
     refs.contains(name)
 }
 
+/// Per-pass wall-time reporting for the optimizer pipeline
+/// (`STOFFEL_OPT_TIMING=1`; prints to stderr, output unchanged).
+fn opt_timing_enabled() -> bool {
+    std::env::var("STOFFEL_OPT_TIMING").is_ok_and(|v| v != "0" && !v.is_empty())
+}
+
+fn timed_pass(name: &str, f: impl FnOnce() -> AstNode) -> AstNode {
+    if !opt_timing_enabled() {
+        return f();
+    }
+    let start = std::time::Instant::now();
+    let out = f();
+    eprintln!("[opt-timing] {name}: {:.3}s", start.elapsed().as_secs_f64());
+    out
+}
+
 fn optimize_all_inner(node: AstNode, optimization_level: u8) -> AstNode {
     // Passes compose forward: each one runs on the previous pass's output, so the
     // pipeline refines the program incrementally rather than each pass re-reading
@@ -3287,7 +3303,7 @@ fn optimize_all_inner(node: AstNode, optimization_level: u8) -> AstNode {
     // gated to -O3. At lower levels LICM/CSE still run; they only ever *reduce* work,
     // so they are always safe.
     let node = if optimization_level >= 3 {
-        inline_functions(node)
+        timed_pass("inline_functions", || inline_functions(node))
     } else {
         node
     };
@@ -3297,7 +3313,7 @@ fn optimize_all_inner(node: AstNode, optimization_level: u8) -> AstNode {
     // register pressure (every unrolled iteration's live shares now coexist),
     // which is why it is gated to -O3.
     let node = if optimization_level >= 3 {
-        unroll_literal_loops(node)
+        timed_pass("unroll_literal_loops", || unroll_literal_loops(node))
     } else {
         node
     };
@@ -3314,7 +3330,7 @@ fn optimize_all_inner(node: AstNode, optimization_level: u8) -> AstNode {
     // scalar `xor` multiplies guarded by `if i == 0 / if i == 2`, so without this
     // every one of those secret-bool xors runs as its own unbatched round.
     let node = if optimization_level >= 3 {
-        fold_constant_branches(node)
+        timed_pass("fold_constant_branches", || fold_constant_branches(node))
     } else {
         node
     };
@@ -3324,7 +3340,7 @@ fn optimize_all_inner(node: AstNode, optimization_level: u8) -> AstNode {
     // folding (so the counter increment is straight-line) and before the
     // multiply batchers (so folded gates never reach `Share.batch_mul`). -O3 only.
     let node = if optimization_level >= 3 {
-        fold_public_gates(node)
+        timed_pass("fold_public_gates", || fold_public_gates(node))
     } else {
         node
     };
@@ -3339,11 +3355,13 @@ fn optimize_all_inner(node: AstNode, optimization_level: u8) -> AstNode {
     // with a fixed number of vector statements, so code size stays O(1) in the
     // iteration count (no unroll blow-up).
     let node = if optimization_level >= 3 {
-        vectorize_map_loops(node)
+        timed_pass("vectorize_map_loops", || vectorize_map_loops(node))
     } else {
         node
     };
-    let node = inline_multiply_wrappers(node);
+    let node = timed_pass("inline_multiply_wrappers", || {
+        inline_multiply_wrappers(node)
+    });
     // Round-minimizing list scheduler (-O3): within each side-effect-free region,
     // reorder statements so that all mutually-independent multiplies at the same
     // dependency depth become consecutive. The greedy multiply batcher that runs
@@ -3352,13 +3370,15 @@ fn optimize_all_inner(node: AstNode, optimization_level: u8) -> AstNode {
     // round's shares are live at once) for fewer communication rounds, so it is
     // gated to -O3 alongside inlining/unrolling.
     let node = if optimization_level >= 3 {
-        schedule_for_batching(node)
+        timed_pass("schedule_for_batching", || schedule_for_batching(node))
     } else {
         node
     };
-    let node = optimize_reveals(node);
-    let node = optimize_multiplies(node);
-    let node = reorder_for_reveal_batching(node);
+    let node = timed_pass("optimize_reveals", || optimize_reveals(node));
+    let node = timed_pass("optimize_multiplies", || optimize_multiplies(node));
+    let node = timed_pass("reorder_for_reveal_batching", || {
+        reorder_for_reveal_batching(node)
+    });
     // SROA / scalarization (-O3): after the batchers settled the block shape,
     // replace constant-index reads of locally-built lists with direct element
     // references and delete the corresponding build calls, rematerializing a
@@ -3368,18 +3388,18 @@ fn optimize_all_inner(node: AstNode, optimization_level: u8) -> AstNode {
     // the emptied builds are swept. -O3 only: below -O3 loops stay rolled, so
     // indices are rarely constant and the pass would only add walk time.
     let node = if optimization_level >= 3 {
-        scalarize_local_arrays(node)
+        timed_pass("scalarize_local_arrays", || scalarize_local_arrays(node))
     } else {
         node
     };
-    let node = optimize_licm_cse(node);
-    let node = optimize_gvn(node);
+    let node = timed_pass("optimize_licm_cse", || optimize_licm_cse(node));
+    let node = timed_pass("optimize_gvn", || optimize_gvn(node));
     // Finally, drop bindings whose value is never used (a pure dead store). This
     // sweeps up the intermediate temporaries that inlining, unrolling, and the
     // batchers leave behind — reducing live values (register pressure / spills)
     // and, when a dead binding's initializer was itself an MPC multiply, even
     // eliminating wasted preprocessing.
-    eliminate_dead_bindings(node)
+    timed_pass("eliminate_dead_bindings", || eliminate_dead_bindings(node))
 }
 
 // ===========================================================================
@@ -7158,6 +7178,34 @@ fn dead_function_names(root: &AstNode) -> HashSet<String> {
 /// Recurse into a node, unrolling resolvable loops in any statement list it owns
 /// (blocks and function bodies) and inside its child scopes. `env` carries the
 /// length context for the scope `node` lives in.
+/// A `LenEnv` restricted to the names referenced anywhere in `nodes`' subtrees.
+/// Lookup-equivalent to a full clone for any walk confined to those subtrees:
+/// the walk can only query names appearing in them (plus names it inserts
+/// itself), no `LenEnv` operation iterates the whole env, and operations on
+/// absent alias partners are no-ops — so entries for unreferenced names are
+/// unobservable. This turns the per-loop-candidate env copy from O(whole env)
+/// — quadratic over a long unroll, since the env holds a shape/int for every
+/// binding processed so far — into O(subtree), which the walk costs anyway.
+fn scoped_len_env(env: &LenEnv, nodes: &[&AstNode]) -> LenEnv {
+    let mut referenced = HashSet::new();
+    for n in nodes {
+        collect_identifiers(n, &mut referenced);
+    }
+    let mut out = LenEnv::default();
+    for name in referenced {
+        if let Some(s) = env.shapes.get(&name) {
+            out.shapes.insert(name.clone(), s.clone());
+        }
+        if let Some(&v) = env.ints.get(&name) {
+            out.ints.insert(name.clone(), v);
+        }
+        if let Some(g) = env.aliases.get(&name) {
+            out.aliases.insert(name, Rc::clone(g));
+        }
+    }
+    out
+}
+
 fn unroll_in_node(node: AstNode, env: &mut LenEnv, budget: &mut usize) -> AstNode {
     match node {
         AstNode::Block(stmts) => AstNode::Block(unroll_stmt_list(stmts, env, budget)),
@@ -7209,7 +7257,7 @@ fn unroll_in_node(node: AstNode, env: &mut LenEnv, budget: &mut usize) -> AstNod
             body,
             location,
         } => {
-            let mut benv = env.clone();
+            let mut benv = scoped_len_env(env, &[&body]);
             let body = Box::new(unroll_in_node(*body, &mut benv, budget));
             let mut mutated = HashSet::new();
             collect_mutated_vars(&body, &mut mutated);
@@ -7231,7 +7279,7 @@ fn unroll_in_node(node: AstNode, env: &mut LenEnv, budget: &mut usize) -> AstNod
             // A `ForLoop` reached here (rather than via a statement list, where
             // `unroll_stmt_list` flattens it) could not be unrolled; recurse into
             // its body for nested loops, then invalidate anything it mutates.
-            let mut benv = env.clone();
+            let mut benv = scoped_len_env(env, &[&body, &iterable]);
             bind_loop_var(&mut benv, &variables, &iterable);
             let body = Box::new(unroll_in_node(*body, &mut benv, budget));
             let mut mutated = HashSet::new();
@@ -7251,10 +7299,10 @@ fn unroll_in_node(node: AstNode, env: &mut LenEnv, budget: &mut usize) -> AstNod
             then_branch,
             else_branch,
         } => {
-            let mut tenv = env.clone();
+            let mut tenv = scoped_len_env(env, &[&then_branch]);
             let then_branch = Box::new(unroll_in_node(*then_branch, &mut tenv, budget));
             let else_branch = else_branch.map(|e| {
-                let mut eenv = env.clone();
+                let mut eenv = scoped_len_env(env, &[&e]);
                 Box::new(unroll_in_node(*e, &mut eenv, budget))
             });
             let mut mutated = HashSet::new();
@@ -7563,7 +7611,7 @@ fn try_unroll_for(stmt: AstNode, env: &LenEnv, budget: &mut usize) -> UnrollOutc
         // what clusters a layer's independent multiplies into one batched round
         // without paying to duplicate the whole round body. See
         // `estimate_unrolled_size`.
-        let mut benv = env.clone();
+        let mut benv = scoped_len_env(env, &[&body, &iterable]);
         bind_loop_var(&mut benv, &variables, &iterable);
         // The estimate only gates a monotone threshold. The loop fits iff
         // `iterations * estimate <= min(unroll_max_expansion, budget)`, so once
