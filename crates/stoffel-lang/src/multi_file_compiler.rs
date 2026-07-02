@@ -238,7 +238,14 @@ impl MultiFileCompiler {
         let exports = self.extract_exports(&optimized_ast, &resolved.module_path);
 
         // Code generation
-        let mut program = codegen::generate_bytecode(&optimized_ast).map_err(|e| vec![e])?;
+        let codegen_opt_level = if self.options.optimize {
+            self.options.optimization_level
+        } else {
+            0
+        };
+        let mut program =
+            codegen::generate_bytecode_with_opt_level(&optimized_ast, codegen_opt_level)
+                .map_err(|e| vec![e])?;
         program.client_io_manifest.mpc_backend = self.options.mpc_backend;
         program.client_io_manifest.mpc_curve = self.options.mpc_curve;
 

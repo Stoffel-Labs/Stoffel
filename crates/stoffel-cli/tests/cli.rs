@@ -474,7 +474,11 @@ fn run_recompiles_when_project_source_is_newer_than_bytecode() {
         ])
         .assert()
         .success()
-        .stdout(predicate::str::contains("Instructions: 7"))
+        // 5 = MOV a, MOV b, ADD, ADD, RET: the two variable-binding copies the
+        // allocator coalesces are now deleted by post-RA self-MOV elimination.
+        // Any count far below the ~113-instruction init template proves the
+        // stale bytecode was recompiled from the new source.
+        .stdout(predicate::str::contains("Instructions: 5"))
         .stdout(predicate::str::contains("5"));
 }
 

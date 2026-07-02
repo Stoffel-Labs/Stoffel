@@ -1526,3 +1526,107 @@ async fn round_histogram_impl() {
         print_depth_histogram(label, rounds, correct, &log);
     }
 }
+
+/// Regression test for the opt-level >= 1 spill-slot reload cache: a value that
+/// is reassigned inside a runtime loop while spilled (a multi-def spill slot
+/// carried across the back edge) is exactly where a stale cached reload would
+/// produce wrong values while straight-line code still passes. The program
+/// keeps ~26 loop-invariant, data-dependent values live across a 128-iteration
+/// `while` loop (forcing clear-bank spills) and accumulates through a spilled
+/// loop-carried variable; every optimization level must agree with -O0.
+#[test]
+fn loop_carried_spill_slot_reloads_are_correct() {
+    run_on_large_stack(loop_carried_spill_slot_reloads_are_correct_impl());
+}
+
+async fn loop_carried_spill_slot_reloads_are_correct_impl() {
+    // Build the source: a first runtime loop makes `seed` opaque to constant
+    // folding, a chain of 24 live-to-the-end variables plus 8 loop-carried
+    // accumulators forces clear-bank spilling, and the second loop reassigns
+    // the (spilled) accumulators on every iteration.
+    let mut source = String::from(
+        "def main() -> int64:\n\
+         \x20 var n = 128\n\
+         \x20 var i = 0\n\
+         \x20 var seed = 0\n\
+         \x20 while i < n:\n\
+         \x20   seed = seed + i\n\
+         \x20   i = i + 1\n\
+         \x20 var a0 = seed + 1\n",
+    );
+    for k in 1..24 {
+        source.push_str(&format!("  var a{k} = a{} + seed\n", k - 1));
+    }
+    for k in 0..8 {
+        source.push_str(&format!("  var t{k} = seed + a{}\n", k * 3));
+    }
+    source.push_str("  var j = 0\n  while j < n:\n");
+    for k in 0..8 {
+        source.push_str(&format!("    t{k} = t{k} + a{}\n", 23 - k));
+    }
+    source.push_str("    j = j + 1\n  var sum = 0\n");
+    for k in 0..24 {
+        source.push_str(&format!("  sum = sum + a{k}\n"));
+    }
+    for k in 0..8 {
+        source.push_str(&format!("  sum = sum + t{k}\n"));
+    }
+    source.push_str("  return sum\n");
+
+    let run_at = |level: u8| {
+        let source = source.clone();
+        async move {
+            let options = stoffellang::CompilerOptions {
+                optimize: level > 0,
+                optimization_level: level,
+                mpc_backend: stoffel_vm_types::compiled_binary::MpcBackend::HoneyBadger,
+                ..Default::default()
+            };
+            let compiled = stoffellang::compile(&source, "<loop-carried-spill>", &options)
+                .unwrap_or_else(|e| panic!("compile at -O{level}: {e:?}"));
+            // The test is only meaningful if the accumulator actually spills:
+            // require a multi-def spill slot (>= 2 static STS to one slot — the
+            // loop-carried reassignments of `t`).
+            if level > 0 {
+                let mut sts_per_slot: std::collections::HashMap<usize, usize> =
+                    std::collections::HashMap::new();
+                for inst in &compiled.main_chunk.instructions {
+                    if let stoffel_vm_types::instructions::Instruction::STS(slot, _) = inst {
+                        *sts_per_slot.entry(*slot).or_default() += 1;
+                    }
+                }
+                assert!(
+                    !sts_per_slot.is_empty(),
+                    "-O{level}: expected register pressure to spill (no STS emitted; \
+                     raise the live-variable count in this test)"
+                );
+                assert!(
+                    sts_per_slot.values().any(|&count| count >= 2),
+                    "-O{level}: expected a multi-def (loop-carried) spill slot, got {sts_per_slot:?}"
+                );
+            }
+            let binary = stoffellang::convert_to_binary(&compiled);
+            let functions = binary.try_to_vm_functions().expect("vm functions");
+            let engine = Arc::new(CountingEngine::default());
+            let mut vm = VirtualMachine::builder()
+                .with_mpc_engine(engine.clone())
+                .build();
+            for function in functions {
+                vm.try_register_function(function)
+                    .expect("register function");
+            }
+            vm.execute_async("main", engine.as_ref())
+                .await
+                .unwrap_or_else(|e| panic!("execute at -O{level}: {e:?}"))
+        }
+    };
+
+    let baseline = run_at(0).await;
+    for level in 1..=3 {
+        let result = run_at(level).await;
+        assert_eq!(
+            result, baseline,
+            "-O{level} disagrees with -O0 on the loop-carried spilled accumulator"
+        );
+    }
+}

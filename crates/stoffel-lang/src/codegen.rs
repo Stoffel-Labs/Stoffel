@@ -187,6 +187,71 @@ struct CodeGenerator {
     active_loop_bounds: Vec<(String, u64)>,
     /// (continue_label, break_label) for each enclosing loop, innermost last
     loop_label_stack: Vec<(String, String)>,
+    /// Optimization level compilation runs at (0 when the optimizer is off). Gates
+    /// the codegen-side spill-traffic passes so -O0 output stays byte-identical.
+    opt_level: u8,
+}
+
+/// Kill-switch for the opt-level >= 1 spill-traffic passes (the slot-reload cache in
+/// `lower_spills_into_slots` and post-RA self-MOV elimination): set
+/// `STOFFEL_SPILL_CACHE=0` to disable both for A/B comparisons.
+fn spill_opt_enabled() -> bool {
+    std::env::var("STOFFEL_SPILL_CACHE").map_or(true, |v| v != "0")
+}
+
+/// Debug hook: set `STOFFEL_SPILL_STATS=1` to print per-function spill-lowering
+/// statistics (rounds, slots, reload cache hit/miss per bank, self-MOVs removed).
+fn spill_stats_enabled() -> bool {
+    std::env::var("STOFFEL_SPILL_STATS").is_ok()
+}
+
+#[derive(Default, Debug)]
+struct SpillLoweringStats {
+    rounds: usize,
+    spill_slots: usize,
+    /// Reloads served from a cached scratch register, per bank ([clear, secret]).
+    reload_hits: [usize; 2],
+    /// Reloads that had to emit an `LDS`, per bank ([clear, secret]).
+    reload_misses: [usize; 2],
+    spilled_defs: usize,
+}
+
+/// Cached scratch registers per bank; kept strictly below `SPILL_RESERVE` minus the
+/// per-instruction transient scratches (2 reloads + 1 store = 3), so every unspillable
+/// scratch always finds a home: 2 cached + 3 transient = 5 < 6.
+const SPILL_SLOT_CACHE_CAPACITY: usize = 2;
+
+/// Tiny per-bank LRU mapping spill slot -> scratch VR currently holding that slot's
+/// value within the current basic block (see `lower_spills_into_slots`).
+#[derive(Default)]
+struct SpillSlotCache {
+    /// `[clear, secret]`; entries ordered least- to most-recently used.
+    banks: [Vec<(usize, usize)>; 2],
+}
+
+impl SpillSlotCache {
+    fn lookup(&mut self, is_secret: bool, slot: usize) -> Option<usize> {
+        let bank = &mut self.banks[is_secret as usize];
+        let pos = bank.iter().position(|&(s, _)| s == slot)?;
+        let entry = bank.remove(pos);
+        bank.push(entry);
+        Some(entry.1)
+    }
+
+    fn insert(&mut self, is_secret: bool, slot: usize, scratch_vr: usize) {
+        let bank = &mut self.banks[is_secret as usize];
+        if let Some(pos) = bank.iter().position(|&(s, _)| s == slot) {
+            bank.remove(pos);
+        } else if bank.len() == SPILL_SLOT_CACHE_CAPACITY {
+            bank.remove(0);
+        }
+        bank.push((slot, scratch_vr));
+    }
+
+    fn clear(&mut self) {
+        self.banks[0].clear();
+        self.banks[1].clear();
+    }
 }
 
 impl CodeGenerator {
@@ -216,7 +281,14 @@ impl CodeGenerator {
             reassigned_vars: HashSet::new(),
             active_loop_bounds: Vec::new(),
             loop_label_stack: Vec::new(),
+            opt_level: 0,
         }
+    }
+
+    /// Whether the opt-level >= 1 spill-traffic passes (slot-reload cache and post-RA
+    /// self-MOV elimination) are active for this generator.
+    fn spill_opt_active(&self) -> bool {
+        self.opt_level >= 1 && spill_opt_enabled()
     }
 
     /// Warn that a client-I/O call could not be recorded in the client-IO
@@ -504,6 +576,18 @@ impl CodeGenerator {
     ///
     /// `next_spill_slot` is the function-wide monotonic slot counter, so slots never
     /// collide across spill rounds.
+    ///
+    /// When `cache_enabled` is set (opt-level >= 1, see `spill_opt_enabled`), a tiny
+    /// per-bank LRU of slot -> scratch VR forwards repeated reloads of the same slot
+    /// within a basic block to the scratch register that already holds the value
+    /// (including the store scratch of a preceding def), eliding the `LDS`. The cache
+    /// is invalidated at every label target and after every control transfer, so a
+    /// cached scratch never crosses a block boundary. Capacity is bounded so cached
+    /// scratches (2/bank) plus the per-instruction transients (<= 3) stay under
+    /// `SPILL_RESERVE`; cached scratches spanning `CALL`s are safe because the VM
+    /// preserves all registers across calls except physical R0, which the allocator
+    /// never hands out (it is reserved for the precolored ABI result VR0).
+    #[allow(clippy::too_many_arguments)]
     fn lower_spills_into_slots(
         instructions: Vec<Instruction>,
         labels: HashMap<String, usize>,
@@ -511,6 +595,8 @@ impl CodeGenerator {
         secrecy_map: &mut Vec<bool>,
         spilled_vrs: &[VirtualRegister],
         next_spill_slot: &mut usize,
+        cache_enabled: bool,
+        stats: &mut SpillLoweringStats,
     ) -> (Vec<Instruction>, HashMap<String, usize>) {
         // Dense spilled/slot tables indexed by VR id: every operand VR was minted
         // before this round, so ids are bounded by the current counter.
@@ -528,11 +614,25 @@ impl CodeGenerator {
         let mut old_to_new = vec![0usize; instructions.len() + 1];
         let num_instructions = instructions.len();
 
+        // Block-boundary set over the ORIGINAL instruction indices: label targets
+        // start new blocks (control transfers are handled after each instruction).
+        let label_targets: HashSet<usize> = if cache_enabled {
+            labels.values().copied().collect()
+        } else {
+            HashSet::new()
+        };
+        let mut cache = SpillSlotCache::default();
+
         for (i, mut instruction) in instructions.into_iter().enumerate() {
             old_to_new[i] = out.len();
 
+            if cache_enabled && label_targets.contains(&i) {
+                cache.clear();
+            }
+
             // Reload each spilled use into a fresh scratch register just before the
-            // instruction (at most two uses per instruction).
+            // instruction (at most two uses per instruction), unless a cached scratch
+            // already holds this slot's value.
             let mut mapped_uses: [Option<(usize, usize)>; 2] = [None; 2];
             let mut mapped_use_count = 0;
             for used_vr in register_allocator::use_regs(&instruction)
@@ -542,10 +642,24 @@ impl CodeGenerator {
                 if spilled[used_vr] && !mapped_uses.iter().flatten().any(|&(old, _)| old == used_vr)
                 {
                     let is_secret = secrecy_map.get(used_vr).copied().unwrap_or(false);
-                    let scratch =
-                        Self::fresh_virtual_register(next_virtual_reg, secrecy_map, is_secret);
-                    out.push(Instruction::LDS(scratch.0, slot_of[used_vr]));
-                    mapped_uses[mapped_use_count] = Some((used_vr, scratch.0));
+                    let slot = slot_of[used_vr];
+                    let scratch_id = if let Some(cached) = cache_enabled
+                        .then(|| cache.lookup(is_secret, slot))
+                        .flatten()
+                    {
+                        stats.reload_hits[is_secret as usize] += 1;
+                        cached
+                    } else {
+                        stats.reload_misses[is_secret as usize] += 1;
+                        let scratch =
+                            Self::fresh_virtual_register(next_virtual_reg, secrecy_map, is_secret);
+                        out.push(Instruction::LDS(scratch.0, slot));
+                        if cache_enabled {
+                            cache.insert(is_secret, slot, scratch.0);
+                        }
+                        scratch.0
+                    };
+                    mapped_uses[mapped_use_count] = Some((used_vr, scratch_id));
                     mapped_use_count += 1;
                 }
             }
@@ -559,14 +673,35 @@ impl CodeGenerator {
                     let scratch =
                         Self::fresh_virtual_register(next_virtual_reg, secrecy_map, is_secret);
                     mapped_def = Some((def_vr, scratch.0));
+                    stats.spilled_defs += 1;
                 }
             }
+
+            let ends_block = matches!(
+                instruction,
+                Instruction::JMP(_)
+                    | Instruction::JMPEQ(_)
+                    | Instruction::JMPNEQ(_)
+                    | Instruction::JMPLT(_)
+                    | Instruction::JMPGT(_)
+                    | Instruction::RET(_)
+            );
 
             Self::remap_instruction_registers_in_place(&mut instruction, &mapped_uses, mapped_def);
             out.push(instruction);
 
             if let Some((spilled_vr, scratch_vr)) = mapped_def {
                 out.push(Instruction::STS(slot_of[spilled_vr], scratch_vr));
+                if cache_enabled {
+                    // Store-forwarding: the store scratch now holds the slot's value,
+                    // superseding any previously cached reload of the same slot.
+                    let is_secret = secrecy_map.get(spilled_vr).copied().unwrap_or(false);
+                    cache.insert(is_secret, slot_of[spilled_vr], scratch_vr);
+                }
+            }
+
+            if cache_enabled && ends_block {
+                cache.clear();
             }
         }
         old_to_new[num_instructions] = out.len();
@@ -585,6 +720,35 @@ impl CodeGenerator {
         (out, lowered_labels)
     }
 
+    /// Post-RA cleanup: delete `MOV(r, r)` no-ops left behind when the allocator
+    /// coalesces a copy's source and destination into the same physical register
+    /// (including the `MOV(0, 0)` form of a post-CALL result capture, which is
+    /// final-form by the time this runs — `rewrite_instructions_with` has already
+    /// rewritten the ABI source). Labels are remapped with the same
+    /// boundary-inclusive old-to-new index table `lower_spills_into_slots` uses,
+    /// so labels pointing one past the end (or at a deleted MOV) stay valid.
+    fn eliminate_self_movs(
+        instructions: Vec<Instruction>,
+        labels: &mut HashMap<String, usize>,
+    ) -> Vec<Instruction> {
+        let num_instructions = instructions.len();
+        let mut out = Vec::with_capacity(num_instructions);
+        let mut old_to_new = vec![0usize; num_instructions + 1];
+        for (i, instruction) in instructions.into_iter().enumerate() {
+            old_to_new[i] = out.len();
+            if matches!(instruction, Instruction::MOV(dest, src) if dest == src) {
+                continue;
+            }
+            out.push(instruction);
+        }
+        old_to_new[num_instructions] = out.len();
+        for index in labels.values_mut() {
+            *index = old_to_new.get(*index).copied().unwrap_or(out.len());
+        }
+        out
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn allocate_registers_with_object_spills(
         instructions: &mut Vec<Instruction>,
         labels: &mut HashMap<String, usize>,
@@ -593,6 +757,7 @@ impl CodeGenerator {
         precolored: &HashMap<VirtualRegister, PhysicalRegister>,
         protected_prologue_len: usize,
         diagnostic_name: &str,
+        spill_slot_cache: bool,
     ) -> CompilerResult<register_allocator::DenseAllocation> {
         let k_clear = SECRET_REGISTER_START;
         let k_secret = MAX_REGISTERS - k_clear;
@@ -633,6 +798,7 @@ impl CodeGenerator {
         let _ = protected_prologue_len; // spill traffic is position-independent now
 
         let live_in_vrs: Vec<VirtualRegister> = precolored.keys().copied().collect();
+        let mut spill_stats = SpillLoweringStats::default();
         for _ in 0..64 {
             let intervals =
                 register_allocator::analyze_liveness_cfg_dense(instructions, labels, &live_in_vrs);
@@ -653,6 +819,20 @@ impl CodeGenerator {
                 unspillable_start.unwrap_or(register_allocator::NO_UNSPILLABLE),
             ) {
                 Ok(allocation) => {
+                    if spill_stats_enabled() && spill_stats.rounds > 0 {
+                        eprintln!(
+                            "SPILL_STATS {diagnostic_name}: rounds={} slots={} defs={} \
+                             reload_hits=[clear {}, secret {}] reload_misses=[clear {}, secret {}] cache={}",
+                            spill_stats.rounds,
+                            spill_stats.spill_slots,
+                            spill_stats.spilled_defs,
+                            spill_stats.reload_hits[0],
+                            spill_stats.reload_hits[1],
+                            spill_stats.reload_misses[0],
+                            spill_stats.reload_misses[1],
+                            spill_slot_cache,
+                        );
+                    }
                     if std::env::var("STOFFEL_RA_CHECK").is_ok() {
                         Self::ra_interference_check(&allocation, &intervals, diagnostic_name);
                         Self::ra_liveness_coverage_check(instructions, &intervals, diagnostic_name);
@@ -668,6 +848,16 @@ impl CodeGenerator {
                 }
                 Err(AllocationError::NeedsSpilling(spilled_vrs)) => {
                     let first_new_vr = *next_virtual_reg;
+                    // The slot-reload cache runs only in the FIRST spill round (which
+                    // carries the mass of the spill traffic). Cached scratches live
+                    // longer than plain per-use transients, and letting every round
+                    // add its own long-lived cached scratches accumulates unspillable
+                    // pressure across rounds: each round then displaces a few more
+                    // spillable VRs and convergence dribbles out over many rounds
+                    // (measured 2 -> 12 on the unrolled AES main). Later rounds use
+                    // the plain transient scheme, restoring B1-like convergence.
+                    let cache_this_round = spill_slot_cache && spill_stats.rounds == 0;
+                    spill_stats.rounds += 1;
                     let old_instructions = std::mem::take(instructions);
                     let old_labels = std::mem::take(labels);
                     let (lowered_instructions, lowered_labels) = Self::lower_spills_into_slots(
@@ -677,7 +867,10 @@ impl CodeGenerator {
                         secrecy_map,
                         &spilled_vrs,
                         &mut next_spill_slot,
+                        cache_this_round,
+                        &mut spill_stats,
                     );
+                    spill_stats.spill_slots = next_spill_slot;
                     *instructions = lowered_instructions;
                     *labels = lowered_labels;
                     // Every VR minted during lowering is spill machinery: keep it out of
@@ -2436,6 +2629,7 @@ impl CodeGenerator {
                 }
                 // --- Compile the function body ---
                 let mut function_generator = CodeGenerator::new();
+                function_generator.opt_level = self.opt_level;
                 function_generator.object_field_types = self.object_field_types.clone();
                 // A variable that is reassigned anywhere in the body (e.g. a
                 // `while`-loop counter) is not a constant, so it must not be
@@ -2497,6 +2691,7 @@ impl CodeGenerator {
                     precolored.insert(*vr, PhysicalRegister(i));
                 }
 
+                let spill_opt = self.spill_opt_active();
                 let allocation = Self::allocate_registers_with_object_spills(
                     &mut virtual_instructions,
                     &mut function_labels,
@@ -2505,13 +2700,18 @@ impl CodeGenerator {
                     &precolored,
                     param_vrs.len(),
                     &format!("function '{}'", name.as_deref().unwrap_or("<anon>")),
+                    spill_opt,
                 )?;
 
                 // Rewrite instructions with physical registers
-                let final_instructions = register_allocator::rewrite_instructions_dense(
+                let mut final_instructions = register_allocator::rewrite_instructions_dense(
                     &virtual_instructions,
                     &allocation,
                 );
+                if spill_opt {
+                    final_instructions =
+                        Self::eliminate_self_movs(final_instructions, &mut function_labels);
+                }
 
                 // Finalize the function's bytecode chunk.
                 let mut function_chunk = BytecodeChunk::new();
@@ -2759,6 +2959,8 @@ impl CodeGenerator {
         let mut next_virtual_reg = self.next_virtual_reg;
         // No precolored mapping for top-level/main chunk
         let empty_pre: HashMap<VirtualRegister, PhysicalRegister> = HashMap::new();
+        // Field access (not `spill_opt_active`): `self` is partially moved here.
+        let spill_opt = self.opt_level >= 1 && spill_opt_enabled();
         let allocation = Self::allocate_registers_with_object_spills(
             &mut main_instructions,
             &mut main_labels,
@@ -2767,10 +2969,15 @@ impl CodeGenerator {
             &empty_pre,
             0,
             "main program body",
+            spill_opt,
         )?;
 
-        let final_main_instructions =
+        let mut final_main_instructions =
             register_allocator::rewrite_instructions_dense(&main_instructions, &allocation);
+        if spill_opt {
+            final_main_instructions =
+                Self::eliminate_self_movs(final_main_instructions, &mut main_labels);
+        }
         let mut main_chunk = BytecodeChunk::new();
         main_chunk.instructions = final_main_instructions;
         main_chunk.labels = main_labels;
@@ -3019,7 +3226,18 @@ fn collect_reassigned_vars(node: &AstNode, out: &mut HashSet<String>) {
 }
 
 pub fn generate_bytecode(node: &AstNode) -> CompilerResult<CompiledProgram> {
+    generate_bytecode_with_opt_level(node, 0)
+}
+
+/// `generate_bytecode` with the effective optimization level (0 when the optimizer
+/// is disabled), which gates codegen-side opt-level >= 1 passes such as the spill
+/// slot-reload cache and post-RA self-MOV elimination.
+pub fn generate_bytecode_with_opt_level(
+    node: &AstNode,
+    opt_level: u8,
+) -> CompilerResult<CompiledProgram> {
     let mut generator = CodeGenerator::new();
+    generator.opt_level = opt_level;
     collect_reassigned_vars(node, &mut generator.reassigned_vars);
     let (_result_vr, _result_is_secret) = generator.compile_node(node)?;
     let mut program = generator.finalize_program()?;
@@ -3033,7 +3251,151 @@ pub fn generate_bytecode(node: &AstNode) -> CompilerResult<CompiledProgram> {
 
 #[cfg(test)]
 mod tests {
-    use super::{dedupe_constants, Constant};
+    use super::{dedupe_constants, CodeGenerator, Constant, SpillLoweringStats};
+    use crate::bytecode::Instruction;
+    use crate::core_types::Value;
+    use crate::register_allocator::VirtualRegister;
+    use std::collections::HashMap;
+
+    fn count_op(instructions: &[Instruction], f: impl Fn(&Instruction) -> bool) -> usize {
+        instructions.iter().filter(|i| f(i)).count()
+    }
+
+    fn lower(
+        instructions: Vec<Instruction>,
+        labels: HashMap<String, usize>,
+        num_vrs: usize,
+        secret_vrs: &[usize],
+        spilled: &[usize],
+        cache_enabled: bool,
+    ) -> (Vec<Instruction>, HashMap<String, usize>) {
+        let mut next_virtual_reg = num_vrs;
+        let mut secrecy_map = vec![false; num_vrs];
+        for &vr in secret_vrs {
+            secrecy_map[vr] = true;
+        }
+        let spilled_vrs: Vec<VirtualRegister> =
+            spilled.iter().map(|&v| VirtualRegister(v)).collect();
+        let mut next_spill_slot = 0;
+        let mut stats = SpillLoweringStats::default();
+        CodeGenerator::lower_spills_into_slots(
+            instructions,
+            labels,
+            &mut next_virtual_reg,
+            &mut secrecy_map,
+            &spilled_vrs,
+            &mut next_spill_slot,
+            cache_enabled,
+            &mut stats,
+        )
+    }
+
+    /// A def's store scratch is forwarded to later same-block uses of the same
+    /// spilled VR, eliding every reload; with the cache off, each use reloads.
+    #[test]
+    fn slot_cache_forwards_def_to_uses_within_block() {
+        let instructions = vec![
+            Instruction::LDI(1, Value::I64(5)), // def spilled VR1
+            Instruction::MOV(2, 1),             // use VR1
+            Instruction::MOV(3, 1),             // use VR1
+        ];
+
+        let (out, _) = lower(instructions.clone(), HashMap::new(), 4, &[], &[1], true);
+        assert_eq!(count_op(&out, |i| matches!(i, Instruction::LDS(..))), 0);
+        assert_eq!(count_op(&out, |i| matches!(i, Instruction::STS(..))), 1);
+        // Both uses must read the store scratch that holds VR1's value.
+        let Instruction::STS(_, store_scratch) = out[1] else {
+            panic!("expected STS after the def, got {out:?}");
+        };
+        assert!(matches!(out[2], Instruction::MOV(2, s) if s == store_scratch));
+        assert!(matches!(out[3], Instruction::MOV(3, s) if s == store_scratch));
+
+        let (out_off, _) = lower(instructions, HashMap::new(), 4, &[], &[1], false);
+        assert_eq!(count_op(&out_off, |i| matches!(i, Instruction::LDS(..))), 2);
+    }
+
+    /// Label targets and control transfers invalidate the cache, so a use in the
+    /// next block reloads from the slot instead of trusting a stale scratch.
+    #[test]
+    fn slot_cache_cleared_at_labels_and_jumps() {
+        let instructions = vec![
+            Instruction::LDI(1, Value::I64(5)), // def spilled VR1
+            Instruction::MOV(2, 1),             // same-block use: forwarded
+            Instruction::MOV(3, 1),             // label target: must reload
+            Instruction::JMP("l".to_string()),
+            Instruction::MOV(4, 1), // after a jump: must reload
+        ];
+        let labels: HashMap<String, usize> = [("l".to_string(), 2)].into();
+
+        let (out, lowered_labels) = lower(instructions, labels, 5, &[], &[1], true);
+        assert_eq!(count_op(&out, |i| matches!(i, Instruction::LDS(..))), 2);
+        // The label must now point at the reload that precedes its instruction:
+        // [LDI, STS, MOV, LDS, MOV, JMP, LDS, MOV].
+        assert_eq!(lowered_labels["l"], 3);
+        assert!(matches!(out[3], Instruction::LDS(..)));
+    }
+
+    /// The per-bank LRU holds two slots; a third reload evicts the least recently
+    /// used entry, and banks do not evict each other.
+    #[test]
+    fn slot_cache_lru_eviction_is_per_bank() {
+        // VR1..VR3 clear + VR17 secret, all spilled; each def caches its slot.
+        let instructions = vec![
+            Instruction::LDI(1, Value::I64(1)),
+            Instruction::LDI(2, Value::I64(2)),
+            Instruction::LDI(17, Value::I64(3)), // secret bank entry
+            Instruction::LDI(3, Value::I64(4)),  // evicts VR1 (clear LRU)
+            Instruction::MOV(4, 2),              // hit (clear)
+            Instruction::MOV(5, 3),              // hit (clear)
+            Instruction::MOV(6, 1),              // miss: VR1 was evicted
+            Instruction::MOV(18, 17),            // hit (secret survived clear traffic)
+        ];
+
+        let (out, _) = lower(
+            instructions,
+            HashMap::new(),
+            19,
+            &[17, 18],
+            &[1, 2, 3, 17],
+            true,
+        );
+        let reloads: Vec<&Instruction> = out
+            .iter()
+            .filter(|i| matches!(i, Instruction::LDS(..)))
+            .collect();
+        assert_eq!(reloads.len(), 1, "only the evicted slot reloads: {out:?}");
+        // Slot 0 belongs to VR1 (first spilled VR listed).
+        assert!(matches!(reloads[0], Instruction::LDS(_, 0)));
+    }
+
+    /// Self-MOV elimination drops `MOV(r, r)` and remaps labels with the
+    /// boundary-inclusive table (labels at a deleted MOV or one past the end).
+    #[test]
+    fn eliminate_self_movs_drops_noops_and_remaps_labels() {
+        let instructions = vec![
+            Instruction::MOV(1, 1), // deleted
+            Instruction::LDI(2, Value::I64(7)),
+            Instruction::MOV(3, 3), // deleted
+            Instruction::MOV(4, 2),
+        ];
+        let mut labels: HashMap<String, usize> = [
+            ("start".to_string(), 0),
+            ("mid".to_string(), 2),
+            ("keep".to_string(), 3),
+            ("end".to_string(), 4),
+        ]
+        .into();
+
+        let out = CodeGenerator::eliminate_self_movs(instructions, &mut labels);
+
+        assert_eq!(out.len(), 2, "self-MOVs must be deleted: {out:?}");
+        assert!(matches!(out[0], Instruction::LDI(2, _)));
+        assert!(matches!(out[1], Instruction::MOV(4, 2)));
+        assert_eq!(labels["start"], 0);
+        assert_eq!(labels["mid"], 1);
+        assert_eq!(labels["keep"], 1);
+        assert_eq!(labels["end"], 2);
+    }
 
     #[test]
     fn dedupe_removes_duplicates_and_preserves_order() {
