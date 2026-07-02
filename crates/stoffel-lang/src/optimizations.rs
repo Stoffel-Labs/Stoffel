@@ -4042,6 +4042,19 @@ fn schedule_statement_list(stmts: Vec<AstNode>, pure_fns: &HashSet<String>) -> V
     out
 }
 
+/// Whether the DAG build prunes logical-read cones to hazard-relevant keys
+/// (default on; `STOFFEL_SCHED_CONE_PRUNE=0` restores the full cone walk).
+fn sched_cone_prune_enabled() -> bool {
+    std::env::var("STOFFEL_SCHED_CONE_PRUNE").map_or(true, |v| v != "0")
+}
+
+/// A/B self-check: build the schedule with both the full and the pruned cone
+/// walk and assert they agree (`STOFFEL_SCHED_CONE_AB=1`; costs a second DAG
+/// build per run, for validation only).
+fn sched_cone_ab_check() -> bool {
+    std::env::var("STOFFEL_SCHED_CONE_AB").is_ok_and(|v| v != "0" && !v.is_empty())
+}
+
 /// Reorder one analyzable straight-line run via dependency-graph list scheduling,
 /// clustering same-depth multiplies. Falls back to the original order if a
 /// dependency cycle is somehow present (never expected).
@@ -4062,15 +4075,160 @@ fn schedule_run(stmts: Vec<AstNode>) -> Vec<AstNode> {
         })
         .collect();
 
+    // Intern the catch-all up front so the relevance pass can identify it
+    // (no-op for the DAG: nothing reads or writes a key merely by interning).
+    let global_key = interner.global();
+    let key_bound = interner.key_bound();
+    let order = if sched_cone_ab_check() {
+        let full = build_schedule_order(&infos, key_bound, global_key, false);
+        let pruned = build_schedule_order(&infos, key_bound, global_key, true);
+        assert_eq!(
+            full, pruned,
+            "cone-pruned schedule diverged from the full-cone schedule"
+        );
+        pruned
+    } else {
+        build_schedule_order(&infos, key_bound, global_key, sched_cone_prune_enabled())
+    };
+
+    let Some(order) = order else {
+        // Dependency cycle (should be impossible for straight-line code) — keep
+        // the original order to stay correct.
+        return stmts;
+    };
+
+    // Materialize the reordered run.
+    let mut slots: Vec<Option<AstNode>> = stmts.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .map(|i| slots[i].take().expect("each index emitted once"))
+        .collect()
+}
+
+/// Compute the memoized *pruned* cone of a `DepNode`: the transitive `own` keys
+/// restricted to `relevant` ones. Pointer-keyed memoization is sound because
+/// each memo entry holds an `Rc` to its node, so no cached address can be freed
+/// and reused while the memo is alive. Iterative post-order (parents before the
+/// node) so long straight-line chains cannot overflow the stack and every node
+/// is computed exactly once per run.
+fn pruned_cone(
+    node: &Rc<DepNode>,
+    relevant: &[bool],
+    memo: &mut HashMap<*const DepNode, (Rc<DepNode>, Rc<Vec<u32>>)>,
+) -> Rc<Vec<u32>> {
+    if let Some((_, keys)) = memo.get(&Rc::as_ptr(node)) {
+        return Rc::clone(keys);
+    }
+    // (node, parents_done): first visit pushes the node back with
+    // parents_done=true plus its unmemoized parents; second visit unions.
+    let mut stack: Vec<(Rc<DepNode>, bool)> = vec![(Rc::clone(node), false)];
+    while let Some((n, parents_done)) = stack.pop() {
+        let ptr = Rc::as_ptr(&n);
+        if memo.contains_key(&ptr) {
+            continue;
+        }
+        if !parents_done {
+            stack.push((Rc::clone(&n), true));
+            for p in &n.parents {
+                if !memo.contains_key(&Rc::as_ptr(p)) {
+                    stack.push((Rc::clone(p), false));
+                }
+            }
+            continue;
+        }
+        let mut keys: HashSet<u32> = n
+            .own
+            .iter()
+            .copied()
+            .filter(|&k| relevant[k as usize])
+            .collect();
+        for p in &n.parents {
+            let (_, pk) = &memo[&Rc::as_ptr(p)];
+            keys.extend(pk.iter().copied());
+        }
+        let mut keys: Vec<u32> = keys.into_iter().collect();
+        // Sorted for determinism; edge application below is per-key independent,
+        // so the order cannot affect the DAG either way.
+        keys.sort_unstable();
+        memo.insert(ptr, (n, Rc::new(keys)));
+    }
+    Rc::clone(&memo[&Rc::as_ptr(node)].1)
+}
+
+/// Build the dependency DAG over `infos` and list-schedule it. Returns the
+/// emission order, or `None` on a dependency cycle (caller keeps source order).
+///
+/// With `prune` set, the lazy logical-read cone walk registers only
+/// *hazard-relevant* keys: scalar keys written at least twice in the run, and
+/// heap/global keys written at all. This changes no emitted schedule:
+///
+/// - A cone key's RAW edge duplicates a chain of never-pruned direct-read
+///   edges whenever the key's last write predates the cone snapshot. Every
+///   cone key entered some binding's `own` because that binding's statement
+///   *directly* read it (registering `writer -> binding` then), and the
+///   consumer reaches that binding through the direct-read RAW edges along the
+///   captured `parents` chain — so the edge `writer -> consumer` is transitive.
+///   A single-write scalar key always qualifies: reads of a scalar cannot
+///   precede its unique (declaration) write, so the snapshot writer IS the
+///   last writer. Multi-write scalars and heap keys (accumulators mutated
+///   between snapshot and consumer) stay registered.
+/// - A reader entry only matters if the key is written again LATER
+///   (`readers` drains on writes). A single-write scalar's one write precedes
+///   every read of it, so its entries can never fire; unwritten keys trivially
+///   so. All still-registered keys keep their entries.
+/// - The list scheduler is invariant under dropping transitive edges: a
+///   statement is ready when all direct predecessors are emitted, and any
+///   valid emission prefix of the pruned DAG already contains the dropped
+///   edge's source via the covering path, so the ready sets — and therefore
+///   the emitted order and multiply rounds — are identical at every step
+///   (`STOFFEL_SCHED_CONE_AB=1` asserts this end to end).
+///
+/// Memoizing the pruned cones per `DepNode` makes the whole build near-linear
+/// in practice (post-alpha-rename, almost all scalars are single-write), where
+/// the full walk re-traversed each consumer's O(run) cone — the last O(n^2)
+/// term in `schedule_for_batching`.
+fn build_schedule_order(
+    infos: &[SchedInfo],
+    key_bound: usize,
+    global_key: u32,
+    prune: bool,
+) -> Option<Vec<usize>> {
+    let n = infos.len();
     // Build the dependency DAG (deduplicated successor sets).
     let mut succ: Vec<HashSet<usize>> = vec![HashSet::new(); n];
     let mut indeg: Vec<usize> = vec![0usize; n];
 
     // All keys are interned by now, so the per-key maps are dense arrays.
-    let key_bound = interner.key_bound();
     let mut last_write: Vec<Option<usize>> = vec![None; key_bound];
     let mut readers: Vec<Vec<usize>> = vec![Vec::new(); key_bound];
     let mut effect_prev: Vec<Option<usize>> = vec![None; key_bound];
+
+    // Hazard relevance for the pruned cone walk (see the doc comment): count
+    // writers per key across the whole run (each statement's `writes` is a
+    // set, so a key gets one count per writing statement).
+    let mut relevant: Vec<bool> = Vec::new();
+    if prune {
+        let mut write_stmts: Vec<u8> = vec![0; key_bound];
+        for info in infos {
+            for &w in &info.writes {
+                write_stmts[w as usize] = write_stmts[w as usize].saturating_add(1);
+            }
+        }
+        relevant = (0..key_bound)
+            .map(|k| {
+                let writes = write_stmts[k];
+                // Odd ids are heap keys; the global catch-all is a scalar key
+                // but aliases every location, so treat it like a heap key.
+                let heap_like = k % 2 == 1 || k == global_key as usize;
+                if heap_like {
+                    writes >= 1
+                } else {
+                    writes >= 2
+                }
+            })
+            .collect();
+    }
+    let mut cone_memo: HashMap<*const DepNode, (Rc<DepNode>, Rc<Vec<u32>>)> = HashMap::new();
 
     // Register statement `i` reading key `r`: a RAW edge from the key's last
     // writer, plus a `readers` entry feeding later WAR edges. Applied per key
@@ -4104,18 +4262,28 @@ fn schedule_run(stmts: Vec<AstNode>) -> Vec<AstNode> {
         {
             apply_read(r, i, &last_write, &mut readers, &mut succ, &mut indeg);
         }
-        // Walk each lazy logical-read cone once per statement (shared visited
-        // set), applying reads directly instead of materializing the flat set.
-        let mut visited: HashSet<*const DepNode> = HashSet::new();
-        let mut stack: Vec<&Rc<DepNode>> = infos[i].logical_nodes.iter().collect();
-        while let Some(node) = stack.pop() {
-            if !visited.insert(Rc::as_ptr(node)) {
-                continue;
+        if prune {
+            // Apply each cone's memoized hazard-relevant keys.
+            for node in &infos[i].logical_nodes {
+                for &r in pruned_cone(node, &relevant, &mut cone_memo).iter() {
+                    apply_read(r, i, &last_write, &mut readers, &mut succ, &mut indeg);
+                }
             }
-            for &r in &node.own {
-                apply_read(r, i, &last_write, &mut readers, &mut succ, &mut indeg);
+        } else {
+            // Walk each lazy logical-read cone once per statement (shared
+            // visited set), applying reads directly instead of materializing
+            // the flat set.
+            let mut visited: HashSet<*const DepNode> = HashSet::new();
+            let mut stack: Vec<&Rc<DepNode>> = infos[i].logical_nodes.iter().collect();
+            while let Some(node) = stack.pop() {
+                if !visited.insert(Rc::as_ptr(node)) {
+                    continue;
+                }
+                for &r in &node.own {
+                    apply_read(r, i, &last_write, &mut readers, &mut succ, &mut indeg);
+                }
+                stack.extend(node.parents.iter());
             }
-            stack.extend(node.parents.iter());
         }
         for &w in &infos[i].writes {
             if let Some(pw) = last_write[w as usize] {
@@ -4184,18 +4352,7 @@ fn schedule_run(stmts: Vec<AstNode>) -> Vec<AstNode> {
         }
     }
 
-    if order.len() != n {
-        // Dependency cycle (should be impossible for straight-line code) — keep
-        // the original order to stay correct.
-        return stmts;
-    }
-
-    // Materialize the reordered run.
-    let mut slots: Vec<Option<AstNode>> = stmts.into_iter().map(Some).collect();
-    order
-        .into_iter()
-        .map(|i| slots[i].take().expect("each index emitted once"))
-        .collect()
+    (order.len() == n).then_some(order)
 }
 
 // ===========================================================================
@@ -10529,6 +10686,90 @@ mod tests {
 
     fn make_loc() -> SourceLocation {
         SourceLocation::default()
+    }
+
+    #[test]
+    /// In-process A/B of the cone-pruned DAG build against the full cone walk
+    /// (the same check `STOFFEL_SCHED_CONE_AB=1` runs end to end): the emitted
+    /// schedule must be identical on a run exercising every hazard class —
+    /// single-write scalar chains (prunable), scalar reassignment (multi-write,
+    /// kept), heap accumulators mutated between cone snapshot and consumer
+    /// (kept), and multiply declarations whose rounds the scheduler clusters.
+    fn cone_pruned_schedule_matches_full_schedule() {
+        let ident = |n: &str| AstNode::Identifier(n.into(), SourceLocation::default());
+        let decl = |n: &str, v: AstNode| AstNode::VariableDeclaration {
+            name: n.into(),
+            type_annotation: None,
+            value: Some(Box::new(v)),
+            is_mutable: true,
+            is_secret: true,
+            location: SourceLocation::default(),
+        };
+        let assign = |n: &str, v: AstNode| AstNode::Assignment {
+            target: Box::new(ident(n)),
+            value: Box::new(v),
+            location: SourceLocation::default(),
+        };
+        let call = |f: &str, args: Vec<AstNode>| AstNode::FunctionCall {
+            function: Box::new(ident(f)),
+            arguments: args,
+            location: SourceLocation::default(),
+            resolved_return_type: None,
+        };
+        let mul = |a: &str, b: &str| AstNode::BinaryOperation {
+            op: "and".to_string(),
+            left: Box::new(ident(a)),
+            right: Box::new(ident(b)),
+            location: SourceLocation::default(),
+        };
+
+        let stmts = vec![
+            decl("x", ident("input0")),
+            decl("acc", call("create_array", vec![])),
+            // Single-write scalar chain feeding a mutator-call cone.
+            decl("a", ident("x")),
+            decl("b", ident("a")),
+            call("append", vec![ident("acc"), ident("b")]),
+            // Heap accumulator mutated again between snapshot and consumer.
+            decl("c", ident("b")),
+            call("append", vec![ident("acc"), ident("c")]),
+            // Scalar reassignment: multi-write key, must stay registered.
+            assign("x", ident("c")),
+            decl("d", ident("x")),
+            call("append", vec![ident("acc"), ident("d")]),
+            // Independent multiplies the scheduler clusters into rounds.
+            decl("m1", mul("a", "b")),
+            decl("m2", mul("c", "d")),
+            decl("m3", mul("m1", "m2")),
+            call("append", vec![ident("acc"), ident("m3")]),
+        ];
+
+        // Mirror schedule_run's info collection, then build both ways.
+        let mut interner = KeyInterner::default();
+        let mut env: SchedEnv = HashMap::new();
+        let infos: Vec<SchedInfo> = stmts
+            .iter()
+            .map(|stmt| {
+                let info = sched_info(stmt, &env, &mut interner);
+                update_sched_env(stmt, &mut env, &info, &mut interner);
+                info
+            })
+            .collect();
+        let global_key = interner.global();
+        let key_bound = interner.key_bound();
+
+        let full = build_schedule_order(&infos, key_bound, global_key, false);
+        let pruned = build_schedule_order(&infos, key_bound, global_key, true);
+        assert!(full.is_some(), "unexpected dependency cycle");
+        assert_eq!(full, pruned);
+        // The mutator calls pin the accumulator order, so appends must stay in
+        // source order relative to each other in both schedules.
+        let order = full.unwrap();
+        let append_pos: Vec<usize> = [4usize, 6, 9, 13]
+            .iter()
+            .map(|s| order.iter().position(|i| i == s).unwrap())
+            .collect();
+        assert!(append_pos.windows(2).all(|w| w[0] < w[1]));
     }
 
     #[test]
