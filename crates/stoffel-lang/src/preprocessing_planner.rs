@@ -449,26 +449,7 @@ impl<'a> Planner<'a> {
             } => self.eval_for_loop(variables, iterable, body, env, demand, ret, call_stack),
             AstNode::WhileLoop {
                 condition, body, ..
-            } => {
-                // A while loop's iteration count is not statically known; any
-                // demand inside is unbounded.
-                self.eval_expr(condition, env, demand, call_stack);
-                let mut body_demand = PreprocessingDemand::default();
-                let mut body_ret = ret.clone();
-                let mut body_env = env.clone();
-                self.eval_block_like(
-                    body,
-                    &mut body_env,
-                    &mut body_demand,
-                    &mut body_ret,
-                    call_stack,
-                );
-                merge_into_ret(ret, body_ret);
-                if has_any_material(&body_demand) {
-                    add_demand(demand, &body_demand);
-                    demand.dynamic = true;
-                }
-            }
+            } => self.eval_while_loop(condition, body, env, demand, ret, call_stack),
             AstNode::IfExpression {
                 condition,
                 then_branch,
@@ -541,6 +522,115 @@ impl<'a> Planner<'a> {
         // Branch-local bindings cannot be reconciled, so leave `env` unchanged
         // for names whose value diverges; subsequent uses fall back to the
         // pre-`if` binding (conservative).
+    }
+
+    /// Evaluate a `while` loop. The counted shape codegen emits everywhere —
+    /// `v = <known>; while v OP <known>: … ; v = v ± step` (or `v = v * k`) —
+    /// gets its trip count inferred and is then treated exactly like a counted
+    /// `for` loop (body analysed once, demand scaled, list growth applied
+    /// `count` times), so `while`-built programs provision correctly instead of
+    /// reporting ZERO demand. Anything non-canonical falls back to
+    /// analyse-once + `dynamic`, and — crucially — poisons the lengths of every
+    /// list the body grew (`apply_loop_length_growth_unknown`): before this,
+    /// the discarded body env left the PRE-loop lengths visible, so a
+    /// post-loop `batch_mul` over a `while`-filled list counted len 0 triples
+    /// with `dynamic: false` (the all-zero manifests that starved the runtime).
+    #[allow(clippy::too_many_arguments)]
+    fn eval_while_loop(
+        &mut self,
+        condition: &AstNode,
+        body: &AstNode,
+        env: &mut Env,
+        demand: &mut PreprocessingDemand,
+        ret: &mut Option<AbstractValue>,
+        call_stack: &mut Vec<String>,
+    ) {
+        self.eval_expr(condition, env, demand, call_stack);
+        let count = self.while_trip_count(condition, body, env, demand, call_stack);
+
+        let mut body_env = env.clone();
+        if let Some((var, _, _)) = while_condition_parts(condition) {
+            // The counter's per-iteration value varies; never fold its start.
+            body_env.insert(var.to_string(), AbstractValue::clear());
+        }
+        let mut body_demand = PreprocessingDemand::default();
+        let mut body_ret = ret.clone();
+        self.eval_block_like(
+            body,
+            &mut body_env,
+            &mut body_demand,
+            &mut body_ret,
+            call_stack,
+        );
+        merge_into_ret(ret, body_ret);
+
+        match count {
+            Some(count) => {
+                add_demand(demand, &scale_demand(&body_demand, count));
+                apply_loop_length_growth(env, &body_env, count);
+                // The counter's post-loop value is loop-shape-dependent; keep it
+                // conservative (clear, value unknown) rather than stale-at-start.
+                if let Some((var, _, _)) = while_condition_parts(condition) {
+                    env.insert(var.to_string(), AbstractValue::clear());
+                }
+            }
+            None => {
+                add_demand(demand, &body_demand);
+                if has_any_material(&body_demand) {
+                    demand.dynamic = true;
+                }
+                apply_loop_length_growth_unknown(env, &body_env);
+                if let Some((var, _, _)) = while_condition_parts(condition) {
+                    env.insert(var.to_string(), AbstractValue::clear());
+                }
+            }
+        }
+    }
+
+    /// Infer the trip count of the canonical counted `while` shape, or `None`.
+    /// Requirements: condition `v < | <= | > | >= <bound>` with `v` a tracked
+    /// int and `<bound>` foldable; EXACTLY one assignment to `v` anywhere in
+    /// the body, at the body's top level, of shape `v = v + s`, `v = v - s`
+    /// (`s` a positive literal, direction matching the comparison) or
+    /// `v = v * k` (`k >= 2`, ascending).
+    fn while_trip_count(
+        &mut self,
+        condition: &AstNode,
+        body: &AstNode,
+        env: &mut Env,
+        demand: &mut PreprocessingDemand,
+        call_stack: &mut Vec<String>,
+    ) -> Option<u64> {
+        let (var, cmp, bound_expr) = while_condition_parts(condition)?;
+        let start = env.get(var)?.int?;
+        let _ = &demand;
+        let bound = {
+            let mut scratch = PreprocessingDemand::default();
+            self.eval_expr(bound_expr, env, &mut scratch, call_stack)
+                .int?
+        };
+        let step = while_step(body, var)?;
+
+        match (cmp, step) {
+            ("<", WhileStep::Add(s)) if bound > start => Some((bound - start).div_ceil(s)),
+            ("<", WhileStep::Add(_)) => Some(0),
+            ("<=", WhileStep::Add(s)) if bound >= start => Some((bound - start) / s + 1),
+            ("<=", WhileStep::Add(_)) => Some(0),
+            (">", WhileStep::Sub(s)) if start > bound => Some((start - bound).div_ceil(s)),
+            (">", WhileStep::Sub(_)) => Some(0),
+            (">=", WhileStep::Sub(s)) if start >= bound => Some((start - bound) / s + 1),
+            (">=", WhileStep::Sub(_)) => Some(0),
+            ("<", WhileStep::Mul(k)) if start >= 1 && k >= 2 => {
+                let mut v = start;
+                let mut c = 0u64;
+                while v < bound && c < 64 {
+                    v = v.saturating_mul(k);
+                    c += 1;
+                }
+                (c < 64).then_some(c)
+            }
+            _ => None,
+        }
     }
 
     /// Evaluate a `for` loop: count its iterations when statically known,
@@ -1059,6 +1149,94 @@ fn merge_value(a: AbstractValue, b: AbstractValue) -> AbstractValue {
     }
 }
 
+/// One canonical `while` counter step, extracted from the body's top level.
+#[derive(Clone, Copy)]
+enum WhileStep {
+    Add(u64),
+    Sub(u64),
+    Mul(u64),
+}
+
+/// `(var, cmp, bound_expr)` of a `while v OP bound:` condition, if that shape.
+fn while_condition_parts(condition: &AstNode) -> Option<(&str, &str, &AstNode)> {
+    if let AstNode::BinaryOperation {
+        op, left, right, ..
+    } = condition
+    {
+        if matches!(op.as_str(), "<" | "<=" | ">" | ">=") {
+            if let AstNode::Identifier(name, _) = left.as_ref() {
+                return Some((name.as_str(), op.as_str(), right));
+            }
+        }
+    }
+    None
+}
+
+/// The single counter-step assignment for `var` in `body`, or `None` when the
+/// body assigns `var` zero times, more than once, somewhere nested, or in a
+/// non-`v = v ± lit` / `v = v * lit` shape.
+fn while_step(body: &AstNode, var: &str) -> Option<WhileStep> {
+    fn count_assignments(node: &AstNode, var: &str, n: &mut usize) {
+        if let AstNode::Assignment { target, .. } = node {
+            if matches!(target.as_ref(), AstNode::Identifier(name, _) if name == var) {
+                *n += 1;
+            }
+        }
+        crate::optimizations::for_each_child(node, &mut |child| count_assignments(child, var, n));
+    }
+
+    let statements = match body {
+        AstNode::Block(statements) => statements.as_slice(),
+        other => std::slice::from_ref(other),
+    };
+
+    let mut total = 0usize;
+    for statement in statements {
+        count_assignments(statement, var, &mut total);
+    }
+    if total != 1 {
+        return None;
+    }
+
+    for statement in statements {
+        let AstNode::Assignment { target, value, .. } = statement else {
+            continue;
+        };
+        if !matches!(target.as_ref(), AstNode::Identifier(name, _) if name == var) {
+            continue;
+        }
+        let AstNode::BinaryOperation {
+            op, left, right, ..
+        } = value.as_ref()
+        else {
+            return None;
+        };
+        let lit = |node: &AstNode| -> Option<u64> {
+            if let AstNode::Literal {
+                value: Value::Int { value, .. },
+                ..
+            } = node
+            {
+                u64::try_from(*value).ok()
+            } else {
+                None
+            }
+        };
+        let var_side = |node: &AstNode| -> bool {
+            matches!(node, AstNode::Identifier(name, _) if name == var)
+        };
+        return match op.as_str() {
+            "+" if var_side(left) => lit(right).filter(|s| *s > 0).map(WhileStep::Add),
+            "+" if var_side(right) => lit(left).filter(|s| *s > 0).map(WhileStep::Add),
+            "-" if var_side(left) => lit(right).filter(|s| *s > 0).map(WhileStep::Sub),
+            "*" if var_side(left) => lit(right).filter(|k| *k >= 2).map(WhileStep::Mul),
+            "*" if var_side(right) => lit(left).filter(|k| *k >= 2).map(WhileStep::Mul),
+            _ => None,
+        };
+    }
+    None
+}
+
 /// Add `addend` into `target` (saturating), preserving/propagating `dynamic`.
 fn add_demand(target: &mut PreprocessingDemand, addend: &PreprocessingDemand) {
     target.add(
@@ -1247,6 +1425,80 @@ mod tests {
             .expect("failed to spawn compile thread")
             .join()
             .expect("compile thread panicked")
+    }
+
+    /// Counted `while` loops (the only loop shape StoffelDB's codegen emits)
+    /// must provision like counted `for` loops — this exact shape used to
+    /// report ZERO demand with `dynamic: false` (the stale pre-loop list
+    /// length made the post-loop `batch_mul` count len 0), starving the
+    /// runtime preprocessing pool.
+    #[test]
+    fn counted_while_batch_mul_provisions_like_for() {
+        let src = r#"
+def main() -> int64:
+  var xs: list[Share] = []
+  var ys: list[Share] = []
+  var i = 0
+  while i < 16:
+    xs.append(ClientStore.take_share(0, i))
+    ys.append(ClientStore.take_share(1, i))
+    i = i + 1
+  var products = Share.batch_mul(xs, ys)
+  return 0
+"#;
+        let demand = demand_for(src);
+        assert_eq!(demand.triples, 16);
+        assert!(!demand.dynamic);
+    }
+
+    /// Descending counted `while` (`i = N-1; while i >= 0: … i = i - 1`) — the
+    /// restoring-divide loop shape.
+    #[test]
+    fn descending_while_counts_iterations() {
+        let src = r#"
+def main() -> int64:
+  var xs: list[Share] = []
+  var ys: list[Share] = []
+  var j = 0
+  while j < 4:
+    xs.append(ClientStore.take_share(0, j))
+    ys.append(ClientStore.take_share(1, j))
+    j = j + 1
+  var i = 7
+  while i >= 0:
+    var p = Share.batch_mul(xs, ys)
+    i = i - 1
+  return 0
+"#;
+        let demand = demand_for(src);
+        // 8 iterations x 4-element batch_mul, plus nothing else.
+        assert_eq!(demand.triples, 32);
+        assert!(!demand.dynamic);
+    }
+
+    /// A non-canonical `while` (data-dependent bound) must flag `dynamic` AND
+    /// poison the lengths of lists it grew, so a post-loop batch op cannot
+    /// count a stale zero length as "known".
+    #[test]
+    fn unknown_while_flags_dynamic_via_poisoned_length() {
+        let src = r#"
+def main(n: int64) -> int64:
+  var xs: list[Share] = []
+  var ys: list[Share] = []
+  var i = 0
+  while i < n:
+    xs.append(ClientStore.take_share(0, i))
+    ys.append(ClientStore.take_share(1, i))
+    i = i + 1
+  var products = Share.batch_mul(xs, ys)
+  return 0
+"#;
+        let demand = demand_for(src);
+        assert!(demand.dynamic, "runtime-bounded while must flag dynamic");
+        assert!(
+            demand.triples >= 1,
+            "unknown batch must provision at least one"
+        );
     }
 
     #[test]

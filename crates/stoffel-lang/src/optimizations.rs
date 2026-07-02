@@ -6136,6 +6136,33 @@ fn apply_call_to_env(expr: &AstNode, env: &mut LenEnv) {
 /// Collect variables a subtree could mutate: assignment targets, list-mutator
 /// receivers, and arguments to calls we do not model as length-safe. Used to
 /// invalidate the outer env across a loop/branch we cannot fully evaluate.
+/// Names ASSIGNED (as a whole variable) anywhere under `node` — the precise
+/// subset of [`collect_mutated_vars`] whose tracked INT value can actually
+/// change inside a loop body. Scalars are by-value at call boundaries (only
+/// lists are mutated by reference), so a scalar's env int survives any call;
+/// it changes only via a direct `name = …` assignment. Used by the kept-loop
+/// body-env invalidation to stay SOUND without killing the int facts (`l`,
+/// `kappa`, `n`, …) that inner-loop unrolling and guard folding legitimately
+/// need.
+fn collect_assigned_vars(node: &AstNode, out: &mut HashSet<String>) {
+    match node {
+        AstNode::Assignment { target, .. } => {
+            if let AstNode::Identifier(name, _) = target.as_ref() {
+                out.insert(name.clone());
+            }
+        }
+        AstNode::ForLoop { variables, .. } => {
+            for v in variables {
+                out.insert(v.clone());
+            }
+        }
+        // A nested function definition is a separate scope.
+        AstNode::FunctionDefinition { .. } => return,
+        _ => {}
+    }
+    for_each_child(node, &mut |c| collect_assigned_vars(c, out));
+}
+
 fn collect_mutated_vars(node: &AstNode, out: &mut HashSet<String>) {
     match node {
         AstNode::Assignment { target, .. } => {
@@ -7257,10 +7284,35 @@ fn unroll_in_node(node: AstNode, env: &mut LenEnv, budget: &mut usize) -> AstNod
             body,
             location,
         } => {
-            let mut benv = scoped_len_env(env, &[&body]);
-            let body = Box::new(unroll_in_node(*body, &mut benv, budget));
+            // SOUNDNESS (kept loop): the body executes an UNKNOWN number of
+            // times, so any variable the body itself mutates must be UNKNOWN
+            // while processing the body — the pre-loop entry values only hold
+            // for the first iteration. Without this, the env-aware constant-
+            // branch folding (`const_eval_bool_env` in `unroll_stmt_list`)
+            // deletes per-iteration guards using first-iteration values (e.g.
+            // `i = 0; while i < n: if i > 0: …` folded the guard FALSE for
+            // every iteration, miscompiling `bit_decompose`'s borrow chain).
             let mut mutated = HashSet::new();
             collect_mutated_vars(&body, &mut mutated);
+            let mut assigned = HashSet::new();
+            collect_assigned_vars(&body, &mut assigned);
+            let mut benv = scoped_len_env(env, &[&body]);
+            // Shapes/aliases of anything possibly mutated (incl. lists passed to
+            // callees) are unknown mid-loop; a SCALAR's int survives unless the
+            // body assigns it (by-value call semantics) — keep those facts so
+            // inner-loop unrolling and legitimate guard folds still fire.
+            let kept_ints: Vec<(String, u128)> = mutated
+                .iter()
+                .filter(|m| !assigned.contains(*m))
+                .filter_map(|m| benv.ints.get(m).map(|&v| (m.clone(), v)))
+                .collect();
+            for m in &mutated {
+                benv.invalidate(m);
+            }
+            for (name, v) in kept_ints {
+                benv.ints.insert(name, v);
+            }
+            let body = Box::new(unroll_in_node(*body, &mut benv, budget));
             for m in mutated {
                 env.invalidate(&m);
             }
@@ -7279,11 +7331,31 @@ fn unroll_in_node(node: AstNode, env: &mut LenEnv, budget: &mut usize) -> AstNod
             // A `ForLoop` reached here (rather than via a statement list, where
             // `unroll_stmt_list` flattens it) could not be unrolled; recurse into
             // its body for nested loops, then invalidate anything it mutates.
-            let mut benv = scoped_len_env(env, &[&body, &iterable]);
-            bind_loop_var(&mut benv, &variables, &iterable);
-            let body = Box::new(unroll_in_node(*body, &mut benv, budget));
+            // SOUNDNESS (kept loop): body-mutated variables are invalidated in
+            // the BODY env before processing — the body runs an unknown number
+            // of times, so their entry values only hold for iteration one (see
+            // the WhileLoop case above).
             let mut mutated = HashSet::new();
             collect_mutated_vars(&body, &mut mutated);
+            let mut assigned = HashSet::new();
+            collect_assigned_vars(&body, &mut assigned);
+            for v in &variables {
+                assigned.insert(v.clone());
+            }
+            let mut benv = scoped_len_env(env, &[&body, &iterable]);
+            let kept_ints: Vec<(String, u128)> = mutated
+                .iter()
+                .filter(|m| !assigned.contains(*m))
+                .filter_map(|m| benv.ints.get(m).map(|&v| (m.clone(), v)))
+                .collect();
+            for m in &mutated {
+                benv.invalidate(m);
+            }
+            for (name, v) in kept_ints {
+                benv.ints.insert(name, v);
+            }
+            bind_loop_var(&mut benv, &variables, &iterable);
+            let body = Box::new(unroll_in_node(*body, &mut benv, budget));
             for m in mutated {
                 env.invalidate(&m);
             }
@@ -8288,7 +8360,7 @@ fn stmt_has_effect(node: &AstNode, pure_fns: &HashSet<String>) -> bool {
 /// callers that build on this walker. It deliberately does NOT descend into
 /// `FunctionDefinition` bodies: that is a scope boundary, and the scope-crossing
 /// walker `for_each_child_def` handles it separately.
-fn for_each_child(node: &AstNode, f: &mut dyn FnMut(&AstNode)) {
+pub(crate) fn for_each_child(node: &AstNode, f: &mut dyn FnMut(&AstNode)) {
     match node {
         AstNode::Assignment { target, value, .. } => {
             f(target);
@@ -10734,6 +10806,92 @@ mod tests {
 
     fn make_loc() -> SourceLocation {
         SourceLocation::default()
+    }
+
+    /// SOUNDNESS regression (kept-loop guard folding): inside a while loop the
+    /// unroller CANNOT flatten (unknown bound), a guard over a loop-mutated
+    /// variable must NOT be folded with the variable's pre-loop entry value —
+    /// the body runs many iterations. This exact shape (`i = 0; while i < n:
+    /// if i > 0: …; i = i + 1`) is `bit_decompose`'s borrow-chain prologue,
+    /// which a stale fold miscompiled (guard deleted for every iteration).
+    #[test]
+    fn kept_loop_guard_over_mutated_var_is_not_folded() {
+        let ident = |n: &str| AstNode::Identifier(n.into(), make_loc());
+        let int = |v: u128| AstNode::Literal {
+            value: crate::ast::Value::Int {
+                value: v,
+                kind: None,
+            },
+            location: make_loc(),
+        };
+        let bin = |op: &str, l: AstNode, r: AstNode| AstNode::BinaryOperation {
+            op: op.to_string(),
+            left: Box::new(l),
+            right: Box::new(r),
+            location: make_loc(),
+        };
+        let decl = |n: &str, v: AstNode| AstNode::VariableDeclaration {
+            name: n.into(),
+            type_annotation: None,
+            value: Some(Box::new(v)),
+            is_mutable: true,
+            is_secret: false,
+            location: make_loc(),
+        };
+        let assign = |n: &str, v: AstNode| AstNode::Assignment {
+            target: Box::new(ident(n)),
+            value: Box::new(v),
+            location: make_loc(),
+        };
+
+        // i = 0; while i < n: { if i > 0: { touched = 1 }; i = i + 1 }
+        let guard = AstNode::IfExpression {
+            condition: Box::new(bin(">", ident("i"), int(0))),
+            then_branch: Box::new(AstNode::Block(vec![assign("touched", int(1))])),
+            else_branch: None,
+        };
+        let body = AstNode::Block(vec![guard, assign("i", bin("+", ident("i"), int(1)))]);
+        let kept_while = AstNode::WhileLoop {
+            condition: Box::new(bin("<", ident("i"), ident("n"))),
+            body: Box::new(body),
+            location: make_loc(),
+        };
+        let stmts = vec![decl("i", int(0)), kept_while];
+
+        let mut env = LenEnv::default(); // `n` unknown => loop is kept
+        let mut budget = 1_000_000usize;
+        let out = unroll_stmt_list(stmts, &mut env, &mut budget);
+
+        // The while survives (bound unknown) AND its body still contains the
+        // guard — folding it against the pre-loop `i = 0` would be unsound.
+        fn count_ifs(node: &AstNode, n: &mut usize) {
+            if matches!(node, AstNode::IfExpression { .. }) {
+                *n += 1;
+            }
+            for_each_child(node, &mut |c| count_ifs(c, n));
+        }
+        let mut ifs = 0;
+        for st in &out {
+            count_ifs(st, &mut ifs);
+        }
+        assert_eq!(ifs, 1, "kept-loop guard must survive, got {out:?}");
+
+        // POSITIVE CONTROL: the same guard in straight-line code (i provably 0)
+        // IS folded away — the optimization itself still fires.
+        let guard2 = AstNode::IfExpression {
+            condition: Box::new(bin(">", ident("i"), int(0))),
+            then_branch: Box::new(AstNode::Block(vec![assign("touched", int(1))])),
+            else_branch: None,
+        };
+        let stmts2 = vec![decl("i", int(0)), guard2];
+        let mut env2 = LenEnv::default();
+        let mut budget2 = 1_000_000usize;
+        let out2 = unroll_stmt_list(stmts2, &mut env2, &mut budget2);
+        let mut ifs2 = 0;
+        for st in &out2 {
+            count_ifs(st, &mut ifs2);
+        }
+        assert_eq!(ifs2, 0, "straight-line provable guard must still fold");
     }
 
     #[test]

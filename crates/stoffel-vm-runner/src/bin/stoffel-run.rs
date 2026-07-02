@@ -1255,6 +1255,21 @@ async fn sync_client_set_across_parties(
     let expected_confirmations = n_parties - 1;
     let receive_deadline = std::time::Instant::now() + Duration::from_secs(20);
 
+    // CANCELLATION SAFETY (the InvalidData flake): `connection.receive()` reads
+    // a length-prefixed frame across MULTIPLE awaits. Wrapping it in
+    // `tokio::time::timeout` (the old polling loop here) can cancel it BETWEEN
+    // the length read and the payload read; the next receive on that stream
+    // then parses payload bytes as a length header, permanently desyncing the
+    // frame stream — and these SAME party connections carry all subsequent MPC
+    // traffic, which then fails to deserialize
+    // (`MulError(ArkSerialization(InvalidData))`) and strands the mesh until
+    // the party timeout. Instead, spawn one NEVER-CANCELLED one-shot reader per
+    // peer (the same dedicated-reader idiom as `spawn_receive_loops`) that
+    // forwards its single sync frame through a channel; the deadline applies
+    // to the channel receive, which IS cancellation-safe.
+    let (sync_tx, mut sync_rx) = mpsc::unbounded_channel::<(usize, Result<Vec<u8>, String>)>();
+    let mut spawned_readers: HashSet<usize> = HashSet::new();
+
     while confirmed_parties.len() < expected_confirmations {
         if std::time::Instant::now() >= receive_deadline {
             return Err(format!(
@@ -1264,65 +1279,61 @@ async fn sync_client_set_across_parties(
             ));
         }
 
-        let mut progressed = false;
+        // Pick up (possibly late-arriving) peer connections.
         for (derived_id, connection) in net.get_all_server_connections() {
             let sender_id = connection.remote_party_id().unwrap_or(derived_id);
-            if sender_id >= n_parties
-                || sender_id == my_id
-                || confirmed_parties.contains(&sender_id)
-            {
+            if sender_id >= n_parties || sender_id == my_id || !spawned_readers.insert(sender_id) {
                 continue;
             }
-
-            let remaining = receive_deadline.saturating_duration_since(std::time::Instant::now());
-            let wait_for = remaining.min(Duration::from_millis(500));
-            if wait_for.is_zero() {
-                continue;
-            }
-
-            match tokio::time::timeout(wait_for, connection.receive()).await {
-                Ok(Ok(data)) => {
-                    let sync = decode_client_set_sync(&data).map_err(|e| {
-                        format!(
-                            "Failed to decode client-set sync from party {}: {}",
-                            sender_id, e
-                        )
-                    })?;
-
-                    if sync.sender_party_id != sender_id {
-                        return Err(format!(
-                            "Client-set sync sender mismatch: transport sender={} payload sender={}",
-                            sender_id, sync.sender_party_id
-                        ));
-                    }
-
-                    let normalized_remote = normalize_client_ids(sync.client_ids);
-                    if normalized_remote != normalized_local {
-                        return Err(format!(
-                            "Client-set mismatch with party {}: local={:?}, remote={:?}",
-                            sender_id, normalized_local, normalized_remote
-                        ));
-                    }
-
-                    confirmed_parties.insert(sender_id);
-                    progressed = true;
-                    eprintln!(
-                        "[party {}] Client-set sync confirmed with party {}",
-                        my_id, sender_id
-                    );
-                }
-                Ok(Err(e)) => {
-                    return Err(format!(
-                        "Failed to receive client-set sync from party {}: {}",
-                        sender_id, e
-                    ));
-                }
-                Err(_) => {}
-            }
+            let tx = sync_tx.clone();
+            tokio::spawn(async move {
+                let result = connection.receive().await;
+                let _ = tx.send((sender_id, result));
+            });
         }
 
-        if !progressed {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait for the next sync frame; short tick so new connections are
+        // still scanned. Cancelling a CHANNEL receive loses nothing.
+        match tokio::time::timeout(Duration::from_millis(100), sync_rx.recv()).await {
+            Ok(Some((sender_id, Ok(data)))) => {
+                let sync = decode_client_set_sync(&data).map_err(|e| {
+                    format!(
+                        "Failed to decode client-set sync from party {}: {}",
+                        sender_id, e
+                    )
+                })?;
+
+                if sync.sender_party_id != sender_id {
+                    return Err(format!(
+                        "Client-set sync sender mismatch: transport sender={} payload sender={}",
+                        sender_id, sync.sender_party_id
+                    ));
+                }
+
+                let normalized_remote = normalize_client_ids(sync.client_ids);
+                if normalized_remote != normalized_local {
+                    return Err(format!(
+                        "Client-set mismatch with party {}: local={:?}, remote={:?}",
+                        sender_id, normalized_local, normalized_remote
+                    ));
+                }
+
+                confirmed_parties.insert(sender_id);
+                eprintln!(
+                    "[party {}] Client-set sync confirmed with party {}",
+                    my_id, sender_id
+                );
+            }
+            Ok(Some((sender_id, Err(e)))) => {
+                return Err(format!(
+                    "Failed to receive client-set sync from party {}: {}",
+                    sender_id, e
+                ));
+            }
+            Ok(None) => {
+                return Err("Client-set sync channel closed unexpectedly".to_string());
+            }
+            Err(_) => {}
         }
     }
 

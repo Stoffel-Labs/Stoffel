@@ -3521,6 +3521,12 @@ pub fn generate_bytecode_with_opt_level(
     // client-IO manifest, replacing the placeholder set during finalisation.
     program.client_io_manifest.preprocessing_demand =
         crate::preprocessing_planner::plan_preprocessing_demand(node);
+    if std::env::var("STOFFEL_DEBUG_DEMAND").is_ok() {
+        eprintln!(
+            "[stoffel-lang] preprocessing demand: {:?}",
+            program.client_io_manifest.preprocessing_demand
+        );
+    }
     Ok(program)
 }
 
