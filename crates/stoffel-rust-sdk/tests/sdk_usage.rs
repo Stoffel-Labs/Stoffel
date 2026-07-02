@@ -4281,6 +4281,11 @@ def main() -> int64:
 
 #[tokio::test]
 async fn client_connect_uses_real_quic_transport() -> stoffel::Result<()> {
+    // The server-side QUIC listener runs before StoffelClient::connect (which
+    // installs the ring provider); under --all-features both rustls providers
+    // are compiled in, so rustls cannot auto-select one and panics without an
+    // explicit install.
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let listener = TcpListener::bind("127.0.0.1:0")?;
     let address: SocketAddr = listener.local_addr()?;
     drop(listener);
