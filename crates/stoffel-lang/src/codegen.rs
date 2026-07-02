@@ -154,8 +154,9 @@ struct CodeGenerator {
     current_labels: HashMap<String, usize>,
     // Counter for allocating new virtual registers.
     next_virtual_reg: usize,
-    // Tracks the required secrecy for each virtual register. True = Secret.
-    vr_secrecy: HashMap<VirtualRegister, bool>,
+    // Tracks the required secrecy for each virtual register, indexed by VR id
+    // (VRs are minted sequentially from 0). True = Secret.
+    vr_secrecy: Vec<bool>,
     // Variable symbol table (maps name to VirtualRegister index). Local to the current scope.
     symbol_table: HashMap<String, usize>,
     // Source-level types for variables in this scope.
@@ -196,7 +197,7 @@ impl CodeGenerator {
             current_instructions: Vec::new(),
             current_labels: HashMap::new(),
             next_virtual_reg: 0, // Start virtual registers from 0
-            vr_secrecy: HashMap::new(),
+            vr_secrecy: Vec::new(),
             // Symbol table starts empty for each new generator instance (e.g., per function)
             symbol_table: HashMap::new(),
             symbol_types: HashMap::new(),
@@ -247,7 +248,8 @@ impl CodeGenerator {
     fn allocate_virtual_register(&mut self, is_secret: bool) -> VirtualRegister {
         let vr = VirtualRegister(self.next_virtual_reg);
         self.next_virtual_reg += 1;
-        self.vr_secrecy.insert(vr, is_secret);
+        debug_assert_eq!(vr.0, self.vr_secrecy.len());
+        self.vr_secrecy.push(is_secret);
         vr
     }
 
@@ -359,12 +361,13 @@ impl CodeGenerator {
 
     fn fresh_virtual_register(
         next_virtual_reg: &mut usize,
-        secrecy_map: &mut HashMap<VirtualRegister, bool>,
+        secrecy_map: &mut Vec<bool>,
         is_secret: bool,
     ) -> VirtualRegister {
         let vr = VirtualRegister(*next_virtual_reg);
         *next_virtual_reg += 1;
-        secrecy_map.insert(vr, is_secret);
+        debug_assert_eq!(vr.0, secrecy_map.len());
+        secrecy_map.push(is_secret);
         vr
     }
 
@@ -373,7 +376,7 @@ impl CodeGenerator {
         out: &mut Vec<Instruction>,
         constants: &mut Vec<Constant>,
         next_virtual_reg: &mut usize,
-        secrecy_map: &mut HashMap<VirtualRegister, bool>,
+        secrecy_map: &mut Vec<bool>,
         spilled_vr: VirtualRegister,
     ) -> VirtualRegister {
         let key = Constant::String(format!("__stoffel_spill_{}", spilled_vr.0));
@@ -391,7 +394,7 @@ impl CodeGenerator {
         out: &mut Vec<Instruction>,
         constants: &mut Vec<Constant>,
         next_virtual_reg: &mut usize,
-        secrecy_map: &mut HashMap<VirtualRegister, bool>,
+        secrecy_map: &mut Vec<bool>,
         spill_object_vr: VirtualRegister,
         spilled_vr: VirtualRegister,
     ) -> VirtualRegister {
@@ -401,7 +404,7 @@ impl CodeGenerator {
         out.push(Instruction::PUSHARG(key_vr.0));
         out.push(Instruction::CALL("get_field".to_string()));
 
-        let value_is_secret = *secrecy_map.get(&spilled_vr).unwrap_or(&false);
+        let value_is_secret = secrecy_map.get(spilled_vr.0).copied().unwrap_or(false);
         let value_vr = Self::fresh_virtual_register(next_virtual_reg, secrecy_map, value_is_secret);
         out.push(Instruction::MOV(value_vr.0, 0));
         value_vr
@@ -412,7 +415,7 @@ impl CodeGenerator {
         out: &mut Vec<Instruction>,
         constants: &mut Vec<Constant>,
         next_virtual_reg: &mut usize,
-        secrecy_map: &mut HashMap<VirtualRegister, bool>,
+        secrecy_map: &mut Vec<bool>,
         spill_object_vr: VirtualRegister,
         spilled_vr: VirtualRegister,
         value_vr: VirtualRegister,
@@ -425,73 +428,66 @@ impl CodeGenerator {
         out.push(Instruction::CALL("set_field".to_string()));
     }
 
-    fn remap_instruction_registers(
-        instruction: &Instruction,
-        mapped_uses: &HashMap<VirtualRegister, VirtualRegister>,
-        mapped_defs: &HashMap<VirtualRegister, VirtualRegister>,
-    ) -> Instruction {
-        let map_use = |r: usize| {
-            mapped_uses
-                .get(&VirtualRegister(r))
-                .copied()
-                .unwrap_or(VirtualRegister(r))
-                .0
+    /// Remaps a spill-lowered instruction's operands in place. `mapped_uses` and
+    /// `mapped_def` hold `(old, scratch)` VR pairs (at most two uses and one def
+    /// per instruction); unmapped operands are left untouched. The def/use
+    /// classification of each operand position must stay in sync with
+    /// `InstructionRegisterAnalysis::uses`/`defs`.
+    fn remap_instruction_registers_in_place(
+        instruction: &mut Instruction,
+        mapped_uses: &[Option<(usize, usize)>; 2],
+        mapped_def: Option<(usize, usize)>,
+    ) {
+        let map_use = |r: &mut usize| {
+            for mapping in mapped_uses.iter().flatten() {
+                if mapping.0 == *r {
+                    *r = mapping.1;
+                    return;
+                }
+            }
         };
-        let map_def = |r: usize| {
-            mapped_defs
-                .get(&VirtualRegister(r))
-                .copied()
-                .unwrap_or(VirtualRegister(r))
-                .0
+        let map_def = |r: &mut usize| {
+            if let Some((old, scratch)) = mapped_def {
+                if old == *r {
+                    *r = scratch;
+                }
+            }
         };
 
         match instruction {
-            Instruction::LD(r, offset) => Instruction::LD(map_def(*r), *offset),
-            Instruction::LDI(r, value) => Instruction::LDI(map_def(*r), value.clone()),
-            Instruction::MOV(dest, src) => Instruction::MOV(map_def(*dest), map_use(*src)),
-            Instruction::ADD(dest, a, b) => {
-                Instruction::ADD(map_def(*dest), map_use(*a), map_use(*b))
+            Instruction::LD(r, _) | Instruction::LDI(r, _) | Instruction::LDS(r, _) => map_def(r),
+            Instruction::MOV(dest, src) | Instruction::NOT(dest, src) => {
+                map_def(dest);
+                map_use(src);
             }
-            Instruction::SUB(dest, a, b) => {
-                Instruction::SUB(map_def(*dest), map_use(*a), map_use(*b))
+            Instruction::ADD(dest, a, b)
+            | Instruction::SUB(dest, a, b)
+            | Instruction::MUL(dest, a, b)
+            | Instruction::DIV(dest, a, b)
+            | Instruction::MOD(dest, a, b)
+            | Instruction::AND(dest, a, b)
+            | Instruction::OR(dest, a, b)
+            | Instruction::XOR(dest, a, b)
+            | Instruction::SHL(dest, a, b)
+            | Instruction::SHR(dest, a, b) => {
+                map_def(dest);
+                map_use(a);
+                map_use(b);
             }
-            Instruction::MUL(dest, a, b) => {
-                Instruction::MUL(map_def(*dest), map_use(*a), map_use(*b))
+            Instruction::RET(src) | Instruction::PUSHARG(src) | Instruction::STS(_, src) => {
+                map_use(src)
             }
-            Instruction::DIV(dest, a, b) => {
-                Instruction::DIV(map_def(*dest), map_use(*a), map_use(*b))
+            Instruction::CMP(a, b) => {
+                map_use(a);
+                map_use(b);
             }
-            Instruction::MOD(dest, a, b) => {
-                Instruction::MOD(map_def(*dest), map_use(*a), map_use(*b))
-            }
-            Instruction::AND(dest, a, b) => {
-                Instruction::AND(map_def(*dest), map_use(*a), map_use(*b))
-            }
-            Instruction::OR(dest, a, b) => {
-                Instruction::OR(map_def(*dest), map_use(*a), map_use(*b))
-            }
-            Instruction::XOR(dest, a, b) => {
-                Instruction::XOR(map_def(*dest), map_use(*a), map_use(*b))
-            }
-            Instruction::NOT(dest, src) => Instruction::NOT(map_def(*dest), map_use(*src)),
-            Instruction::SHL(dest, a, b) => {
-                Instruction::SHL(map_def(*dest), map_use(*a), map_use(*b))
-            }
-            Instruction::SHR(dest, a, b) => {
-                Instruction::SHR(map_def(*dest), map_use(*a), map_use(*b))
-            }
-            Instruction::RET(src) => Instruction::RET(map_use(*src)),
-            Instruction::PUSHARG(src) => Instruction::PUSHARG(map_use(*src)),
-            Instruction::CMP(a, b) => Instruction::CMP(map_use(*a), map_use(*b)),
-            Instruction::LDS(dest, slot) => Instruction::LDS(map_def(*dest), *slot),
-            Instruction::STS(slot, src) => Instruction::STS(*slot, map_use(*src)),
-            Instruction::JMP(label) => Instruction::JMP(label.clone()),
-            Instruction::JMPEQ(label) => Instruction::JMPEQ(label.clone()),
-            Instruction::JMPNEQ(label) => Instruction::JMPNEQ(label.clone()),
-            Instruction::JMPLT(label) => Instruction::JMPLT(label.clone()),
-            Instruction::JMPGT(label) => Instruction::JMPGT(label.clone()),
-            Instruction::CALL(name) => Instruction::CALL(name.clone()),
-            Instruction::NOP => Instruction::NOP,
+            Instruction::JMP(_)
+            | Instruction::JMPEQ(_)
+            | Instruction::JMPNEQ(_)
+            | Instruction::JMPLT(_)
+            | Instruction::JMPGT(_)
+            | Instruction::CALL(_)
+            | Instruction::NOP => {}
         }
     }
 
@@ -512,65 +508,68 @@ impl CodeGenerator {
         instructions: Vec<Instruction>,
         labels: HashMap<String, usize>,
         next_virtual_reg: &mut usize,
-        secrecy_map: &mut HashMap<VirtualRegister, bool>,
+        secrecy_map: &mut Vec<bool>,
         spilled_vrs: &[VirtualRegister],
         next_spill_slot: &mut usize,
     ) -> (Vec<Instruction>, HashMap<String, usize>) {
-        use crate::register_allocator::InstructionRegisterAnalysis;
-
-        let spilled: HashSet<VirtualRegister> = spilled_vrs.iter().copied().collect();
-
-        // Assign each spilled VR a fresh, stable spill slot.
-        let mut slot_of: HashMap<VirtualRegister, usize> = HashMap::new();
+        // Dense spilled/slot tables indexed by VR id: every operand VR was minted
+        // before this round, so ids are bounded by the current counter.
+        let mut spilled = vec![false; *next_virtual_reg];
+        let mut slot_of = vec![usize::MAX; *next_virtual_reg];
         for &vr in spilled_vrs {
-            slot_of.entry(vr).or_insert_with(|| {
-                let s = *next_spill_slot;
+            if !spilled[vr.0] {
+                spilled[vr.0] = true;
+                slot_of[vr.0] = *next_spill_slot;
                 *next_spill_slot += 1;
-                s
-            });
+            }
         }
 
-        let mut out = Vec::with_capacity(instructions.len() + spilled.len() * 4);
+        let mut out = Vec::with_capacity(instructions.len() + spilled_vrs.len() * 4);
         let mut old_to_new = vec![0usize; instructions.len() + 1];
+        let num_instructions = instructions.len();
 
-        for (i, instruction) in instructions.iter().enumerate() {
+        for (i, mut instruction) in instructions.into_iter().enumerate() {
             old_to_new[i] = out.len();
 
             // Reload each spilled use into a fresh scratch register just before the
-            // instruction.
-            let mut mapped_uses: HashMap<VirtualRegister, VirtualRegister> = HashMap::new();
-            for used_vr in instruction.uses() {
-                if spilled.contains(&used_vr) && !mapped_uses.contains_key(&used_vr) {
-                    let is_secret = *secrecy_map.get(&used_vr).unwrap_or(&false);
+            // instruction (at most two uses per instruction).
+            let mut mapped_uses: [Option<(usize, usize)>; 2] = [None; 2];
+            let mut mapped_use_count = 0;
+            for used_vr in register_allocator::use_regs(&instruction)
+                .into_iter()
+                .flatten()
+            {
+                if spilled[used_vr] && !mapped_uses.iter().flatten().any(|&(old, _)| old == used_vr)
+                {
+                    let is_secret = secrecy_map.get(used_vr).copied().unwrap_or(false);
                     let scratch =
                         Self::fresh_virtual_register(next_virtual_reg, secrecy_map, is_secret);
-                    out.push(Instruction::LDS(scratch.0, slot_of[&used_vr]));
-                    mapped_uses.insert(used_vr, scratch);
+                    out.push(Instruction::LDS(scratch.0, slot_of[used_vr]));
+                    mapped_uses[mapped_use_count] = Some((used_vr, scratch.0));
+                    mapped_use_count += 1;
                 }
             }
 
-            // Spilled defs are computed into a fresh scratch register, then stored back.
-            let mut mapped_defs: HashMap<VirtualRegister, VirtualRegister> = HashMap::new();
-            for def_vr in instruction.defs() {
-                if spilled.contains(&def_vr) {
-                    let is_secret = *secrecy_map.get(&def_vr).unwrap_or(&false);
+            // A spilled def (at most one) is computed into a fresh scratch register,
+            // then stored back.
+            let mut mapped_def: Option<(usize, usize)> = None;
+            if let Some(def_vr) = register_allocator::def_reg(&instruction) {
+                if spilled[def_vr] {
+                    let is_secret = secrecy_map.get(def_vr).copied().unwrap_or(false);
                     let scratch =
                         Self::fresh_virtual_register(next_virtual_reg, secrecy_map, is_secret);
-                    mapped_defs.insert(def_vr, scratch);
+                    mapped_def = Some((def_vr, scratch.0));
                 }
             }
 
-            out.push(Self::remap_instruction_registers(
-                instruction,
-                &mapped_uses,
-                &mapped_defs,
-            ));
+            Self::remap_instruction_registers_in_place(&mut instruction, &mapped_uses, mapped_def);
+            out.push(instruction);
 
-            for (spilled_vr, scratch_vr) in mapped_defs {
-                out.push(Instruction::STS(slot_of[&spilled_vr], scratch_vr.0));
+            if let Some((spilled_vr, scratch_vr)) = mapped_def {
+                out.push(Instruction::STS(slot_of[spilled_vr], scratch_vr));
             }
         }
-        old_to_new[instructions.len()] = out.len();
+        old_to_new[num_instructions] = out.len();
 
         let lowered_labels = labels
             .into_iter()
@@ -590,11 +589,11 @@ impl CodeGenerator {
         instructions: &mut Vec<Instruction>,
         labels: &mut HashMap<String, usize>,
         next_virtual_reg: &mut usize,
-        secrecy_map: &mut HashMap<VirtualRegister, bool>,
+        secrecy_map: &mut Vec<bool>,
         precolored: &HashMap<VirtualRegister, PhysicalRegister>,
         protected_prologue_len: usize,
         diagnostic_name: &str,
-    ) -> CompilerResult<register_allocator::Allocation> {
+    ) -> CompilerResult<register_allocator::DenseAllocation> {
         let k_clear = SECRET_REGISTER_START;
         let k_secret = MAX_REGISTERS - k_clear;
         // Once spilling has started, hold back this many registers per pool so the reload
@@ -605,9 +604,10 @@ impl CodeGenerator {
 
         // Virtual registers created by spill lowering (the short-lived reload/store
         // scratch registers). They are never chosen as spill victims and may use the
-        // reserved headroom above.
-        let mut unspillable: std::collections::HashSet<register_allocator::VirtualRegister> =
-            std::collections::HashSet::new();
+        // reserved headroom above. Nothing else mints VRs inside the loop below, so
+        // the unspillable set is always the contiguous id range
+        // [unspillable_start, *next_virtual_reg) — a threshold compare instead of a set.
+        let mut unspillable_start: Option<usize> = None;
         // Pin virtual register 0 to physical R0, the ABI result/scratch register.
         // Every CALL/builtin writes its result into physical R0, which codegen reads
         // back via `MOV(dest, 0)` — a use with no corresponding virtual-register def.
@@ -632,15 +632,13 @@ impl CodeGenerator {
         let mut next_spill_slot: usize = 0;
         let _ = protected_prologue_len; // spill traffic is position-independent now
 
+        let live_in_vrs: Vec<VirtualRegister> = precolored.keys().copied().collect();
         for _ in 0..64 {
-            let intervals = register_allocator::analyze_liveness_cfg_with_liveins(
-                instructions,
-                labels,
-                &precolored.keys().copied().collect::<Vec<_>>(),
-            );
+            let intervals =
+                register_allocator::analyze_liveness_cfg_dense(instructions, labels, &live_in_vrs);
             // No headroom needed until the first spill introduces unspillable temporaries,
             // so functions that fit get the full register file.
-            let reserve = if unspillable.is_empty() {
+            let reserve = if unspillable_start.is_none() {
                 0
             } else {
                 SPILL_RESERVE
@@ -652,7 +650,7 @@ impl CodeGenerator {
                 reserve,
                 secrecy_map,
                 &precolored,
-                &unspillable,
+                unspillable_start.unwrap_or(register_allocator::NO_UNSPILLABLE),
             ) {
                 Ok(allocation) => {
                     if std::env::var("STOFFEL_RA_CHECK").is_ok() {
@@ -683,9 +681,11 @@ impl CodeGenerator {
                     *instructions = lowered_instructions;
                     *labels = lowered_labels;
                     // Every VR minted during lowering is spill machinery: keep it out of
-                    // future spill decisions.
-                    for vr in first_new_vr..*next_virtual_reg {
-                        unspillable.insert(register_allocator::VirtualRegister(vr));
+                    // future spill decisions. Contiguous-range invariant: later rounds
+                    // only ever mint ids above the recorded start.
+                    debug_assert!(unspillable_start.is_none_or(|start| start <= first_new_vr));
+                    if unspillable_start.is_none() && *next_virtual_reg > first_new_vr {
+                        unspillable_start = Some(first_new_vr);
                     }
                 }
                 Err(AllocationError::PoolExhausted(_, _)) => {
@@ -708,20 +708,22 @@ impl CodeGenerator {
     /// write at the boundary instruction); `earlier.end > later.start` is a real overlap.
     #[allow(dead_code)]
     fn ra_interference_check(
-        allocation: &register_allocator::Allocation,
-        intervals: &HashMap<register_allocator::VirtualRegister, register_allocator::LiveInterval>,
+        allocation: &register_allocator::DenseAllocation,
+        intervals: &[Option<register_allocator::LiveInterval>],
         name: &str,
     ) {
         let mut by_reg: HashMap<
             register_allocator::PhysicalRegister,
             Vec<(usize, usize, register_allocator::VirtualRegister)>,
         > = HashMap::new();
-        for (vr, phys) in allocation {
-            if let Some(iv) = intervals.get(vr) {
-                by_reg
-                    .entry(*phys)
-                    .or_default()
-                    .push((iv.start, iv.end, *vr));
+        for (id, phys) in allocation.iter().enumerate() {
+            let Some(phys) = phys else { continue };
+            if let Some(iv) = intervals.get(id).copied().flatten() {
+                by_reg.entry(*phys).or_default().push((
+                    iv.start,
+                    iv.end,
+                    register_allocator::VirtualRegister(id),
+                ));
             }
         }
         let mut total = 0usize;
@@ -754,14 +756,14 @@ impl CodeGenerator {
     #[allow(dead_code)]
     fn ra_liveness_coverage_check(
         instructions: &[Instruction],
-        intervals: &HashMap<register_allocator::VirtualRegister, register_allocator::LiveInterval>,
+        intervals: &[Option<register_allocator::LiveInterval>],
         name: &str,
     ) {
         use crate::register_allocator::InstructionRegisterAnalysis;
         let mut total = 0usize;
         for (ip, inst) in instructions.iter().enumerate() {
             for used_vr in inst.uses() {
-                if let Some(iv) = intervals.get(&used_vr) {
+                if let Some(iv) = intervals.get(used_vr.0).copied().flatten().as_ref() {
                     if ip < iv.start || ip > iv.end {
                         total += 1;
                         if total <= 12 {
@@ -784,20 +786,22 @@ impl CodeGenerator {
     /// (reveal vs copy) and MPC ops on it.
     #[allow(dead_code)]
     fn ra_pool_check(
-        allocation: &register_allocator::Allocation,
-        secrecy_map: &HashMap<register_allocator::VirtualRegister, bool>,
+        allocation: &register_allocator::DenseAllocation,
+        secrecy_map: &[bool],
         k_clear: usize,
         k_secret: usize,
         name: &str,
     ) {
         let secret_end = k_clear + k_secret;
         let mut total = 0usize;
-        for (vr, phys) in allocation {
+        for (id, phys) in allocation.iter().enumerate() {
+            let Some(phys) = phys else { continue };
+            let vr = register_allocator::VirtualRegister(id);
             // R0 (0) is the ABI register; skip it.
             if phys.0 == 0 {
                 continue;
             }
-            let is_secret = secrecy_map.get(vr).copied().unwrap_or(false);
+            let is_secret = secrecy_map.get(vr.0).copied().unwrap_or(false);
             let in_secret_pool = (k_clear..secret_end).contains(&phys.0);
             let in_clear_pool = (1..k_clear).contains(&phys.0);
             if is_secret && !in_secret_pool {
@@ -1391,7 +1395,7 @@ impl CodeGenerator {
                     let vr = VirtualRegister(vr_index);
                     let is_secret = *self
                         .vr_secrecy
-                        .get(&vr)
+                        .get(vr.0)
                         .expect("Identifier VR missing from secrecy map");
                     Ok((vr, is_secret))
                 } else {
@@ -1496,8 +1500,12 @@ impl CodeGenerator {
                 } else {
                     self.clear_int_constants.remove(name);
                 }
-                // Update vr_secrecy map for this VR to ensure it has the correct flag
-                self.vr_secrecy.insert(value_vr, value_is_secret);
+                // Update vr_secrecy for this VR to ensure it has the correct flag.
+                // Sentinel VRs (e.g. VirtualRegister(0) from EnumDefinition/Import arms)
+                // may not have been minted, so guard the indexed write.
+                if let Some(slot) = self.vr_secrecy.get_mut(value_vr.0) {
+                    *slot = value_is_secret;
+                }
 
                 Ok((value_vr, value_is_secret)) // Return the VR holding the initial value and its secrecy
             }
@@ -1552,20 +1560,16 @@ impl CodeGenerator {
                 right,
                 location,
             } => {
+                let left_type_hint = self.type_hint_for_node(left);
+                let right_type_hint = self.type_hint_for_node(right);
                 let is_list_concat = op == "+"
                     && matches!(
                         (
-                            self.type_hint_for_node(left)
-                                .as_ref()
-                                .map(SymbolType::underlying_type),
-                            self.type_hint_for_node(right)
-                                .as_ref()
-                                .map(SymbolType::underlying_type),
+                            left_type_hint.as_ref().map(SymbolType::underlying_type),
+                            right_type_hint.as_ref().map(SymbolType::underlying_type),
                         ),
                         (Some(SymbolType::List(_)), Some(SymbolType::List(_)))
                     );
-                let left_type_hint = self.type_hint_for_node(left);
-                let right_type_hint = self.type_hint_for_node(right);
                 let is_left_list = matches!(
                     left_type_hint.as_ref().map(SymbolType::underlying_type),
                     Some(SymbolType::List(_))
@@ -2025,7 +2029,10 @@ impl CodeGenerator {
                 let final_result_is_secret = result_is_secret || else_is_secret;
                 if final_result_is_secret != result_is_secret {
                     // Update secrecy map so allocator places this VR into correct bank
-                    self.vr_secrecy.insert(result_vr, final_result_is_secret);
+                    // (guarded: sentinel VRs may not have been minted).
+                    if let Some(slot) = self.vr_secrecy.get_mut(result_vr.0) {
+                        *slot = final_result_is_secret;
+                    }
                 }
                 self.emit(Instruction::MOV(result_vr.0, else_vr.0));
 
@@ -2501,8 +2508,10 @@ impl CodeGenerator {
                 )?;
 
                 // Rewrite instructions with physical registers
-                let final_instructions =
-                    register_allocator::rewrite_instructions(&virtual_instructions, &allocation);
+                let final_instructions = register_allocator::rewrite_instructions_dense(
+                    &virtual_instructions,
+                    &allocation,
+                );
 
                 // Finalize the function's bytecode chunk.
                 let mut function_chunk = BytecodeChunk::new();
@@ -2761,7 +2770,7 @@ impl CodeGenerator {
         )?;
 
         let final_main_instructions =
-            register_allocator::rewrite_instructions(&main_instructions, &allocation);
+            register_allocator::rewrite_instructions_dense(&main_instructions, &allocation);
         let mut main_chunk = BytecodeChunk::new();
         main_chunk.instructions = final_main_instructions;
         main_chunk.labels = main_labels;
@@ -2790,11 +2799,16 @@ fn handle_builtin_pragma(
 
 fn dedupe_constants(constants: Vec<Constant>) -> Vec<Constant> {
     use std::collections::HashSet;
-    let mut seen: HashSet<crate::core_types::Value> = HashSet::new();
+    // `Constant`'s derived equality/hash are structural, and `Value::from` maps each
+    // variant field-preservingly onto a distinct `Value` variant, so deduping on the
+    // `Constant` itself keeps exactly the elements the previous `Value`-keyed set
+    // kept — without a clone + `Value` conversion per element (only first
+    // occurrences are cloned into the set).
+    let mut seen: HashSet<Constant> = HashSet::new();
     let mut out = Vec::with_capacity(constants.len());
     for c in constants.into_iter() {
-        let v = crate::core_types::Value::from(c.clone());
-        if seen.insert(v) {
+        if !seen.contains(&c) {
+            seen.insert(c.clone());
             out.push(c);
         }
     }

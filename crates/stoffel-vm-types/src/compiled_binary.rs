@@ -2729,8 +2729,12 @@ pub mod utils {
     ///
     /// A result indicating success or an error
     pub fn save_to_file<P: AsRef<Path>>(binary: &CompiledBinary, path: P) -> BinaryResult<()> {
-        let mut file = File::create(path)?;
-        binary.serialize(&mut file)
+        // The serializer writes each field with a tiny write_all; unbuffered, every
+        // instruction becomes several write(2) syscalls. Buffer ~1MB and flush.
+        let mut writer = std::io::BufWriter::with_capacity(1 << 20, File::create(path)?);
+        binary.serialize(&mut writer)?;
+        writer.flush()?;
+        Ok(())
     }
 
     /// Converts a compiled binary to VM functions

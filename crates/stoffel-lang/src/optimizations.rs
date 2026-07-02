@@ -3455,10 +3455,15 @@ fn value_is_multiply(value: &AstNode) -> bool {
 
 /// Per-statement scheduling facts.
 struct SchedInfo {
-    direct_reads: HashSet<String>,
-    logical_reads: HashSet<String>,
-    writes: HashSet<String>,
-    effects: HashSet<String>,
+    direct_reads: HashSet<u32>,
+    /// Materialized logical-read keys (loop aggregates; see `loop_sched_info`).
+    logical_reads: HashSet<u32>,
+    /// Lazy logical-read cones (one per mutator-call argument), flattened only
+    /// where consumed: the DAG build in `schedule_run` applies them as edges
+    /// directly, loop aggregation materializes them into `logical_reads`.
+    logical_nodes: Vec<Rc<DepNode>>,
+    writes: HashSet<u32>,
+    effects: HashSet<u32>,
     is_multiply: bool,
 }
 
@@ -3478,12 +3483,60 @@ fn global_key() -> String {
     GLOBAL_KEY.to_string()
 }
 
-fn collect_direct_read_keys(node: &AstNode, out: &mut HashSet<String>) {
+/// Run-local interner for the scheduler's dependency keys: each variable name
+/// gets a dense id, its scalar key is `2*id` and its heap key is `2*id + 1`
+/// (mirroring the `var:`/`heap:` string scheme used by the reveal reorderer;
+/// the mapping is injective so key equality — and therefore the dependency DAG
+/// — is unchanged). The catch-all key is the scalar key of `GLOBAL_KEY`, which
+/// contains `:`/`*` and so can never collide with an identifier.
+#[derive(Default)]
+struct KeyInterner {
+    ids: HashMap<String, u32>,
+    names: Vec<String>,
+}
+
+impl KeyInterner {
+    fn var_id(&mut self, name: &str) -> u32 {
+        if let Some(&id) = self.ids.get(name) {
+            id
+        } else {
+            let id = self.names.len() as u32;
+            self.ids.insert(name.to_string(), id);
+            self.names.push(name.to_string());
+            id
+        }
+    }
+
+    fn scalar(&mut self, name: &str) -> u32 {
+        self.var_id(name) * 2
+    }
+
+    fn heap(&mut self, name: &str) -> u32 {
+        self.var_id(name) * 2 + 1
+    }
+
+    fn global(&mut self) -> u32 {
+        self.scalar(GLOBAL_KEY)
+    }
+
+    /// The variable name behind a scalar/heap key (`None` for the global key).
+    fn key_root(&self, key: u32) -> Option<&str> {
+        let name = self.names[(key / 2) as usize].as_str();
+        (name != GLOBAL_KEY).then_some(name)
+    }
+
+    /// Exclusive upper bound on issued key ids, for dense per-key arrays.
+    fn key_bound(&self) -> usize {
+        self.names.len() * 2
+    }
+}
+
+fn collect_direct_read_keys(node: &AstNode, out: &mut HashSet<u32>, interner: &mut KeyInterner) {
     let mut vars = HashSet::new();
     collect_referenced_vars(node, &mut vars);
     for var in vars {
-        out.insert(scalar_key(&var));
-        out.insert(heap_key(&var));
+        out.insert(interner.scalar(&var));
+        out.insert(interner.heap(&var));
     }
 }
 
@@ -3497,21 +3550,23 @@ fn collect_direct_read_keys(node: &AstNode, out: &mut HashSet<String>) {
 /// `O(i)` and constructing the whole environment was `O(N^2)` time and memory —
 /// the dominant cost of `schedule_run` and the reason CBC `-O3` took tens of
 /// minutes / 3GB+ RSS. We now store each binding as a `DepNode` that references
-/// its predecessors by `Rc` (O(1) to build) and only flatten to a concrete key
-/// set where a statement actually *consumes* logical reads (the `FunctionCall`
-/// arm of `sched_info` and the loop-commit case of `update_sched_env`). The
-/// flattened set is membership-identical to the old materialized one, so the
-/// dependency DAG — and therefore the emitted schedule and round counts — is
-/// byte-for-byte unchanged.
+/// its predecessors by `Rc` (O(1) to build) and only walk the closure where a
+/// statement actually *consumes* logical reads: the DAG build in `schedule_run`
+/// applies cone keys as edges directly, and the loop paths (`loop_sched_info`
+/// aggregation, the loop-commit case of `update_sched_env`) materialize a
+/// concrete set. The consumed key set is membership-identical to the old
+/// materialized one, so the dependency DAG — and therefore the emitted schedule
+/// and round counts — is byte-for-byte unchanged.
 type SchedEnv = HashMap<String, Rc<DepNode>>;
 
 /// A lazily-evaluated set of logical-dependency keys (see [`SchedEnv`]).
 #[derive(Default)]
 struct DepNode {
-    /// Keys contributed directly by this binding: the `var:`/`heap:` keys of the
-    /// variables its initializer references (plus, for loop commits, the concrete
-    /// aggregate keys computed by `loop_sched_info`).
-    own: HashSet<String>,
+    /// Keys contributed directly by this binding: the interned scalar/heap keys
+    /// of the variables its initializer references (plus, for loop commits, the
+    /// concrete aggregate keys computed by `loop_sched_info`). Duplicate-free by
+    /// construction (built from a set of variables / a key set).
+    own: Vec<u32>,
     /// Predecessor closures included transitively — the `env` entries of the
     /// referenced variables, captured by value (`Rc` snapshot) at build time so
     /// a later reassignment of one of those variables cannot retroactively change
@@ -3521,14 +3576,14 @@ struct DepNode {
 
 /// Build the lazy dependency node for `node`'s logical reads against `env`,
 /// without flattening the transitive closure (O(referenced vars), not O(N)).
-fn logical_reads_node(node: &AstNode, env: &SchedEnv) -> Rc<DepNode> {
+fn logical_reads_node(node: &AstNode, env: &SchedEnv, interner: &mut KeyInterner) -> Rc<DepNode> {
     let mut vars = HashSet::new();
     collect_referenced_vars(node, &mut vars);
-    let mut own = HashSet::new();
+    let mut own = Vec::with_capacity(vars.len() * 2);
     let mut parents = Vec::new();
     for var in vars {
-        own.insert(scalar_key(&var));
-        own.insert(heap_key(&var));
+        own.push(interner.scalar(&var));
+        own.push(interner.heap(&var));
         if let Some(dep) = env.get(&var) {
             parents.push(Rc::clone(dep));
         }
@@ -3540,29 +3595,20 @@ fn logical_reads_node(node: &AstNode, env: &SchedEnv) -> Rc<DepNode> {
 /// `visited` set both dedups shared sub-closures and guarantees termination;
 /// the result is exactly the transitive union of `own` over the node and all its
 /// (transitive) parents — i.e. the set the old materialized `env` stored.
+/// Iterative so a long straight-line dependency chain cannot overflow the stack.
 fn flatten_dep_node(
     node: &Rc<DepNode>,
-    out: &mut HashSet<String>,
+    out: &mut HashSet<u32>,
     visited: &mut HashSet<*const DepNode>,
 ) {
-    if !visited.insert(Rc::as_ptr(node)) {
-        return;
+    let mut stack: Vec<&Rc<DepNode>> = vec![node];
+    while let Some(n) = stack.pop() {
+        if !visited.insert(Rc::as_ptr(n)) {
+            continue;
+        }
+        out.extend(n.own.iter().copied());
+        stack.extend(n.parents.iter());
     }
-    out.extend(node.own.iter().cloned());
-    for parent in &node.parents {
-        flatten_dep_node(parent, out, visited);
-    }
-}
-
-/// The flat set of logical-read keys for `node` against `env`. Membership is
-/// identical to the historical materialized computation; only the intermediate
-/// `env` storage is now lazy (see [`SchedEnv`]).
-fn expr_logical_reads(node: &AstNode, env: &SchedEnv) -> HashSet<String> {
-    let depnode = logical_reads_node(node, env);
-    let mut out = HashSet::new();
-    let mut visited = HashSet::new();
-    flatten_dep_node(&depnode, &mut out, &mut visited);
-    out
 }
 
 /// The body statements of a loop, viewed as a slice (a body is normally a
@@ -3594,32 +3640,42 @@ fn loop_sched_info(
     iterable: &AstNode,
     body: &AstNode,
     env: &SchedEnv,
+    interner: &mut KeyInterner,
 ) -> SchedInfo {
     let mut direct_reads = HashSet::new();
     let mut logical_reads = HashSet::new();
     let mut writes = HashSet::new();
     let mut effects = HashSet::new();
 
-    collect_direct_read_keys(iterable, &mut direct_reads);
+    collect_direct_read_keys(iterable, &mut direct_reads, interner);
 
     // Walk the body with a private env seeded from the outer one so each
     // statement's logical reads resolve against bindings created earlier in the
     // loop body (mirroring `schedule_run`'s per-statement env threading).
     let mut body_env = env.clone();
     for stmt in loop_body_statements(body) {
-        let info = sched_info(stmt, &body_env);
+        let info = sched_info(stmt, &body_env, interner);
+        update_sched_env(stmt, &mut body_env, &info, interner);
         direct_reads.extend(info.direct_reads);
         logical_reads.extend(info.logical_reads);
+        // Materialize the statement's lazy cones into the loop aggregate: the
+        // aggregate must be a concrete set (induction-variable filtering below,
+        // loop-commit leaf in `update_sched_env`). One shared visited set per
+        // statement; sharing the `logical_reads` out-set keeps the resulting
+        // union identical to flattening each cone separately.
+        let mut visited = HashSet::new();
+        for node in &info.logical_nodes {
+            flatten_dep_node(node, &mut logical_reads, &mut visited);
+        }
         writes.extend(info.writes);
         effects.extend(info.effects);
-        update_sched_env(stmt, &mut body_env);
     }
 
     // The induction variables are loop-local: drop their keys so they neither
     // create false hazards with outer bindings nor leak as loop writes.
     for var in variables {
-        let sk = scalar_key(var);
-        let hk = heap_key(var);
+        let sk = interner.scalar(var);
+        let hk = interner.heap(var);
         for set in [
             &mut direct_reads,
             &mut logical_reads,
@@ -3634,6 +3690,7 @@ fn loop_sched_info(
     SchedInfo {
         direct_reads,
         logical_reads,
+        logical_nodes: Vec::new(),
         writes,
         effects,
         is_multiply: false,
@@ -3685,45 +3742,46 @@ fn stmt_is_schedulable(stmt: &AstNode, pure_fns: &HashSet<String>) -> bool {
 /// is deliberately coarser than the multiply batcher's field-level keying
 /// (`statement_reads_and_writes` / `keys_conflict`) and must not be merged with
 /// it — see the note on `statement_reads_and_writes`.
-fn sched_info(stmt: &AstNode, env: &SchedEnv) -> SchedInfo {
+fn sched_info(stmt: &AstNode, env: &SchedEnv, interner: &mut KeyInterner) -> SchedInfo {
     let mut direct_reads = HashSet::new();
-    let mut logical_reads = HashSet::new();
+    let logical_reads = HashSet::new();
+    let mut logical_nodes = Vec::new();
     let mut writes = HashSet::new();
     let mut effects = HashSet::new();
     let mut is_multiply = false;
 
     match stmt {
         AstNode::VariableDeclaration { name, value, .. } => {
-            writes.insert(scalar_key(name));
+            writes.insert(interner.scalar(name));
             if let Some(v) = value.as_deref() {
-                collect_direct_read_keys(v, &mut direct_reads);
+                collect_direct_read_keys(v, &mut direct_reads, interner);
                 is_multiply = value_is_multiply(v);
             }
         }
         AstNode::Assignment { target, value, .. } => {
-            collect_direct_read_keys(value, &mut direct_reads);
+            collect_direct_read_keys(value, &mut direct_reads, interner);
             is_multiply = value_is_multiply(value);
             match target.as_ref() {
                 AstNode::Identifier(name, _) => {
-                    writes.insert(scalar_key(name));
+                    writes.insert(interner.scalar(name));
                 }
                 // Index/field assignment mutates (and reads) the base object.
                 other => {
                     if let Some(root) = root_var(other) {
-                        let key = heap_key(&root);
-                        writes.insert(key.clone());
-                        direct_reads.insert(key.clone());
+                        let key = interner.heap(&root);
+                        writes.insert(key);
+                        direct_reads.insert(key);
                         effects.insert(key);
                     } else {
-                        writes.insert(global_key());
-                        effects.insert(global_key());
+                        writes.insert(interner.global());
+                        effects.insert(interner.global());
                     }
-                    collect_direct_read_keys(other, &mut direct_reads);
+                    collect_direct_read_keys(other, &mut direct_reads, interner);
                 }
             }
         }
         AstNode::DiscardStatement { expression, .. } => {
-            return sched_info(expression, env);
+            return sched_info(expression, env, interner);
         }
         AstNode::ForLoop {
             variables,
@@ -3731,54 +3789,64 @@ fn sched_info(stmt: &AstNode, env: &SchedEnv) -> SchedInfo {
             body,
             ..
         } => {
-            return loop_sched_info(variables, iterable, body, env);
+            return loop_sched_info(variables, iterable, body, env, interner);
         }
         AstNode::FunctionCall { arguments, .. } => {
             // A recognized mutator: first argument is the receiver (read+written),
             // the rest are read.
             if let Some(receiver) = arguments.first() {
                 if let Some(root) = root_var(receiver) {
-                    let key = heap_key(&root);
-                    writes.insert(key.clone());
-                    direct_reads.insert(key.clone());
+                    let key = interner.heap(&root);
+                    writes.insert(key);
+                    direct_reads.insert(key);
                     effects.insert(key);
                 } else {
-                    writes.insert(global_key());
-                    effects.insert(global_key());
+                    writes.insert(interner.global());
+                    effects.insert(interner.global());
                 }
-                collect_direct_read_keys(receiver, &mut direct_reads);
+                collect_direct_read_keys(receiver, &mut direct_reads, interner);
             }
             for arg in arguments.iter().skip(1) {
-                collect_direct_read_keys(arg, &mut direct_reads);
-                logical_reads.extend(expr_logical_reads(arg, env));
+                collect_direct_read_keys(arg, &mut direct_reads, interner);
+                logical_nodes.push(logical_reads_node(arg, env, interner));
             }
         }
         _ => {
-            collect_direct_read_keys(stmt, &mut direct_reads);
+            collect_direct_read_keys(stmt, &mut direct_reads, interner);
         }
     }
 
     SchedInfo {
         direct_reads,
         logical_reads,
+        logical_nodes,
         writes,
         effects,
         is_multiply,
     }
 }
 
-fn update_sched_env(stmt: &AstNode, env: &mut SchedEnv) {
+/// Advance the scheduling env past `stmt`. `info` must be the `SchedInfo` that
+/// `sched_info(stmt, env)` computed against this same env (both call sites have
+/// it in hand); the `ForLoop` arm reuses it instead of recomputing
+/// `loop_sched_info` — a pure memoization of a deterministic function.
+fn update_sched_env(
+    stmt: &AstNode,
+    env: &mut SchedEnv,
+    info: &SchedInfo,
+    interner: &mut KeyInterner,
+) {
     match stmt {
         AstNode::VariableDeclaration { name, value, .. } => {
             let deps = value
                 .as_deref()
-                .map(|v| logical_reads_node(v, env))
+                .map(|v| logical_reads_node(v, env, interner))
                 .unwrap_or_default();
             env.insert(name.clone(), deps);
         }
         AstNode::Assignment { target, value, .. } => {
             if let AstNode::Identifier(name, _) = target.as_ref() {
-                let deps = logical_reads_node(value, env);
+                let deps = logical_reads_node(value, env, interner);
                 env.insert(name.clone(), deps);
             } else if let Some(root) = root_var(target) {
                 env.remove(&root);
@@ -3786,34 +3854,35 @@ fn update_sched_env(stmt: &AstNode, env: &mut SchedEnv) {
                 env.clear();
             }
         }
-        AstNode::DiscardStatement { expression, .. } => update_sched_env(expression, env),
-        AstNode::ForLoop {
-            variables,
-            iterable,
-            body,
-            ..
-        } => {
+        AstNode::DiscardStatement { expression, .. } => {
+            update_sched_env(expression, env, info, interner)
+        }
+        AstNode::ForLoop { variables, .. } => {
             // After the loop, every root it wrote logically depends on everything
             // the loop read (its inputs). Record that so a later effectful commit
             // that consumes a loop-written value still cannot move before a write
-            // to one of those inputs.
-            let info = loop_sched_info(variables, iterable, body, env);
-            let deps: HashSet<String> = info
+            // to one of those inputs. `info` is the loop's aggregate (already
+            // materialized by `loop_sched_info`, so `logical_nodes` is empty —
+            // flattened anyway for robustness).
+            let mut deps: HashSet<u32> = info
                 .direct_reads
                 .iter()
                 .chain(info.logical_reads.iter())
-                .cloned()
+                .copied()
                 .collect();
+            let mut visited = HashSet::new();
+            for node in &info.logical_nodes {
+                flatten_dep_node(node, &mut deps, &mut visited);
+            }
             // One shared leaf node holding the concrete aggregate set; every
             // root the loop wrote points at it (flattens to `deps`, exactly as
             // the old per-root `deps.clone()` did).
             let dep_node = Rc::new(DepNode {
-                own: deps,
+                own: deps.into_iter().collect(),
                 parents: Vec::new(),
             });
             for w in &info.writes {
-                let root = w.strip_prefix("var:").or_else(|| w.strip_prefix("heap:"));
-                if let Some(root) = root {
+                if let Some(root) = interner.key_root(*w) {
                     env.insert(root.to_string(), Rc::clone(&dep_node));
                 }
             }
@@ -3969,12 +4038,13 @@ fn schedule_run(stmts: Vec<AstNode>) -> Vec<AstNode> {
         return stmts;
     }
 
+    let mut interner = KeyInterner::default();
     let mut env: SchedEnv = HashMap::new();
     let infos: Vec<SchedInfo> = stmts
         .iter()
         .map(|stmt| {
-            let info = sched_info(stmt, &env);
-            update_sched_env(stmt, &mut env);
+            let info = sched_info(stmt, &env, &mut interner);
+            update_sched_env(stmt, &mut env, &info, &mut interner);
             info
         })
         .collect();
@@ -3983,50 +4053,77 @@ fn schedule_run(stmts: Vec<AstNode>) -> Vec<AstNode> {
     let mut succ: Vec<HashSet<usize>> = vec![HashSet::new(); n];
     let mut indeg: Vec<usize> = vec![0usize; n];
 
-    let mut last_write: HashMap<String, usize> = HashMap::new();
-    let mut readers: HashMap<String, Vec<usize>> = HashMap::new();
-    let mut effect_prev: HashMap<String, usize> = HashMap::new();
+    // All keys are interned by now, so the per-key maps are dense arrays.
+    let key_bound = interner.key_bound();
+    let mut last_write: Vec<Option<usize>> = vec![None; key_bound];
+    let mut readers: Vec<Vec<usize>> = vec![Vec::new(); key_bound];
+    let mut effect_prev: Vec<Option<usize>> = vec![None; key_bound];
+
+    // Register statement `i` reading key `r`: a RAW edge from the key's last
+    // writer, plus a `readers` entry feeding later WAR edges. Applied per key
+    // occurrence (the lazy cones may repeat a key across nodes); `succ` dedups
+    // edges and consecutive same-statement pushes are collapsed, so repeated
+    // occurrences change no edge.
+    fn apply_read(
+        r: u32,
+        i: usize,
+        last_write: &[Option<usize>],
+        readers: &mut [Vec<usize>],
+        succ: &mut [HashSet<usize>],
+        indeg: &mut [usize],
+    ) {
+        if let Some(w) = last_write[r as usize] {
+            if w != i && succ[w].insert(i) {
+                indeg[i] += 1;
+            }
+        }
+        let rl = &mut readers[r as usize];
+        if rl.last() != Some(&i) {
+            rl.push(i);
+        }
+    }
 
     for i in 0..n {
-        for r in infos[i]
+        for &r in infos[i]
             .direct_reads
             .iter()
             .chain(infos[i].logical_reads.iter())
         {
-            if let Some(&w) = last_write.get(r) {
-                if w != i && succ[w].insert(i) {
-                    indeg[i] += 1;
-                }
+            apply_read(r, i, &last_write, &mut readers, &mut succ, &mut indeg);
+        }
+        // Walk each lazy logical-read cone once per statement (shared visited
+        // set), applying reads directly instead of materializing the flat set.
+        let mut visited: HashSet<*const DepNode> = HashSet::new();
+        let mut stack: Vec<&Rc<DepNode>> = infos[i].logical_nodes.iter().collect();
+        while let Some(node) = stack.pop() {
+            if !visited.insert(Rc::as_ptr(node)) {
+                continue;
             }
+            for &r in &node.own {
+                apply_read(r, i, &last_write, &mut readers, &mut succ, &mut indeg);
+            }
+            stack.extend(node.parents.iter());
         }
-        for r in &infos[i].direct_reads {
-            readers.entry(r.clone()).or_default().push(i);
-        }
-        for r in &infos[i].logical_reads {
-            readers.entry(r.clone()).or_default().push(i);
-        }
-        for w in &infos[i].writes {
-            if let Some(&pw) = last_write.get(w) {
+        for &w in &infos[i].writes {
+            if let Some(pw) = last_write[w as usize] {
                 if pw != i && succ[pw].insert(i) {
                     indeg[i] += 1; // WAW
                 }
             }
-            if let Some(rs) = readers.remove(w) {
-                for rd in rs {
-                    if rd != i && succ[rd].insert(i) {
-                        indeg[i] += 1; // WAR
-                    }
+            for rd in std::mem::take(&mut readers[w as usize]) {
+                if rd != i && succ[rd].insert(i) {
+                    indeg[i] += 1; // WAR
                 }
             }
-            last_write.insert(w.clone(), i);
+            last_write[w as usize] = Some(i);
         }
-        for effect in &infos[i].effects {
-            if let Some(&pe) = effect_prev.get(effect) {
+        for &effect in &infos[i].effects {
+            if let Some(pe) = effect_prev[effect as usize] {
                 if pe != i && succ[pe].insert(i) {
                     indeg[i] += 1;
                 }
             }
-            effect_prev.insert(effect.clone(), i);
+            effect_prev[effect as usize] = Some(i);
         }
     }
 
@@ -4107,13 +4204,25 @@ fn schedule_run(stmts: Vec<AstNode>) -> Vec<AstNode> {
 /// Entry point: remove unused pure bindings to a fixpoint.
 pub fn eliminate_dead_bindings(mut node: AstNode) -> AstNode {
     let pure_fns = compute_pure_functions(&node);
+    // Count identifier uses ONCE; each round then subtracts the occurrences
+    // inside the initializers it removed, which is exactly what a from-scratch
+    // recount over the post-removal tree would produce (a removed declaration
+    // contributes only its initializer subtree's identifiers to the counts).
+    // Decrements are applied *between* rounds so every round decides against the
+    // same counts snapshot the old per-round recount gave it.
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    count_identifier_uses(&node, &mut counts);
     loop {
-        let mut counts: HashMap<String, usize> = HashMap::new();
-        count_identifier_uses(&node, &mut counts);
         let mut changed = false;
-        node = drop_dead_bindings(node, &counts, &pure_fns, &mut changed);
+        let mut removed_uses: HashMap<String, usize> = HashMap::new();
+        node = drop_dead_bindings(node, &counts, &pure_fns, &mut changed, &mut removed_uses);
         if !changed {
             break;
+        }
+        for (name, n) in removed_uses {
+            if let Some(c) = counts.get_mut(&name) {
+                *c -= n;
+            }
         }
     }
     node
@@ -4124,7 +4233,12 @@ pub fn eliminate_dead_bindings(mut node: AstNode) -> AstNode {
 /// not visited, so type names never inflate a variable's use count.
 fn count_identifier_uses(node: &AstNode, counts: &mut HashMap<String, usize>) {
     if let AstNode::Identifier(name, _) = node {
-        *counts.entry(name.clone()).or_insert(0) += 1;
+        // Clone the name only on first insertion, not per occurrence.
+        if let Some(c) = counts.get_mut(name) {
+            *c += 1;
+        } else {
+            counts.insert(name.clone(), 1);
+        }
     }
     match node {
         AstNode::FunctionDefinition { body, .. } => count_identifier_uses(body, counts),
@@ -4133,14 +4247,20 @@ fn count_identifier_uses(node: &AstNode, counts: &mut HashMap<String, usize>) {
 }
 
 /// Walk the tree removing `VariableDeclaration`s whose name has zero identifier
-/// uses and whose initializer is pure. Does not descend a removed declaration.
+/// uses and whose initializer is pure. Does not descend a removed declaration;
+/// instead the identifier uses inside its initializer are tallied into
+/// `removed_uses` so the caller can subtract them from the counts (equivalent
+/// to recounting the post-removal tree).
 fn drop_dead_bindings(
     node: AstNode,
     counts: &HashMap<String, usize>,
     pure_fns: &HashSet<String>,
     changed: &mut bool,
+    removed_uses: &mut HashMap<String, usize>,
 ) -> AstNode {
-    let recurse = |n: AstNode, changed: &mut bool| drop_dead_bindings(n, counts, pure_fns, changed);
+    let recurse = |n: AstNode, changed: &mut bool, removed_uses: &mut HashMap<String, usize>| {
+        drop_dead_bindings(n, counts, pure_fns, changed, removed_uses)
+    };
     match node {
         AstNode::Block(stmts) => {
             let mut kept = Vec::with_capacity(stmts.len());
@@ -4150,10 +4270,13 @@ fn drop_dead_bindings(
                     let pure = value.as_deref().is_none_or(|v| expr_is_pure(v, pure_fns));
                     if unused && pure {
                         *changed = true;
+                        if let Some(v) = value.as_deref() {
+                            count_identifier_uses(v, removed_uses);
+                        }
                         continue;
                     }
                 }
-                kept.push(recurse(stmt, changed));
+                kept.push(recurse(stmt, changed, removed_uses));
             }
             AstNode::Block(kept)
         }
@@ -4172,7 +4295,7 @@ fn drop_dead_bindings(
             type_params,
             parameters,
             return_type,
-            body: Box::new(recurse(*body, changed)),
+            body: Box::new(recurse(*body, changed, removed_uses)),
             is_secret,
             pragmas,
             location,
@@ -4184,7 +4307,7 @@ fn drop_dead_bindings(
             location,
         } => AstNode::WhileLoop {
             condition,
-            body: Box::new(recurse(*body, changed)),
+            body: Box::new(recurse(*body, changed, removed_uses)),
             location,
         },
         AstNode::ForLoop {
@@ -4195,7 +4318,7 @@ fn drop_dead_bindings(
         } => AstNode::ForLoop {
             variables,
             iterable,
-            body: Box::new(recurse(*body, changed)),
+            body: Box::new(recurse(*body, changed, removed_uses)),
             location,
         },
         AstNode::IfExpression {
@@ -4204,8 +4327,8 @@ fn drop_dead_bindings(
             else_branch,
         } => AstNode::IfExpression {
             condition,
-            then_branch: Box::new(recurse(*then_branch, changed)),
-            else_branch: else_branch.map(|e| Box::new(recurse(*e, changed))),
+            then_branch: Box::new(recurse(*then_branch, changed, removed_uses)),
+            else_branch: else_branch.map(|e| Box::new(recurse(*e, changed, removed_uses))),
         },
         AstNode::TryCatch {
             try_block,
@@ -4213,15 +4336,21 @@ fn drop_dead_bindings(
             finally_block,
             location,
         } => AstNode::TryCatch {
-            try_block: Box::new(recurse(*try_block, changed)),
+            try_block: Box::new(recurse(*try_block, changed, removed_uses)),
             catch_clauses: catch_clauses
                 .into_iter()
                 .map(|c| crate::ast::CatchClause {
-                    body: Box::new(drop_dead_bindings(*c.body, counts, pure_fns, changed)),
+                    body: Box::new(drop_dead_bindings(
+                        *c.body,
+                        counts,
+                        pure_fns,
+                        changed,
+                        removed_uses,
+                    )),
                     ..c
                 })
                 .collect(),
-            finally_block: finally_block.map(|b| Box::new(recurse(*b, changed))),
+            finally_block: finally_block.map(|b| Box::new(recurse(*b, changed, removed_uses))),
             location,
         },
         other => other,
@@ -5284,7 +5413,7 @@ struct LenEnv {
     ints: HashMap<String, u128>,
     /// `aliases[x]` = the set of other names that may alias the same list as `x`
     /// (symmetric). Empty/absent means `x` is known not to alias.
-    aliases: HashMap<String, HashSet<String>>,
+    aliases: HashMap<String, Rc<HashSet<String>>>,
 }
 
 impl LenEnv {
@@ -5293,7 +5422,7 @@ impl LenEnv {
     fn alias_group(&self, name: &str) -> Vec<String> {
         self.aliases
             .get(name)
-            .map(|s| s.iter().cloned().collect())
+            .map(|s| s.as_ref().iter().cloned().collect())
             .unwrap_or_default()
     }
 
@@ -5311,9 +5440,9 @@ impl LenEnv {
     /// Detach `name` from any alias group (it is being rebound to a new value).
     fn alias_unbind(&mut self, name: &str) {
         if let Some(group) = self.aliases.remove(name) {
-            for other in group {
-                if let Some(set) = self.aliases.get_mut(&other) {
-                    set.remove(name);
+            for other in group.as_ref() {
+                if let Some(set) = self.aliases.get_mut(other) {
+                    Rc::make_mut(set).remove(name);
                 }
             }
         }
@@ -5324,18 +5453,19 @@ impl LenEnv {
         if b == a {
             return;
         }
-        let mut group: HashSet<String> = self.aliases.get(a).cloned().unwrap_or_default();
+        let mut group: HashSet<String> = self
+            .aliases
+            .get(a)
+            .map(|set| set.as_ref().clone())
+            .unwrap_or_default();
         group.insert(a.to_string());
         for m in &group {
-            self.aliases
-                .entry(m.clone())
-                .or_default()
-                .insert(b.to_string());
+            Rc::make_mut(self.aliases.entry(m.clone()).or_default()).insert(b.to_string());
         }
         let entry = self.aliases.entry(b.to_string()).or_default();
         for m in group {
             if m != b {
-                entry.insert(m);
+                Rc::make_mut(entry).insert(m);
             }
         }
     }
@@ -5387,6 +5517,25 @@ struct BuiltinEffect {
 /// every call site (impure / mutates-unknown / not-len-safe), matching the old
 /// `matches!`-returns-false behavior exactly.
 fn builtin_effect(name: &str) -> BuiltinEffect {
+    // Memoized per call name: the registry canonicalization + base-name match is
+    // deterministic (static registry), and this is queried at every FunctionCall
+    // visit of every walker — one hash lookup thereafter instead of 2-3 registry
+    // probes per query. Thread-local, so no cross-thread sync is involved.
+    thread_local! {
+        static EFFECT_CACHE: RefCell<HashMap<String, BuiltinEffect>> =
+            RefCell::new(HashMap::new());
+    }
+    EFFECT_CACHE.with(|cache| {
+        if let Some(e) = cache.borrow().get(name) {
+            return *e;
+        }
+        let e = builtin_effect_uncached(name);
+        cache.borrow_mut().insert(name.to_string(), e);
+        e
+    })
+}
+
+fn builtin_effect_uncached(name: &str) -> BuiltinEffect {
     // `e(pure, mutates_receiver, grows_list, len_safe, is_len_builtin)`.
     const fn e(
         pure: bool,
@@ -6899,8 +7048,10 @@ fn unroll_stmt_list(stmts: Vec<AstNode>, env: &mut LenEnv, budget: &mut usize) -
                     else_branch.as_deref().cloned()
                 };
                 if let Some(b) = branch {
-                    for (offset, produced) in branch_into_stmts(b).into_iter().enumerate() {
-                        pending.insert(offset, produced);
+                    // Front-splice in order via reversed push_front (O(k), same
+                    // resulting queue as inserting at offsets 0..k).
+                    for produced in branch_into_stmts(b).into_iter().rev() {
+                        pending.push_front(produced);
                     }
                 }
                 continue;
@@ -6911,8 +7062,8 @@ fn unroll_stmt_list(stmts: Vec<AstNode>, env: &mut LenEnv, budget: &mut usize) -
                 // Re-queue the produced statements (preserving order); their env
                 // effects apply as each is popped, and nested loops get a fresh
                 // unroll attempt with the now-richer env.
-                for (offset, produced) in iterations.into_iter().enumerate() {
-                    pending.insert(offset, produced);
+                for produced in iterations.into_iter().rev() {
+                    pending.push_front(produced);
                 }
             }
             UnrollOutcome::Kept(node) => out.push(process_kept_statement(node, env, budget)),
@@ -6995,14 +7146,11 @@ fn estimate_stmt_size(stmt: &AstNode, env: &mut LenEnv, limit: usize) -> usize {
             body,
             ..
         } => {
-            let body_stmts: Vec<AstNode> = match body.as_ref() {
-                AstNode::Block(s) => s.clone(),
-                single => vec![single.clone()],
-            };
+            let body_stmts = loop_body_statements(body);
             // Estimate one iteration's inner-unrolled size in a child env.
             let mut benv = env.clone();
             bind_loop_var(&mut benv, variables, iterable);
-            let inner = estimate_unrolled_size(&body_stmts, &benv, limit).max(1);
+            let inner = estimate_unrolled_size(body_stmts, &benv, limit).max(1);
             // Would this loop itself unroll? (Same predicate as `try_unroll_for`.)
             let unrolls = matches!(variables.as_slice(), [v] if !body_assigns_var(body, v))
                 && range_bounds(iterable, env)
@@ -7126,28 +7274,9 @@ fn try_unroll_for(stmt: AstNode, env: &LenEnv, budget: &mut usize) -> UnrollOutc
         });
     }
 
-    // The statements making up one iteration of the body.
-    let body_stmts: Vec<AstNode> = match body.as_ref() {
-        AstNode::Block(stmts) => stmts.clone(),
-        single => vec![single.clone()],
-    };
-    // Decide flatten-vs-keep on the per-iteration size *after inner loops are
-    // unrolled*, not the raw body size: flattening this loop would replicate that
-    // inner-unrolled work `iterations` times. A loop whose body hides heavy inner
-    // element loops (the AES `for round`, CTR's per-block loop) is therefore kept
-    // rolled — the kept-loop path still unrolls its inner loops once, which is
-    // what clusters a layer's independent multiplies into one batched round
-    // without paying to duplicate the whole round body. See
-    // `estimate_unrolled_size`.
-    let mut benv = env.clone();
-    bind_loop_var(&mut benv, &variables, &iterable);
-    // The estimate only gates a monotone threshold (`fits` below): both consumers
-    // compare against `unroll_max_expansion()` and `*budget`, so capping the walk
-    // at the larger of the two is decision-equivalent while bounding cost on
-    // deeply-nested inlined bodies. See `estimate_unrolled_size`.
-    let estimate_limit = unroll_max_expansion().max(*budget);
-    let inner_unrolled_estimate: usize = estimate_unrolled_size(&body_stmts, &benv, estimate_limit);
-    let decision_expansion = (iterations as usize).saturating_mul(inner_unrolled_estimate.max(1));
+    // The statements making up one iteration of the body (borrowed; each
+    // iteration clones per statement during materialization below).
+    let body_stmts = loop_body_statements(&body);
     // Raw (un-inner-unrolled) duplication cost of flattening this loop. The
     // flattened copies are re-queued and their inner loops draw from the same
     // budget when *they* unroll, so this — not `decision_expansion` — is the code
@@ -7169,6 +7298,31 @@ fn try_unroll_for(stmt: AstNode, env: &LenEnv, budget: &mut usize) -> UnrollOutc
     let fits = if small_trip {
         raw_duplication <= *budget
     } else {
+        // Decide flatten-vs-keep on the per-iteration size *after inner loops are
+        // unrolled*, not the raw body size: flattening this loop would replicate that
+        // inner-unrolled work `iterations` times. A loop whose body hides heavy inner
+        // element loops (the AES `for round`, CTR's per-block loop) is therefore kept
+        // rolled — the kept-loop path still unrolls its inner loops once, which is
+        // what clusters a layer's independent multiplies into one batched round
+        // without paying to duplicate the whole round body. See
+        // `estimate_unrolled_size`.
+        let mut benv = env.clone();
+        bind_loop_var(&mut benv, &variables, &iterable);
+        // The estimate only gates a monotone threshold. The loop fits iff
+        // `iterations * estimate <= min(unroll_max_expansion, budget)`, so once
+        // one iteration's estimate exceeds that quotient, the exact size cannot
+        // change the decision. Capping at this threshold keeps the estimator
+        // linear in the useful evidence instead of walking huge inlined bodies
+        // under large project budgets.
+        let threshold = unroll_max_expansion().min(*budget);
+        let estimate_limit = threshold
+            .checked_div(iterations as usize)
+            .unwrap_or(0)
+            .saturating_add(1)
+            .max(1);
+        let inner_unrolled_estimate = estimate_unrolled_size(body_stmts, &benv, estimate_limit);
+        let decision_expansion =
+            (iterations as usize).saturating_mul(inner_unrolled_estimate.max(1));
         decision_expansion <= unroll_max_expansion() && decision_expansion <= *budget
     };
     if !fits {
@@ -7188,7 +7342,7 @@ fn try_unroll_for(stmt: AstNode, env: &LenEnv, budget: &mut usize) -> UnrollOutc
     // fresh per-iteration suffix so the unrolled copies cannot collide or
     // shadow one another.
     let mut body_declared: HashSet<String> = HashSet::new();
-    for stmt in &body_stmts {
+    for stmt in body_stmts {
         collect_declared_names(stmt, &mut body_declared);
     }
 
@@ -7200,7 +7354,7 @@ fn try_unroll_for(stmt: AstNode, env: &LenEnv, budget: &mut usize) -> UnrollOutc
             .iter()
             .map(|name| (name.clone(), format!("{name}__unroll{suffix}")))
             .collect();
-        for stmt in &body_stmts {
+        for stmt in body_stmts {
             // Alpha-rename body-declared names first, then substitute the loop
             // variable (which is never body-declared) with this iteration value.
             let renamed = if rename.is_empty() {
@@ -7512,6 +7666,10 @@ fn collect_written_vars(node: &AstNode, out: &mut HashSet<String>) {
 
 /// True if `name` is written (reassigned or mutated) anywhere in the subtree.
 /// Variable *declarations* are not counted, so the introducing `var` is allowed.
+/// No longer called on the hot path (block_licm uses the set-valued mirror
+/// `collect_licm_mutated_vars`); retained as the executable spec that mirror
+/// must match arm-for-arm.
+#[allow(dead_code)]
 fn is_var_mutated(node: &AstNode, name: &str) -> bool {
     fn walk(node: &AstNode, name: &str) -> bool {
         match node {
@@ -7560,6 +7718,90 @@ fn is_var_mutated(node: &AstNode, name: &str) -> bool {
         }
     }
     walk(node, name)
+}
+
+/// Set-valued mirror of `is_var_mutated`: collects every name that walker would
+/// report as mutated, visiting EXACTLY the same arms (so for every `name`,
+/// `out.contains(name)` == `is_var_mutated(node, name)`). This lets `block_licm`
+/// test single-assignment in O(1) per candidate instead of re-walking the whole
+/// loop body per candidate. Deliberately NOT `collect_block_mutated_names`,
+/// which descends more node kinds (CommandCall / NamedArgument / DictLiteral /
+/// TryCatch) than `is_var_mutated` does and would therefore over-report.
+fn collect_licm_mutated_vars(node: &AstNode, out: &mut HashSet<String>) {
+    match node {
+        AstNode::Assignment { target, value, .. } => {
+            if let Some(b) = base_var_of(target) {
+                out.insert(b);
+            }
+            collect_licm_mutated_vars(value, out);
+        }
+        AstNode::FunctionCall {
+            function,
+            arguments,
+            ..
+        } => {
+            if let Some(cn) = call_name(node) {
+                if is_mutator_call_name(cn) {
+                    if let Some(b) = arguments.first().and_then(base_var_of) {
+                        out.insert(b);
+                    }
+                }
+            }
+            collect_licm_mutated_vars(function, out);
+            for a in arguments {
+                collect_licm_mutated_vars(a, out);
+            }
+        }
+        AstNode::VariableDeclaration { value: Some(v), .. } => collect_licm_mutated_vars(v, out),
+        AstNode::Block(stmts) => {
+            for s in stmts {
+                collect_licm_mutated_vars(s, out);
+            }
+        }
+        AstNode::BinaryOperation { left, right, .. } => {
+            collect_licm_mutated_vars(left, out);
+            collect_licm_mutated_vars(right, out);
+        }
+        AstNode::UnaryOperation { operand, .. } => collect_licm_mutated_vars(operand, out),
+        AstNode::IndexAccess { base, index, .. } => {
+            collect_licm_mutated_vars(base, out);
+            collect_licm_mutated_vars(index, out);
+        }
+        AstNode::FieldAccess { object, .. } => collect_licm_mutated_vars(object, out),
+        AstNode::ListLiteral { elements, .. }
+        | AstNode::TupleLiteral(elements)
+        | AstNode::SetLiteral(elements) => {
+            for e in elements {
+                collect_licm_mutated_vars(e, out);
+            }
+        }
+        AstNode::IfExpression {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            collect_licm_mutated_vars(condition, out);
+            collect_licm_mutated_vars(then_branch, out);
+            if let Some(e) = else_branch {
+                collect_licm_mutated_vars(e, out);
+            }
+        }
+        AstNode::WhileLoop {
+            condition, body, ..
+        } => {
+            collect_licm_mutated_vars(condition, out);
+            collect_licm_mutated_vars(body, out);
+        }
+        AstNode::ForLoop { iterable, body, .. } => {
+            collect_licm_mutated_vars(iterable, out);
+            collect_licm_mutated_vars(body, out);
+        }
+        AstNode::Return { value: Some(v), .. } | AstNode::Yield(Some(v)) => {
+            collect_licm_mutated_vars(v, out)
+        }
+        AstNode::DiscardStatement { expression, .. } => collect_licm_mutated_vars(expression, out),
+        _ => {}
+    }
 }
 
 /// Is `node` a pure expression that may be hoisted / deduplicated, given the set
@@ -7612,8 +7854,10 @@ fn expr_is_pure(node: &AstNode, pure_fns: &HashSet<String>) -> bool {
 fn expr_key(expr: &AstNode, out: &mut String) -> bool {
     match expr {
         AstNode::Literal { value, .. } => {
+            use std::fmt::Write as _;
             out.push_str("L(");
-            out.push_str(&format!("{value:?}"));
+            // write! straight into the key buffer (no format! temporary String).
+            let _ = write!(out, "{value:?}");
             out.push(')');
             true
         }
@@ -7721,7 +7965,8 @@ fn stmt_has_effect(node: &AstNode, pure_fns: &HashSet<String>) -> bool {
         }
         let mut effect = false;
         for_each_child(node, &mut |c| {
-            if walk(c, pure_fns) {
+            // Short-circuit: once an effect is found, skip the remaining children.
+            if !effect && walk(c, pure_fns) {
                 effect = true;
             }
         });
@@ -8095,15 +8340,24 @@ fn compute_pure_functions(root: &AstNode) -> HashSet<String> {
     }
     gather(root, &mut funcs);
 
+    // Param taint depends only on (body, params), which the purity fixpoint
+    // never changes — compute it once per function, not once per round.
+    let funcs: Vec<(String, HashSet<String>, &AstNode)> = funcs
+        .into_iter()
+        .map(|(name, params, body)| {
+            let tainted = compute_param_taint(body, &params);
+            (name, tainted, body)
+        })
+        .collect();
+
     let mut pure: HashSet<String> = HashSet::new();
     loop {
         let mut changed = false;
-        for (name, params, body) in &funcs {
+        for (name, tainted, body) in &funcs {
             if pure.contains(name) {
                 continue;
             }
-            let tainted = compute_param_taint(body, params);
-            if !body_has_effect_for_purity(body, &tainted, &pure) {
+            if !body_has_effect_for_purity(body, tainted, &pure) {
                 pure.insert(name.clone());
                 changed = true;
             }
@@ -8222,7 +8476,8 @@ fn body_has_effect_for_purity(
         | AstNode::DiscardStatement { .. } => {
             let mut effect = false;
             for_each_child(node, &mut |c| {
-                if body_has_effect_for_purity(c, tainted, pure_fns) {
+                // Short-circuit: once impure, skip walking the remaining children.
+                if !effect && body_has_effect_for_purity(c, tainted, pure_fns) {
                     effect = true;
                 }
             });
@@ -8262,7 +8517,7 @@ fn loop_with_body(loop_node: AstNode, new_body: Vec<AstNode>) -> AstNode {
 
 /// LICM over one block: pull pure, loop-invariant, single-assignment, read-only
 /// `var x = E` declarations out of each loop in the block to just before it.
-fn block_licm(stmts: Vec<AstNode>, pure_fns: &HashSet<String>) -> Vec<AstNode> {
+fn block_licm(stmts: Vec<AstNode>, pure_fns: &HashSet<String>, changed: &mut bool) -> Vec<AstNode> {
     let mut out: Vec<AstNode> = Vec::with_capacity(stmts.len());
     for stmt in stmts {
         let is_loop = matches!(stmt, AstNode::ForLoop { .. } | AstNode::WhileLoop { .. });
@@ -8288,6 +8543,11 @@ fn block_licm(stmts: Vec<AstNode>, pure_fns: &HashSet<String>) -> Vec<AstNode> {
             }
         }
 
+        // Names the body mutates, computed once (was an O(body) `is_var_mutated`
+        // walk per candidate declaration → O(n²) on large kept-loop bodies).
+        let mut body_mutated: HashSet<String> = HashSet::new();
+        collect_licm_mutated_vars(body, &mut body_mutated);
+
         let mut hoisted: Vec<AstNode> = Vec::new();
         let mut remaining: Vec<AstNode> = Vec::with_capacity(body_stmts.len());
         for s in body_stmts {
@@ -8300,7 +8560,7 @@ fn block_licm(stmts: Vec<AstNode>, pure_fns: &HashSet<String>) -> Vec<AstNode> {
                 let mut refs = HashSet::new();
                 collect_referenced_vars(value, &mut refs);
                 let invariant = refs.iter().all(|r| !variant.contains(r));
-                let single_assignment = !is_var_mutated(body, name);
+                let single_assignment = !body_mutated.contains(name);
                 if invariant && single_assignment && expr_is_pure(value, pure_fns) {
                     hoisted.push(s.clone());
                     continue;
@@ -8312,6 +8572,7 @@ fn block_licm(stmts: Vec<AstNode>, pure_fns: &HashSet<String>) -> Vec<AstNode> {
         if hoisted.is_empty() {
             out.push(stmt);
         } else {
+            *changed = true;
             out.extend(hoisted);
             out.push(loop_with_body(stmt, remaining));
         }
@@ -8359,7 +8620,7 @@ fn collect_block_mutated_names(node: &AstNode, out: &mut HashSet<String>) {
 /// earlier `var a = E'` computed an equivalent pure value that is still valid
 /// (no intervening write to its inputs, no intervening effect) and both `a` and
 /// `b` are never mutated in the block.
-fn block_cse(stmts: Vec<AstNode>, pure_fns: &HashSet<String>) -> Vec<AstNode> {
+fn block_cse(stmts: Vec<AstNode>, pure_fns: &HashSet<String>, changed: &mut bool) -> Vec<AstNode> {
     // Names mutated anywhere in the block, computed once (was an O(n)
     // `is_var_mutated` whole-block walk per statement → O(n²)).
     let mut mutated: HashSet<String> = HashSet::new();
@@ -8381,8 +8642,10 @@ fn block_cse(stmts: Vec<AstNode>, pure_fns: &HashSet<String>) -> Vec<AstNode> {
         // Look up THIS declaration's value before invalidating with its own write;
         // stage any new entry and commit it *after* invalidation (the declaration's
         // own name is in its `writes`, so committing earlier would immediately evict
-        // it — the bug that made CSE a no-op).
-        let mut new_stmt = stmt.clone();
+        // it — the bug that made CSE a no-op). All analysis borrows `stmt`; the
+        // owned value is moved into `out` afterwards (rebuilt only on the rewrite
+        // path — no wholesale clone of the >99% unchanged statements).
+        let mut alias: Option<String> = None;
         let mut staged: Option<(String, String, HashSet<String>)> = None; // (key, name, refs)
         if let AstNode::VariableDeclaration {
             name,
@@ -8395,27 +8658,7 @@ fn block_cse(stmts: Vec<AstNode>, pure_fns: &HashSet<String>) -> Vec<AstNode> {
                 if expr_key(value, &mut key) {
                     if let Some(src) = env.key_to_src.get(&key) {
                         // Replace the redundant computation with an alias to the earlier result.
-                        if let AstNode::VariableDeclaration {
-                            name,
-                            type_annotation,
-                            is_mutable,
-                            is_secret,
-                            location,
-                            ..
-                        } = stmt.clone()
-                        {
-                            new_stmt = AstNode::VariableDeclaration {
-                                name,
-                                type_annotation,
-                                value: Some(Box::new(AstNode::Identifier(
-                                    src.clone(),
-                                    location.clone(),
-                                ))),
-                                is_mutable,
-                                is_secret,
-                                location,
-                            };
-                        }
+                        alias = Some(src.clone());
                     } else {
                         let mut refs = HashSet::new();
                         collect_referenced_vars(value, &mut refs);
@@ -8449,7 +8692,30 @@ fn block_cse(stmts: Vec<AstNode>, pure_fns: &HashSet<String>) -> Vec<AstNode> {
             env.key_to_src.insert(key, name);
         }
 
-        out.push(new_stmt);
+        match (alias, stmt) {
+            (
+                Some(src),
+                AstNode::VariableDeclaration {
+                    name,
+                    type_annotation,
+                    is_mutable,
+                    is_secret,
+                    location,
+                    ..
+                },
+            ) => {
+                *changed = true;
+                out.push(AstNode::VariableDeclaration {
+                    name,
+                    type_annotation,
+                    value: Some(Box::new(AstNode::Identifier(src, location.clone()))),
+                    is_mutable,
+                    is_secret,
+                    location,
+                });
+            }
+            (_, stmt) => out.push(stmt),
+        }
     }
     out
 }
@@ -8466,10 +8732,15 @@ fn transform_licm_cse(node: AstNode, pure_fns: &HashSet<String>) -> AstNode {
             // hoisting exposes (and vice versa) within this block. Each block
             // converges on its own, so the whole program needs only one traversal
             // — no global fixpoint re-traversal (which is what made this pass
-            // superlinear on huge flattened functions).
-            for _ in 0..2 {
-                stmts = block_licm(stmts, pure_fns);
-                stmts = block_cse(stmts, pure_fns);
+            // superlinear on huge flattened functions). The second pass only runs
+            // when the first changed anything: an unchanged pass is deterministic
+            // on unchanged input, so re-running it would reproduce its input.
+            let mut changed = false;
+            stmts = block_licm(stmts, pure_fns, &mut changed);
+            stmts = block_cse(stmts, pure_fns, &mut changed);
+            if changed {
+                stmts = block_licm(stmts, pure_fns, &mut changed);
+                stmts = block_cse(stmts, pure_fns, &mut changed);
             }
             AstNode::Block(stmts)
         }
@@ -8726,11 +8997,14 @@ impl AvailEnv {
 }
 
 /// Recursively apply GVN, threading availability `env` through control flow.
-/// Returns the transformed node and the env flowing out of it.
+/// Returns the transformed node and the env flowing out of it. `changed` is set
+/// exactly when an alias rewrite alters a statement (the only mutation GVN
+/// performs), replacing the old whole-AST clone + deep-eq convergence test.
 fn transform_gvn(
     node: AstNode,
     mut env: AvailEnv,
     pure_fns: &HashSet<String>,
+    changed: &mut bool,
 ) -> (AstNode, AvailEnv) {
     match node {
         AstNode::Block(stmts) => {
@@ -8738,7 +9012,7 @@ fn transform_gvn(
             // so drop block-local names on the way out (prevents aliasing an
             // out-of-scope name). Parent-defined names remain available.
             let dominating = env.dominating_names();
-            let (out_stmts, env_out) = block_gvn(stmts, env, pure_fns);
+            let (out_stmts, env_out) = block_gvn(stmts, env, pure_fns, changed);
             (
                 AstNode::Block(out_stmts),
                 env_out.restrict_to_dominators(&dominating),
@@ -8758,10 +9032,10 @@ fn transform_gvn(
             }
             // Bindings available at branch entry dominate the merge.
             let dominating = env.dominating_names();
-            let (then_b, then_out) = transform_gvn(*then_branch, env.clone(), pure_fns);
+            let (then_b, then_out) = transform_gvn(*then_branch, env.clone(), pure_fns, changed);
             let (else_b, else_out) = match else_branch {
                 Some(e) => {
-                    let (e_b, e_out) = transform_gvn(*e, env.clone(), pure_fns);
+                    let (e_b, e_out) = transform_gvn(*e, env.clone(), pure_fns, changed);
                     (Some(Box::new(e_b)), e_out)
                 }
                 // No else branch: the else path is a no-op, so it contributes the
@@ -8793,7 +9067,7 @@ fn transform_gvn(
             } else {
                 env.restrict_to_invariants(&touched)
             };
-            let (body_b, _) = transform_gvn(*body, body_env, pure_fns);
+            let (body_b, _) = transform_gvn(*body, body_env, pure_fns, changed);
             // Post-loop: drop anything the body/condition may touch.
             env.invalidate(&touched);
             if effect {
@@ -8824,7 +9098,7 @@ fn transform_gvn(
             } else {
                 env.restrict_to_invariants(&touched)
             };
-            let (body_b, _) = transform_gvn(*body, body_env, pure_fns);
+            let (body_b, _) = transform_gvn(*body, body_env, pure_fns, changed);
             env.invalidate(&touched);
             if effect {
                 env.clear();
@@ -8852,7 +9126,7 @@ fn transform_gvn(
         } => {
             // A function body is a fresh scope; the caller's availability is
             // unaffected (matches `block_cse`, which is local per function).
-            let (body_b, _) = transform_gvn(*body, AvailEnv::new(), pure_fns);
+            let (body_b, _) = transform_gvn(*body, AvailEnv::new(), pure_fns, changed);
             (
                 AstNode::FunctionDefinition {
                     name,
@@ -8876,10 +9150,10 @@ fn transform_gvn(
         } => {
             // Exceptions make carried availability unsound; transform the bodies
             // for local effect but discard availability afterwards.
-            let (try_b, _) = transform_gvn(*try_block, env.clone(), pure_fns);
+            let (try_b, _) = transform_gvn(*try_block, env.clone(), pure_fns, changed);
             let mut catches = Vec::with_capacity(catch_clauses.len());
             for c in catch_clauses {
-                let (cb, _) = transform_gvn(*c.body, env.clone(), pure_fns);
+                let (cb, _) = transform_gvn(*c.body, env.clone(), pure_fns, changed);
                 catches.push(crate::ast::CatchClause {
                     body: Box::new(cb),
                     ..c
@@ -8887,7 +9161,7 @@ fn transform_gvn(
             }
             let finally_b = match finally_block {
                 Some(f) => {
-                    let (fb, _) = transform_gvn(*f, env.clone(), pure_fns);
+                    let (fb, _) = transform_gvn(*f, env.clone(), pure_fns, changed);
                     Some(Box::new(fb))
                 }
                 None => None,
@@ -8918,6 +9192,7 @@ fn block_gvn(
     stmts: Vec<AstNode>,
     mut env: AvailEnv,
     pure_fns: &HashSet<String>,
+    changed: &mut bool,
 ) -> (Vec<AstNode>, AvailEnv) {
     // Names mutated anywhere in this block (computed once, as in `block_cse`),
     // so single-assignment is testable in O(1) per statement.
@@ -8938,7 +9213,7 @@ fn block_gvn(
                 | AstNode::TryCatch { .. }
         );
         if is_compound {
-            let (s, env_out) = transform_gvn(stmt, env, pure_fns);
+            let (s, env_out) = transform_gvn(stmt, env, pure_fns, changed);
             env = env_out;
             out.push(s);
             continue;
@@ -8948,7 +9223,9 @@ fn block_gvn(
         // Look up THIS declaration's value before invalidating with its own write;
         // stage any new entry and commit it *after* invalidation (the declaration's
         // own name is in its `writes`, so committing earlier would evict it).
-        let mut new_stmt = stmt.clone();
+        // Analysis borrows `stmt`; the owned value is moved into `out` afterwards
+        // (rebuilt only on the rewrite path — no clone of unchanged statements).
+        let mut alias: Option<String> = None;
         let mut staged: Option<(String, String, HashSet<String>)> = None; // (key, name, refs)
         if let AstNode::VariableDeclaration {
             name,
@@ -8962,24 +9239,7 @@ fn block_gvn(
                     if let Some(src) = env.key_to_src.get(&key).cloned() {
                         // Replace the redundant computation with an alias to the
                         // earlier dominating result.
-                        if let AstNode::VariableDeclaration {
-                            name,
-                            type_annotation,
-                            is_mutable,
-                            is_secret,
-                            location,
-                            ..
-                        } = stmt.clone()
-                        {
-                            new_stmt = AstNode::VariableDeclaration {
-                                name,
-                                type_annotation,
-                                value: Some(Box::new(AstNode::Identifier(src, location.clone()))),
-                                is_mutable,
-                                is_secret,
-                                location,
-                            };
-                        }
+                        alias = Some(src);
                     } else {
                         let mut refs = HashSet::new();
                         collect_referenced_vars(value, &mut refs);
@@ -9000,7 +9260,35 @@ fn block_gvn(
             env.commit(key, name, refs);
         }
 
-        out.push(new_stmt);
+        match (alias, stmt) {
+            (
+                Some(src),
+                AstNode::VariableDeclaration {
+                    name,
+                    type_annotation,
+                    value,
+                    is_mutable,
+                    is_secret,
+                    location,
+                },
+            ) => {
+                let replacement = AstNode::Identifier(src, location.clone());
+                // Matches the old `next == node` convergence test exactly: only a
+                // rewrite that actually alters the value counts as a change.
+                if value.as_deref() != Some(&replacement) {
+                    *changed = true;
+                }
+                out.push(AstNode::VariableDeclaration {
+                    name,
+                    type_annotation,
+                    value: Some(Box::new(replacement)),
+                    is_mutable,
+                    is_secret,
+                    location,
+                });
+            }
+            (_, stmt) => out.push(stmt),
+        }
     }
     (out, env)
 }
@@ -9014,13 +9302,17 @@ pub fn optimize_gvn(node: AstNode) -> AstNode {
     // GVN is alias-only (it never mints fresh names), so a couple of passes reach
     // the fixpoint — bounded here instead of the previous up-to-16x re-traversal,
     // which re-cloned and re-walked the whole AST each iteration (superlinear on a
-    // huge flattened function).
+    // huge flattened function). Convergence is detected by the `changed` flag
+    // (set exactly when an alias rewrite alters a statement) instead of cloning
+    // the whole AST and deep-comparing it: `!changed` implies the pass rebuilt
+    // its input node-for-node, which is what `next == node` used to test.
     for _ in 0..2 {
-        let (next, _) = transform_gvn(node.clone(), AvailEnv::new(), &pure_fns);
-        if next == node {
+        let mut changed = false;
+        let (next, _) = transform_gvn(node, AvailEnv::new(), &pure_fns, &mut changed);
+        node = next;
+        if !changed {
             break;
         }
-        node = next;
     }
     node
 }

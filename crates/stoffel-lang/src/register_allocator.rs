@@ -29,6 +29,14 @@ pub struct InterferenceGraph {
 /// Represents the result of register allocation.
 pub type Allocation = HashMap<VirtualRegister, PhysicalRegister>;
 
+/// Dense allocation result, indexed by `VirtualRegister.0` (VR ids are minted
+/// sequentially by codegen, so the index space has no holes worth hashing over).
+pub type DenseAllocation = Vec<Option<PhysicalRegister>>;
+
+/// Sentinel meaning "no unspillable virtual registers" for the
+/// `unspillable_start` threshold parameter of `linear_scan_partition`.
+pub const NO_UNSPILLABLE: usize = usize::MAX;
+
 /// Error type for allocation failures (e.g., needs spilling).
 #[derive(Debug, Clone)]
 pub enum AllocationError {
@@ -119,53 +127,189 @@ pub fn analyze_liveness_with_liveins(
 }
 
 /// CFG-based liveness with explicit labels (block successors) and live-ins.
-/// Builds basic blocks, runs iterative dataflow to compute live-in/out, then per-instruction liveness,
-/// and finally collapses to single intervals per virtual register.
+/// Legacy map-returning wrapper around `analyze_liveness_cfg_dense`.
 pub fn analyze_liveness_cfg_with_liveins(
     instructions: &[Instruction],
     labels: &HashMap<String, usize>,
     live_in: &[VirtualRegister],
 ) -> HashMap<VirtualRegister, LiveInterval> {
-    use crate::register_allocator::InstructionRegisterAnalysis;
+    analyze_liveness_cfg_dense(instructions, labels, live_in)
+        .iter()
+        .enumerate()
+        .filter_map(|(id, iv)| iv.map(|iv| (VirtualRegister(id), iv)))
+        .collect()
+}
+
+/// Sentinel for an empty operand slot in `InstOps`.
+const NO_REG: u32 = u32::MAX;
+
+/// Per-instruction operands in a fixed shape: at most two uses and one def
+/// (the invariant `uses()`/`defs()` encode with their `vec!` literals). Slots
+/// hold raw VR ids first, then are remapped in place to dense indices.
+#[derive(Clone, Copy)]
+struct InstOps {
+    uses: [u32; 2],
+    def: u32,
+}
+
+/// Allocation-free mirror of `defs()`: the destination register, if any.
+/// Must stay in sync with `InstructionRegisterAnalysis::defs`.
+#[inline]
+pub fn def_reg(inst: &Instruction) -> Option<usize> {
+    match inst {
+        Instruction::LD(r, _)
+        | Instruction::LDI(r, _)
+        | Instruction::MOV(r, _)
+        | Instruction::ADD(r, _, _)
+        | Instruction::SUB(r, _, _)
+        | Instruction::MUL(r, _, _)
+        | Instruction::DIV(r, _, _)
+        | Instruction::MOD(r, _, _)
+        | Instruction::AND(r, _, _)
+        | Instruction::OR(r, _, _)
+        | Instruction::XOR(r, _, _)
+        | Instruction::NOT(r, _)
+        | Instruction::SHL(r, _, _)
+        | Instruction::SHR(r, _, _)
+        | Instruction::LDS(r, _) => Some(*r),
+        Instruction::RET(_)
+        | Instruction::PUSHARG(_)
+        | Instruction::CMP(_, _)
+        | Instruction::STS(_, _)
+        | Instruction::JMP(_)
+        | Instruction::JMPEQ(_)
+        | Instruction::JMPNEQ(_)
+        | Instruction::JMPLT(_)
+        | Instruction::JMPGT(_)
+        | Instruction::CALL(_)
+        | Instruction::NOP => None,
+    }
+}
+
+/// Allocation-free mirror of `uses()`: up to two source registers, in the same
+/// operand order `uses()` returns them. Must stay in sync with
+/// `InstructionRegisterAnalysis::uses`.
+#[inline]
+pub fn use_regs(inst: &Instruction) -> [Option<usize>; 2] {
+    match inst {
+        Instruction::MOV(_, r_src)
+        | Instruction::NOT(_, r_src)
+        | Instruction::RET(r_src)
+        | Instruction::PUSHARG(r_src)
+        | Instruction::STS(_, r_src) => [Some(*r_src), None],
+        Instruction::ADD(_, r1, r2)
+        | Instruction::SUB(_, r1, r2)
+        | Instruction::MUL(_, r1, r2)
+        | Instruction::DIV(_, r1, r2)
+        | Instruction::MOD(_, r1, r2)
+        | Instruction::AND(_, r1, r2)
+        | Instruction::OR(_, r1, r2)
+        | Instruction::XOR(_, r1, r2)
+        | Instruction::SHL(_, r1, r2)
+        | Instruction::SHR(_, r1, r2)
+        | Instruction::CMP(r1, r2) => [Some(*r1), Some(*r2)],
+        Instruction::LD(_, _)
+        | Instruction::LDI(_, _)
+        | Instruction::LDS(_, _)
+        | Instruction::JMP(_)
+        | Instruction::JMPEQ(_)
+        | Instruction::JMPNEQ(_)
+        | Instruction::JMPLT(_)
+        | Instruction::JMPGT(_)
+        | Instruction::CALL(_)
+        | Instruction::NOP => [None, None],
+    }
+}
+
+/// CFG-based liveness with explicit labels (block successors) and live-ins.
+/// Builds basic blocks, runs iterative dataflow to compute live-in/out, then per-instruction liveness,
+/// and finally collapses to single intervals per virtual register.
+///
+/// Returns the intervals as a dense vector indexed by `VirtualRegister.0` (`None`
+/// for ids that never appear), so downstream consumers never hash a VR.
+pub fn analyze_liveness_cfg_dense(
+    instructions: &[Instruction],
+    labels: &HashMap<String, usize>,
+    live_in: &[VirtualRegister],
+) -> Vec<Option<LiveInterval>> {
     let n = instructions.len();
     // Early exit
     if n == 0 {
-        return HashMap::new();
+        return Vec::new();
     }
 
-    // Collect all VRs seen. Each VR gets a dense index so liveness can run over
+    // Decode each instruction's operands exactly once into a fixed-shape record
+    // (`uses()`/`defs()` allocate a Vec per call), tracking the largest VR id in
+    // the same pass. Each VR then gets a dense index so liveness can run over
     // fixed-size bitsets (Vec<u64>) instead of cloning HashSets — the per-instruction
     // HashSet clones were the O(n * live_set) blowup that made large functions
     // (e.g. the vectorized AES circuit) take minutes to compile.
-    let mut all_vrs: HashSet<VirtualRegister> = HashSet::new();
+    let mut inst_ops: Vec<InstOps> = Vec::with_capacity(n);
+    let mut max_vr: Option<usize> = None;
     for inst in instructions.iter() {
-        for u in inst.uses() {
-            all_vrs.insert(u);
+        let mut ops = InstOps {
+            uses: [NO_REG; 2],
+            def: NO_REG,
+        };
+        for (slot, u) in use_regs(inst).into_iter().flatten().enumerate() {
+            max_vr = Some(max_vr.map_or(u, |m| m.max(u)));
+            ops.uses[slot] = u as u32;
         }
-        for d in inst.defs() {
-            all_vrs.insert(d);
+        if let Some(d) = def_reg(inst) {
+            max_vr = Some(max_vr.map_or(d, |m| m.max(d)));
+            ops.def = d as u32;
+        }
+        inst_ops.push(ops);
+    }
+    for &vr in live_in {
+        max_vr = Some(max_vr.map_or(vr.0, |m| m.max(vr.0)));
+    }
+
+    // Dense, deterministic indexing without hashing every virtual register. VR
+    // ids are compiler-generated usize values, so a direct seen table makes this
+    // setup O(instructions + uses/defs + max_vr) instead of spending much of
+    // large-function compile time in HashSet growth and SipHash.
+    let Some(max_vr) = max_vr else {
+        return Vec::new();
+    };
+    // Ids are stored in u32 slots with NO_REG as the sentinel.
+    assert!(max_vr < NO_REG as usize, "virtual register id overflow");
+    let mut seen = vec![false; max_vr.saturating_add(1)];
+    for ops in &inst_ops {
+        for &u in &ops.uses {
+            if u != NO_REG {
+                seen[u as usize] = true;
+            }
+        }
+        if ops.def != NO_REG {
+            seen[ops.def as usize] = true;
         }
     }
     for &vr in live_in {
-        all_vrs.insert(vr);
+        seen[vr.0] = true;
     }
-
-    // Dense, deterministic indexing (sorted so register allocation is reproducible).
-    let mut vrs: Vec<VirtualRegister> = all_vrs.into_iter().collect();
-    vrs.sort_unstable();
+    let mut vrs: Vec<VirtualRegister> = Vec::with_capacity(seen.iter().filter(|&&b| b).count());
+    let mut vr_index_by_id: Vec<u32> = vec![u32::MAX; seen.len()];
+    for (id, is_seen) in seen.into_iter().enumerate() {
+        if is_seen {
+            let dense = vrs.len() as u32;
+            vrs.push(VirtualRegister(id));
+            vr_index_by_id[id] = dense;
+        }
+    }
     let num_vrs = vrs.len();
-    let mut vr_index: HashMap<VirtualRegister, u32> = HashMap::with_capacity(num_vrs);
-    for (i, &vr) in vrs.iter().enumerate() {
-        vr_index.insert(vr, i as u32);
-    }
 
-    // Precompute per-instruction use/def index lists once, so the hot loops below
-    // never re-call uses()/defs() (each allocates a Vec) or hash a VirtualRegister.
-    let mut inst_uses: Vec<Vec<u32>> = Vec::with_capacity(n);
-    let mut inst_defs: Vec<Vec<u32>> = Vec::with_capacity(n);
-    for inst in instructions.iter() {
-        inst_uses.push(inst.uses().iter().map(|u| vr_index[u]).collect());
-        inst_defs.push(inst.defs().iter().map(|d| vr_index[d]).collect());
+    // Remap the operand records from raw ids to dense indices in place, so the
+    // hot loops below never re-decode an instruction or hash a VirtualRegister.
+    for ops in &mut inst_ops {
+        for u in &mut ops.uses {
+            if *u != NO_REG {
+                *u = vr_index_by_id[*u as usize];
+            }
+        }
+        if ops.def != NO_REG {
+            ops.def = vr_index_by_id[ops.def as usize];
+        }
     }
 
     // Bitset over `words` u64 lanes, one bit per dense VR index.
@@ -277,14 +421,17 @@ pub fn analyze_liveness_cfg_with_liveins(
 
     // 3) Compute use/def per block (use = used before being defined within the block).
     for b in &mut blocks {
-        for i in b.start..b.end {
-            for &u in &inst_uses[i] {
+        for &ops in &inst_ops[b.start..b.end] {
+            for &u in &ops.uses {
+                if u == NO_REG {
+                    continue;
+                }
                 if (b.def_bits[(u >> 6) as usize] >> (u & 63)) & 1 == 0 {
                     bit_set(&mut b.use_bits, u);
                 }
             }
-            for &d in &inst_defs[i] {
-                bit_set(&mut b.def_bits, d);
+            if ops.def != NO_REG {
+                bit_set(&mut b.def_bits, ops.def);
             }
         }
     }
@@ -297,7 +444,7 @@ pub fn analyze_liveness_cfg_with_liveins(
     let entry_block = inst2block[0];
     let mut entry_seed = vec![0u64; words];
     for &vr in live_in {
-        bit_set(&mut entry_seed, vr_index[&vr]);
+        bit_set(&mut entry_seed, vr_index_by_id[vr.0]);
     }
     live_in_b[entry_block].copy_from_slice(&entry_seed);
 
@@ -351,9 +498,9 @@ pub fn analyze_liveness_cfg_with_liveins(
     // with the instruction count) and dominated allocation time for very large
     // fully-unrolled/inlined functions; the sparse walk removes it.
     let mut def_first = vec![usize::MAX; num_vrs];
-    for (i, defs) in inst_defs.iter().enumerate() {
-        for &d in defs {
-            let di = d as usize;
+    for (i, ops) in inst_ops.iter().enumerate() {
+        if ops.def != NO_REG {
+            let di = ops.def as usize;
             if i < def_first[di] {
                 def_first[di] = i;
             }
@@ -389,10 +536,14 @@ pub fn analyze_liveness_cfg_with_liveins(
         }
         for i in (block.start..block.end).rev() {
             // `present` is live_out_inst[i]. Step to live_in_inst[i] = (live − defs) ∪ uses.
-            for &d in &inst_defs[i] {
-                present[d as usize] = false;
+            let ops = inst_ops[i];
+            if ops.def != NO_REG {
+                present[ops.def as usize] = false;
             }
-            for &u in &inst_uses[i] {
+            for &u in &ops.uses {
+                if u == NO_REG {
+                    continue;
+                }
                 let ui = u as usize;
                 if !present[ui] {
                     present[ui] = true;
@@ -408,7 +559,7 @@ pub fn analyze_liveness_cfg_with_liveins(
         }
     }
 
-    let mut intervals: HashMap<VirtualRegister, LiveInterval> = HashMap::with_capacity(num_vrs);
+    let mut intervals: Vec<Option<LiveInterval>> = vec![None; max_vr + 1];
     for (vi, &vr) in vrs.iter().enumerate() {
         // A VR with no def is a function live-in (parameter): live from entry, so
         // start at 0 — a conservative interval that is never too short.
@@ -427,7 +578,7 @@ pub fn analyze_liveness_cfg_with_liveins(
         if end <= start {
             end = start + 1;
         }
-        intervals.insert(vr, LiveInterval { start, end });
+        intervals[vr.0] = Some(LiveInterval { start, end });
     }
 
     intervals
@@ -564,7 +715,9 @@ pub fn color_graph(
     let mut sg = graph.clone();
 
     // Start with precolored allocation (e.g., ABI-fixed registers like parameters)
-    let mut allocation: Allocation = precolored.clone();
+    let mut allocation: Allocation =
+        HashMap::with_capacity(graph.nodes.len().max(precolored.len()));
+    allocation.extend(precolored.iter().map(|(&vr, &pr)| (vr, pr)));
     // Remove precolored nodes from the simplification graph so they are not recolored/spilled
     for v in allocation.keys() {
         if sg.nodes.contains(v) {
@@ -712,21 +865,27 @@ pub fn color_graph(
 /// instead of growing without bound:
 /// * `reserve` registers per pool are withheld from *spillable* virtual registers, leaving
 ///   headroom for the short-lived reload/store temporaries that spill lowering introduces.
-/// * VRs in `unspillable` (those reload/store temporaries and the spill-object pointer) are
+/// * Unspillable VRs (those reload/store temporaries and the spill-object pointer) are
 ///   never chosen as spill victims and may use the reserved headroom, so once a value has
 ///   been spilled it never needs to be spilled again.
 ///
 /// Returns the same contract as `color_graph`: a complete allocation, or `NeedsSpilling`
 /// listing the virtual registers to spill.
+///
+/// `intervals` and `secrecy` are dense, indexed by `VirtualRegister.0` (see
+/// `analyze_liveness_cfg_dense`). `unspillable_start` is a threshold: every VR
+/// with `id >= unspillable_start` is unspillable (spill lowering mints its
+/// scratch registers as one contiguous id range at the top of the id space);
+/// pass `NO_UNSPILLABLE` when there are none.
 pub fn linear_scan_partition(
-    intervals: &HashMap<VirtualRegister, LiveInterval>,
+    intervals: &[Option<LiveInterval>],
     k_clear: usize,
     k_secret: usize,
     reserve: usize,
-    secrecy_map: &HashMap<VirtualRegister, bool>,
+    secrecy: &[bool],
     precolored: &HashMap<VirtualRegister, PhysicalRegister>,
-    unspillable: &HashSet<VirtualRegister>,
-) -> Result<Allocation, AllocationError> {
+    unspillable_start: usize,
+) -> Result<DenseAllocation, AllocationError> {
     use std::collections::BTreeSet;
 
     let secret_end = k_clear + k_secret;
@@ -750,14 +909,57 @@ pub fn linear_scan_partition(
         .filter(|r| !reserved.contains(r))
         .collect();
 
-    let mut order: Vec<(VirtualRegister, usize, usize)> = intervals
-        .iter()
-        .filter(|(vr, _)| !precolored.contains_key(vr))
-        .map(|(&vr, iv)| (vr, iv.start, iv.end))
-        .collect();
-    order.sort_unstable_by(|a, b| a.1.cmp(&b.1).then(a.0.cmp(&b.0)));
+    // Candidate list in (start, vr) order via a counting sort by interval start:
+    // starts are instruction indices, and iterating VR ids ascending within each
+    // start bucket reproduces the `sort_unstable_by((start, vr))` order exactly
+    // (each interval's vr is unique, so the tie-break key is the iteration order).
+    let mut is_precolored = vec![false; intervals.len()];
+    for vr in precolored.keys() {
+        if vr.0 < is_precolored.len() {
+            is_precolored[vr.0] = true;
+        }
+    }
+    let mut max_start = 0usize;
+    let mut total = 0usize;
+    for (id, iv) in intervals.iter().enumerate() {
+        if let Some(iv) = iv {
+            if !is_precolored[id] {
+                total += 1;
+                max_start = max_start.max(iv.start);
+            }
+        }
+    }
+    // offsets[s+1] counts intervals starting at s; after the prefix sum, offsets[s]
+    // is the next write position for start s.
+    let mut offsets = vec![0u32; max_start + 2];
+    for (id, iv) in intervals.iter().enumerate() {
+        if let Some(iv) = iv {
+            if !is_precolored[id] {
+                offsets[iv.start + 1] += 1;
+            }
+        }
+    }
+    for s in 1..offsets.len() {
+        offsets[s] += offsets[s - 1];
+    }
+    let mut order: Vec<(VirtualRegister, usize, usize)> = vec![(VirtualRegister(0), 0, 0); total];
+    for (id, iv) in intervals.iter().enumerate() {
+        if let Some(iv) = iv {
+            if !is_precolored[id] {
+                let slot = &mut offsets[iv.start];
+                order[*slot as usize] = (VirtualRegister(id), iv.start, iv.end);
+                *slot += 1;
+            }
+        }
+    }
 
-    let mut allocation: Allocation = precolored.clone();
+    let alloc_len = intervals
+        .len()
+        .max(precolored.keys().map(|vr| vr.0 + 1).max().unwrap_or(0));
+    let mut allocation: DenseAllocation = vec![None; alloc_len];
+    for (&vr, &pr) in precolored.iter() {
+        allocation[vr.0] = Some(pr);
+    }
     let mut spilled: Vec<VirtualRegister> = Vec::new();
     // Currently-assigned intervals: (end, reg, vr). Bounded by the register count, so the
     // linear scans of it below are cheap.
@@ -790,10 +992,10 @@ pub fn linear_scan_partition(
             }
         }
 
-        let is_secret = *secrecy_map
-            .get(&vr)
-            .expect("missing secrecy_map entry for virtual register");
-        let is_unspillable = unspillable.contains(&vr);
+        let is_secret = *secrecy
+            .get(vr.0)
+            .expect("missing secrecy entry for virtual register");
+        let is_unspillable = vr.0 >= unspillable_start;
         let free_len = if is_secret {
             free_secret.len()
         } else {
@@ -812,7 +1014,7 @@ pub fn linear_scan_partition(
             } else {
                 take_lowest(&mut free_clear)
             };
-            allocation.insert(vr, PhysicalRegister(reg));
+            allocation[vr.0] = Some(PhysicalRegister(reg));
             active.push((end, reg, vr));
             continue;
         }
@@ -821,7 +1023,7 @@ pub fn linear_scan_partition(
         let mut victim: Option<usize> = None;
         for (idx, a) in active.iter().enumerate() {
             if classify(a.1) == Some(is_secret)
-                && !unspillable.contains(&a.2)
+                && a.2 .0 < unspillable_start
                 && victim.is_none_or(|best: usize| a.0 > active[best].0)
             {
                 victim = Some(idx);
@@ -834,8 +1036,8 @@ pub fn linear_scan_partition(
                 Some(idx) => {
                     let stolen_reg = active[idx].1;
                     spilled.push(active[idx].2);
-                    allocation.remove(&active[idx].2);
-                    allocation.insert(vr, PhysicalRegister(stolen_reg));
+                    allocation[active[idx].2 .0] = None;
+                    allocation[vr.0] = Some(PhysicalRegister(stolen_reg));
                     active[idx] = (end, stolen_reg, vr);
                 }
                 None => return Err(AllocationError::PoolExhausted(vr, is_secret)),
@@ -847,8 +1049,8 @@ pub fn linear_scan_partition(
                 Some(idx) if active[idx].0 > end => {
                     let stolen_reg = active[idx].1;
                     spilled.push(active[idx].2);
-                    allocation.remove(&active[idx].2);
-                    allocation.insert(vr, PhysicalRegister(stolen_reg));
+                    allocation[active[idx].2 .0] = None;
+                    allocation[vr.0] = Some(PhysicalRegister(stolen_reg));
                     active[idx] = (end, stolen_reg, vr);
                 }
                 _ => spilled.push(vr),
@@ -871,7 +1073,35 @@ pub fn rewrite_instructions(
     instructions: &[Instruction],
     allocation: &Allocation,
 ) -> Vec<Instruction> {
-    use crate::register_allocator::InstructionRegisterAnalysis;
+    let map_reg = |vr: usize| {
+        allocation
+            .get(&VirtualRegister(vr))
+            .expect("Virtual register not found in allocation map during rewrite")
+            .0
+    };
+    rewrite_instructions_with(instructions, &map_reg)
+}
+
+/// Dense-allocation variant of `rewrite_instructions` (see `DenseAllocation`).
+pub fn rewrite_instructions_dense(
+    instructions: &[Instruction],
+    allocation: &[Option<PhysicalRegister>],
+) -> Vec<Instruction> {
+    let map_reg = |vr: usize| {
+        allocation
+            .get(vr)
+            .copied()
+            .flatten()
+            .expect("Virtual register not found in allocation map during rewrite")
+            .0
+    };
+    rewrite_instructions_with(instructions, &map_reg)
+}
+
+fn rewrite_instructions_with(
+    instructions: &[Instruction],
+    map_reg: &dyn Fn(usize) -> usize,
+) -> Vec<Instruction> {
     let mut out: Vec<Instruction> = Vec::with_capacity(instructions.len());
     let mut last_was_call = false;
     for inst in instructions.iter() {
@@ -880,10 +1110,7 @@ pub fn rewrite_instructions(
             // If src is virtual register 0 in the IR, it was intended to mean ABI R0.
             // Emit MOV(dest_phys, 0) using physical R0 for the source.
             Instruction::MOV(dest_vr, src_vr) if last_was_call && *src_vr == 0 => {
-                let dest_pr = allocation
-                    .get(&VirtualRegister(*dest_vr))
-                    .expect("Virtual register not found in allocation map during rewrite (MOV dest after CALL)")
-                    .0;
+                let dest_pr = map_reg(*dest_vr);
                 out.push(Instruction::MOV(dest_pr, 0));
                 last_was_call = false; // handled
                 continue;
@@ -891,7 +1118,7 @@ pub fn rewrite_instructions(
             _ => {}
         }
         // Default remapping path
-        let rewritten = inst.remap_registers(allocation);
+        let rewritten = remap_instruction_with(inst, map_reg);
         last_was_call = matches!(inst, Instruction::CALL(_));
         out.push(rewritten);
     }
@@ -987,60 +1214,60 @@ impl InstructionRegisterAnalysis for Instruction {
                 .expect("Virtual register not found in allocation map during rewrite")
                 .0
         }; // Get the usize physical register index
+        remap_instruction_with(self, &map_reg)
+    }
+}
 
-        match *self {
-            Instruction::LD(vr_dest, offset) => Instruction::LD(map_reg(vr_dest), offset),
-            Instruction::LDI(vr_dest, ref val) => Instruction::LDI(map_reg(vr_dest), val.clone()),
-            Instruction::MOV(vr_dest, vr_src) => {
-                Instruction::MOV(map_reg(vr_dest), map_reg(vr_src))
-            }
-            Instruction::ADD(vr_dest, vr1, vr2) => {
-                Instruction::ADD(map_reg(vr_dest), map_reg(vr1), map_reg(vr2))
-            }
-            Instruction::SUB(vr_dest, vr1, vr2) => {
-                Instruction::SUB(map_reg(vr_dest), map_reg(vr1), map_reg(vr2))
-            }
-            Instruction::MUL(vr_dest, vr1, vr2) => {
-                Instruction::MUL(map_reg(vr_dest), map_reg(vr1), map_reg(vr2))
-            }
-            Instruction::DIV(vr_dest, vr1, vr2) => {
-                Instruction::DIV(map_reg(vr_dest), map_reg(vr1), map_reg(vr2))
-            }
-            Instruction::MOD(vr_dest, vr1, vr2) => {
-                Instruction::MOD(map_reg(vr_dest), map_reg(vr1), map_reg(vr2))
-            }
-            Instruction::AND(vr_dest, vr1, vr2) => {
-                Instruction::AND(map_reg(vr_dest), map_reg(vr1), map_reg(vr2))
-            }
-            Instruction::OR(vr_dest, vr1, vr2) => {
-                Instruction::OR(map_reg(vr_dest), map_reg(vr1), map_reg(vr2))
-            }
-            Instruction::XOR(vr_dest, vr1, vr2) => {
-                Instruction::XOR(map_reg(vr_dest), map_reg(vr1), map_reg(vr2))
-            }
-            Instruction::NOT(vr_dest, vr_src) => {
-                Instruction::NOT(map_reg(vr_dest), map_reg(vr_src))
-            }
-            Instruction::SHL(vr_dest, vr1, vr2) => {
-                Instruction::SHL(map_reg(vr_dest), map_reg(vr1), map_reg(vr2))
-            }
-            Instruction::SHR(vr_dest, vr1, vr2) => {
-                Instruction::SHR(map_reg(vr_dest), map_reg(vr1), map_reg(vr2))
-            }
-            Instruction::CMP(vr1, vr2) => Instruction::CMP(map_reg(vr1), map_reg(vr2)),
-            Instruction::RET(vr_src) => Instruction::RET(map_reg(vr_src)),
-            Instruction::PUSHARG(vr_src) => Instruction::PUSHARG(map_reg(vr_src)),
-            // Spill-slot ops: remap the register operand, leave the slot index as-is.
-            Instruction::LDS(vr_dest, slot) => Instruction::LDS(map_reg(vr_dest), slot),
-            Instruction::STS(slot, vr_src) => Instruction::STS(slot, map_reg(vr_src)),
-            // Instructions without registers remain the same
-            Instruction::JMP(ref label) => Instruction::JMP(label.clone()),
-            Instruction::JMPEQ(ref label) => Instruction::JMPEQ(label.clone()),
-            Instruction::JMPNEQ(ref label) => Instruction::JMPNEQ(label.clone()),
-            Instruction::JMPLT(ref label) => Instruction::JMPLT(label.clone()),
-            Instruction::JMPGT(ref label) => Instruction::JMPGT(label.clone()),
-            Instruction::CALL(ref name) => Instruction::CALL(name.clone()),
-            Instruction::NOP => Instruction::NOP,
+/// Rebuilds `inst` with every register operand passed through `map_reg`.
+fn remap_instruction_with(inst: &Instruction, map_reg: &dyn Fn(usize) -> usize) -> Instruction {
+    match *inst {
+        Instruction::LD(vr_dest, offset) => Instruction::LD(map_reg(vr_dest), offset),
+        Instruction::LDI(vr_dest, ref val) => Instruction::LDI(map_reg(vr_dest), val.clone()),
+        Instruction::MOV(vr_dest, vr_src) => Instruction::MOV(map_reg(vr_dest), map_reg(vr_src)),
+        Instruction::ADD(vr_dest, vr1, vr2) => {
+            Instruction::ADD(map_reg(vr_dest), map_reg(vr1), map_reg(vr2))
         }
+        Instruction::SUB(vr_dest, vr1, vr2) => {
+            Instruction::SUB(map_reg(vr_dest), map_reg(vr1), map_reg(vr2))
+        }
+        Instruction::MUL(vr_dest, vr1, vr2) => {
+            Instruction::MUL(map_reg(vr_dest), map_reg(vr1), map_reg(vr2))
+        }
+        Instruction::DIV(vr_dest, vr1, vr2) => {
+            Instruction::DIV(map_reg(vr_dest), map_reg(vr1), map_reg(vr2))
+        }
+        Instruction::MOD(vr_dest, vr1, vr2) => {
+            Instruction::MOD(map_reg(vr_dest), map_reg(vr1), map_reg(vr2))
+        }
+        Instruction::AND(vr_dest, vr1, vr2) => {
+            Instruction::AND(map_reg(vr_dest), map_reg(vr1), map_reg(vr2))
+        }
+        Instruction::OR(vr_dest, vr1, vr2) => {
+            Instruction::OR(map_reg(vr_dest), map_reg(vr1), map_reg(vr2))
+        }
+        Instruction::XOR(vr_dest, vr1, vr2) => {
+            Instruction::XOR(map_reg(vr_dest), map_reg(vr1), map_reg(vr2))
+        }
+        Instruction::NOT(vr_dest, vr_src) => Instruction::NOT(map_reg(vr_dest), map_reg(vr_src)),
+        Instruction::SHL(vr_dest, vr1, vr2) => {
+            Instruction::SHL(map_reg(vr_dest), map_reg(vr1), map_reg(vr2))
+        }
+        Instruction::SHR(vr_dest, vr1, vr2) => {
+            Instruction::SHR(map_reg(vr_dest), map_reg(vr1), map_reg(vr2))
+        }
+        Instruction::CMP(vr1, vr2) => Instruction::CMP(map_reg(vr1), map_reg(vr2)),
+        Instruction::RET(vr_src) => Instruction::RET(map_reg(vr_src)),
+        Instruction::PUSHARG(vr_src) => Instruction::PUSHARG(map_reg(vr_src)),
+        // Spill-slot ops: remap the register operand, leave the slot index as-is.
+        Instruction::LDS(vr_dest, slot) => Instruction::LDS(map_reg(vr_dest), slot),
+        Instruction::STS(slot, vr_src) => Instruction::STS(slot, map_reg(vr_src)),
+        // Instructions without registers remain the same
+        Instruction::JMP(ref label) => Instruction::JMP(label.clone()),
+        Instruction::JMPEQ(ref label) => Instruction::JMPEQ(label.clone()),
+        Instruction::JMPNEQ(ref label) => Instruction::JMPNEQ(label.clone()),
+        Instruction::JMPLT(ref label) => Instruction::JMPLT(label.clone()),
+        Instruction::JMPGT(ref label) => Instruction::JMPGT(label.clone()),
+        Instruction::CALL(ref name) => Instruction::CALL(name.clone()),
+        Instruction::NOP => Instruction::NOP,
     }
 }
