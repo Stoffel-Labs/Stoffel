@@ -130,18 +130,3 @@ jobs:
             ghcr.io/stoffel-labs/stoffelvm:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
-
-  # Trigger integration tests when pushing to main
-  trigger-integration-tests:
-    name: Trigger Integration Tests
-    needs: [build-and-test]
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger integration tests
-        uses: peter-evans/repository-dispatch@v3
-        with:
-          token: ${{ secrets.INTEGRATION_TESTS_PAT }}
-          repository: Stoffel-Labs/integration-tests
-          event-type: stoffel-vm-updated
-          client-payload: '{"ref": "${{ github.sha }}", "branch": "${{ github.ref_name }}"}'
