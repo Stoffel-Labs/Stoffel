@@ -1216,7 +1216,7 @@ async fn round_gate_run(
     source: &str,
     level: u8,
     client_inputs: &[(usize, Vec<stoffel_vm::ClientShare>)],
-) -> (usize, Vec<i64>, LeverMetrics) {
+) -> Result<(usize, Vec<i64>, LeverMetrics), String> {
     let options = stoffellang::CompilerOptions {
         optimize: level > 0,
         optimization_level: level,
@@ -1224,9 +1224,11 @@ async fn round_gate_run(
         ..Default::default()
     };
     let compiled = stoffellang::compile(source, "<round-gate>", &options)
-        .unwrap_or_else(|e| panic!("compile at -O{level}: {e:?}"));
+        .map_err(|e| format!("compile at -O{level}: {e:?}"))?;
     let binary = stoffellang::convert_to_binary(&compiled);
-    let functions = binary.try_to_vm_functions().expect("vm functions");
+    let functions = binary
+        .try_to_vm_functions()
+        .map_err(|e| format!("vm functions at -O{level}: {e:?}"))?;
 
     let engine = Arc::new(CountingEngine::default());
     let mut vm = VirtualMachine::builder()
@@ -1234,7 +1236,7 @@ async fn round_gate_run(
         .build();
     for function in functions {
         vm.try_register_function(function)
-            .expect("register function");
+            .map_err(|e| format!("register function at -O{level}: {e:?}"))?;
     }
     for (client_id, shares) in client_inputs {
         vm.store_client_shares(*client_id, shares.clone());
@@ -1243,25 +1245,30 @@ async fn round_gate_run(
     let result = vm
         .execute_async("main", engine.as_ref())
         .await
-        .unwrap_or_else(|e| panic!("execute at -O{level}: {e:?}"));
+        .map_err(|e| format!("execute at -O{level}: {e:?}"))?;
     let Value::Array(result_ref) = result else {
-        panic!("main should return an array, got something else");
+        return Err(format!("main should return an array at -O{level}"));
     };
     let mut out = Vec::new();
-    for index in 0..vm.read_array_len(result_ref).expect("result length") {
+    let result_len = vm
+        .read_array_len(result_ref)
+        .map_err(|e| format!("result length at -O{level}: {e:?}"))?;
+    for index in 0..result_len {
         let value = vm
             .read_table_field(TableRef::from(result_ref), &Value::I64(index as i64))
-            .expect("read byte")
-            .expect("byte present");
+            .map_err(|e| format!("read byte at -O{level}: {e:?}"))?
+            .ok_or_else(|| format!("byte {index} missing at -O{level}"))?;
         let Value::I64(byte) = value else {
-            panic!("output byte should be int64, got {value:?}");
+            return Err(format!(
+                "output byte should be int64 at -O{level}, got {value:?}"
+            ));
         };
         out.push(byte);
     }
 
     let (scalar, batch_calls, _items) = engine.counts();
     let (public_operand_muls, both_public_muls, mul_depth) = engine.lever_b_counts();
-    (
+    Ok((
         scalar + batch_calls,
         out,
         LeverMetrics {
@@ -1269,7 +1276,7 @@ async fn round_gate_run(
             both_public_muls,
             mul_depth,
         },
-    )
+    ))
 }
 
 // Heavy measurement harness (compiles + runs AES/CTR/CBC at O0/O2/O3): run
@@ -1316,26 +1323,38 @@ async fn round_gate_impl() {
 
     for (label, source, inputs, expected) in &programs {
         for level in [0u8, 2, 3] {
-            let (mul_rounds, output, lever) = round_gate_run(source, level, inputs).await;
-            let correct = output == *expected;
-            // The stable, machine-parseable gate line.
-            println!("ROUNDGATE {label} O{level} mul_rounds={mul_rounds} correct={correct}");
-            // Lever-B headroom: multiplies whose `ab` term has a public-literal
-            // operand (could become a local `mul_scalar`). `both_public` is the
-            // fully-constant-foldable subset.
-            println!(
-                "PUBMUL {label} O{level} public_operand_muls={} both_public={}",
-                lever.public_operand_muls, lever.both_public_muls
-            );
-            // Critical-path multiply depth = theoretical round floor.
-            println!("MULDEPTH {label} O{level} mul_depth={}", lever.mul_depth);
-            if !correct {
-                eprintln!(
-                    "ROUNDGATE {label} O{level} MISMATCH: got {output:?}, expected {expected:?}"
-                );
-            }
-            if *label == "AES" && !correct {
-                aes_all_correct = false;
+            match round_gate_run(source, level, inputs).await {
+                Ok((mul_rounds, output, lever)) => {
+                    let correct = output == *expected;
+                    // The stable, machine-parseable gate line.
+                    println!(
+                        "ROUNDGATE {label} O{level} mul_rounds={mul_rounds} correct={correct}"
+                    );
+                    // Lever-B headroom: multiplies whose `ab` term has a public-literal
+                    // operand (could become a local `mul_scalar`). `both_public` is the
+                    // fully-constant-foldable subset.
+                    println!(
+                        "PUBMUL {label} O{level} public_operand_muls={} both_public={}",
+                        lever.public_operand_muls, lever.both_public_muls
+                    );
+                    // Critical-path multiply depth = theoretical round floor.
+                    println!("MULDEPTH {label} O{level} mul_depth={}", lever.mul_depth);
+                    if !correct {
+                        eprintln!(
+                            "ROUNDGATE {label} O{level} MISMATCH: got {output:?}, expected {expected:?}"
+                        );
+                    }
+                    if *label == "AES" && !correct {
+                        aes_all_correct = false;
+                    }
+                }
+                Err(error) => {
+                    println!("ROUNDGATE {label} O{level} mul_rounds=ERR correct=false");
+                    eprintln!("ROUNDGATE {label} O{level} ERROR: {error}");
+                    if *label == "AES" {
+                        aes_all_correct = false;
+                    }
+                }
             }
         }
     }
@@ -1376,7 +1395,7 @@ async fn histogram_run(
     source: &str,
     level: u8,
     client_inputs: &[(usize, Vec<stoffel_vm::ClientShare>)],
-) -> (usize, Vec<i64>, Vec<PairRecord>) {
+) -> Result<(usize, Vec<i64>, Vec<PairRecord>), String> {
     let options = stoffellang::CompilerOptions {
         optimize: level > 0,
         optimization_level: level,
@@ -1384,9 +1403,11 @@ async fn histogram_run(
         ..Default::default()
     };
     let compiled = stoffellang::compile(source, "<histogram>", &options)
-        .unwrap_or_else(|e| panic!("compile at -O{level}: {e:?}"));
+        .map_err(|e| format!("compile at -O{level}: {e:?}"))?;
     let binary = stoffellang::convert_to_binary(&compiled);
-    let functions = binary.try_to_vm_functions().expect("vm functions");
+    let functions = binary
+        .try_to_vm_functions()
+        .map_err(|e| format!("vm functions at -O{level}: {e:?}"))?;
 
     let engine = Arc::new(CountingEngine::default());
     let mut vm = VirtualMachine::builder()
@@ -1394,7 +1415,7 @@ async fn histogram_run(
         .build();
     for function in functions {
         vm.try_register_function(function)
-            .expect("register function");
+            .map_err(|e| format!("register function at -O{level}: {e:?}"))?;
     }
     for (client_id, shares) in client_inputs {
         vm.store_client_shares(*client_id, shares.clone());
@@ -1403,23 +1424,28 @@ async fn histogram_run(
     let result = vm
         .execute_async("main", engine.as_ref())
         .await
-        .unwrap_or_else(|e| panic!("execute at -O{level}: {e:?}"));
+        .map_err(|e| format!("execute at -O{level}: {e:?}"))?;
     let Value::Array(result_ref) = result else {
-        panic!("main should return an array");
+        return Err(format!("main should return an array at -O{level}"));
     };
     let mut out = Vec::new();
-    for index in 0..vm.read_array_len(result_ref).expect("result length") {
+    let result_len = vm
+        .read_array_len(result_ref)
+        .map_err(|e| format!("result length at -O{level}: {e:?}"))?;
+    for index in 0..result_len {
         let value = vm
             .read_table_field(TableRef::from(result_ref), &Value::I64(index as i64))
-            .expect("read byte")
-            .expect("byte present");
+            .map_err(|e| format!("read byte at -O{level}: {e:?}"))?
+            .ok_or_else(|| format!("byte {index} missing at -O{level}"))?;
         let Value::I64(byte) = value else {
-            panic!("output byte should be int64, got {value:?}");
+            return Err(format!(
+                "output byte should be int64 at -O{level}, got {value:?}"
+            ));
         };
         out.push(byte);
     }
     let (scalar, batch_calls, _items) = engine.counts();
-    (scalar + batch_calls, out, engine.pair_log_snapshot())
+    Ok((scalar + batch_calls, out, engine.pair_log_snapshot()))
 }
 
 fn print_depth_histogram(label: &str, rounds: usize, correct: bool, log: &[PairRecord]) {
@@ -1521,9 +1547,15 @@ async fn round_histogram_impl() {
     ];
 
     for (label, source, inputs, expected) in &programs {
-        let (rounds, output, log) = histogram_run(source, 3, inputs).await;
-        let correct = output == *expected;
-        print_depth_histogram(label, rounds, correct, &log);
+        match histogram_run(source, 3, inputs).await {
+            Ok((rounds, output, log)) => {
+                let correct = output == *expected;
+                print_depth_histogram(label, rounds, correct, &log);
+            }
+            Err(error) => {
+                println!("HIST {label} O3 rounds=ERR correct=false error={error}");
+            }
+        }
     }
 }
 
@@ -1627,6 +1659,47 @@ async fn loop_carried_spill_slot_reloads_are_correct_impl() {
         assert_eq!(
             result, baseline,
             "-O{level} disagrees with -O0 on the loop-carried spilled accumulator"
+        );
+    }
+}
+
+/// Regression test for the CTR-only -O3 SROA empty-husk crash.
+///
+/// SROA (`scalarize_local_arrays`) deletes the `append` builder calls of a
+/// scalar-backed local list, emitting a length-0 array and substituting each
+/// constant-index read with the captured element. The bug: when a scalar-backed
+/// list's handle is *aliased* under a new name (`var counter = initial_counter`)
+/// or *captured* into another list, the empty-husk handle escaped into a sibling
+/// block (an inlined callee body scalarized in its own per-block pass) where it
+/// was read as a real, length-0 array — faulting at runtime with
+/// `get_field: array index 0 out of range (length 0)`. The name-keyed demotion
+/// machinery never saw the cross-block read. The fix demotes a scalar-backed
+/// source whenever its bare handle can escape via such an alias/capture
+/// (fail-closed: the real array is rebuilt), leaving the MPC round structure
+/// untouched.
+///
+/// This self-contained program exercises exactly that shape: CTR keystream with
+/// a loop-carried `counter` alias, `list.insert(0, ...)`-built blocks, and
+/// nested flatten/regroup lists — then encrypts and decrypts, so `main` must
+/// round-trip back to the plaintext `[16..=31]` at every optimization level.
+/// Before the fix it crashed at -O3 while -O0/-O2 were correct.
+const CTR_SROA_HUSK_SRC: &str = include_str!("data/ctr_sroa_husk.stfl");
+
+#[test]
+fn ctr_sroa_husk_o3_matches_o0() {
+    run_on_large_stack(ctr_sroa_husk_o3_matches_o0_impl());
+}
+
+async fn ctr_sroa_husk_o3_matches_o0_impl() {
+    let inputs: Vec<(usize, Vec<stoffel_vm::ClientShare>)> = Vec::new();
+    let expected: Vec<i64> = (16..=31).collect();
+    for level in [0u8, 2u8, 3u8] {
+        let out = round_gate_run(CTR_SROA_HUSK_SRC, level, &inputs)
+            .await
+            .unwrap_or_else(|e| panic!("CTR SROA husk repro failed at -O{level}: {e}"));
+        assert_eq!(
+            out.1, expected,
+            "-O{level} CTR keystream round-trip diverged (SROA empty-husk regression)"
         );
     }
 }

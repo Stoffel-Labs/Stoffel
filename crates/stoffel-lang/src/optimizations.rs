@@ -9777,6 +9777,7 @@ struct Sroa {
     /// First bound name per state id (diagnostics only; populated when
     /// tracing).
     state_names: Vec<String>,
+    replay_diverged: bool,
     out: Vec<AstNode>,
 }
 
@@ -9866,6 +9867,7 @@ impl Sroa {
             ints: HashMap::new(),
             trace: (analyze && sroa_trace_enabled()).then(Vec::new),
             state_names: Vec::new(),
+            replay_diverged: false,
             out: Vec::new(),
         }
     }
@@ -9886,14 +9888,10 @@ impl Sroa {
     }
 
     fn demote_id(&mut self, id: usize, cause: &'static str) {
-        // The REWRITE replay must never discover a NEW demotion: ANALYZE saw
-        // the identical walk and already recorded it (REWRITE captures only a
-        // subset of ANALYZE's element-source names, so its demote triggers are
-        // a subset too).
-        debug_assert!(
-            self.analyze || self.demoted.contains(&id),
-            "SROA replay divergence: rewrite-phase demotion of state {id} ({cause})"
-        );
+        if !self.analyze && !self.demoted.contains(&id) {
+            self.replay_diverged = true;
+            return;
+        }
         if let Some(trace) = &mut self.trace {
             if !self.demoted.contains(&id) {
                 let name = self.state_names.get(id).cloned().unwrap_or_default();
@@ -9914,10 +9912,10 @@ impl Sroa {
                 trace.push((cause, name));
             }
         }
-        debug_assert!(
-            self.analyze || demoted,
-            "SROA replay divergence: rewrite-phase demotion of state {id} ({cause})"
-        );
+        if !self.analyze && !demoted {
+            self.replay_diverged = true;
+            return;
+        }
         self.demoted.insert(id);
     }
 
@@ -10014,9 +10012,25 @@ impl Sroa {
                 !o.literal_backed || o.husk
             };
             self.demote_edges.push((st_id, other.borrow().id));
-            if fragile && st.borrow().literal_backed {
-                // The capturer's emitted literal now holds a husk element.
-                st.borrow_mut().husk = true;
+            if fragile {
+                if st.borrow().literal_backed {
+                    // The capturer's emitted literal now holds a husk element.
+                    st.borrow_mut().husk = true;
+                } else {
+                    // Scalar-backed capturer: it is scalarized rather than kept
+                    // real, so the capture edge (which fires only if the
+                    // capturer is demoted) never restores the source, and the
+                    // husk flag guards only literal-backed capturers. A
+                    // constant-index read of the capturer hands out this
+                    // scalar-backed source's bare handle, which can escape into
+                    // a sibling block (e.g. an inlined callee body scalarized in
+                    // its own pass) and be dereferenced there as a length-0
+                    // array. Demote the source now (fail-closed): its real
+                    // array is rebuilt, so any escaping handle is non-empty.
+                    // This only turns extra array plumbing real; the MPC round
+                    // structure is untouched.
+                    self.demote(&other, "captured-fragile");
+                }
             }
         }
     }
@@ -10408,7 +10422,23 @@ impl Sroa {
                 let rhs_int = self.ints.get(rhs).copied();
                 self.rebind(name);
                 if let Some(st) = rhs_state {
-                    self.env.insert(name.to_string(), st);
+                    if st.borrow().literal_backed {
+                        self.env.insert(name.to_string(), st);
+                    } else {
+                        // Aliasing a scalar-backed (empty-husk-backed) list
+                        // under a new name lets that handle flow wherever the
+                        // alias goes. The inliner emits exactly this for a
+                        // list-returning callee (`var caller = callee_local`),
+                        // so the alias routinely crosses into a sibling block
+                        // that was scalarized in its own pass and reads the
+                        // handle as a real (length-0) array. The per-block model
+                        // cannot see that read, and neither the capture edge nor
+                        // the husk flag covers a bare alias, so demote the
+                        // source (fail-closed: its real array is kept). A
+                        // literal-backed list is already real and faithful, so
+                        // aliasing it stays safe.
+                        self.demote(&st, "alias-escape");
+                    }
                 }
                 if let Some(v) = rhs_int {
                     self.ints.insert(name.to_string(), v);
@@ -10438,9 +10468,17 @@ impl Sroa {
                 if let AstNode::Identifier(rhs, _) = &v2 {
                     // Substitution resolved the value to a tracked list (e.g.
                     // `var q = z[0]` -> `var q = g`): join the alias group so
-                    // later hazards through `q` demote the whole group.
+                    // later hazards through `q` demote the whole group. A
+                    // scalar-backed source, however, is an empty husk whose
+                    // handle now escapes under `name` and can be read in a
+                    // sibling block (same cross-block hole as the bare-alias
+                    // arm above), so demote it instead of aliasing.
                     if let Some(st) = self.tracked(rhs) {
-                        self.env.insert(name.to_string(), st);
+                        if st.borrow().literal_backed {
+                            self.env.insert(name.to_string(), st);
+                        } else {
+                            self.demote(&st, "alias-escape");
+                        }
                     }
                 }
                 Some(v2)
@@ -10680,6 +10718,7 @@ fn scalarize_block(stmts: Vec<AstNode>) -> Vec<AstNode> {
     let mut demoted = analyzer.demoted;
     let edges = analyzer.demote_edges;
     let direct_demotions = demoted.len();
+
     loop {
         let mut changed = false;
         for (a, b) in &edges {
@@ -10691,6 +10730,7 @@ fn scalarize_block(stmts: Vec<AstNode>) -> Vec<AstNode> {
             break;
         }
     }
+
     if let Some(trace) = &analyzer.trace {
         if analyzer.next_id >= 100 {
             let mut counts: HashMap<(&str, String), usize> = HashMap::new();
@@ -10715,7 +10755,12 @@ fn scalarize_block(stmts: Vec<AstNode>) -> Vec<AstNode> {
         }
     }
     let mut rewriter = Sroa::new(false, demoted);
-    rewriter.run(&stmts)
+    let rewritten = rewriter.run(&stmts);
+    if rewriter.replay_diverged {
+        stmts
+    } else {
+        rewritten
+    }
 }
 
 /// -O3 entry point: structurally recurse, scalarizing each block's local
