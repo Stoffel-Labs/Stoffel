@@ -154,8 +154,9 @@ struct CodeGenerator {
     current_labels: HashMap<String, usize>,
     // Counter for allocating new virtual registers.
     next_virtual_reg: usize,
-    // Tracks the required secrecy for each virtual register. True = Secret.
-    vr_secrecy: HashMap<VirtualRegister, bool>,
+    // Tracks the required secrecy for each virtual register, indexed by VR id
+    // (VRs are minted sequentially from 0). True = Secret.
+    vr_secrecy: Vec<bool>,
     // Variable symbol table (maps name to VirtualRegister index). Local to the current scope.
     symbol_table: HashMap<String, usize>,
     // Source-level types for variables in this scope.
@@ -186,6 +187,130 @@ struct CodeGenerator {
     active_loop_bounds: Vec<(String, u64)>,
     /// (continue_label, break_label) for each enclosing loop, innermost last
     loop_label_stack: Vec<(String, String)>,
+    /// Optimization level compilation runs at (0 when the optimizer is off). Gates
+    /// the codegen-side spill-traffic passes so -O0 output stays byte-identical.
+    opt_level: u8,
+}
+
+/// Kill-switch for the opt-level >= 1 spill-traffic passes (the slot-reload cache in
+/// `lower_spills_into_slots` and post-RA self-MOV elimination): set
+/// `STOFFEL_SPILL_CACHE=0` to disable both for A/B comparisons.
+fn spill_opt_enabled() -> bool {
+    std::env::var("STOFFEL_SPILL_CACHE").map_or(true, |v| v != "0")
+}
+
+/// Debug hook: set `STOFFEL_SPILL_STATS=1` to print per-function spill-lowering
+/// statistics (rounds, slots, reload cache hit/miss per bank, self-MOVs removed).
+fn spill_stats_enabled() -> bool {
+    std::env::var("STOFFEL_SPILL_STATS").is_ok()
+}
+
+#[derive(Default, Debug)]
+struct SpillLoweringStats {
+    rounds: usize,
+    spill_slots: usize,
+    /// Reloads served from a cached scratch register, per bank ([clear, secret]).
+    reload_hits: [usize; 2],
+    /// Reloads that had to emit an `LDS`, per bank ([clear, secret]).
+    reload_misses: [usize; 2],
+    spilled_defs: usize,
+}
+
+/// Cached scratch registers per bank; kept strictly below `SPILL_RESERVE` minus the
+/// per-instruction transient scratches (2 reloads + 1 store = 3), so every unspillable
+/// scratch always finds a home: 2 cached + 3 transient = 5 < 6.
+const SPILL_SLOT_CACHE_CAPACITY: usize = 2;
+
+/// Tiny per-bank LRU mapping spill slot -> scratch VR currently holding that slot's
+/// value within the current basic block (see `lower_spills_into_slots`).
+#[derive(Default)]
+struct SpillSlotCache {
+    /// `[clear, secret]`; entries ordered least- to most-recently used.
+    banks: [Vec<(usize, usize)>; 2],
+}
+
+impl SpillSlotCache {
+    fn lookup(&mut self, is_secret: bool, slot: usize) -> Option<usize> {
+        let bank = &mut self.banks[is_secret as usize];
+        let pos = bank.iter().position(|&(s, _)| s == slot)?;
+        let entry = bank.remove(pos);
+        bank.push(entry);
+        Some(entry.1)
+    }
+
+    fn insert(&mut self, is_secret: bool, slot: usize, scratch_vr: usize) {
+        let bank = &mut self.banks[is_secret as usize];
+        if let Some(pos) = bank.iter().position(|&(s, _)| s == slot) {
+            bank.remove(pos);
+        } else if bank.len() == SPILL_SLOT_CACHE_CAPACITY {
+            bank.remove(0);
+        }
+        bank.push((slot, scratch_vr));
+    }
+
+    fn clear(&mut self) {
+        self.banks[0].clear();
+        self.banks[1].clear();
+    }
+}
+
+/// Constant pinning (`pin_hot_constants`) only scans functions at least this
+/// large: small functions rarely re-materialize a constant often enough to
+/// clear `CONST_PIN_MIN_FREQ`, and skipping them keeps -O1 compile cost flat.
+const CONST_PIN_MIN_INSTRUCTIONS: usize = 256;
+/// An immediate must be re-materialized at least this often to earn a pin
+/// (each pin permanently reserves one clear physical register).
+const CONST_PIN_MIN_FREQ: usize = 32;
+const CONST_PIN_DEFAULT_MAX: usize = 4;
+const CONST_PIN_HARD_CAP: usize = 6;
+
+/// Number of constants `pin_hot_constants` may pin. `STOFFEL_CONST_PIN_MAX`
+/// overrides the default for tuning (0 disables the pass entirely); the hard
+/// cap keeps the clear spillable pool from collapsing under `SPILL_RESERVE`.
+fn const_pin_max() -> usize {
+    std::env::var("STOFFEL_CONST_PIN_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(CONST_PIN_DEFAULT_MAX)
+        .min(CONST_PIN_HARD_CAP)
+}
+
+/// Identity of a pinnable `LDI` immediate, keyed on the full typed constant:
+/// `I64(4)`, `I32(4)` and `U8(4)` are distinct keys because the VM rejects
+/// mixed-width arithmetic, so folding widths would miscompile. Floats key by
+/// raw bit pattern (bit-unequal NaNs pin separately, which is always safe).
+/// `Ord` exists so candidate selection has a deterministic tie-break.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+enum PinKey {
+    I64(i64),
+    I32(i32),
+    I16(i16),
+    I8(i8),
+    U64(u64),
+    U32(u32),
+    U16(u16),
+    U8(u8),
+    F64Bits(u64),
+    Bool(bool),
+    Unit,
+}
+
+fn pin_key(value: &crate::core_types::Value) -> Option<PinKey> {
+    use crate::core_types::Value;
+    Some(match value {
+        Value::I64(v) => PinKey::I64(*v),
+        Value::I32(v) => PinKey::I32(*v),
+        Value::I16(v) => PinKey::I16(*v),
+        Value::I8(v) => PinKey::I8(*v),
+        Value::U64(v) => PinKey::U64(*v),
+        Value::U32(v) => PinKey::U32(*v),
+        Value::U16(v) => PinKey::U16(*v),
+        Value::U8(v) => PinKey::U8(*v),
+        Value::Float(f) => PinKey::F64Bits(f.0.to_bits()),
+        Value::Bool(b) => PinKey::Bool(*b),
+        Value::Unit => PinKey::Unit,
+        _ => return None,
+    })
 }
 
 impl CodeGenerator {
@@ -196,7 +321,7 @@ impl CodeGenerator {
             current_instructions: Vec::new(),
             current_labels: HashMap::new(),
             next_virtual_reg: 0, // Start virtual registers from 0
-            vr_secrecy: HashMap::new(),
+            vr_secrecy: Vec::new(),
             // Symbol table starts empty for each new generator instance (e.g., per function)
             symbol_table: HashMap::new(),
             symbol_types: HashMap::new(),
@@ -215,7 +340,14 @@ impl CodeGenerator {
             reassigned_vars: HashSet::new(),
             active_loop_bounds: Vec::new(),
             loop_label_stack: Vec::new(),
+            opt_level: 0,
         }
+    }
+
+    /// Whether the opt-level >= 1 spill-traffic passes (slot-reload cache and post-RA
+    /// self-MOV elimination) are active for this generator.
+    fn spill_opt_active(&self) -> bool {
+        self.opt_level >= 1 && spill_opt_enabled()
     }
 
     /// Warn that a client-I/O call could not be recorded in the client-IO
@@ -247,7 +379,8 @@ impl CodeGenerator {
     fn allocate_virtual_register(&mut self, is_secret: bool) -> VirtualRegister {
         let vr = VirtualRegister(self.next_virtual_reg);
         self.next_virtual_reg += 1;
-        self.vr_secrecy.insert(vr, is_secret);
+        debug_assert_eq!(vr.0, self.vr_secrecy.len());
+        self.vr_secrecy.push(is_secret);
         vr
     }
 
@@ -359,12 +492,13 @@ impl CodeGenerator {
 
     fn fresh_virtual_register(
         next_virtual_reg: &mut usize,
-        secrecy_map: &mut HashMap<VirtualRegister, bool>,
+        secrecy_map: &mut Vec<bool>,
         is_secret: bool,
     ) -> VirtualRegister {
         let vr = VirtualRegister(*next_virtual_reg);
         *next_virtual_reg += 1;
-        secrecy_map.insert(vr, is_secret);
+        debug_assert_eq!(vr.0, secrecy_map.len());
+        secrecy_map.push(is_secret);
         vr
     }
 
@@ -373,7 +507,7 @@ impl CodeGenerator {
         out: &mut Vec<Instruction>,
         constants: &mut Vec<Constant>,
         next_virtual_reg: &mut usize,
-        secrecy_map: &mut HashMap<VirtualRegister, bool>,
+        secrecy_map: &mut Vec<bool>,
         spilled_vr: VirtualRegister,
     ) -> VirtualRegister {
         let key = Constant::String(format!("__stoffel_spill_{}", spilled_vr.0));
@@ -391,7 +525,7 @@ impl CodeGenerator {
         out: &mut Vec<Instruction>,
         constants: &mut Vec<Constant>,
         next_virtual_reg: &mut usize,
-        secrecy_map: &mut HashMap<VirtualRegister, bool>,
+        secrecy_map: &mut Vec<bool>,
         spill_object_vr: VirtualRegister,
         spilled_vr: VirtualRegister,
     ) -> VirtualRegister {
@@ -401,7 +535,7 @@ impl CodeGenerator {
         out.push(Instruction::PUSHARG(key_vr.0));
         out.push(Instruction::CALL("get_field".to_string()));
 
-        let value_is_secret = *secrecy_map.get(&spilled_vr).unwrap_or(&false);
+        let value_is_secret = secrecy_map.get(spilled_vr.0).copied().unwrap_or(false);
         let value_vr = Self::fresh_virtual_register(next_virtual_reg, secrecy_map, value_is_secret);
         out.push(Instruction::MOV(value_vr.0, 0));
         value_vr
@@ -412,7 +546,7 @@ impl CodeGenerator {
         out: &mut Vec<Instruction>,
         constants: &mut Vec<Constant>,
         next_virtual_reg: &mut usize,
-        secrecy_map: &mut HashMap<VirtualRegister, bool>,
+        secrecy_map: &mut Vec<bool>,
         spill_object_vr: VirtualRegister,
         spilled_vr: VirtualRegister,
         value_vr: VirtualRegister,
@@ -425,73 +559,66 @@ impl CodeGenerator {
         out.push(Instruction::CALL("set_field".to_string()));
     }
 
-    fn remap_instruction_registers(
-        instruction: &Instruction,
-        mapped_uses: &HashMap<VirtualRegister, VirtualRegister>,
-        mapped_defs: &HashMap<VirtualRegister, VirtualRegister>,
-    ) -> Instruction {
-        let map_use = |r: usize| {
-            mapped_uses
-                .get(&VirtualRegister(r))
-                .copied()
-                .unwrap_or(VirtualRegister(r))
-                .0
+    /// Remaps a spill-lowered instruction's operands in place. `mapped_uses` and
+    /// `mapped_def` hold `(old, scratch)` VR pairs (at most two uses and one def
+    /// per instruction); unmapped operands are left untouched. The def/use
+    /// classification of each operand position must stay in sync with
+    /// `InstructionRegisterAnalysis::uses`/`defs`.
+    fn remap_instruction_registers_in_place(
+        instruction: &mut Instruction,
+        mapped_uses: &[Option<(usize, usize)>; 2],
+        mapped_def: Option<(usize, usize)>,
+    ) {
+        let map_use = |r: &mut usize| {
+            for mapping in mapped_uses.iter().flatten() {
+                if mapping.0 == *r {
+                    *r = mapping.1;
+                    return;
+                }
+            }
         };
-        let map_def = |r: usize| {
-            mapped_defs
-                .get(&VirtualRegister(r))
-                .copied()
-                .unwrap_or(VirtualRegister(r))
-                .0
+        let map_def = |r: &mut usize| {
+            if let Some((old, scratch)) = mapped_def {
+                if old == *r {
+                    *r = scratch;
+                }
+            }
         };
 
         match instruction {
-            Instruction::LD(r, offset) => Instruction::LD(map_def(*r), *offset),
-            Instruction::LDI(r, value) => Instruction::LDI(map_def(*r), value.clone()),
-            Instruction::MOV(dest, src) => Instruction::MOV(map_def(*dest), map_use(*src)),
-            Instruction::ADD(dest, a, b) => {
-                Instruction::ADD(map_def(*dest), map_use(*a), map_use(*b))
+            Instruction::LD(r, _) | Instruction::LDI(r, _) | Instruction::LDS(r, _) => map_def(r),
+            Instruction::MOV(dest, src) | Instruction::NOT(dest, src) => {
+                map_def(dest);
+                map_use(src);
             }
-            Instruction::SUB(dest, a, b) => {
-                Instruction::SUB(map_def(*dest), map_use(*a), map_use(*b))
+            Instruction::ADD(dest, a, b)
+            | Instruction::SUB(dest, a, b)
+            | Instruction::MUL(dest, a, b)
+            | Instruction::DIV(dest, a, b)
+            | Instruction::MOD(dest, a, b)
+            | Instruction::AND(dest, a, b)
+            | Instruction::OR(dest, a, b)
+            | Instruction::XOR(dest, a, b)
+            | Instruction::SHL(dest, a, b)
+            | Instruction::SHR(dest, a, b) => {
+                map_def(dest);
+                map_use(a);
+                map_use(b);
             }
-            Instruction::MUL(dest, a, b) => {
-                Instruction::MUL(map_def(*dest), map_use(*a), map_use(*b))
+            Instruction::RET(src) | Instruction::PUSHARG(src) | Instruction::STS(_, src) => {
+                map_use(src)
             }
-            Instruction::DIV(dest, a, b) => {
-                Instruction::DIV(map_def(*dest), map_use(*a), map_use(*b))
+            Instruction::CMP(a, b) => {
+                map_use(a);
+                map_use(b);
             }
-            Instruction::MOD(dest, a, b) => {
-                Instruction::MOD(map_def(*dest), map_use(*a), map_use(*b))
-            }
-            Instruction::AND(dest, a, b) => {
-                Instruction::AND(map_def(*dest), map_use(*a), map_use(*b))
-            }
-            Instruction::OR(dest, a, b) => {
-                Instruction::OR(map_def(*dest), map_use(*a), map_use(*b))
-            }
-            Instruction::XOR(dest, a, b) => {
-                Instruction::XOR(map_def(*dest), map_use(*a), map_use(*b))
-            }
-            Instruction::NOT(dest, src) => Instruction::NOT(map_def(*dest), map_use(*src)),
-            Instruction::SHL(dest, a, b) => {
-                Instruction::SHL(map_def(*dest), map_use(*a), map_use(*b))
-            }
-            Instruction::SHR(dest, a, b) => {
-                Instruction::SHR(map_def(*dest), map_use(*a), map_use(*b))
-            }
-            Instruction::RET(src) => Instruction::RET(map_use(*src)),
-            Instruction::PUSHARG(src) => Instruction::PUSHARG(map_use(*src)),
-            Instruction::CMP(a, b) => Instruction::CMP(map_use(*a), map_use(*b)),
-            Instruction::LDS(dest, slot) => Instruction::LDS(map_def(*dest), *slot),
-            Instruction::STS(slot, src) => Instruction::STS(*slot, map_use(*src)),
-            Instruction::JMP(label) => Instruction::JMP(label.clone()),
-            Instruction::JMPEQ(label) => Instruction::JMPEQ(label.clone()),
-            Instruction::JMPNEQ(label) => Instruction::JMPNEQ(label.clone()),
-            Instruction::JMPLT(label) => Instruction::JMPLT(label.clone()),
-            Instruction::JMPGT(label) => Instruction::JMPGT(label.clone()),
-            Instruction::CALL(name) => Instruction::CALL(name.clone()),
-            Instruction::NOP => Instruction::NOP,
+            Instruction::JMP(_)
+            | Instruction::JMPEQ(_)
+            | Instruction::JMPNEQ(_)
+            | Instruction::JMPLT(_)
+            | Instruction::JMPGT(_)
+            | Instruction::CALL(_)
+            | Instruction::NOP => {}
         }
     }
 
@@ -508,69 +635,135 @@ impl CodeGenerator {
     ///
     /// `next_spill_slot` is the function-wide monotonic slot counter, so slots never
     /// collide across spill rounds.
+    ///
+    /// When `cache_enabled` is set (opt-level >= 1, see `spill_opt_enabled`), a tiny
+    /// per-bank LRU of slot -> scratch VR forwards repeated reloads of the same slot
+    /// within a basic block to the scratch register that already holds the value
+    /// (including the store scratch of a preceding def), eliding the `LDS`. The cache
+    /// is invalidated at every label target and after every control transfer, so a
+    /// cached scratch never crosses a block boundary. Capacity is bounded so cached
+    /// scratches (2/bank) plus the per-instruction transients (<= 3) stay under
+    /// `SPILL_RESERVE`; cached scratches spanning `CALL`s are safe because the VM
+    /// preserves all registers across calls except physical R0, which the allocator
+    /// never hands out (it is reserved for the precolored ABI result VR0).
+    #[allow(clippy::too_many_arguments)]
     fn lower_spills_into_slots(
         instructions: Vec<Instruction>,
         labels: HashMap<String, usize>,
         next_virtual_reg: &mut usize,
-        secrecy_map: &mut HashMap<VirtualRegister, bool>,
+        secrecy_map: &mut Vec<bool>,
         spilled_vrs: &[VirtualRegister],
         next_spill_slot: &mut usize,
+        cache_enabled: bool,
+        stats: &mut SpillLoweringStats,
     ) -> (Vec<Instruction>, HashMap<String, usize>) {
-        use crate::register_allocator::InstructionRegisterAnalysis;
-
-        let spilled: HashSet<VirtualRegister> = spilled_vrs.iter().copied().collect();
-
-        // Assign each spilled VR a fresh, stable spill slot.
-        let mut slot_of: HashMap<VirtualRegister, usize> = HashMap::new();
+        // Dense spilled/slot tables indexed by VR id: every operand VR was minted
+        // before this round, so ids are bounded by the current counter.
+        let mut spilled = vec![false; *next_virtual_reg];
+        let mut slot_of = vec![usize::MAX; *next_virtual_reg];
         for &vr in spilled_vrs {
-            slot_of.entry(vr).or_insert_with(|| {
-                let s = *next_spill_slot;
+            if !spilled[vr.0] {
+                spilled[vr.0] = true;
+                slot_of[vr.0] = *next_spill_slot;
                 *next_spill_slot += 1;
-                s
-            });
+            }
         }
 
-        let mut out = Vec::with_capacity(instructions.len() + spilled.len() * 4);
+        let mut out = Vec::with_capacity(instructions.len() + spilled_vrs.len() * 4);
         let mut old_to_new = vec![0usize; instructions.len() + 1];
+        let num_instructions = instructions.len();
 
-        for (i, instruction) in instructions.iter().enumerate() {
+        // Block-boundary set over the ORIGINAL instruction indices: label targets
+        // start new blocks (control transfers are handled after each instruction).
+        let label_targets: HashSet<usize> = if cache_enabled {
+            labels.values().copied().collect()
+        } else {
+            HashSet::new()
+        };
+        let mut cache = SpillSlotCache::default();
+
+        for (i, mut instruction) in instructions.into_iter().enumerate() {
             old_to_new[i] = out.len();
 
+            if cache_enabled && label_targets.contains(&i) {
+                cache.clear();
+            }
+
             // Reload each spilled use into a fresh scratch register just before the
-            // instruction.
-            let mut mapped_uses: HashMap<VirtualRegister, VirtualRegister> = HashMap::new();
-            for used_vr in instruction.uses() {
-                if spilled.contains(&used_vr) && !mapped_uses.contains_key(&used_vr) {
-                    let is_secret = *secrecy_map.get(&used_vr).unwrap_or(&false);
-                    let scratch =
-                        Self::fresh_virtual_register(next_virtual_reg, secrecy_map, is_secret);
-                    out.push(Instruction::LDS(scratch.0, slot_of[&used_vr]));
-                    mapped_uses.insert(used_vr, scratch);
+            // instruction (at most two uses per instruction), unless a cached scratch
+            // already holds this slot's value.
+            let mut mapped_uses: [Option<(usize, usize)>; 2] = [None; 2];
+            let mut mapped_use_count = 0;
+            for used_vr in register_allocator::use_regs(&instruction)
+                .into_iter()
+                .flatten()
+            {
+                if spilled[used_vr] && !mapped_uses.iter().flatten().any(|&(old, _)| old == used_vr)
+                {
+                    let is_secret = secrecy_map.get(used_vr).copied().unwrap_or(false);
+                    let slot = slot_of[used_vr];
+                    let scratch_id = if let Some(cached) = cache_enabled
+                        .then(|| cache.lookup(is_secret, slot))
+                        .flatten()
+                    {
+                        stats.reload_hits[is_secret as usize] += 1;
+                        cached
+                    } else {
+                        stats.reload_misses[is_secret as usize] += 1;
+                        let scratch =
+                            Self::fresh_virtual_register(next_virtual_reg, secrecy_map, is_secret);
+                        out.push(Instruction::LDS(scratch.0, slot));
+                        if cache_enabled {
+                            cache.insert(is_secret, slot, scratch.0);
+                        }
+                        scratch.0
+                    };
+                    mapped_uses[mapped_use_count] = Some((used_vr, scratch_id));
+                    mapped_use_count += 1;
                 }
             }
 
-            // Spilled defs are computed into a fresh scratch register, then stored back.
-            let mut mapped_defs: HashMap<VirtualRegister, VirtualRegister> = HashMap::new();
-            for def_vr in instruction.defs() {
-                if spilled.contains(&def_vr) {
-                    let is_secret = *secrecy_map.get(&def_vr).unwrap_or(&false);
+            // A spilled def (at most one) is computed into a fresh scratch register,
+            // then stored back.
+            let mut mapped_def: Option<(usize, usize)> = None;
+            if let Some(def_vr) = register_allocator::def_reg(&instruction) {
+                if spilled[def_vr] {
+                    let is_secret = secrecy_map.get(def_vr).copied().unwrap_or(false);
                     let scratch =
                         Self::fresh_virtual_register(next_virtual_reg, secrecy_map, is_secret);
-                    mapped_defs.insert(def_vr, scratch);
+                    mapped_def = Some((def_vr, scratch.0));
+                    stats.spilled_defs += 1;
                 }
             }
 
-            out.push(Self::remap_instruction_registers(
+            let ends_block = matches!(
                 instruction,
-                &mapped_uses,
-                &mapped_defs,
-            ));
+                Instruction::JMP(_)
+                    | Instruction::JMPEQ(_)
+                    | Instruction::JMPNEQ(_)
+                    | Instruction::JMPLT(_)
+                    | Instruction::JMPGT(_)
+                    | Instruction::RET(_)
+            );
 
-            for (spilled_vr, scratch_vr) in mapped_defs {
-                out.push(Instruction::STS(slot_of[&spilled_vr], scratch_vr.0));
+            Self::remap_instruction_registers_in_place(&mut instruction, &mapped_uses, mapped_def);
+            out.push(instruction);
+
+            if let Some((spilled_vr, scratch_vr)) = mapped_def {
+                out.push(Instruction::STS(slot_of[spilled_vr], scratch_vr));
+                if cache_enabled {
+                    // Store-forwarding: the store scratch now holds the slot's value,
+                    // superseding any previously cached reload of the same slot.
+                    let is_secret = secrecy_map.get(spilled_vr).copied().unwrap_or(false);
+                    cache.insert(is_secret, slot_of[spilled_vr], scratch_vr);
+                }
+            }
+
+            if cache_enabled && ends_block {
+                cache.clear();
             }
         }
-        old_to_new[instructions.len()] = out.len();
+        old_to_new[num_instructions] = out.len();
 
         let lowered_labels = labels
             .into_iter()
@@ -586,15 +779,239 @@ impl CodeGenerator {
         (out, lowered_labels)
     }
 
+    /// Post-RA cleanup: delete `MOV(r, r)` no-ops left behind when the allocator
+    /// coalesces a copy's source and destination into the same physical register
+    /// (including the `MOV(0, 0)` form of a post-CALL result capture, which is
+    /// final-form by the time this runs — `rewrite_instructions_with` has already
+    /// rewritten the ABI source). Labels are remapped with the same
+    /// boundary-inclusive old-to-new index table `lower_spills_into_slots` uses,
+    /// so labels pointing one past the end (or at a deleted MOV) stay valid.
+    fn eliminate_self_movs(
+        instructions: Vec<Instruction>,
+        labels: &mut HashMap<String, usize>,
+    ) -> Vec<Instruction> {
+        let num_instructions = instructions.len();
+        let mut out = Vec::with_capacity(num_instructions);
+        let mut old_to_new = vec![0usize; num_instructions + 1];
+        for (i, instruction) in instructions.into_iter().enumerate() {
+            old_to_new[i] = out.len();
+            if matches!(instruction, Instruction::MOV(dest, src) if dest == src) {
+                continue;
+            }
+            out.push(instruction);
+        }
+        old_to_new[num_instructions] = out.len();
+        for index in labels.values_mut() {
+            *index = old_to_new.get(*index).copied().unwrap_or(out.len());
+        }
+        out
+    }
+
+    /// Pre-RA constant pinning (opt-level >= 1): hoist the hottest `LDI`
+    /// immediates into K fresh clear VRs, loaded once in a prologue prepended at
+    /// function entry (entry dominates everything, so no dominance analysis is
+    /// needed) and precolored to the top of the clear bank. `linear_scan_partition`
+    /// reserves precolored physical registers for the whole function, so pinned
+    /// constants are never evicted and never chosen as spill victims. Every
+    /// `LDI(vr, c)` whose constant is pinned is deleted and `vr` renamed to the
+    /// pinned VR, provided `vr` is a single-def clear non-precolored VR other
+    /// than VR0 (VR0 is the ABI result register: the post-CALL `MOV(dest, 0)`
+    /// rewrite in `rewrite_instructions_with` reads physical R0, so VR0 must
+    /// never be renamed). An `LDI` whose previous *surviving* instruction is a
+    /// `CALL` is also kept: deleting it would make a following `MOV(dest, 0)`
+    /// newly CALL-adjacent and trip that same rewrite special case.
+    fn pin_hot_constants(
+        instructions: &mut Vec<Instruction>,
+        labels: &mut HashMap<String, usize>,
+        next_virtual_reg: &mut usize,
+        secrecy_map: &mut Vec<bool>,
+        precolored: &mut HashMap<VirtualRegister, PhysicalRegister>,
+        diagnostic_name: &str,
+    ) {
+        Self::pin_hot_constants_with_limits(
+            instructions,
+            labels,
+            next_virtual_reg,
+            secrecy_map,
+            precolored,
+            CONST_PIN_MIN_INSTRUCTIONS,
+            CONST_PIN_MIN_FREQ,
+            const_pin_max(),
+            diagnostic_name,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn pin_hot_constants_with_limits(
+        instructions: &mut Vec<Instruction>,
+        labels: &mut HashMap<String, usize>,
+        next_virtual_reg: &mut usize,
+        secrecy_map: &mut Vec<bool>,
+        precolored: &mut HashMap<VirtualRegister, PhysicalRegister>,
+        min_instructions: usize,
+        min_freq: usize,
+        max_pins: usize,
+        diagnostic_name: &str,
+    ) {
+        if instructions.len() < min_instructions || max_pins == 0 {
+            return;
+        }
+
+        // Pin homes: top of the clear bank downward, skipping physical registers
+        // already reserved (ABI R0 and the R0..Rn-1 parameter slots).
+        let reserved: HashSet<usize> = precolored.values().map(|p| p.0).collect();
+        let homes: Vec<usize> = (1..SECRET_REGISTER_START)
+            .rev()
+            .filter(|r| !reserved.contains(r))
+            .take(max_pins)
+            .collect();
+        if homes.is_empty() {
+            return;
+        }
+
+        // Defs per VR plus per-typed-constant LDI frequencies. The first-seen
+        // `Value` is kept as the representative for the prologue load (all
+        // occurrences of a key are bit-identical by construction of `PinKey`).
+        let mut def_count = vec![0u32; *next_virtual_reg];
+        let mut freq: HashMap<PinKey, (usize, crate::core_types::Value)> = HashMap::new();
+        for inst in instructions.iter() {
+            if let Some(def) = register_allocator::def_reg(inst) {
+                if let Some(count) = def_count.get_mut(def) {
+                    *count += 1;
+                }
+            }
+            if let Instruction::LDI(_, value) = inst {
+                if let Some(key) = pin_key(value) {
+                    freq.entry(key)
+                        .and_modify(|(count, _)| *count += 1)
+                        .or_insert_with(|| (1, value.clone()));
+                }
+            }
+        }
+        let mut candidates: Vec<(PinKey, usize, crate::core_types::Value)> = freq
+            .into_iter()
+            .filter(|(_, (count, _))| *count >= min_freq)
+            .map(|(key, (count, value))| (key, count, value))
+            .collect();
+        if candidates.is_empty() {
+            return;
+        }
+        // Deterministic selection: frequency descending, typed key as tie-break
+        // (HashMap iteration order must not leak into emitted code).
+        candidates.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        candidates.truncate(homes.len());
+
+        let mut pinned_vr_of: HashMap<PinKey, usize> = HashMap::with_capacity(candidates.len());
+        let mut prologue: Vec<Instruction> = Vec::with_capacity(candidates.len());
+        for ((key, _, value), &home) in candidates.iter().zip(homes.iter()) {
+            let vr = Self::fresh_virtual_register(next_virtual_reg, secrecy_map, false);
+            precolored.insert(vr, PhysicalRegister(home));
+            pinned_vr_of.insert(*key, vr.0);
+            prologue.push(Instruction::LDI(vr.0, value.clone()));
+        }
+
+        // Pass 1: decide deletions and build the dense rename map. This must be
+        // a separate pass because a use may sit textually *before* its VR's
+        // single def (a loop-carried read reached via a backedge), and every use
+        // of a renamed VR has to be remapped, not just those after the def.
+        let num_instructions = instructions.len();
+        let mut delete = vec![false; num_instructions];
+        let mut rename = vec![usize::MAX; def_count.len()];
+        let mut deleted = 0usize;
+        let mut prev_out_is_call = false;
+        for (i, inst) in instructions.iter().enumerate() {
+            if let Instruction::LDI(dest, value) = inst {
+                let single_def_clear = def_count.get(*dest) == Some(&1)
+                    && !secrecy_map.get(*dest).copied().unwrap_or(true);
+                if *dest != 0
+                    && single_def_clear
+                    && !prev_out_is_call
+                    && !precolored.contains_key(&VirtualRegister(*dest))
+                {
+                    if let Some(&pinned) = pin_key(value).and_then(|k| pinned_vr_of.get(&k)) {
+                        rename[*dest] = pinned;
+                        delete[i] = true;
+                        deleted += 1;
+                        // A deleted LDI emits nothing: `prev_out_is_call` keeps
+                        // tracking the previous surviving instruction.
+                        continue;
+                    }
+                }
+            }
+            prev_out_is_call = matches!(inst, Instruction::CALL(_));
+        }
+        if deleted == 0 {
+            // Nothing to rewrite; drop the speculative pins again so the
+            // allocator keeps the full clear bank.
+            for (key, _, _) in &candidates {
+                if let Some(vr) = pinned_vr_of.get(key) {
+                    precolored.remove(&VirtualRegister(*vr));
+                }
+            }
+            return;
+        }
+
+        // Pass 2: prepend the prologue, drop deleted LDIs, remap renamed uses
+        // (renamed VRs are single-def with the def deleted, so defs never need
+        // remapping), and shift labels through the usual boundary-inclusive
+        // old-to-new index table.
+        let old = std::mem::take(instructions);
+        let mut out = Vec::with_capacity(num_instructions + prologue.len() - deleted);
+        out.append(&mut prologue);
+        let mut old_to_new = vec![0usize; num_instructions + 1];
+        for (i, mut inst) in old.into_iter().enumerate() {
+            old_to_new[i] = out.len();
+            if delete[i] {
+                continue;
+            }
+            let mut mapped_uses: [Option<(usize, usize)>; 2] = [None; 2];
+            let mut mapped_use_count = 0;
+            for used in register_allocator::use_regs(&inst).into_iter().flatten() {
+                let target = rename.get(used).copied().unwrap_or(usize::MAX);
+                if target != usize::MAX
+                    && !mapped_uses
+                        .iter()
+                        .flatten()
+                        .any(|&(old_vr, _)| old_vr == used)
+                {
+                    mapped_uses[mapped_use_count] = Some((used, target));
+                    mapped_use_count += 1;
+                }
+            }
+            Self::remap_instruction_registers_in_place(&mut inst, &mapped_uses, None);
+            out.push(inst);
+        }
+        old_to_new[num_instructions] = out.len();
+        for index in labels.values_mut() {
+            *index = old_to_new.get(*index).copied().unwrap_or(out.len());
+        }
+        *instructions = out;
+
+        if spill_stats_enabled() {
+            let pins: Vec<String> = candidates
+                .iter()
+                .zip(homes.iter())
+                .map(|((key, count, _), home)| format!("{key:?}x{count}->R{home}"))
+                .collect();
+            eprintln!(
+                "CONST_PIN {diagnostic_name}: pinned={} deleted_ldis={deleted} pins=[{}]",
+                candidates.len(),
+                pins.join(", "),
+            );
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn allocate_registers_with_object_spills(
         instructions: &mut Vec<Instruction>,
         labels: &mut HashMap<String, usize>,
         next_virtual_reg: &mut usize,
-        secrecy_map: &mut HashMap<VirtualRegister, bool>,
+        secrecy_map: &mut Vec<bool>,
         precolored: &HashMap<VirtualRegister, PhysicalRegister>,
         protected_prologue_len: usize,
         diagnostic_name: &str,
-    ) -> CompilerResult<register_allocator::Allocation> {
+        spill_slot_cache: bool,
+    ) -> CompilerResult<register_allocator::DenseAllocation> {
         let k_clear = SECRET_REGISTER_START;
         let k_secret = MAX_REGISTERS - k_clear;
         // Once spilling has started, hold back this many registers per pool so the reload
@@ -605,9 +1022,10 @@ impl CodeGenerator {
 
         // Virtual registers created by spill lowering (the short-lived reload/store
         // scratch registers). They are never chosen as spill victims and may use the
-        // reserved headroom above.
-        let mut unspillable: std::collections::HashSet<register_allocator::VirtualRegister> =
-            std::collections::HashSet::new();
+        // reserved headroom above. Nothing else mints VRs inside the loop below, so
+        // the unspillable set is always the contiguous id range
+        // [unspillable_start, *next_virtual_reg) — a threshold compare instead of a set.
+        let mut unspillable_start: Option<usize> = None;
         // Pin virtual register 0 to physical R0, the ABI result/scratch register.
         // Every CALL/builtin writes its result into physical R0, which codegen reads
         // back via `MOV(dest, 0)` — a use with no corresponding virtual-register def.
@@ -632,15 +1050,14 @@ impl CodeGenerator {
         let mut next_spill_slot: usize = 0;
         let _ = protected_prologue_len; // spill traffic is position-independent now
 
+        let live_in_vrs: Vec<VirtualRegister> = precolored.keys().copied().collect();
+        let mut spill_stats = SpillLoweringStats::default();
         for _ in 0..64 {
-            let intervals = register_allocator::analyze_liveness_cfg_with_liveins(
-                instructions,
-                labels,
-                &precolored.keys().copied().collect::<Vec<_>>(),
-            );
+            let intervals =
+                register_allocator::analyze_liveness_cfg_dense(instructions, labels, &live_in_vrs);
             // No headroom needed until the first spill introduces unspillable temporaries,
             // so functions that fit get the full register file.
-            let reserve = if unspillable.is_empty() {
+            let reserve = if unspillable_start.is_none() {
                 0
             } else {
                 SPILL_RESERVE
@@ -652,9 +1069,23 @@ impl CodeGenerator {
                 reserve,
                 secrecy_map,
                 &precolored,
-                &unspillable,
+                unspillable_start.unwrap_or(register_allocator::NO_UNSPILLABLE),
             ) {
                 Ok(allocation) => {
+                    if spill_stats_enabled() && spill_stats.rounds > 0 {
+                        eprintln!(
+                            "SPILL_STATS {diagnostic_name}: rounds={} slots={} defs={} \
+                             reload_hits=[clear {}, secret {}] reload_misses=[clear {}, secret {}] cache={}",
+                            spill_stats.rounds,
+                            spill_stats.spill_slots,
+                            spill_stats.spilled_defs,
+                            spill_stats.reload_hits[0],
+                            spill_stats.reload_hits[1],
+                            spill_stats.reload_misses[0],
+                            spill_stats.reload_misses[1],
+                            spill_slot_cache,
+                        );
+                    }
                     if std::env::var("STOFFEL_RA_CHECK").is_ok() {
                         Self::ra_interference_check(&allocation, &intervals, diagnostic_name);
                         Self::ra_liveness_coverage_check(instructions, &intervals, diagnostic_name);
@@ -670,6 +1101,16 @@ impl CodeGenerator {
                 }
                 Err(AllocationError::NeedsSpilling(spilled_vrs)) => {
                     let first_new_vr = *next_virtual_reg;
+                    // The slot-reload cache runs only in the FIRST spill round (which
+                    // carries the mass of the spill traffic). Cached scratches live
+                    // longer than plain per-use transients, and letting every round
+                    // add its own long-lived cached scratches accumulates unspillable
+                    // pressure across rounds: each round then displaces a few more
+                    // spillable VRs and convergence dribbles out over many rounds
+                    // (measured 2 -> 12 on the unrolled AES main). Later rounds use
+                    // the plain transient scheme, restoring B1-like convergence.
+                    let cache_this_round = spill_slot_cache && spill_stats.rounds == 0;
+                    spill_stats.rounds += 1;
                     let old_instructions = std::mem::take(instructions);
                     let old_labels = std::mem::take(labels);
                     let (lowered_instructions, lowered_labels) = Self::lower_spills_into_slots(
@@ -679,13 +1120,18 @@ impl CodeGenerator {
                         secrecy_map,
                         &spilled_vrs,
                         &mut next_spill_slot,
+                        cache_this_round,
+                        &mut spill_stats,
                     );
+                    spill_stats.spill_slots = next_spill_slot;
                     *instructions = lowered_instructions;
                     *labels = lowered_labels;
                     // Every VR minted during lowering is spill machinery: keep it out of
-                    // future spill decisions.
-                    for vr in first_new_vr..*next_virtual_reg {
-                        unspillable.insert(register_allocator::VirtualRegister(vr));
+                    // future spill decisions. Contiguous-range invariant: later rounds
+                    // only ever mint ids above the recorded start.
+                    debug_assert!(unspillable_start.is_none_or(|start| start <= first_new_vr));
+                    if unspillable_start.is_none() && *next_virtual_reg > first_new_vr {
+                        unspillable_start = Some(first_new_vr);
                     }
                 }
                 Err(AllocationError::PoolExhausted(_, _)) => {
@@ -708,20 +1154,22 @@ impl CodeGenerator {
     /// write at the boundary instruction); `earlier.end > later.start` is a real overlap.
     #[allow(dead_code)]
     fn ra_interference_check(
-        allocation: &register_allocator::Allocation,
-        intervals: &HashMap<register_allocator::VirtualRegister, register_allocator::LiveInterval>,
+        allocation: &register_allocator::DenseAllocation,
+        intervals: &[Option<register_allocator::LiveInterval>],
         name: &str,
     ) {
         let mut by_reg: HashMap<
             register_allocator::PhysicalRegister,
             Vec<(usize, usize, register_allocator::VirtualRegister)>,
         > = HashMap::new();
-        for (vr, phys) in allocation {
-            if let Some(iv) = intervals.get(vr) {
-                by_reg
-                    .entry(*phys)
-                    .or_default()
-                    .push((iv.start, iv.end, *vr));
+        for (id, phys) in allocation.iter().enumerate() {
+            let Some(phys) = phys else { continue };
+            if let Some(iv) = intervals.get(id).copied().flatten() {
+                by_reg.entry(*phys).or_default().push((
+                    iv.start,
+                    iv.end,
+                    register_allocator::VirtualRegister(id),
+                ));
             }
         }
         let mut total = 0usize;
@@ -754,14 +1202,14 @@ impl CodeGenerator {
     #[allow(dead_code)]
     fn ra_liveness_coverage_check(
         instructions: &[Instruction],
-        intervals: &HashMap<register_allocator::VirtualRegister, register_allocator::LiveInterval>,
+        intervals: &[Option<register_allocator::LiveInterval>],
         name: &str,
     ) {
         use crate::register_allocator::InstructionRegisterAnalysis;
         let mut total = 0usize;
         for (ip, inst) in instructions.iter().enumerate() {
             for used_vr in inst.uses() {
-                if let Some(iv) = intervals.get(&used_vr) {
+                if let Some(iv) = intervals.get(used_vr.0).copied().flatten().as_ref() {
                     if ip < iv.start || ip > iv.end {
                         total += 1;
                         if total <= 12 {
@@ -784,20 +1232,22 @@ impl CodeGenerator {
     /// (reveal vs copy) and MPC ops on it.
     #[allow(dead_code)]
     fn ra_pool_check(
-        allocation: &register_allocator::Allocation,
-        secrecy_map: &HashMap<register_allocator::VirtualRegister, bool>,
+        allocation: &register_allocator::DenseAllocation,
+        secrecy_map: &[bool],
         k_clear: usize,
         k_secret: usize,
         name: &str,
     ) {
         let secret_end = k_clear + k_secret;
         let mut total = 0usize;
-        for (vr, phys) in allocation {
+        for (id, phys) in allocation.iter().enumerate() {
+            let Some(phys) = phys else { continue };
+            let vr = register_allocator::VirtualRegister(id);
             // R0 (0) is the ABI register; skip it.
             if phys.0 == 0 {
                 continue;
             }
-            let is_secret = secrecy_map.get(vr).copied().unwrap_or(false);
+            let is_secret = secrecy_map.get(vr.0).copied().unwrap_or(false);
             let in_secret_pool = (k_clear..secret_end).contains(&phys.0);
             let in_clear_pool = (1..k_clear).contains(&phys.0);
             if is_secret && !in_secret_pool {
@@ -1391,7 +1841,7 @@ impl CodeGenerator {
                     let vr = VirtualRegister(vr_index);
                     let is_secret = *self
                         .vr_secrecy
-                        .get(&vr)
+                        .get(vr.0)
                         .expect("Identifier VR missing from secrecy map");
                     Ok((vr, is_secret))
                 } else {
@@ -1496,8 +1946,12 @@ impl CodeGenerator {
                 } else {
                     self.clear_int_constants.remove(name);
                 }
-                // Update vr_secrecy map for this VR to ensure it has the correct flag
-                self.vr_secrecy.insert(value_vr, value_is_secret);
+                // Update vr_secrecy for this VR to ensure it has the correct flag.
+                // Sentinel VRs (e.g. VirtualRegister(0) from EnumDefinition/Import arms)
+                // may not have been minted, so guard the indexed write.
+                if let Some(slot) = self.vr_secrecy.get_mut(value_vr.0) {
+                    *slot = value_is_secret;
+                }
 
                 Ok((value_vr, value_is_secret)) // Return the VR holding the initial value and its secrecy
             }
@@ -1552,20 +2006,16 @@ impl CodeGenerator {
                 right,
                 location,
             } => {
+                let left_type_hint = self.type_hint_for_node(left);
+                let right_type_hint = self.type_hint_for_node(right);
                 let is_list_concat = op == "+"
                     && matches!(
                         (
-                            self.type_hint_for_node(left)
-                                .as_ref()
-                                .map(SymbolType::underlying_type),
-                            self.type_hint_for_node(right)
-                                .as_ref()
-                                .map(SymbolType::underlying_type),
+                            left_type_hint.as_ref().map(SymbolType::underlying_type),
+                            right_type_hint.as_ref().map(SymbolType::underlying_type),
                         ),
                         (Some(SymbolType::List(_)), Some(SymbolType::List(_)))
                     );
-                let left_type_hint = self.type_hint_for_node(left);
-                let right_type_hint = self.type_hint_for_node(right);
                 let is_left_list = matches!(
                     left_type_hint.as_ref().map(SymbolType::underlying_type),
                     Some(SymbolType::List(_))
@@ -2025,7 +2475,10 @@ impl CodeGenerator {
                 let final_result_is_secret = result_is_secret || else_is_secret;
                 if final_result_is_secret != result_is_secret {
                     // Update secrecy map so allocator places this VR into correct bank
-                    self.vr_secrecy.insert(result_vr, final_result_is_secret);
+                    // (guarded: sentinel VRs may not have been minted).
+                    if let Some(slot) = self.vr_secrecy.get_mut(result_vr.0) {
+                        *slot = final_result_is_secret;
+                    }
                 }
                 self.emit(Instruction::MOV(result_vr.0, else_vr.0));
 
@@ -2429,6 +2882,7 @@ impl CodeGenerator {
                 }
                 // --- Compile the function body ---
                 let mut function_generator = CodeGenerator::new();
+                function_generator.opt_level = self.opt_level;
                 function_generator.object_field_types = self.object_field_types.clone();
                 // A variable that is reassigned anywhere in the body (e.g. a
                 // `while`-loop counter) is not a constant, so it must not be
@@ -2490,6 +2944,18 @@ impl CodeGenerator {
                     precolored.insert(*vr, PhysicalRegister(i));
                 }
 
+                let diagnostic_name = format!("function '{}'", name.as_deref().unwrap_or("<anon>"));
+                if self.opt_level >= 1 {
+                    Self::pin_hot_constants(
+                        &mut virtual_instructions,
+                        &mut function_labels,
+                        &mut next_virtual_reg,
+                        &mut secrecy_map,
+                        &mut precolored,
+                        &diagnostic_name,
+                    );
+                }
+                let spill_opt = self.spill_opt_active();
                 let allocation = Self::allocate_registers_with_object_spills(
                     &mut virtual_instructions,
                     &mut function_labels,
@@ -2497,12 +2963,19 @@ impl CodeGenerator {
                     &mut secrecy_map,
                     &precolored,
                     param_vrs.len(),
-                    &format!("function '{}'", name.as_deref().unwrap_or("<anon>")),
+                    &diagnostic_name,
+                    spill_opt,
                 )?;
 
                 // Rewrite instructions with physical registers
-                let final_instructions =
-                    register_allocator::rewrite_instructions(&virtual_instructions, &allocation);
+                let mut final_instructions = register_allocator::rewrite_instructions_dense(
+                    &virtual_instructions,
+                    &allocation,
+                );
+                if spill_opt {
+                    final_instructions =
+                        Self::eliminate_self_movs(final_instructions, &mut function_labels);
+                }
 
                 // Finalize the function's bytecode chunk.
                 let mut function_chunk = BytecodeChunk::new();
@@ -2748,20 +3221,38 @@ impl CodeGenerator {
         let main_constants = self.identified_constants;
         let mut secrecy_map = self.vr_secrecy;
         let mut next_virtual_reg = self.next_virtual_reg;
-        // No precolored mapping for top-level/main chunk
-        let empty_pre: HashMap<VirtualRegister, PhysicalRegister> = HashMap::new();
+        // No precolored mapping for the top-level/main chunk until constant
+        // pinning adds its own entries.
+        let mut main_precolored: HashMap<VirtualRegister, PhysicalRegister> = HashMap::new();
+        // Field access (not `spill_opt_active`): `self` is partially moved here.
+        if self.opt_level >= 1 {
+            Self::pin_hot_constants(
+                &mut main_instructions,
+                &mut main_labels,
+                &mut next_virtual_reg,
+                &mut secrecy_map,
+                &mut main_precolored,
+                "main program body",
+            );
+        }
+        let spill_opt = self.opt_level >= 1 && spill_opt_enabled();
         let allocation = Self::allocate_registers_with_object_spills(
             &mut main_instructions,
             &mut main_labels,
             &mut next_virtual_reg,
             &mut secrecy_map,
-            &empty_pre,
+            &main_precolored,
             0,
             "main program body",
+            spill_opt,
         )?;
 
-        let final_main_instructions =
-            register_allocator::rewrite_instructions(&main_instructions, &allocation);
+        let mut final_main_instructions =
+            register_allocator::rewrite_instructions_dense(&main_instructions, &allocation);
+        if spill_opt {
+            final_main_instructions =
+                Self::eliminate_self_movs(final_main_instructions, &mut main_labels);
+        }
         let mut main_chunk = BytecodeChunk::new();
         main_chunk.instructions = final_main_instructions;
         main_chunk.labels = main_labels;
@@ -2790,11 +3281,16 @@ fn handle_builtin_pragma(
 
 fn dedupe_constants(constants: Vec<Constant>) -> Vec<Constant> {
     use std::collections::HashSet;
-    let mut seen: HashSet<crate::core_types::Value> = HashSet::new();
+    // `Constant`'s derived equality/hash are structural, and `Value::from` maps each
+    // variant field-preservingly onto a distinct `Value` variant, so deduping on the
+    // `Constant` itself keeps exactly the elements the previous `Value`-keyed set
+    // kept — without a clone + `Value` conversion per element (only first
+    // occurrences are cloned into the set).
+    let mut seen: HashSet<Constant> = HashSet::new();
     let mut out = Vec::with_capacity(constants.len());
     for c in constants.into_iter() {
-        let v = crate::core_types::Value::from(c.clone());
-        if seen.insert(v) {
+        if !seen.contains(&c) {
+            seen.insert(c.clone());
             out.push(c);
         }
     }
@@ -3005,7 +3501,18 @@ fn collect_reassigned_vars(node: &AstNode, out: &mut HashSet<String>) {
 }
 
 pub fn generate_bytecode(node: &AstNode) -> CompilerResult<CompiledProgram> {
+    generate_bytecode_with_opt_level(node, 0)
+}
+
+/// `generate_bytecode` with the effective optimization level (0 when the optimizer
+/// is disabled), which gates codegen-side opt-level >= 1 passes such as the spill
+/// slot-reload cache and post-RA self-MOV elimination.
+pub fn generate_bytecode_with_opt_level(
+    node: &AstNode,
+    opt_level: u8,
+) -> CompilerResult<CompiledProgram> {
     let mut generator = CodeGenerator::new();
+    generator.opt_level = opt_level;
     collect_reassigned_vars(node, &mut generator.reassigned_vars);
     let (_result_vr, _result_is_secret) = generator.compile_node(node)?;
     let mut program = generator.finalize_program()?;
@@ -3014,12 +3521,347 @@ pub fn generate_bytecode(node: &AstNode) -> CompilerResult<CompiledProgram> {
     // client-IO manifest, replacing the placeholder set during finalisation.
     program.client_io_manifest.preprocessing_demand =
         crate::preprocessing_planner::plan_preprocessing_demand(node);
+    if std::env::var("STOFFEL_DEBUG_DEMAND").is_ok() {
+        eprintln!(
+            "[stoffel-lang] preprocessing demand: {:?}",
+            program.client_io_manifest.preprocessing_demand
+        );
+    }
     Ok(program)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{dedupe_constants, Constant};
+    use super::{dedupe_constants, CodeGenerator, Constant, SpillLoweringStats};
+    use crate::bytecode::Instruction;
+    use crate::core_types::Value;
+    use crate::register_allocator::{PhysicalRegister, VirtualRegister};
+    use std::collections::HashMap;
+
+    fn count_op(instructions: &[Instruction], f: impl Fn(&Instruction) -> bool) -> usize {
+        instructions.iter().filter(|i| f(i)).count()
+    }
+
+    fn lower(
+        instructions: Vec<Instruction>,
+        labels: HashMap<String, usize>,
+        num_vrs: usize,
+        secret_vrs: &[usize],
+        spilled: &[usize],
+        cache_enabled: bool,
+    ) -> (Vec<Instruction>, HashMap<String, usize>) {
+        let mut next_virtual_reg = num_vrs;
+        let mut secrecy_map = vec![false; num_vrs];
+        for &vr in secret_vrs {
+            secrecy_map[vr] = true;
+        }
+        let spilled_vrs: Vec<VirtualRegister> =
+            spilled.iter().map(|&v| VirtualRegister(v)).collect();
+        let mut next_spill_slot = 0;
+        let mut stats = SpillLoweringStats::default();
+        CodeGenerator::lower_spills_into_slots(
+            instructions,
+            labels,
+            &mut next_virtual_reg,
+            &mut secrecy_map,
+            &spilled_vrs,
+            &mut next_spill_slot,
+            cache_enabled,
+            &mut stats,
+        )
+    }
+
+    /// A def's store scratch is forwarded to later same-block uses of the same
+    /// spilled VR, eliding every reload; with the cache off, each use reloads.
+    #[test]
+    fn slot_cache_forwards_def_to_uses_within_block() {
+        let instructions = vec![
+            Instruction::LDI(1, Value::I64(5)), // def spilled VR1
+            Instruction::MOV(2, 1),             // use VR1
+            Instruction::MOV(3, 1),             // use VR1
+        ];
+
+        let (out, _) = lower(instructions.clone(), HashMap::new(), 4, &[], &[1], true);
+        assert_eq!(count_op(&out, |i| matches!(i, Instruction::LDS(..))), 0);
+        assert_eq!(count_op(&out, |i| matches!(i, Instruction::STS(..))), 1);
+        // Both uses must read the store scratch that holds VR1's value.
+        let Instruction::STS(_, store_scratch) = out[1] else {
+            panic!("expected STS after the def, got {out:?}");
+        };
+        assert!(matches!(out[2], Instruction::MOV(2, s) if s == store_scratch));
+        assert!(matches!(out[3], Instruction::MOV(3, s) if s == store_scratch));
+
+        let (out_off, _) = lower(instructions, HashMap::new(), 4, &[], &[1], false);
+        assert_eq!(count_op(&out_off, |i| matches!(i, Instruction::LDS(..))), 2);
+    }
+
+    /// Label targets and control transfers invalidate the cache, so a use in the
+    /// next block reloads from the slot instead of trusting a stale scratch.
+    #[test]
+    fn slot_cache_cleared_at_labels_and_jumps() {
+        let instructions = vec![
+            Instruction::LDI(1, Value::I64(5)), // def spilled VR1
+            Instruction::MOV(2, 1),             // same-block use: forwarded
+            Instruction::MOV(3, 1),             // label target: must reload
+            Instruction::JMP("l".to_string()),
+            Instruction::MOV(4, 1), // after a jump: must reload
+        ];
+        let labels: HashMap<String, usize> = [("l".to_string(), 2)].into();
+
+        let (out, lowered_labels) = lower(instructions, labels, 5, &[], &[1], true);
+        assert_eq!(count_op(&out, |i| matches!(i, Instruction::LDS(..))), 2);
+        // The label must now point at the reload that precedes its instruction:
+        // [LDI, STS, MOV, LDS, MOV, JMP, LDS, MOV].
+        assert_eq!(lowered_labels["l"], 3);
+        assert!(matches!(out[3], Instruction::LDS(..)));
+    }
+
+    /// The per-bank LRU holds two slots; a third reload evicts the least recently
+    /// used entry, and banks do not evict each other.
+    #[test]
+    fn slot_cache_lru_eviction_is_per_bank() {
+        // VR1..VR3 clear + VR17 secret, all spilled; each def caches its slot.
+        let instructions = vec![
+            Instruction::LDI(1, Value::I64(1)),
+            Instruction::LDI(2, Value::I64(2)),
+            Instruction::LDI(17, Value::I64(3)), // secret bank entry
+            Instruction::LDI(3, Value::I64(4)),  // evicts VR1 (clear LRU)
+            Instruction::MOV(4, 2),              // hit (clear)
+            Instruction::MOV(5, 3),              // hit (clear)
+            Instruction::MOV(6, 1),              // miss: VR1 was evicted
+            Instruction::MOV(18, 17),            // hit (secret survived clear traffic)
+        ];
+
+        let (out, _) = lower(
+            instructions,
+            HashMap::new(),
+            19,
+            &[17, 18],
+            &[1, 2, 3, 17],
+            true,
+        );
+        let reloads: Vec<&Instruction> = out
+            .iter()
+            .filter(|i| matches!(i, Instruction::LDS(..)))
+            .collect();
+        assert_eq!(reloads.len(), 1, "only the evicted slot reloads: {out:?}");
+        // Slot 0 belongs to VR1 (first spilled VR listed).
+        assert!(matches!(reloads[0], Instruction::LDS(_, 0)));
+    }
+
+    /// Self-MOV elimination drops `MOV(r, r)` and remaps labels with the
+    /// boundary-inclusive table (labels at a deleted MOV or one past the end).
+    #[test]
+    fn eliminate_self_movs_drops_noops_and_remaps_labels() {
+        let instructions = vec![
+            Instruction::MOV(1, 1), // deleted
+            Instruction::LDI(2, Value::I64(7)),
+            Instruction::MOV(3, 3), // deleted
+            Instruction::MOV(4, 2),
+        ];
+        let mut labels: HashMap<String, usize> = [
+            ("start".to_string(), 0),
+            ("mid".to_string(), 2),
+            ("keep".to_string(), 3),
+            ("end".to_string(), 4),
+        ]
+        .into();
+
+        let out = CodeGenerator::eliminate_self_movs(instructions, &mut labels);
+
+        assert_eq!(out.len(), 2, "self-MOVs must be deleted: {out:?}");
+        assert!(matches!(out[0], Instruction::LDI(2, _)));
+        assert!(matches!(out[1], Instruction::MOV(4, 2)));
+        assert_eq!(labels["start"], 0);
+        assert_eq!(labels["mid"], 1);
+        assert_eq!(labels["keep"], 1);
+        assert_eq!(labels["end"], 2);
+    }
+
+    /// Runs `pin_hot_constants_with_limits` with test-sized thresholds and
+    /// returns the rewritten stream plus the updated labels/precolored map.
+    #[allow(clippy::type_complexity)]
+    fn pin(
+        mut instructions: Vec<Instruction>,
+        mut labels: HashMap<String, usize>,
+        num_vrs: usize,
+        secret_vrs: &[usize],
+        precolored_in: &[(usize, usize)],
+        min_freq: usize,
+        max_pins: usize,
+    ) -> (
+        Vec<Instruction>,
+        HashMap<String, usize>,
+        HashMap<VirtualRegister, PhysicalRegister>,
+    ) {
+        let mut next_virtual_reg = num_vrs;
+        let mut secrecy_map = vec![false; num_vrs];
+        for &vr in secret_vrs {
+            secrecy_map[vr] = true;
+        }
+        let mut precolored: HashMap<VirtualRegister, PhysicalRegister> = precolored_in
+            .iter()
+            .map(|&(vr, pr)| (VirtualRegister(vr), PhysicalRegister(pr)))
+            .collect();
+        CodeGenerator::pin_hot_constants_with_limits(
+            &mut instructions,
+            &mut labels,
+            &mut next_virtual_reg,
+            &mut secrecy_map,
+            &mut precolored,
+            0,
+            min_freq,
+            max_pins,
+            "test",
+        );
+        (instructions, labels, precolored)
+    }
+
+    /// Hot immediates of *different* typed widths pin separately (I64(4) and
+    /// U8(4) must never merge), replaced LDIs are deleted with their uses
+    /// renamed to the pinned VR, and labels shift through the prologue.
+    #[test]
+    fn const_pin_pins_typed_constants_separately_and_shifts_labels() {
+        let mut instructions = Vec::new();
+        for i in 0..32 {
+            instructions.push(Instruction::LDI(1 + 2 * i, Value::I64(4)));
+            instructions.push(Instruction::PUSHARG(1 + 2 * i));
+        }
+        for i in 0..32 {
+            instructions.push(Instruction::LDI(65 + 2 * i, Value::U8(4)));
+            instructions.push(Instruction::PUSHARG(65 + 2 * i));
+        }
+        instructions.push(Instruction::JMP("top".to_string()));
+        let n = instructions.len();
+        let labels: HashMap<String, usize> =
+            [("top".to_string(), 0), ("end".to_string(), n)].into();
+
+        let (out, labels, precolored) = pin(instructions, labels, 129, &[], &[], 32, 6);
+
+        // Two pins loaded in the prologue; equal frequencies tie-break on the
+        // typed key, so I64(4) pins first (R15), then U8(4) (R14).
+        let Instruction::LDI(pin_i64, Value::I64(4)) = out[0] else {
+            panic!("expected I64(4) prologue load, got {:?}", out[0]);
+        };
+        let Instruction::LDI(pin_u8, Value::U8(4)) = out[1] else {
+            panic!("expected U8(4) prologue load, got {:?}", out[1]);
+        };
+        assert_ne!(pin_i64, pin_u8, "typed constants must not merge");
+        assert_eq!(precolored[&VirtualRegister(pin_i64)], PhysicalRegister(15));
+        assert_eq!(precolored[&VirtualRegister(pin_u8)], PhysicalRegister(14));
+        // All 64 hot LDIs deleted; every PUSHARG renamed to its pin.
+        assert_eq!(out.len(), 2 + 64 + 1);
+        assert_eq!(
+            count_op(&out, |i| matches!(i, Instruction::LDI(..))),
+            2,
+            "all hot LDIs must be deleted: {out:?}"
+        );
+        for inst in &out[2..2 + 32] {
+            assert!(matches!(inst, Instruction::PUSHARG(r) if *r == pin_i64));
+        }
+        for inst in &out[2 + 32..2 + 64] {
+            assert!(matches!(inst, Instruction::PUSHARG(r) if *r == pin_u8));
+        }
+        // Labels shift by the prologue (a label on a deleted LDI lands on the
+        // next surviving instruction) and the one-past-the-end label stays valid.
+        assert_eq!(labels["top"], 2);
+        assert_eq!(labels["end"], out.len());
+    }
+
+    /// VR0, precolored VRs, multi-def VRs and secret-bank VRs are never renamed
+    /// even when their immediate is pinned, and pin homes skip physical
+    /// registers already reserved by the precolored map.
+    #[test]
+    fn const_pin_guards_vr0_precolored_multi_def_and_secret() {
+        let mut instructions = vec![
+            Instruction::LDI(0, Value::I64(9)),  // VR0: ABI result register
+            Instruction::LDI(1, Value::I64(9)),  // precolored (parameter)
+            Instruction::LDI(2, Value::I64(9)),  // multi-def below
+            Instruction::MOV(2, 1),              // second def of VR2
+            Instruction::LDI(17, Value::I64(9)), // secret-bank VR
+        ];
+        for i in 0..32 {
+            instructions.push(Instruction::LDI(20 + i, Value::I64(9)));
+            instructions.push(Instruction::PUSHARG(20 + i));
+        }
+
+        // R15 is already taken, so the single pin must land in R14.
+        let (out, _, precolored) = pin(instructions, HashMap::new(), 60, &[17], &[(1, 15)], 32, 6);
+
+        let Instruction::LDI(pinned, Value::I64(9)) = out[0] else {
+            panic!("expected prologue load, got {:?}", out[0]);
+        };
+        assert_eq!(precolored[&VirtualRegister(pinned)], PhysicalRegister(14));
+        // The four guarded LDIs survive; the 32 hot ones are gone.
+        let surviving: Vec<usize> = out
+            .iter()
+            .filter_map(|i| match i {
+                Instruction::LDI(dest, _) if *dest != pinned => Some(*dest),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(surviving, vec![0, 1, 2, 17], "guarded LDIs must survive");
+        assert!(out
+            .iter()
+            .all(|i| !matches!(i, Instruction::PUSHARG(r) if *r != pinned)));
+    }
+
+    /// An LDI whose previous surviving instruction is a CALL is kept, so a
+    /// following `MOV(dest, 0)` never becomes newly CALL-adjacent (the post-CALL
+    /// MOV rewrite reads physical R0). A later LDI in the same run is still
+    /// deletable once a surviving instruction sits between it and the CALL.
+    #[test]
+    fn const_pin_keeps_ldi_directly_after_call() {
+        let mut instructions = vec![
+            Instruction::CALL("f".to_string()),
+            Instruction::LDI(1, Value::I64(5)), // kept: CALL-adjacent
+            Instruction::MOV(2, 0),             // must stay the post-CALL capture
+            Instruction::LDI(3, Value::I64(5)), // deletable
+            Instruction::PUSHARG(1),
+            Instruction::PUSHARG(3),
+        ];
+        for i in 0..32 {
+            instructions.push(Instruction::LDI(10 + i, Value::I64(5)));
+            instructions.push(Instruction::PUSHARG(10 + i));
+        }
+
+        let (out, _, _) = pin(instructions, HashMap::new(), 50, &[], &[], 32, 6);
+
+        let Instruction::LDI(pinned, Value::I64(5)) = out[0] else {
+            panic!("expected prologue load, got {:?}", out[0]);
+        };
+        assert!(matches!(out[1], Instruction::CALL(_)));
+        assert!(
+            matches!(out[2], Instruction::LDI(1, Value::I64(5))),
+            "the CALL-adjacent LDI must survive: {:?}",
+            &out[..4]
+        );
+        assert!(matches!(out[3], Instruction::MOV(2, 0)));
+        // VR1 keeps its own register (not renamed); VR3 was renamed to the pin.
+        assert!(matches!(out[4], Instruction::PUSHARG(1)));
+        assert!(matches!(out[5], Instruction::PUSHARG(r) if r == pinned));
+    }
+
+    /// When every occurrence of a hot constant is guarded, the pass backs out
+    /// entirely: no prologue, no precolored entries, instructions untouched.
+    #[test]
+    fn const_pin_backs_out_when_nothing_is_deletable() {
+        let mut instructions = Vec::new();
+        for _ in 0..32 {
+            instructions.push(Instruction::LDI(1, Value::I64(7))); // multi-def VR1
+        }
+        instructions.push(Instruction::PUSHARG(1));
+        let before = instructions.clone();
+
+        let (out, _, precolored) = pin(instructions, HashMap::new(), 2, &[], &[], 32, 6);
+
+        assert_eq!(
+            format!("{out:?}"),
+            format!("{before:?}"),
+            "stream must be untouched"
+        );
+        assert!(precolored.is_empty(), "speculative pins must be dropped");
+    }
 
     #[test]
     fn dedupe_removes_duplicates_and_preserves_order() {

@@ -86,8 +86,13 @@ impl MultiFileCompiler {
             self.compile_module(module_key)?;
         }
 
-        // Phase 4: Link all modules into a single program
-        self.link_modules(&entry_module)
+        // Phase 4: Link all modules into a single program, then remove any
+        // functions that are not reachable from the entry chunk.
+        let mut program = self.link_modules(&entry_module)?;
+        program.prune_unreachable_functions_with_roots(
+            self.options.entry_points.iter().map(String::as_str),
+        );
+        Ok(program)
     }
 
     /// Compiles a single module, using exports from already-compiled dependencies.
@@ -220,7 +225,11 @@ impl MultiFileCompiler {
 
         // Apply optimizations
         let optimized_ast = if self.options.optimize {
-            optimizations::optimize_all(analyzed_ast, self.options.optimization_level)
+            optimizations::optimize_all_with_budgets(
+                analyzed_ast,
+                self.options.optimization_level,
+                self.options.opt_budgets(),
+            )
         } else {
             analyzed_ast
         };
@@ -229,7 +238,14 @@ impl MultiFileCompiler {
         let exports = self.extract_exports(&optimized_ast, &resolved.module_path);
 
         // Code generation
-        let mut program = codegen::generate_bytecode(&optimized_ast).map_err(|e| vec![e])?;
+        let codegen_opt_level = if self.options.optimize {
+            self.options.optimization_level
+        } else {
+            0
+        };
+        let mut program =
+            codegen::generate_bytecode_with_opt_level(&optimized_ast, codegen_opt_level)
+                .map_err(|e| vec![e])?;
         program.client_io_manifest.mpc_backend = self.options.mpc_backend;
         program.client_io_manifest.mpc_curve = self.options.mpc_curve;
 

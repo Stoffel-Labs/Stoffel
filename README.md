@@ -90,9 +90,10 @@ It reads `Stoffel.toml`, defaults to `src/main.stfl`, and writes bytecode to
 stoffel init my-lib --lib
 stoffel init rust-app --template rust
 stoffel init py-app --template python
-stoffel init contract-app --template solidity-foundry
-stoffel init hardhat-app --template solidity-hardhat
 ```
+
+Solidity/EVM project templates (`solidity-foundry`, `solidity-hardhat`) are
+planned but not yet available — see [Roadmap](#roadmap).
 
 ### Build, check, and inspect
 
@@ -516,6 +517,26 @@ cargo build --release -p stoffel-vm -p stoffel-vm-runner
 
 HoneyBadger and AVSS backend code is built by default. Distributed party runs
 select the backend from the compiled `.stflb` program manifest.
+
+## Roadmap
+
+Stoffel is under active development. The following capabilities are planned or
+in progress and are **not yet supported**:
+
+- **Solidity / EVM integration** — `solidity-foundry` and `solidity-hardhat`
+  project templates, and tooling for using Stoffel MPC outputs from on-chain
+  smart contracts. Referenced in some docs, but not yet shipped.
+- **Additional SDKs** — Python and TypeScript/WASM SDKs to complement the Rust
+  SDK. The C FFI surface exists today; higher-level language bindings are still
+  in progress.
+- **Persistent / long-running MPC networks** — keeping nodes and the coordinator
+  warm across runs with ahead-of-time preprocessing, so repeated runs pay only
+  the online cost.
+- **Hosted / managed deployment** — turnkey deployment of MPC party networks
+  beyond the local runner and Docker Compose stacks.
+
+Have a use case you don't see here? Open an issue or reach out — priorities are
+shaped by what people are building.
 
 ## Learn More
 

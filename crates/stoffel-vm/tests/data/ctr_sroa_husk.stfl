@@ -1,0 +1,129 @@
+def gate_xor(a: secret bool, b: secret bool) -> secret bool:
+  return a xor b
+
+def reveal_byte(byte: list[secret bool]) -> int64:
+  var value: int64 = 0
+  var b0: bool = byte[0].reveal()
+  if b0:
+    value += 1
+  var b1: bool = byte[1].reveal()
+  if b1:
+    value += 2
+  var b2: bool = byte[2].reveal()
+  if b2:
+    value += 4
+  var b3: bool = byte[3].reveal()
+  if b3:
+    value += 8
+  var b4: bool = byte[4].reveal()
+  if b4:
+    value += 16
+  var b5: bool = byte[5].reveal()
+  if b5:
+    value += 32
+  var b6: bool = byte[6].reveal()
+  if b6:
+    value += 64
+  var b7: bool = byte[7].reveal()
+  if b7:
+    value += 128
+  return value
+
+def reveal_block(block: list[list[secret bool]]) -> list[int64]:
+  return [reveal_byte(block[0]), reveal_byte(block[1]), reveal_byte(block[2]), reveal_byte(block[3]), reveal_byte(block[4]), reveal_byte(block[5]), reveal_byte(block[6]), reveal_byte(block[7]), reveal_byte(block[8]), reveal_byte(block[9]), reveal_byte(block[10]), reveal_byte(block[11]), reveal_byte(block[12]), reveal_byte(block[13]), reveal_byte(block[14]), reveal_byte(block[15])]
+
+def public_byte(value: int64) -> list[secret bool]:
+  var bits: list[secret bool] = []
+  var v: int64 = value
+  for i in 0..8:
+    bits.append(Share.from_clear_int(v % 2, 1))
+    v = v / 2
+  return bits
+
+def public_block(values: list[int64]) -> list[list[secret bool]]:
+  var block: list[list[secret bool]] = []
+  for i in 0..16:
+    block.append(public_byte(values[i]))
+  return block
+
+def bits_xor(a: list[secret bool], b: list[secret bool]) -> list[secret bool]:
+  var products = Share.batch_mul(a, b)
+  var out: list[secret bool] = []
+  for i in 0..a.len():
+    out.append(Share.sub(Share.add(a[i], b[i]), Share.mul_scalar(products[i], 2)))
+  return out
+
+def bits_to_bytes(bits: list[secret bool]) -> list[list[secret bool]]:
+  var out: list[list[secret bool]] = []
+  var k: int64 = 0
+  for i in 0..(bits.len() / 8):
+    var byte: list[secret bool] = []
+    for j in 0..8:
+      byte.append(bits[k])
+      k += 1
+    out.append(byte)
+  return out
+
+def bytes_xor(a: list[list[secret bool]], b: list[list[secret bool]]) -> list[list[secret bool]]:
+  var lefts: list[secret bool] = []
+  var rights: list[secret bool] = []
+  for i in 0..a.len():
+    for j in 0..8:
+      lefts.append(a[i][j])
+      rights.append(b[i][j])
+  return bits_to_bytes(bits_xor(lefts, rights))
+
+def gate_and(a: secret bool, b: secret bool) -> secret bool:
+  return a and b
+
+def increment_counter_byte(byte: list[secret bool], carry_in: secret bool) -> list[secret bool]:
+  var out: list[secret bool] = []
+  var carry = carry_in
+  for bit_index in 0..8:
+    out.append(gate_xor(byte[bit_index], carry))
+    carry = gate_and(byte[bit_index], carry)
+  return out
+
+def increment_counter_byte_carry(byte: list[secret bool], carry_in: secret bool) -> secret bool:
+  var carry = carry_in
+  for bit_index in 0..8:
+    carry = gate_and(byte[bit_index], carry)
+  return carry
+
+def increment_counter_block(counter: list[list[secret bool]]) -> list[list[secret bool]]:
+  var out: list[list[secret bool]] = []
+  var carry = Share.from_clear_int(1, 1)
+  for offset in 0..16:
+    var byte_index = 15 - offset
+    out.insert(0, increment_counter_byte(counter[byte_index], carry))
+    carry = increment_counter_byte_carry(counter[byte_index], carry)
+  return out
+
+# cheap stand-in for aes128_encrypt: returns a fresh block
+def transform(block: list[list[secret bool]]) -> list[list[secret bool]]:
+  var mask = public_block([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16])
+  return bytes_xor(block, mask)
+
+def ctr_keystream(blocks: list[list[list[secret bool]]], initial_counter: list[list[secret bool]]) -> list[list[list[secret bool]]]:
+  var keystream: list[list[list[secret bool]]] = []
+  var counter = initial_counter
+  for i in 0..blocks.len():
+    keystream.append(transform(counter))
+    counter = increment_counter_block(counter)
+  return keystream
+
+def ctr_apply(blocks: list[list[list[secret bool]]], keystream: list[list[list[secret bool]]]) -> list[list[list[secret bool]]]:
+  var out: list[list[list[secret bool]]] = []
+  for i in 0..blocks.len():
+    out.append(bytes_xor(blocks[i], keystream[i]))
+  return out
+
+def main() -> list[int64]:
+  var b0 = public_block([16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31])
+  var b1 = public_block([32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47])
+  var plaintext = [b0, b1]
+  var ctr0 = public_block([240, 241, 242, 243, 244, 245, 246, 247, 248, 249, 250, 251, 252, 253, 254, 255])
+  var keystream = ctr_keystream(plaintext, ctr0)
+  var ct = ctr_apply(plaintext, keystream)
+  var pt = ctr_apply(ct, keystream)
+  return reveal_block(pt[0])

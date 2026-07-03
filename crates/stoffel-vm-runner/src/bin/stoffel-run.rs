@@ -1255,6 +1255,21 @@ async fn sync_client_set_across_parties(
     let expected_confirmations = n_parties - 1;
     let receive_deadline = std::time::Instant::now() + Duration::from_secs(20);
 
+    // CANCELLATION SAFETY (the InvalidData flake): `connection.receive()` reads
+    // a length-prefixed frame across MULTIPLE awaits. Wrapping it in
+    // `tokio::time::timeout` (the old polling loop here) can cancel it BETWEEN
+    // the length read and the payload read; the next receive on that stream
+    // then parses payload bytes as a length header, permanently desyncing the
+    // frame stream — and these SAME party connections carry all subsequent MPC
+    // traffic, which then fails to deserialize
+    // (`MulError(ArkSerialization(InvalidData))`) and strands the mesh until
+    // the party timeout. Instead, spawn one NEVER-CANCELLED one-shot reader per
+    // peer (the same dedicated-reader idiom as `spawn_receive_loops`) that
+    // forwards its single sync frame through a channel; the deadline applies
+    // to the channel receive, which IS cancellation-safe.
+    let (sync_tx, mut sync_rx) = mpsc::unbounded_channel::<(usize, Result<Vec<u8>, String>)>();
+    let mut spawned_readers: HashSet<usize> = HashSet::new();
+
     while confirmed_parties.len() < expected_confirmations {
         if std::time::Instant::now() >= receive_deadline {
             return Err(format!(
@@ -1264,65 +1279,61 @@ async fn sync_client_set_across_parties(
             ));
         }
 
-        let mut progressed = false;
+        // Pick up (possibly late-arriving) peer connections.
         for (derived_id, connection) in net.get_all_server_connections() {
             let sender_id = connection.remote_party_id().unwrap_or(derived_id);
-            if sender_id >= n_parties
-                || sender_id == my_id
-                || confirmed_parties.contains(&sender_id)
-            {
+            if sender_id >= n_parties || sender_id == my_id || !spawned_readers.insert(sender_id) {
                 continue;
             }
-
-            let remaining = receive_deadline.saturating_duration_since(std::time::Instant::now());
-            let wait_for = remaining.min(Duration::from_millis(500));
-            if wait_for.is_zero() {
-                continue;
-            }
-
-            match tokio::time::timeout(wait_for, connection.receive()).await {
-                Ok(Ok(data)) => {
-                    let sync = decode_client_set_sync(&data).map_err(|e| {
-                        format!(
-                            "Failed to decode client-set sync from party {}: {}",
-                            sender_id, e
-                        )
-                    })?;
-
-                    if sync.sender_party_id != sender_id {
-                        return Err(format!(
-                            "Client-set sync sender mismatch: transport sender={} payload sender={}",
-                            sender_id, sync.sender_party_id
-                        ));
-                    }
-
-                    let normalized_remote = normalize_client_ids(sync.client_ids);
-                    if normalized_remote != normalized_local {
-                        return Err(format!(
-                            "Client-set mismatch with party {}: local={:?}, remote={:?}",
-                            sender_id, normalized_local, normalized_remote
-                        ));
-                    }
-
-                    confirmed_parties.insert(sender_id);
-                    progressed = true;
-                    eprintln!(
-                        "[party {}] Client-set sync confirmed with party {}",
-                        my_id, sender_id
-                    );
-                }
-                Ok(Err(e)) => {
-                    return Err(format!(
-                        "Failed to receive client-set sync from party {}: {}",
-                        sender_id, e
-                    ));
-                }
-                Err(_) => {}
-            }
+            let tx = sync_tx.clone();
+            tokio::spawn(async move {
+                let result = connection.receive().await;
+                let _ = tx.send((sender_id, result));
+            });
         }
 
-        if !progressed {
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        // Wait for the next sync frame; short tick so new connections are
+        // still scanned. Cancelling a CHANNEL receive loses nothing.
+        match tokio::time::timeout(Duration::from_millis(100), sync_rx.recv()).await {
+            Ok(Some((sender_id, Ok(data)))) => {
+                let sync = decode_client_set_sync(&data).map_err(|e| {
+                    format!(
+                        "Failed to decode client-set sync from party {}: {}",
+                        sender_id, e
+                    )
+                })?;
+
+                if sync.sender_party_id != sender_id {
+                    return Err(format!(
+                        "Client-set sync sender mismatch: transport sender={} payload sender={}",
+                        sender_id, sync.sender_party_id
+                    ));
+                }
+
+                let normalized_remote = normalize_client_ids(sync.client_ids);
+                if normalized_remote != normalized_local {
+                    return Err(format!(
+                        "Client-set mismatch with party {}: local={:?}, remote={:?}",
+                        sender_id, normalized_local, normalized_remote
+                    ));
+                }
+
+                confirmed_parties.insert(sender_id);
+                eprintln!(
+                    "[party {}] Client-set sync confirmed with party {}",
+                    my_id, sender_id
+                );
+            }
+            Ok(Some((sender_id, Err(e)))) => {
+                return Err(format!(
+                    "Failed to receive client-set sync from party {}: {}",
+                    sender_id, e
+                ));
+            }
+            Ok(None) => {
+                return Err("Client-set sync channel closed unexpectedly".to_string());
+            }
+            Err(_) => {}
         }
     }
 
@@ -3248,18 +3259,6 @@ where
         .map(|path| extract_pubkey_from_cert(&fs::read(path).expect("read client cert")))
         .collect();
 
-    if input_ids.is_empty() {
-        eprintln!(
-            "[party {}] AVSS coordinator mode has no client inputs; executing '{}' without preprocessing",
-            my_id, agreed_entry
-        );
-        let result = vm
-            .execute(agreed_entry)
-            .map_err(|err| format!("Execution error in '{}': {}", agreed_entry, err))?;
-        print_vm_result(vm, result);
-        return Ok(());
-    }
-
     let coord: AvssOffChainCoordinator<F, G> = AvssOffChainCoordinator::<F, G>::start_rpc_client(
         &coord_addr.0,
         coord_addr.1,
@@ -3307,85 +3306,94 @@ where
     .await?;
     engine.enable_client_output_capture().await;
 
-    let mut mask_shares = Vec::with_capacity(input_ids.len());
-    {
-        let node = engine.node_handle().lock().await;
-        for idx in 0..input_ids.len() {
-            let local_shares = node
-                .preprocessing_material
-                .lock()
-                .await
-                .take_v_random_shares(1)
-                .map_err(|e| format!("Not enough AVSS random shares for client {idx}: {:?}", e))?;
-            let share = local_shares
-                .into_iter()
-                .next()
-                .ok_or_else(|| format!("AVSS random share batch for client {idx} was empty"))?;
-            node_rpc
-                .add_mask_share(idx as u64, &share)
-                .await
-                .map_err(|e| format!("add_mask_share: {:?}", e))?;
-            mask_shares.push(share);
+    if input_ids.is_empty() {
+        eprintln!(
+            "[party {}] AVSS coordinator mode has no client inputs; preprocessing complete, skipping input collection",
+            my_id
+        );
+    } else {
+        let mut mask_shares = Vec::with_capacity(input_ids.len());
+        {
+            let node = engine.node_handle().lock().await;
+            for idx in 0..input_ids.len() {
+                let local_shares = node
+                    .preprocessing_material
+                    .lock()
+                    .await
+                    .take_v_random_shares(1)
+                    .map_err(|e| {
+                        format!("Not enough AVSS random shares for client {idx}: {:?}", e)
+                    })?;
+                let share = local_shares
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| format!("AVSS random share batch for client {idx} was empty"))?;
+                node_rpc
+                    .add_mask_share(idx as u64, &share)
+                    .await
+                    .map_err(|e| format!("add_mask_share: {:?}", e))?;
+                mask_shares.push(share);
+            }
         }
-    }
 
-    if as_leader {
+        if as_leader {
+            coord
+                .reserve_input_masks()
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         coord
-            .reserve_input_masks()
+            .wait_for_round(Round::InputMaskReservation)
             .await
             .map_err(|e| e.to_string())?;
-    }
-    coord
-        .wait_for_round(Round::InputMaskReservation)
-        .await
-        .map_err(|e| e.to_string())?;
 
-    let client_to_indices = normalize_client_to_indices(
-        coord
-            .wait_for_indices(input_ids.len() as u64)
-            .await
-            .map_err(|e| e.to_string())?,
-    );
-
-    for (cid, indices) in &client_to_indices {
-        for idx in indices {
-            node_rpc
-                .add_reserved_index(cid.clone(), *idx)
+        let client_to_indices = normalize_client_to_indices(
+            coord
+                .wait_for_indices(input_ids.len() as u64)
                 .await
-                .or_else(|e| match e {
-                    NodeRPCError::JSONError => {
-                        eprintln!(
-                            "[party {}] add_reserved_index observed a stale client sink for index {}; continuing",
-                            my_id, idx
-                        );
-                        Ok(())
-                    }
-                    other => Err(format!("add_reserved_index: {:?}", other)),
-                })?;
+                .map_err(|e| e.to_string())?,
+        );
+
+        for (cid, indices) in &client_to_indices {
+            for idx in indices {
+                node_rpc
+                    .add_reserved_index(cid.clone(), *idx)
+                    .await
+                    .or_else(|e| match e {
+                        NodeRPCError::JSONError => {
+                            eprintln!(
+                                "[party {}] add_reserved_index observed a stale client sink for index {}; continuing",
+                                my_id, idx
+                            );
+                            Ok(())
+                        }
+                        other => Err(format!("add_reserved_index: {:?}", other)),
+                    })?;
+            }
         }
-    }
 
-    if as_leader {
-        coord.collect_inputs().await.map_err(|e| e.to_string())?;
-    }
-    coord
-        .wait_for_round(Round::InputCollection)
-        .await
-        .map_err(|e| e.to_string())?;
+        if as_leader {
+            coord.collect_inputs().await.map_err(|e| e.to_string())?;
+        }
+        coord
+            .wait_for_round(Round::InputCollection)
+            .await
+            .map_err(|e| e.to_string())?;
 
-    let client_inputs = coord
-        .wait_for_inputs(input_ids.len() as u64, mask_shares)
-        .await
-        .map_err(|e| e.to_string())?;
-    let client_input_types = std::collections::BTreeMap::new();
-    store_reserved_client_inputs_feldman::<F, G, _>(
-        vm,
-        &client_to_indices,
-        client_inputs,
-        1,
-        &[],
-        &client_input_types,
-    );
+        let client_inputs = coord
+            .wait_for_inputs(input_ids.len() as u64, mask_shares)
+            .await
+            .map_err(|e| e.to_string())?;
+        let client_input_types = std::collections::BTreeMap::new();
+        store_reserved_client_inputs_feldman::<F, G, _>(
+            vm,
+            &client_to_indices,
+            client_inputs,
+            1,
+            &[],
+            &client_input_types,
+        );
+    }
 
     if as_leader {
         coord.start_mpc().await.map_err(|e| e.to_string())?;
@@ -4451,13 +4459,30 @@ async fn main() {
         (function_count, bytecode_version, client_io_manifest)
     } else {
         // Register all functions as they are read and lowered to avoid retaining
-        // the compiled function table beside the runtime program.
+        // the compiled or resolved function table beside the runtime program.
         let f = File::open(&load_path).expect("open binary file");
-        match CompiledBinary::try_for_each_vm_function_from_reader(&mut BufReader::new(f), |f| {
-            vm.try_register_function_without_source(f)
-                .map_err(|err| BinaryError::InvalidData(format!("invalid VM function: {err}")))?;
-            Ok(())
-        }) {
+        match CompiledBinary::try_for_each_resolved_vm_function_from_reader(
+            &mut BufReader::new(f),
+            |header, stream| {
+                let mut stream_error = None;
+                let result = vm.try_register_resolved_function_without_source(header, || {
+                    match stream.next_instruction() {
+                        Ok(instruction) => instruction,
+                        Err(err) => {
+                            stream_error = Some(err);
+                            None
+                        }
+                    }
+                });
+                if let Some(err) = stream_error {
+                    return Err(err);
+                }
+                result.map_err(|err| {
+                    BinaryError::InvalidData(format!("invalid VM function: {err}"))
+                })?;
+                Ok(())
+            },
+        ) {
             Ok(result) => result,
             Err(err) => {
                 eprintln!("Error: invalid compiled program: {:?}", err);

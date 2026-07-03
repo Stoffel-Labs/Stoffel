@@ -167,7 +167,9 @@ case "$COMPONENT" in
     info "done — run '${BIN} --help' to get started"
     ;;
   runner)
-    if runner_check_output="$("$INSTALL_DIR/${RUNNER}" 2>&1)"; then
+    if "$INSTALL_DIR/${RUNNER}" --help >/dev/null 2>&1; then
+      info "${RUNNER} installed"
+    elif runner_check_output="$("$INSTALL_DIR/${RUNNER}" 2>&1)"; then
       info "${RUNNER} installed"
     else
       status=$?

@@ -7,7 +7,6 @@ use crate::net::mpc_engine::{
     MpcSessionTopology,
 };
 use ark_ec::CurveGroup;
-use ark_std::rand::SeedableRng;
 use std::any::TypeId;
 use std::sync::{atomic::Ordering, Arc};
 use stoffel_vm_types::core_types::{
@@ -26,10 +25,6 @@ where
     F: SupportedMpcField,
     G: CurveGroup<ScalarField = F> + Send + Sync + 'static,
 {
-    pub(super) fn allocate_input_share_session(&self) -> Result<(usize, AvssSessionId), String> {
-        self.session_ids.next_input_share_session()
-    }
-
     pub(super) fn clear_input_to_field(clear: ClearShareInput) -> Result<F, String> {
         match clear.into_parts() {
             (ShareType::SecretInt { .. }, ClearShareValue::Integer(v)) => {
@@ -58,23 +53,36 @@ where
         }
     }
 
-    pub(super) async fn run_input_share_round(
+    /// Build the local share of a PUBLIC constant, with no network round.
+    ///
+    /// A clear input has no secret to protect, so it needs no AVSS dealing:
+    /// the constant polynomial `f(x) = value` written as a degree-`t` sharing
+    /// (all non-constant coefficients zero) gives every party the share `value`
+    /// at its own evaluation point, with Feldman commitments
+    /// `[value*G, 0, .., 0]`. This verifies under `verify_feldman`, adds and
+    /// Beaver-multiplies like any degree-`t` sharing, and reconstructs to
+    /// `value` — mirroring the HoneyBadger engine's local `input_share`.
+    ///
+    /// Do NOT replace this with a runtime AVSS dealing: preprocessing already
+    /// consumes the low `(ProtocolType::Avss, dealer, exec/round)` session
+    /// slots, so a runtime dealing allocated from a fresh counter collides
+    /// with an ended preprocessing session and the RBC layer silently drops it
+    /// (the original from_clear timeout).
+    pub(super) async fn local_constant_share(
         &self,
-        dealer_id: usize,
-        session_id: AvssSessionId,
-        secret: F,
+        value: F,
     ) -> Result<FeldmanShamirShare<F, G>, String> {
-        if self.topology.party_id() == dealer_id {
-            let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-            let mut node = self.clone_avss_node().await;
-            node.share_gen_avss
-                .avss
-                .init(vec![secret], session_id, &mut rng, self.net.clone())
-                .await
-                .map_err(|e| format!("AVSS input_share init failed: {:?}", e))?;
-        }
-
-        self.wait_for_share(session_id).await
+        let node = self.clone_avss_node().await;
+        let avss = &node.share_gen_avss.avss;
+        let share_id = *avss
+            .ids
+            .get(avss.id)
+            .ok_or_else(|| format!("AVSS party index {} missing from share ids", avss.id))?;
+        let threshold = self.topology.threshold();
+        let mut commitments = vec![G::zero(); threshold + 1];
+        commitments[0] = G::generator().mul(value);
+        FeldmanShamirShare::new(value, share_id, threshold, commitments)
+            .map_err(|e| format!("constant share construction failed: {:?}", e))
     }
 
     pub(super) async fn run_multiply_round(
@@ -212,10 +220,7 @@ where
     ) -> crate::net::mpc_engine::MpcEngineResult<ShareData> {
         (|| -> Result<ShareData, String> {
             let secret = Self::clear_input_to_field(clear)?;
-            let (dealer_id, session_id) = self.allocate_input_share_session()?;
-            let share = crate::net::block_on_current(
-                self.run_input_share_round(dealer_id, session_id, secret),
-            )?;
+            let share = crate::net::block_on_current(self.local_constant_share(secret))?;
             Self::share_to_share_data(&share)
         })()
         .map_mpc_engine_operation("input_share")

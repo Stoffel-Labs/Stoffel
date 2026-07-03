@@ -695,10 +695,7 @@ where
     async fn input_share_async(&self, clear: ClearShareInput) -> MpcEngineResult<ShareData> {
         async {
             let secret = Self::clear_input_to_field(clear)?;
-            let (dealer_id, session_id) = self.allocate_input_share_session()?;
-            let share = self
-                .run_input_share_round(dealer_id, session_id, secret)
-                .await?;
+            let share = self.local_constant_share(secret).await?;
             Self::share_to_share_data(&share)
         }
         .await

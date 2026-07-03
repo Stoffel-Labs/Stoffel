@@ -13,11 +13,12 @@ use crate::backend::MpcBackend;
 use crate::error::{format_compiler_errors, Error, Result};
 use crate::program::Program;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CompilationOptions {
     pub optimize: bool,
     pub optimization_level: u8,
     pub print_ir: bool,
+    pub entry_points: Vec<String>,
 }
 
 pub fn compile_source(source: &str, filename: &str, backend: MpcBackend) -> Result<Program> {
@@ -69,11 +70,19 @@ fn compiler_options(
     backend: MpcBackend,
     options: CompilationOptions,
 ) -> stoffellang::CompilerOptions {
+    // Optimizer budget knobs are honored here, at the SDK boundary, rather than
+    // inside the optimizer — keeping the library compile path hermetic. The
+    // Stoffel CLI populates these env vars from the project's build config.
+    let env_budget = |name: &str| std::env::var(name).ok().and_then(|v| v.parse().ok());
     stoffellang::CompilerOptions {
         optimize: options.optimize || options.optimization_level > 0,
         optimization_level: options.optimization_level,
         print_ir: options.print_ir,
         mpc_backend: backend.compiler_backend(),
         mpc_curve: backend.compiler_curve(),
+        entry_points: options.entry_points,
+        inline_budget: env_budget("STOFFEL_INLINE_BUDGET"),
+        unroll_budget: env_budget("STOFFEL_UNROLL_BUDGET"),
+        unroll_max_expansion: env_budget("STOFFEL_UNROLL_MAX_EXPANSION"),
     }
 }

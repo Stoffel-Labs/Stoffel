@@ -8,43 +8,21 @@ use crate::net::mpc::protocol_ids::derive_protocol_instance_id_u32;
 pub(super) struct AvssSessionIds {
     instance_id: u64,
     party_id: usize,
-    n_parties: usize,
     local_counter: AtomicU64,
-    input_share_counter: AtomicU64,
 }
 
 impl AvssSessionIds {
-    pub fn new(instance_id: u64, party_id: usize, n_parties: usize) -> Self {
+    pub fn new(instance_id: u64, party_id: usize, _n_parties: usize) -> Self {
         Self {
             instance_id,
             party_id,
-            n_parties,
             local_counter: AtomicU64::new(0),
-            input_share_counter: AtomicU64::new(0),
         }
     }
 
     pub fn next_dealer_session(&self) -> Result<AvssSessionId, String> {
         let counter = next_u16_domain_counter(&self.local_counter, "AVSS local session counter")?;
         allocate_local_avss_session(self.instance_id, self.party_id, counter)
-    }
-
-    pub fn next_input_share_session(&self) -> Result<(usize, AvssSessionId), String> {
-        if self.n_parties == 0 {
-            return Err("AVSS input-share session allocation requires at least one party".into());
-        }
-
-        let round = next_u16_domain_counter(
-            &self.input_share_counter,
-            "AVSS input-share session counter",
-        )?;
-        let dealer_id = usize::try_from(round)
-            .map_err(|_| format!("AVSS input share round {round} exceeds usize::MAX"))?
-            % self.n_parties;
-        Ok((
-            dealer_id,
-            allocate_local_avss_session(self.instance_id, dealer_id, round)?,
-        ))
     }
 }
 
@@ -141,43 +119,6 @@ mod tests {
         assert_eq!(
             protocol_instance_id_u32(instance_id),
             protocol_instance_id_u32(instance_id)
-        );
-    }
-
-    #[test]
-    fn input_share_session_allocation_is_consistent_across_parties() {
-        let first = AvssSessionIds::new(77, 0, 4);
-        let second = AvssSessionIds::new(77, 1, 4);
-
-        let (dealer0, sid0) = first.next_input_share_session().expect("session0");
-        let (dealer1, sid1) = second.next_input_share_session().expect("session1");
-        assert_eq!(dealer0, dealer1, "dealer selection must be deterministic");
-        assert_eq!(
-            sid0.as_u128(),
-            sid1.as_u128(),
-            "session ids must match across parties for the same input_share round"
-        );
-        assert_eq!(
-            sid0.sub_id() as usize,
-            dealer0,
-            "session sub_id must identify the input-share dealer"
-        );
-
-        let (dealer0_next, sid0_next) = first.next_input_share_session().expect("session0-next");
-        let (dealer1_next, sid1_next) = second.next_input_share_session().expect("session1-next");
-        assert_eq!(
-            dealer0_next, dealer1_next,
-            "dealer selection must stay aligned across rounds"
-        );
-        assert_eq!(
-            sid0_next.as_u128(),
-            sid1_next.as_u128(),
-            "session ids must stay aligned across rounds"
-        );
-        assert_eq!(
-            sid0_next.sub_id() as usize,
-            dealer0_next,
-            "session sub_id must track the input-share dealer each round"
         );
     }
 
