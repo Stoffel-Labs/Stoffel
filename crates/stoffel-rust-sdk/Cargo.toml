@@ -44,6 +44,6 @@ stoffelmpc-mpc = { package = "stoffelcrypto", version = "0.1.0" }
 
 [dev-dependencies]
 aes = "0.8"
-stoffel-bindgen = { path = "../stoffel-bindgen" }
+stoffel-bindgen = { version = "0.1.1", path = "../stoffel-bindgen" }
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
 trybuild = "1"
