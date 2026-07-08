@@ -4,7 +4,7 @@ use crate::net::client_store::{
     ClientInputHydrationCount, ClientInputStore, ClientOutputShareCount,
 };
 use crate::net::reservation::ReservationGrant;
-use crate::storage::preproc::PreprocStore;
+use crate::storage::preproc::{PoolAvailability, PreprocStore};
 use std::sync::Arc;
 use stoffel_vm_types::core_types::{ShareData, ShareType};
 use stoffelnet::network_utils::ClientId;
@@ -193,6 +193,20 @@ pub trait MpcEngineReservation: MpcEngine {
     /// Initialize or restore reservation state for a program.
     async fn init_reservations(&self, program_hash: [u8; 32], capacity: u64)
         -> MpcEngineResult<()>;
+
+    /// Initialize or restore reservation state for one persistent run.
+    ///
+    /// One-shot callers can use [`MpcEngineReservation::init_reservations`].
+    async fn init_reservations_for_run(
+        &self,
+        program_hash: [u8; 32],
+        capacity: u64,
+        run_id: u64,
+        preproc_offset: PoolAvailability,
+    ) -> MpcEngineResult<()> {
+        let _ = (run_id, preproc_offset);
+        self.init_reservations(program_hash, capacity).await
+    }
 
     /// Reserve `n` consecutive mask indices for a client.
     async fn reserve_masks(&self, client_id: ClientId, n: u64)

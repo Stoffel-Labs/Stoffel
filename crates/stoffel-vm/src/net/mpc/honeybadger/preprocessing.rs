@@ -1,6 +1,8 @@
 use super::HoneyBadgerMpcEngine;
 use crate::net::curve::SupportedMpcField;
-use crate::storage::preproc::{self, PreprocBlob, PreprocKeyScope};
+use crate::storage::preproc::{
+    self, PoolAvailability, PreprocBlob, PreprocKeyScope, PreprocTargets, TopUpReport,
+};
 use ark_ec::{CurveGroup, PrimeGroup};
 use ark_std::rand::SeedableRng;
 use std::sync::{
@@ -10,7 +12,9 @@ use std::sync::{
 use std::time::{Duration, Instant};
 use stoffel_vm_types::core_types::{ShareData, ShareType};
 use stoffelmpc_mpc::common::PreprocessingMPCProtocol;
+use stoffelmpc_mpc::honeybadger::fpmul::f256::Gf256;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+use stoffelmpc_mpc::honeybadger::triple_gen::ShamirBeaverTriple;
 use stoffelmpc_mpc::honeybadger::HoneyBadgerError;
 
 fn ensure_decoded_count(label: &str, actual: usize, expected: u32) -> Result<(), String> {
@@ -43,6 +47,10 @@ where
     }
 
     pub async fn preprocess(&self) -> Result<(), String> {
+        if self.is_standing() {
+            return self.preprocess_standing().await;
+        }
+
         if self.try_load_preproc().await? {
             self.ready.store(true, Ordering::SeqCst);
             return Ok(());
@@ -83,6 +91,138 @@ where
 
         self.ready.store(true, Ordering::SeqCst);
         Ok(())
+    }
+
+    async fn preproc_scope(
+        &self,
+    ) -> Result<
+        (
+            Arc<dyn crate::storage::preproc::PreprocStore>,
+            [u8; 32],
+            PreprocKeyScope,
+        ),
+        String,
+    > {
+        let store = self.preproc_store.read().await.clone();
+        let hash = *self.program_hash.read().await;
+        let (store, hash) = match (store, hash) {
+            (Some(s), Some(h)) => (s, h),
+            _ => {
+                return Err(
+                    "standing preprocessing requires configured preproc store and program hash"
+                        .to_owned(),
+                )
+            }
+        };
+        let scope = PreprocKeyScope::new(
+            hash,
+            F::field_kind(),
+            self.topology.n_parties(),
+            self.topology.threshold(),
+            self.persistent_identity(),
+        );
+        Ok((store, hash, scope))
+    }
+
+    async fn current_preproc_targets(&self) -> Result<PreprocTargets, String> {
+        let node = self.clone_node().await;
+        Ok(PreprocTargets {
+            beaver: preproc::u32_index(node.params.n_triples as u64, "HB beaver target")?,
+            random: preproc::u32_index(node.params.n_random_shares as u64, "HB random target")?,
+            prand_bit: preproc::u32_index(node.params.n_prandbit as u64, "HB prandbit target")?,
+            prand_int: preproc::u32_index(node.params.n_prandint as u64, "HB prandint target")?,
+        })
+    }
+
+    async fn preprocess_standing(&self) -> Result<(), String> {
+        let (store, _hash, scope) = self.preproc_scope().await?;
+        let targets = self.current_preproc_targets().await?;
+        let availability = store.scope_availability(&scope).await?;
+        if availability.beaver < targets.beaver
+            || availability.random < targets.random
+            || availability.prand_bit < targets.prand_bit
+            || availability.prand_int < targets.prand_int
+        {
+            self.top_up_to(targets).await?;
+        }
+        self.ready.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub async fn top_up_to(&self, targets: PreprocTargets) -> Result<TopUpReport, String> {
+        let (store, _hash, scope) = self.preproc_scope().await?;
+        let availability = store.scope_availability(&scope).await?;
+        let needed = PoolAvailability {
+            beaver: targets.beaver.saturating_sub(availability.beaver),
+            random: targets.random.saturating_sub(availability.random),
+            prand_bit: targets.prand_bit.saturating_sub(availability.prand_bit),
+            prand_int: targets.prand_int.saturating_sub(availability.prand_int),
+        };
+        if needed == PoolAvailability::default() {
+            return Ok(TopUpReport {
+                generated: PoolAvailability::default(),
+                skipped: true,
+            });
+        }
+
+        let mut node = self.clone_node().await;
+        node.params.n_triples = needed.beaver as usize;
+        node.params.n_random_shares = needed.random as usize;
+        node.params.n_prandbit = needed.prand_bit as usize;
+        node.params.n_prandint = needed.prand_int as usize;
+
+        let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
+        node.run_preprocessing(self.net.clone(), &mut rng)
+            .await
+            .map_err(|e| format!("Failed to top up preprocessing material: {:?}", e))?;
+
+        let mut generated = PoolAvailability::default();
+        let mut to_append = Vec::new();
+        {
+            let mut prep = node.preprocessing_material.lock().await;
+            let lengths = prep.length();
+            if lengths.beaver_triples > 0 {
+                let items = prep
+                    .take_beaver_triples(lengths.beaver_triples)
+                    .map_err(|e| format!("{e:?}"))?;
+                let (data, item_size) = preproc::serialize_beaver_triples::<F>(&items)?;
+                generated.beaver = preproc::u32_index(items.len() as u64, "generated beaver")?;
+                to_append.push((scope.beaver_triple(), item_size, generated.beaver, data));
+            }
+            if lengths.random_shr > 0 {
+                let items = prep
+                    .take_random_shares(lengths.random_shr)
+                    .map_err(|e| format!("{e:?}"))?;
+                let (data, item_size) = preproc::serialize_robust_shares::<F>(&items)?;
+                generated.random = preproc::u32_index(items.len() as u64, "generated random")?;
+                to_append.push((scope.random_share(), item_size, generated.random, data));
+            }
+            if lengths.prandbit > 0 {
+                let items = prep
+                    .take_prandbit_shares(lengths.prandbit)
+                    .map_err(|e| format!("{e:?}"))?;
+                let (data, item_size) = preproc::serialize_prandbit_shares::<F>(&items)?;
+                generated.prand_bit = preproc::u32_index(items.len() as u64, "generated prandbit")?;
+                to_append.push((scope.prand_bit(), item_size, generated.prand_bit, data));
+            }
+            if lengths.prandint > 0 {
+                let items = prep
+                    .take_prandint_shares(lengths.prandint)
+                    .map_err(|e| format!("{e:?}"))?;
+                let (data, item_size) = preproc::serialize_robust_shares::<F>(&items)?;
+                generated.prand_int = preproc::u32_index(items.len() as u64, "generated prandint")?;
+                to_append.push((scope.prand_int(), item_size, generated.prand_int, data));
+            }
+        }
+
+        for (key, item_size, added, data) in to_append {
+            store.append_items(&key, item_size, added, &data).await?;
+        }
+
+        Ok(TopUpReport {
+            generated,
+            skipped: false,
+        })
     }
 
     /// Try to load preprocessing material from the persistent store.
@@ -367,6 +507,32 @@ where
         &self,
         num_shares: usize,
     ) -> Result<Vec<RobustShare<F>>, String> {
+        if self.is_standing() {
+            let (store, _hash, scope) = self.preproc_scope().await?;
+            let key = scope.random_share();
+            let meta = store
+                .meta(&key)
+                .await?
+                .ok_or_else(|| "no standing random shares stored".to_owned())?;
+            let count = preproc::u32_index(num_shares as u64, "standing random share count")?;
+            if meta.available() < count {
+                return Err(format!(
+                    "InsufficientPreproc: random shares need {}, available {}",
+                    count,
+                    meta.available()
+                ));
+            }
+            let start = meta.consumed;
+            store.reserve_at(&key, start, count).await?;
+            let blob = store
+                .load(&key)
+                .await?
+                .ok_or("no standing random shares stored")?;
+            let decoded =
+                preproc::deserialize_robust_shares::<F>(&blob.data, blob.meta.item_size, start)?;
+            return Ok(decoded.into_iter().take(num_shares).collect());
+        }
+
         loop {
             let attempt = {
                 let node = self.clone_node().await;
@@ -392,6 +558,33 @@ where
         num_shares: usize,
         ty: ShareType,
     ) -> Result<Vec<RobustShare<F>>, String> {
+        if self.is_standing() {
+            let _ = ty;
+            let (store, _hash, scope) = self.preproc_scope().await?;
+            let key = scope.prand_int();
+            let meta = store
+                .meta(&key)
+                .await?
+                .ok_or_else(|| "no standing PRandInt shares stored".to_owned())?;
+            let count = preproc::u32_index(num_shares as u64, "standing PRandInt share count")?;
+            if meta.available() < count {
+                return Err(format!(
+                    "InsufficientPreproc: PRandInt shares need {}, available {}",
+                    count,
+                    meta.available()
+                ));
+            }
+            let start = meta.consumed;
+            store.reserve_at(&key, start, count).await?;
+            let blob = store
+                .load(&key)
+                .await?
+                .ok_or("no standing PRandInt shares stored")?;
+            let decoded =
+                preproc::deserialize_robust_shares::<F>(&blob.data, blob.meta.item_size, start)?;
+            return Ok(decoded.into_iter().take(num_shares).collect());
+        }
+
         loop {
             let attempt = {
                 let node = self.clone_node().await;
@@ -410,6 +603,98 @@ where
                 }
             }
         }
+    }
+
+    pub(super) async fn reserve_beaver_triples(
+        &self,
+        num_triples: usize,
+    ) -> Result<Vec<ShamirBeaverTriple<F>>, String> {
+        if !self.is_standing() {
+            let node = self.clone_node().await;
+            return node
+                .preprocessing_material
+                .lock()
+                .await
+                .take_beaver_triples(num_triples)
+                .map_err(|e| format!("Failed to take Beaver triples: {:?}", e));
+        }
+
+        let (store, _hash, scope) = self.preproc_scope().await?;
+        let key = scope.beaver_triple();
+        let meta = store
+            .meta(&key)
+            .await?
+            .ok_or_else(|| "no standing Beaver triples stored".to_owned())?;
+        let count = preproc::u32_index(num_triples as u64, "standing Beaver triple count")?;
+        if meta.available() < count {
+            return Err(format!(
+                "InsufficientPreproc: Beaver triples need {}, available {}",
+                count,
+                meta.available()
+            ));
+        }
+        let start = meta.consumed;
+        store.reserve_at(&key, start, count).await?;
+        let blob = store
+            .load(&key)
+            .await?
+            .ok_or("no standing Beaver triples stored")?;
+        let decoded =
+            preproc::deserialize_beaver_triples::<F>(&blob.data, blob.meta.item_size, start)?;
+        if decoded.len() < num_triples {
+            return Err(format!(
+                "standing Beaver triple decode returned {} items, expected {}",
+                decoded.len(),
+                num_triples
+            ));
+        }
+        Ok(decoded.into_iter().take(num_triples).collect())
+    }
+
+    pub(super) async fn reserve_prandbit_shares(
+        &self,
+        num_shares: usize,
+    ) -> Result<Vec<(RobustShare<F>, Gf256)>, String> {
+        if !self.is_standing() {
+            let node = self.clone_node().await;
+            return node
+                .preprocessing_material
+                .lock()
+                .await
+                .take_prandbit_shares(num_shares)
+                .map_err(|e| format!("Failed to take PRandBit shares: {:?}", e));
+        }
+
+        let (store, _hash, scope) = self.preproc_scope().await?;
+        let key = scope.prand_bit();
+        let meta = store
+            .meta(&key)
+            .await?
+            .ok_or_else(|| "no standing PRandBit shares stored".to_owned())?;
+        let count = preproc::u32_index(num_shares as u64, "standing PRandBit share count")?;
+        if meta.available() < count {
+            return Err(format!(
+                "InsufficientPreproc: PRandBit shares need {}, available {}",
+                count,
+                meta.available()
+            ));
+        }
+        let start = meta.consumed;
+        store.reserve_at(&key, start, count).await?;
+        let blob = store
+            .load(&key)
+            .await?
+            .ok_or("no standing PRandBit shares stored")?;
+        let decoded =
+            preproc::deserialize_prandbit_shares::<F>(&blob.data, blob.meta.item_size, start)?;
+        if decoded.len() < num_shares {
+            return Err(format!(
+                "standing PRandBit decode returned {} items, expected {}",
+                decoded.len(),
+                num_shares
+            ));
+        }
+        Ok(decoded.into_iter().take(num_shares).collect())
     }
 
     async fn regenerate_random_shares(&self, needed: usize) -> Result<(), String> {

@@ -7,6 +7,13 @@ use std::sync::Arc;
 use stoffelnet::network_utils::ClientId;
 use stoffelnet::transports::quic::QuicNetworkManager;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum DeploymentMode {
+    #[default]
+    OneShot,
+    Standing,
+}
+
 /// Common MPC engine session wiring shared by backend implementations.
 ///
 /// Backend constructors should take this named config instead of long

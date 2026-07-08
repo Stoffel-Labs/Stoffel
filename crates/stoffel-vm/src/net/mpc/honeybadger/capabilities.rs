@@ -175,6 +175,12 @@ where
         Some(self)
     }
 
+    async fn reset_for_next_run(&self, new_instance_id: u64) -> MpcEngineResult<()> {
+        self.reset_state_for_next_run(new_instance_id)
+            .await
+            .map_mpc_engine_operation("reset_for_next_run")
+    }
+
     async fn input_share_async(&self, clear: ClearShareInput) -> MpcEngineResult<ShareData> {
         self.input_share(clear)
     }

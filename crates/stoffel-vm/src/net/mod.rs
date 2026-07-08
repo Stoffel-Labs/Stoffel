@@ -5,6 +5,8 @@ pub mod avss_server;
 pub(crate) mod broadcast;
 pub mod client_store;
 pub mod curve;
+pub mod deployment_epoch;
+pub mod deployment_manifest;
 pub mod discovery;
 pub(crate) mod group_interpolation;
 pub mod hb_server;

@@ -1,12 +1,14 @@
 use crate::net::curve::SupportedMpcField;
-use crate::net::mpc::honeybadger_node_opts;
+use crate::net::mpc::{honeybadger_node_opts, honeybadger_node_opts_with_truncation};
 use crate::net::mpc_engine::{DurableIdentityDigest, MpcPartyId, MpcSessionTopology};
 use crate::net::reservation::ReservationRegistry;
 use crate::storage::preproc::PreprocStore;
 use ark_ec::{CurveGroup, PrimeGroup};
 use std::marker::PhantomData;
-use std::sync::atomic::AtomicBool;
+use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, RwLock as StdRwLock};
+use std::time::Duration;
 use stoffelmpc_mpc::common::MPCProtocol;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelmpc_mpc::honeybadger::HoneyBadgerMPCNode;
@@ -30,8 +32,9 @@ pub use config::{HoneyBadgerEngineConfig, HoneyBadgerPreprocessingConfig};
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
 use stoffelmpc_mpc::honeybadger::SessionId as HbSessionId;
 type RBCImpl = Avid<HbSessionId>;
+const DEFAULT_RESET_DRAIN_TIMEOUT_MS: u64 = 30_000;
 
-use crate::net::engine_config::MpcSessionConfig;
+use crate::net::engine_config::{DeploymentMode, MpcSessionConfig};
 
 /// HoneyBadger-backed MPC engine that integrates with the VM.
 /// This wraps a real HoneyBadgerMPCNode and provides MPC operations
@@ -42,9 +45,12 @@ where
     G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
 {
     topology: MpcSessionTopology,
+    current_instance_id: AtomicU64,
     local_identity: DurableIdentityDigest,
     net: Arc<QuicNetworkManager>,
+    input_ids: Vec<ClientId>,
     node: Arc<Mutex<HoneyBadgerMPCNode<F, RBCImpl>>>,
+    in_flight: Arc<AtomicUsize>,
     ready: AtomicBool,
     group_marker: PhantomData<G>,
     /// Persistent preprocessing store.
@@ -62,7 +68,46 @@ where
     /// Session-local router for open-share/open-exp payloads.
     open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
     /// Per-instance open share accumulation registry.
-    open_registry: Arc<crate::net::open_registry::InstanceRegistry>,
+    open_registry: StdRwLock<Arc<crate::net::open_registry::InstanceRegistry>>,
+    /// Deployment lifetime semantics. OneShot preserves legacy load/delete/RAM behavior.
+    deployment_mode: DeploymentMode,
+}
+
+pub(super) struct HoneyBadgerNodeLease<F>
+where
+    F: SupportedMpcField,
+{
+    node: HoneyBadgerMPCNode<F, RBCImpl>,
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl<F> Deref for HoneyBadgerNodeLease<F>
+where
+    F: SupportedMpcField,
+{
+    type Target = HoneyBadgerMPCNode<F, RBCImpl>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.node
+    }
+}
+
+impl<F> DerefMut for HoneyBadgerNodeLease<F>
+where
+    F: SupportedMpcField,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.node
+    }
+}
+
+impl<F> Drop for HoneyBadgerNodeLease<F>
+where
+    F: SupportedMpcField,
+{
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Clone)]
@@ -99,16 +144,142 @@ where
         self.open_message_router.clone()
     }
 
+    pub(crate) fn open_registry(&self) -> Arc<crate::net::open_registry::InstanceRegistry> {
+        self.open_registry
+            .read()
+            .expect("open registry lock poisoned")
+            .clone()
+    }
+
     pub fn net(&self) -> Arc<QuicNetworkManager> {
         self.net.clone()
     }
 
     pub fn topology(&self) -> MpcSessionTopology {
         self.topology
+            .with_instance(self.current_instance_id.load(Ordering::SeqCst))
     }
 
-    pub(super) async fn clone_node(&self) -> HoneyBadgerMPCNode<F, RBCImpl> {
-        self.node.lock().await.clone()
+    pub fn current_instance_id(&self) -> u64 {
+        self.current_instance_id.load(Ordering::SeqCst)
+    }
+
+    pub(super) async fn clone_node(&self) -> HoneyBadgerNodeLease<F> {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let node = self.node.lock().await.clone();
+        HoneyBadgerNodeLease {
+            node,
+            in_flight: self.in_flight.clone(),
+        }
+    }
+
+    fn reset_drain_timeout() -> Duration {
+        let millis = std::env::var("STOFFEL_DRAIN_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_RESET_DRAIN_TIMEOUT_MS);
+        Duration::from_millis(millis)
+    }
+
+    async fn await_inflight_drained(&self) -> Result<(), String> {
+        let timeout = Self::reset_drain_timeout();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.in_flight.load(Ordering::SeqCst) == 0 {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {:?} waiting for HoneyBadger in-flight operations to drain",
+                    timeout
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn build_node_for_instance(
+        &self,
+        new_instance_id: u64,
+    ) -> Result<HoneyBadgerMPCNode<F, RBCImpl>, String> {
+        let (n_triples, n_random_shares, n_prandbit, n_prandint) = {
+            let node = self.node.lock().await;
+            (
+                node.params.n_triples,
+                node.params.n_random_shares,
+                node.params.n_prandbit,
+                node.params.n_prandint,
+            )
+        };
+        let mpc_opts = honeybadger_node_opts_with_truncation(
+            self.topology.n_parties(),
+            self.topology.threshold(),
+            n_triples,
+            n_random_shares,
+            n_prandbit,
+            n_prandint,
+            new_instance_id,
+        )?;
+        <HoneyBadgerMPCNode<F, RBCImpl> as MPCProtocol<
+            F,
+            RobustShare<F>,
+            QuicNetworkManager,
+        >>::setup(self.topology.party_id(), mpc_opts, self.input_ids.clone())
+        .map_err(|e| format!("Failed to recreate HoneyBadger MPC node: {:?}", e))
+    }
+
+    pub(crate) async fn reset_state_for_next_run(
+        &self,
+        new_instance_id: u64,
+    ) -> Result<(), String> {
+        let was_ready = self.ready.swap(false, Ordering::SeqCst);
+        self.await_inflight_drained().await?;
+
+        let new_node = self.build_node_for_instance(new_instance_id).await?;
+        {
+            let mut node = self.node.lock().await;
+            *node = new_node;
+        }
+
+        let new_registry = self.open_message_router.register_instance(new_instance_id);
+        let old_registry = {
+            let mut slot = self
+                .open_registry
+                .write()
+                .expect("open registry lock poisoned");
+            std::mem::replace(&mut *slot, new_registry)
+        };
+        let old_ref_count = Arc::strong_count(&old_registry);
+        if old_ref_count > 1 {
+            tracing::warn!(
+                instance_id = old_registry.instance_id(),
+                strong_count = old_ref_count,
+                "old HoneyBadger open registry still has external references after reset"
+            );
+        }
+        drop(old_registry);
+
+        self.current_instance_id
+            .store(new_instance_id, Ordering::SeqCst);
+        *self.reservation.write().await = None;
+        self.client_output_id_map.write().await.clear();
+        {
+            let mut capture = self.client_output_capture.lock().await;
+            if capture.is_some() {
+                *capture = Some(Vec::new());
+            }
+        }
+        self.ready.store(was_ready, Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub fn deployment_mode(&self) -> DeploymentMode {
+        self.deployment_mode
+    }
+
+    pub fn is_standing(&self) -> bool {
+        self.deployment_mode == DeploymentMode::Standing
     }
 
     pub fn party(&self) -> MpcPartyId {
@@ -133,6 +304,7 @@ where
         let HoneyBadgerEngineConfig {
             session,
             preprocessing,
+            deployment_mode,
         } = config;
         let (topology, local_identity, network, input_ids, open_message_router) =
             session.into_parts();
@@ -155,14 +327,17 @@ where
             F,
             RobustShare<F>,
             QuicNetworkManager,
-        >>::setup(party_id, mpc_opts, input_ids)
+        >>::setup(party_id, mpc_opts, input_ids.clone())
         .map_err(|e| format!("Failed to create MPC node: {:?}", e))?;
 
         Ok(Arc::new(Self {
             topology,
+            current_instance_id: AtomicU64::new(instance_id),
             local_identity,
             net: network,
+            input_ids: input_ids.clone(),
             node: Arc::new(Mutex::new(node)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
             ready: AtomicBool::new(false),
             group_marker: PhantomData,
             preproc_store: tokio::sync::RwLock::new(None),
@@ -171,8 +346,9 @@ where
             reservation: tokio::sync::RwLock::new(None),
             client_output_capture: Mutex::new(None),
             client_output_id_map: RwLock::new(Vec::new()),
-            open_registry: open_message_router.register_instance(instance_id),
+            open_registry: StdRwLock::new(open_message_router.register_instance(instance_id)),
             open_message_router,
+            deployment_mode,
         }))
     }
 
@@ -275,13 +451,34 @@ where
         net: Arc<QuicNetworkManager>,
         node: HoneyBadgerMPCNode<F, RBCImpl>,
     ) -> Arc<Self> {
-        let instance_id = topology.instance_id();
-        let node = Arc::new(Mutex::new(node));
-        Arc::new(Self {
+        Self::from_existing_node_with_router_topology_and_mode(
+            open_message_router,
             topology,
             local_identity,
             net,
             node,
+            DeploymentMode::OneShot,
+        )
+    }
+
+    pub fn from_existing_node_with_router_topology_and_mode(
+        open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
+        topology: MpcSessionTopology,
+        local_identity: DurableIdentityDigest,
+        net: Arc<QuicNetworkManager>,
+        node: HoneyBadgerMPCNode<F, RBCImpl>,
+        deployment_mode: DeploymentMode,
+    ) -> Arc<Self> {
+        let instance_id = topology.instance_id();
+        let node = Arc::new(Mutex::new(node));
+        Arc::new(Self {
+            topology,
+            current_instance_id: AtomicU64::new(instance_id),
+            local_identity,
+            net,
+            input_ids: Vec::new(),
+            node,
+            in_flight: Arc::new(AtomicUsize::new(0)),
             ready: AtomicBool::new(true),
             group_marker: PhantomData,
             preproc_store: tokio::sync::RwLock::new(None),
@@ -290,8 +487,9 @@ where
             reservation: tokio::sync::RwLock::new(None),
             client_output_capture: Mutex::new(None),
             client_output_id_map: RwLock::new(Vec::new()),
-            open_registry: open_message_router.register_instance(instance_id),
+            open_registry: StdRwLock::new(open_message_router.register_instance(instance_id)),
             open_message_router,
+            deployment_mode,
         })
     }
 

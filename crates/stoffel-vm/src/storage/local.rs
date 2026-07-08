@@ -66,6 +66,9 @@ pub trait LocalStorage: Send + Sync {
 
     /// Checks if a key exists.
     fn exists(&self, key: &[u8]) -> LocalStorageResult<bool>;
+
+    /// Removes all data from this storage namespace.
+    fn clear(&mut self) -> LocalStorageResult<()>;
 }
 
 /// Value-oriented extension methods for [`LocalStorage`] implementations.
@@ -250,6 +253,37 @@ impl LocalStorage for RedbLocalStorage {
     fn exists(&self, key: &[u8]) -> LocalStorageResult<bool> {
         self.retrieve(key).map(|opt| opt.is_some())
     }
+
+    fn clear(&mut self) -> LocalStorageResult<()> {
+        let write_txn = self
+            .db
+            .begin_write()
+            .map_err(|error| LocalStorageError::Transaction {
+                operation: "begin clear",
+                reason: error.to_string(),
+            })?;
+        write_txn
+            .delete_table(DATA_TABLE)
+            .map_err(|error| LocalStorageError::Table {
+                operation: "delete data table",
+                reason: error.to_string(),
+            })?;
+        {
+            let _ = write_txn
+                .open_table(DATA_TABLE)
+                .map_err(|error| LocalStorageError::Table {
+                    operation: "recreate data table",
+                    reason: error.to_string(),
+                })?;
+        }
+        write_txn
+            .commit()
+            .map_err(|error| LocalStorageError::Transaction {
+                operation: "commit clear",
+                reason: error.to_string(),
+            })?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -306,6 +340,25 @@ mod tests {
             storage.retrieve(b"key").expect("retrieve"),
             Some(b"value".to_vec())
         );
+    }
+
+    #[test]
+    fn redb_storage_clear_removes_all_entries() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("local.redb");
+        let mut storage = RedbLocalStorage::new(&path).expect("open storage");
+
+        storage.store(b"a", b"1").expect("store a");
+        storage.store(b"b", b"2").expect("store b");
+        storage.clear().expect("clear storage");
+
+        assert_eq!(storage.retrieve(b"a").expect("retrieve a"), None);
+        assert_eq!(storage.retrieve(b"b").expect("retrieve b"), None);
+
+        drop(storage);
+        let storage = RedbLocalStorage::new(&path).expect("reopen storage");
+        assert_eq!(storage.retrieve(b"a").expect("retrieve a"), None);
+        assert_eq!(storage.retrieve(b"b").expect("retrieve b"), None);
     }
 
     #[test]

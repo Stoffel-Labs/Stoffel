@@ -108,7 +108,9 @@ impl From<MpcCurveError> for String {
 /// so `SupportedMpcField` is implemented once and covers both curves.
 /// Engine implementations use the group type to preserve the configured curve
 /// identity where the field alone is ambiguous.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, Hash, Default, serde::Serialize, serde::Deserialize,
+)]
 pub enum MpcCurveConfig {
     #[default]
     Bls12_381,
@@ -180,7 +182,7 @@ impl MpcCurveConfig {
 }
 
 /// Field-dispatch metadata for VM-local share math.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 pub enum MpcFieldKind {
     Bls12_381Fr,
     Bn254Fr,

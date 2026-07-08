@@ -3,7 +3,7 @@ use std::sync::Arc;
 use ark_ec::CurveGroup;
 use ark_ff::{FftField, PrimeField};
 
-use crate::net::engine_config::MpcSessionConfig;
+use crate::net::engine_config::{DeploymentMode, MpcSessionConfig};
 
 #[derive(Clone)]
 pub struct AvssEngineConfig<F, G>
@@ -14,6 +14,7 @@ where
     pub session: MpcSessionConfig,
     pub secret_key: F,
     pub public_keys: Arc<Vec<G>>,
+    pub deployment_mode: DeploymentMode,
 }
 
 impl<F, G> AvssEngineConfig<F, G>
@@ -26,6 +27,12 @@ where
             session,
             secret_key,
             public_keys,
+            deployment_mode: DeploymentMode::OneShot,
         }
+    }
+
+    pub fn with_deployment_mode(mut self, deployment_mode: DeploymentMode) -> Self {
+        self.deployment_mode = deployment_mode;
+        self
     }
 }

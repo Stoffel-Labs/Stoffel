@@ -18,8 +18,11 @@ use stoffel_mpc_coordinator_off_chain::OffChainCoordinatorClient;
 use stoffel_mpc_coordinator_shared::{Coordinator, NodeRPCError, Round};
 use stoffel_vm::core_vm::VirtualMachine;
 use stoffel_vm::net::curve::{field_from_i64, field_to_i64, SupportedMpcField};
+use stoffel_vm::net::engine_config::DeploymentMode;
 use stoffel_vm::net::hb_engine::HoneyBadgerMpcEngine;
-use stoffel_vm::net::mpc_engine::{DurableIdentityDigest, MpcEngine, MpcSessionTopology};
+use stoffel_vm::net::mpc_engine::{
+    AsyncMpcEngine, DurableIdentityDigest, MpcEngine, MpcSessionTopology,
+};
 use stoffel_vm::net::{
     avss_protocol_instance_id, honeybadger_node_opts_with_truncation,
     honeybadger_protocol_instance_id, honeybadger_protocol_timeout, spawn_receive_loops_split,
@@ -196,6 +199,15 @@ type AvssOffChainNodeRpcClient<F, G> = OffChainNodeRPCClient<F, AvssCoordinatorS
 type AvssOffChainNodeRpcServer<F, G> = OffChainNodeRPCServer<F, AvssCoordinatorShare<F, G>>;
 
 const HB_PREPROCESSING_READY_PREFIX: &[u8] = b"STOFFEL_HB_PREPROCESSING_READY_V1";
+const HB_RUN_COMPLETE_PREFIX: &[u8] = b"STOFFEL_HB_RUN_COMPLETE_V1";
+
+fn parse_u64_marker(prefix: &[u8], raw_msg: &[u8]) -> Option<u64> {
+    let payload = raw_msg.strip_prefix(prefix)?;
+    if payload.len() != std::mem::size_of::<u64>() {
+        return None;
+    }
+    Some(u64::from_le_bytes(payload.try_into().ok()?))
+}
 
 fn session_registration_timeout() -> Duration {
     let seconds = env::var("STOFFEL_SESSION_REGISTRATION_TIMEOUT_SECONDS")
@@ -620,6 +632,248 @@ where
             share.ok_or_else(|| format!("missing reserved mask share for slot {slot}"))
         })
         .collect()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn collect_hb_coordinator_inputs_for_bls(
+    vm: &mut VirtualMachine,
+    engine: &Arc<HoneyBadgerMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projective>>,
+    coord: &mut HbOffChainCoordinator<ark_bls12_381::Fr>,
+    node_rpc: &mut HbOffChainNodeRpcServer<ark_bls12_381::Fr>,
+    input_ids: &[Vec<u8>],
+    client_input_total: usize,
+    client_input_count: usize,
+    client_input_slots: &[usize],
+    client_input_types: &std::collections::BTreeMap<usize, Vec<ShareType>>,
+    program_id: [u8; 32],
+    run_id: u64,
+    my_id: usize,
+    as_leader: bool,
+) -> Result<(), String> {
+    if input_ids.is_empty() {
+        return Ok(());
+    }
+
+    let total_input_count = if client_input_total > 0 {
+        client_input_total
+    } else {
+        input_ids.len().saturating_mul(client_input_count)
+    };
+
+    if engine.is_standing() {
+        engine
+            .reservation_ops()
+            .map_err(|e| e.to_string())?
+            .init_reservations_for_run(
+                program_id,
+                total_input_count as u64,
+                run_id,
+                stoffel_vm::storage::preproc::PoolAvailability::default(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+
+    let precomputed_mask_shares = if engine.is_standing() {
+        None
+    } else {
+        Some(
+            engine
+                .node_handle()
+                .lock()
+                .await
+                .preprocessing_material
+                .lock()
+                .await
+                .take_random_shares(total_input_count)
+                .map_err(|e| format!("take_random_shares: {e}"))?,
+        )
+    };
+
+    if let Some(ref mask_shares) = precomputed_mask_shares {
+        for (i, share) in mask_shares.iter().enumerate() {
+            node_rpc
+                .add_mask_share(i as u64, share)
+                .await
+                .map_err(|e| format!("add_mask_share: {:?}", e))?;
+        }
+    }
+
+    if as_leader {
+        eprintln!("[party {my_id}] coordinator -> InputMaskReservation");
+        coord
+            .reserve_input_masks()
+            .await
+            .map_err(|e| e.to_string())?;
+    }
+    coord
+        .wait_for_round(Round::InputMaskReservation)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    eprintln!("[party {my_id}] waiting for reserved input indices");
+    let client_to_indices = normalize_client_to_indices(
+        coord
+            .wait_for_indices(total_input_count as u64)
+            .await
+            .map_err(|e| e.to_string())?,
+    );
+    eprintln!("[party {my_id}] reserved input indices received");
+
+    let mask_shares = if let Some(mask_shares) = precomputed_mask_shares {
+        mask_shares
+    } else {
+        let mask_shares = load_reserved_mask_shares(
+            engine,
+            total_input_count,
+            client_to_indices.values().flatten().copied(),
+        )
+        .await?;
+
+        for idx in client_to_indices.values().flatten().copied() {
+            let slot = usize::try_from(idx)
+                .map_err(|_| format!("reserved index {idx} exceeds usize range"))?;
+            let share = mask_shares
+                .get(slot)
+                .ok_or_else(|| format!("reserved index {idx} exceeds mask share slots"))?;
+            node_rpc
+                .add_mask_share(idx, share)
+                .await
+                .map_err(|e| format!("add_mask_share: {:?}", e))?;
+        }
+
+        mask_shares
+    };
+
+    for (cid, indices) in &client_to_indices {
+        for idx in indices {
+            node_rpc
+                .add_reserved_index(cid.clone(), *idx)
+                .await
+                .or_else(|e| match e {
+                    NodeRPCError::JSONError => {
+                        eprintln!(
+                            "[party {my_id}] add_reserved_index observed a stale client sink for index {idx}; continuing"
+                        );
+                        Ok(())
+                    }
+                    other => Err(format!("add_reserved_index: {:?}", other)),
+                })?;
+        }
+    }
+
+    if as_leader {
+        eprintln!("[party {my_id}] coordinator -> InputCollection");
+        coord.collect_inputs().await.map_err(|e| e.to_string())?;
+    }
+    coord
+        .wait_for_round(Round::InputCollection)
+        .await
+        .map_err(|e| e.to_string())?;
+
+    eprintln!("[party {my_id}] waiting for masked client inputs");
+    let client_inputs = coord
+        .wait_for_inputs(total_input_count as u64, mask_shares)
+        .await
+        .map_err(|e| e.to_string())?;
+    eprintln!("[party {my_id}] masked client inputs received");
+    store_reserved_client_inputs(
+        vm,
+        &client_to_indices,
+        client_inputs,
+        client_input_count,
+        client_input_slots,
+        client_input_types,
+    );
+
+    Ok(())
+}
+
+async fn reset_hb_node_rpcs_as_designated_party(
+    node_rpc_addrs: &[SocketAddr],
+    parties: usize,
+    threshold: usize,
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+) -> Result<(), String> {
+    if node_rpc_addrs.is_empty() {
+        return Err("persistent coordinator reset requires --node-rpc-addrs".to_owned());
+    }
+    let rpc_addrs = node_rpc_addrs
+        .iter()
+        .map(|addr| (addr.ip().to_string(), addr.port()))
+        .collect::<Vec<_>>();
+    let node_rpc: HbOffChainNodeRpcClient<ark_bls12_381::Fr> =
+        HbOffChainNodeRpcClient::<ark_bls12_381::Fr>::start_rpc_client(
+            parties, threshold, rpc_addrs, cert_der, key_der,
+        )
+        .await
+        .map_err(|e| format!("connect node RPC reset client: {e}"))?;
+    node_rpc
+        .reset()
+        .await
+        .map_err(|e| format!("reset node RPC servers: {e}"))
+}
+
+async fn wait_for_hb_run_complete_barrier(
+    net: &Arc<QuicNetworkManager>,
+    run_complete_rx: &mut mpsc::Receiver<(usize, u64)>,
+    my_id: usize,
+    parties: usize,
+    run_id: u64,
+    run_instance_id: u64,
+) -> Result<(), String> {
+    if parties <= 1 {
+        return Ok(());
+    }
+
+    let mut complete_message =
+        Vec::with_capacity(HB_RUN_COMPLETE_PREFIX.len() + std::mem::size_of::<u64>());
+    complete_message.extend_from_slice(HB_RUN_COMPLETE_PREFIX);
+    complete_message.extend_from_slice(&run_instance_id.to_le_bytes());
+
+    for peer_id in 0..parties {
+        if peer_id == my_id {
+            continue;
+        }
+        net.send(peer_id, &complete_message)
+            .await
+            .map_err(|error| {
+                format!(
+                    "Failed to send run-complete marker for run {run_id} to party {peer_id}: {error}"
+                )
+            })?;
+    }
+
+    let mut complete_parties = std::collections::HashSet::with_capacity(parties.saturating_sub(1));
+    let barrier_timeout = honeybadger_protocol_timeout();
+    let barrier_result = tokio::time::timeout(barrier_timeout, async {
+        while complete_parties.len() < parties.saturating_sub(1) {
+            let (sender_id, marker_instance_id) =
+                run_complete_rx.recv().await.ok_or_else(|| {
+                    format!("Run-complete marker channel closed before run {run_id} completed")
+                })?;
+            if sender_id == my_id {
+                continue;
+            }
+            if marker_instance_id == run_instance_id {
+                complete_parties.insert(sender_id);
+            }
+        }
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "Timed out waiting for run-complete markers for run {run_id} ({}/{})",
+            complete_parties.len(),
+            parties.saturating_sub(1)
+        )
+    })?;
+    barrier_result?;
+
+    eprintln!("[party {my_id}] persistent run {run_id}: all parties complete");
+    Ok(())
 }
 
 /// Network adapter for MPC clients.
@@ -2309,11 +2563,22 @@ struct HbPartySetup<'a> {
     preprocessing_demand: stoffel_vm_types::compiled_binary::PreprocessingDemand,
     program_hash: [u8; 32],
     preproc_store_path: Option<&'a str>,
+    deployment_mode: DeploymentMode,
 }
+
+struct HbPartyRuntime<F, G>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
+    engine: Arc<HoneyBadgerMpcEngine<F, G>>,
+    run_complete_rx: mpsc::Receiver<(usize, u64)>,
+}
+
 async fn setup_hb_party_for_curve<F, G>(
     vm: &mut VirtualMachine,
     setup: HbPartySetup<'_>,
-) -> Result<Arc<HoneyBadgerMpcEngine<F, G>>, String>
+) -> Result<HbPartyRuntime<F, G>, String>
 where
     F: SupportedMpcField,
     G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
@@ -2332,6 +2597,7 @@ where
         preprocessing_demand,
         program_hash,
         preproc_store_path,
+        deployment_mode,
     } = setup;
 
     // ---- Phase 1: Wait for clients ----
@@ -2471,21 +2737,21 @@ where
     .map_err(|e| format!("Failed to create MPC node: {:?}", e))?;
     eprintln!("[party {}] MPC node setup complete", my_id);
 
-    // Clone 1: the processing node — MOVED into the processing loop task.
-    // This is the ONLY clone that calls process() on incoming messages.
-    let mut processing_node = mpc_node.clone();
-
-    // Clone 2: the engine node — used for preprocessing initiation only.
+    // The receive loop processes through the engine's resettable node handle.
+    // Earlier code captured a separate cloned node here, which works for a
+    // one-shot process but leaves persistent runs receiving on the old
+    // instance_id after `reset_for_next_run`.
     // Created via from_existing_node which wraps it in Arc<Mutex>.
     let open_message_router = Arc::new(stoffel_vm::net::OpenMessageRouter::new());
     let topology = MpcSessionTopology::try_new(instance_id, my_id, n, t)
         .map_err(|error| format!("Invalid HoneyBadger MPC topology: {error}"))?;
-    let engine = HoneyBadgerMpcEngine::<F, G>::from_existing_node_with_router_and_topology(
+    let engine = HoneyBadgerMpcEngine::<F, G>::from_existing_node_with_router_topology_and_mode(
         open_message_router.clone(),
         topology,
         persistent_identity,
         net.clone(),
         mpc_node, // moved, not cloned
+        deployment_mode,
     );
 
     configure_hb_preproc_store(
@@ -2515,10 +2781,12 @@ where
         .collect();
 
     // Single processing loop using tokio::select! for both server and client messages.
-    // Only this task calls process() — no other task touches the processing_node.
+    // Only this task calls process(); fetch the node handle per message so reset swaps are visible.
     let processing_net = net.clone();
+    let processing_engine = engine.clone();
     let process_party_id = my_id;
     let (preprocessing_ready_tx, mut preprocessing_ready_rx) = mpsc::channel::<usize>(n);
+    let (run_complete_tx, run_complete_rx) = mpsc::channel::<(usize, u64)>(n);
     tokio::spawn(async move {
         let mut msg_count = 0u64;
         let trace_messages = std::env::var("STOFFEL_RUN_TRACE_MESSAGES")
@@ -2535,6 +2803,15 @@ where
                         }
                         continue;
                     }
+                    if let Some(run_instance_id) = parse_u64_marker(HB_RUN_COMPLETE_PREFIX, &raw_msg) {
+                        if let Err(error) = run_complete_tx.send((sender_id, run_instance_id)).await {
+                            eprintln!(
+                                "[party {}] Failed to record run-complete marker from {}: {}",
+                                process_party_id, sender_id, error
+                            );
+                        }
+                        continue;
+                    }
 
                     msg_count += 1;
                     if trace_messages && (msg_count <= 5 || msg_count.is_multiple_of(1000)) {
@@ -2543,10 +2820,12 @@ where
                             process_party_id, msg_count, sender_id, raw_msg.len()
                         );
                     }
-                    if let Err(e) = processing_node
-                        .process(sender_id, raw_msg, processing_net.clone())
-                        .await
-                    {
+                    let node_handle = processing_engine.node_handle().clone();
+                    let process_result = {
+                        let mut node = node_handle.lock().await;
+                        node.process(sender_id, raw_msg, processing_net.clone()).await
+                    };
+                    if let Err(e) = process_result {
                         eprintln!(
                             "[party {}] Failed to process message from {}: {:?}",
                             process_party_id, sender_id, e
@@ -2559,10 +2838,12 @@ where
                         .get(&client_id)
                         .copied()
                         .unwrap_or(client_id);
-                    if let Err(e) = processing_node
-                        .process(mpc_sender_id, raw_msg, processing_net.clone())
-                        .await
-                    {
+                    let node_handle = processing_engine.node_handle().clone();
+                    let process_result = {
+                        let mut node = node_handle.lock().await;
+                        node.process(mpc_sender_id, raw_msg, processing_net.clone()).await
+                    };
+                    if let Err(e) = process_result {
                         eprintln!(
                             "[party {}] Failed to process client message from {} (idx {}): {:?}",
                             process_party_id, client_id, mpc_sender_id, e
@@ -2759,7 +3040,10 @@ where
         }
     }
 
-    Ok(engine)
+    Ok(HbPartyRuntime {
+        engine,
+        run_complete_rx,
+    })
 }
 struct AvssPartySetup<'a> {
     my_id: usize,
@@ -3276,6 +3560,7 @@ where
         rpc_addr.1,
         cert_der.clone(),
         key_der.clone(),
+        extract_pubkey_from_cert(&cert_der),
     )
     .await
     .map_err(|error| format!("Failed to start AVSS node RPC server: {error}"))?;
@@ -3646,6 +3931,9 @@ async fn main() {
     let mut preproc_store_path: Option<String> = None;
     let mut local_store_path: Option<String> = None;
     let mut advertise_addr: Option<SocketAddr> = None;
+    let mut persistent_runs: usize = 1;
+    let mut node_rpc_addrs: Vec<SocketAddr> = Vec::new();
+    let mut node_rpc_designated_party_cert: Option<Vec<u8>> = None;
 
     for arg in &raw_args {
         if arg == "-h" || arg == "--help" {
@@ -3697,6 +3985,9 @@ async fn main() {
         } else if let Some(_rest) = arg.strip_prefix("--preproc-store") {
         } else if let Some(_rest) = arg.strip_prefix("--local-store") {
         } else if let Some(_rest) = arg.strip_prefix("--advertise") {
+        } else if let Some(_rest) = arg.strip_prefix("--persistent-runs") {
+        } else if let Some(_rest) = arg.strip_prefix("--node-rpc-addrs") {
+        } else if let Some(_rest) = arg.strip_prefix("--node-rpc-designated-party-cert") {
         } else if let Some(_rest) = arg.strip_prefix("--no-program-upload") {
         }
     }
@@ -3919,9 +4210,40 @@ async fn main() {
                     advertise_addr = Some(v.parse().expect("Invalid --advertise addr"));
                 }
             }
+            "--persistent-runs" => {
+                if let Some(v) = args_iter.next() {
+                    persistent_runs = v.parse().expect("Invalid --persistent-runs");
+                }
+            }
+            "--node-rpc-addrs" => {
+                if let Some(v) = args_iter.next() {
+                    node_rpc_addrs = v
+                        .split(',')
+                        .filter(|s| !s.trim().is_empty())
+                        .map(|s| s.trim().parse().expect("Invalid --node-rpc-addrs entry"))
+                        .collect();
+                }
+            }
+            "--node-rpc-designated-party-cert" => {
+                if let Some(v) = args_iter.next() {
+                    node_rpc_designated_party_cert = Some(
+                        std::fs::read(&v)
+                            .expect("Failed to read --node-rpc-designated-party-cert file"),
+                    );
+                }
+            }
             "--no-program-upload" => {}
             _ => {}
         }
+    }
+
+    if persistent_runs == 0 {
+        eprintln!("Error: --persistent-runs must be greater than zero");
+        exit(2);
+    }
+    if persistent_runs > 1 && preproc_store_path.is_none() {
+        eprintln!("Error: --persistent-runs requires --preproc-store");
+        exit(2);
     }
 
     let coordinator_output_format = match output_fixed_point_fractional_bits {
@@ -4665,6 +4987,7 @@ async fn main() {
     let mut hb_bls12381_coord_engine: Option<
         Arc<HoneyBadgerMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projective>>,
     > = None;
+    let mut hb_bls12381_run_complete_rx: Option<mpsc::Receiver<(usize, u64)>> = None;
 
     if matches!(backend_kind, MpcBackendKind::HoneyBadger) {
         if let Some(ref ca) = coord_addr {
@@ -4697,11 +5020,16 @@ async fn main() {
             );
 
             if let Some(ref rpc) = rpc_addr {
+                let node_cert_der = cert_der.clone().unwrap();
                 let node_rpc = HbOffChainNodeRpcServer::<ark_bls12_381::Fr>::start(
                     &rpc.0,
                     rpc.1,
-                    cert_der.clone().unwrap(),
+                    node_cert_der.clone(),
                     key_der.clone().unwrap(),
+                    node_rpc_designated_party_cert
+                        .as_deref()
+                        .map(extract_pubkey_from_cert)
+                        .unwrap_or_else(|| extract_pubkey_from_cert(&node_cert_der)),
                 )
                 .await
                 .unwrap_or_else(|error| {
@@ -4774,6 +5102,7 @@ async fn main() {
                                 preprocessing_demand,
                                 program_hash: program_id,
                                 preproc_store_path: preproc_store_path.as_deref(),
+                                deployment_mode: DeploymentMode::OneShot,
                             },
                         )
                         .await
@@ -4789,7 +5118,7 @@ async fn main() {
 
                 // Bls12_381 path with coordinator support
                 if coord_opt.is_some() && matches!(curve_config, MpcCurveConfig::Bls12_381) {
-                    let engine = match setup_hb_party_for_curve::<
+                    let runtime = match setup_hb_party_for_curve::<
                         ark_bls12_381::Fr,
                         ark_bls12_381::G1Projective,
                     >(
@@ -4810,6 +5139,11 @@ async fn main() {
                             preprocessing_demand,
                             program_hash: program_id,
                             preproc_store_path: preproc_store_path.as_deref(),
+                            deployment_mode: if persistent_runs > 1 {
+                                DeploymentMode::Standing
+                            } else {
+                                DeploymentMode::OneShot
+                            },
                         },
                     )
                     .await
@@ -4820,130 +5154,46 @@ async fn main() {
                             exit(13);
                         }
                     };
+                    let HbPartyRuntime {
+                        engine,
+                        run_complete_rx,
+                    } = runtime;
                     if coord_opt.is_some() {
                         engine.enable_client_output_capture().await;
                         hb_bls12381_coord_engine = Some(engine.clone());
+                        hb_bls12381_run_complete_rx = Some(run_complete_rx);
                     }
 
                     // Coordinator mask distribution + input collection
-                    if let Some(ref mut coord) = coord_opt {
-                        let node_rpc = node_rpc_opt
-                            .as_mut()
-                            .expect("--rpc-bind required with coordinator");
+                    if persistent_runs == 1 {
+                        if let Some(ref mut coord) = coord_opt {
+                            let node_rpc = node_rpc_opt
+                                .as_mut()
+                                .expect("--rpc-bind required with coordinator");
 
-                        if !input_ids.is_empty() {
-                            // Actual total across clients (supports asymmetric
-                            // per-client input counts); fall back to the uniform
-                            // estimate only when the total wasn't supplied.
-                            let total_input_count = if client_input_total > 0 {
-                                client_input_total
-                            } else {
-                                input_ids.len().saturating_mul(client_input_count)
-                            };
-                            let precomputed_mask_shares = Some(
-                                engine
-                                    .node_handle()
-                                    .lock()
-                                    .await
-                                    .preprocessing_material
-                                    .lock()
-                                    .await
-                                    .take_random_shares(total_input_count)
-                                    .unwrap_or_else(|e| {
-                                        eprintln!("take_random_shares: {}", e);
-                                        exit(13);
-                                    }),
-                            );
-
-                            if let Some(ref mask_shares) = precomputed_mask_shares {
-                                for (i, share) in mask_shares.iter().enumerate() {
-                                    node_rpc
-                                        .add_mask_share(i as u64, share)
-                                        .await
-                                        .unwrap_or_else(|e| {
-                                            eprintln!("add_mask_share: {:?}", e);
-                                            exit(13);
-                                        });
-                                }
-                            }
-
-                            if as_leader {
-                                eprintln!("[party {my_id}] coordinator -> InputMaskReservation");
-                                coord.reserve_input_masks().await.unwrap();
-                            }
-                            coord
-                                .wait_for_round(Round::InputMaskReservation)
-                                .await
-                                .unwrap();
-
-                            eprintln!("[party {my_id}] waiting for reserved input indices");
-                            let client_to_indices = normalize_client_to_indices(
-                                coord
-                                    .wait_for_indices(total_input_count as u64)
-                                    .await
-                                    .unwrap(),
-                            );
-                            eprintln!("[party {my_id}] reserved input indices received");
-
-                            let mask_shares = if let Some(mask_shares) = precomputed_mask_shares {
-                                mask_shares
-                            } else {
-                                let mask_shares = load_reserved_mask_shares(
-                                    &engine,
-                                    total_input_count,
-                                    client_to_indices.values().flatten().copied(),
-                                )
-                                .await
-                                .unwrap_or_else(|e| {
-                                    eprintln!("load_reserved_mask_shares: {}", e);
-                                    exit(13);
-                                });
-
-                                for idx in client_to_indices.values().flatten().copied() {
-                                    node_rpc
-                                        .add_mask_share(idx, &mask_shares[idx as usize])
-                                        .await
-                                        .unwrap_or_else(|e| {
-                                            eprintln!("add_mask_share: {:?}", e);
-                                            exit(13);
-                                        });
-                                }
-
-                                mask_shares
-                            };
-
-                            for (cid, indices) in &client_to_indices {
-                                for idx in indices {
-                                    node_rpc
-                                        .add_reserved_index(cid.clone(), *idx)
-                                        .await
-                                        .unwrap_or_else(|e| {
-                                            eprintln!("add_reserved_index: {:?}", e);
-                                            exit(13);
-                                        });
-                                }
-                            }
-
-                            if as_leader {
-                                eprintln!("[party {my_id}] coordinator -> InputCollection");
-                                coord.collect_inputs().await.unwrap();
-                            }
-                            coord.wait_for_round(Round::InputCollection).await.unwrap();
-
-                            eprintln!("[party {my_id}] waiting for masked client inputs");
-                            let client_inputs = coord
-                                .wait_for_inputs(total_input_count as u64, mask_shares)
-                                .await
-                                .unwrap();
-                            eprintln!("[party {my_id}] masked client inputs received");
-                            store_reserved_client_inputs(
+                            if let Err(e) = collect_hb_coordinator_inputs_for_bls(
                                 &mut vm,
-                                &client_to_indices,
-                                client_inputs,
+                                &engine,
+                                coord,
+                                node_rpc,
+                                &input_ids,
+                                client_input_total,
                                 client_input_count,
                                 &client_input_slots,
                                 &client_input_types,
-                            );
+                                program_id,
+                                0,
+                                my_id,
+                                as_leader,
+                            )
+                            .await
+                            {
+                                eprintln!(
+                                    "[party {}] coordinator input collection failed: {}",
+                                    my_id, e
+                                );
+                                exit(13);
+                            }
                         }
                     }
                 } else {
@@ -5073,6 +5323,246 @@ async fn main() {
                 );
             }
         }
+    }
+
+    if persistent_runs > 1 {
+        if !matches!(backend_kind, MpcBackendKind::HoneyBadger)
+            || !matches!(curve_config, MpcCurveConfig::Bls12_381)
+            || coord_opt.is_none()
+            || hb_bls12381_coord_engine.is_none()
+            || hb_bls12381_run_complete_rx.is_none()
+        {
+            eprintln!(
+                "Error: --persistent-runs currently supports HoneyBadger bls12-381 off-chain coordinator party mode"
+            );
+            exit(2);
+        }
+        let mut coord = coord_opt.take().expect("coordinator checked above");
+        let engine = hb_bls12381_coord_engine
+            .as_ref()
+            .expect("engine checked above")
+            .clone();
+        let node_rpc = node_rpc_opt
+            .as_mut()
+            .expect("--rpc-bind required with persistent coordinator mode");
+        let mut run_complete_rx = hb_bls12381_run_complete_rx
+            .take()
+            .expect("run-complete receiver checked above");
+        let instance_id =
+            session_instance_id.expect("session instance_id should be set in party mode");
+        let n = session_n_parties.unwrap_or_else(|| {
+            net_opt
+                .as_ref()
+                .map(|net| net.parties().len())
+                .unwrap_or_else(|| n_parties.unwrap_or(0))
+        });
+        let t = session_threshold.unwrap_or(1);
+        let my_id = net_opt
+            .as_ref()
+            .map(|net| net.local_party_id())
+            .unwrap_or_else(|| party_id.unwrap_or(0));
+        let persistent_net = net_opt
+            .as_ref()
+            .expect("persistent coordinator mode requires a party network")
+            .clone();
+
+        if !client_roster.is_empty() {
+            vm.set_client_roster(client_roster.clone());
+        }
+
+        for run_index in 0..persistent_runs {
+            let run_id = u64::try_from(run_index)
+                .ok()
+                .and_then(|idx| idx.checked_add(1))
+                .unwrap_or(u64::MAX);
+            let run_instance_id = instance_id.saturating_add(run_index as u64);
+
+            if run_index > 0 {
+                eprintln!(
+                    "[party {my_id}] persistent run {run_id}: resetting engine to instance_id={run_instance_id}"
+                );
+                engine
+                    .reset_for_next_run(run_instance_id)
+                    .await
+                    .unwrap_or_else(|error| {
+                        eprintln!(
+                            "[party {my_id}] reset_for_next_run failed for run {run_id}: {error}"
+                        );
+                        exit(13);
+                    });
+                if let Err(error) = vm.clear_local_storage() {
+                    eprintln!("[party {my_id}] failed to clear local storage: {error}");
+                    exit(13);
+                }
+                engine.preprocess().await.unwrap_or_else(|error| {
+                    eprintln!("[party {my_id}] persistent top-up failed: {error}");
+                    exit(13);
+                });
+            }
+
+            if as_leader {
+                eprintln!("[party {my_id}] persistent run {run_id}: coordinator reset");
+                coord.reset_coord().await.unwrap_or_else(|error| {
+                    eprintln!("[party {my_id}] coordinator reset failed: {error}");
+                    exit(13);
+                });
+                reset_hb_node_rpcs_as_designated_party(
+                    &node_rpc_addrs,
+                    n,
+                    t,
+                    cert_der.clone().expect("--cert required"),
+                    key_der.clone().expect("--key required"),
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    eprintln!("[party {my_id}] node RPC reset failed: {error}");
+                    exit(13);
+                });
+                eprintln!("[party {my_id}] persistent run {run_id}: node RPC reset complete");
+                coord.start_preprocessing().await.unwrap_or_else(|error| {
+                    eprintln!("[party {my_id}] coordinator preprocessing start failed: {error}");
+                    exit(13);
+                });
+            }
+
+            if let Err(e) = collect_hb_coordinator_inputs_for_bls(
+                &mut vm,
+                &engine,
+                &mut coord,
+                node_rpc,
+                &input_ids,
+                client_input_total,
+                client_input_count,
+                &client_input_slots,
+                &client_input_types,
+                program_id,
+                run_id,
+                my_id,
+                as_leader,
+            )
+            .await
+            {
+                eprintln!("[party {my_id}] persistent input collection failed: {e}");
+                exit(13);
+            }
+
+            if as_leader {
+                eprintln!("[party {my_id}] persistent run {run_id}: coordinator -> MPCExecution");
+                coord.start_mpc().await.unwrap_or_else(|error| {
+                    eprintln!("[party {my_id}] coordinator MPC start failed: {error}");
+                    exit(13);
+                });
+            }
+            coord
+                .wait_for_round(Round::MPCExecution)
+                .await
+                .unwrap_or_else(|error| {
+                    eprintln!("[party {my_id}] wait for MPCExecution failed: {error}");
+                    exit(13);
+                });
+
+            eprintln!(
+                "Starting persistent VM run {run_id} of '{}'...",
+                agreed_entry
+            );
+            let online_started_at = std::time::Instant::now();
+            let execution_result = vm.execute_async(&agreed_entry, engine.as_ref()).await;
+            eprintln!(
+                "persistent VM run {run_id} complete! elapsed_ms={}",
+                online_started_at.elapsed().as_millis()
+            );
+
+            let result = execution_result.unwrap_or_else(|err| {
+                eprintln!("Execution error in '{}': {}", agreed_entry, err);
+                exit(4);
+            });
+
+            let output_share = if output_ids.is_empty() {
+                None
+            } else {
+                coordinator_output_share_bytes(&mut vm, &result)
+            };
+            let captured_outputs = engine.drain_client_output_records().await;
+
+            if output_share.is_some() || !captured_outputs.is_empty() {
+                let mut output_shares_by_client: Vec<Vec<HbCoordinatorShare<ark_bls12_381::Fr>>> =
+                    vec![Vec::new(); output_ids.len()];
+
+                if let Some(output_share) = output_share {
+                    let share: HbCoordinatorShare<ark_bls12_381::Fr> =
+                        ark_serialize::CanonicalDeserialize::deserialize_compressed(
+                            output_share.as_slice(),
+                        )
+                        .expect("deserialize output share");
+                    for shares in output_shares_by_client.iter_mut() {
+                        shares.push(share.clone());
+                    }
+                }
+
+                for record in captured_outputs {
+                    let Some(shares) = output_shares_by_client.get_mut(record.client_id) else {
+                        eprintln!(
+                            "Execution error in '{}': HoneyBadger output client index {} has no matching coordinator client identity",
+                            agreed_entry, record.client_id
+                        );
+                        exit(4);
+                    };
+                    shares.extend(record.shares);
+                }
+
+                if as_leader {
+                    coord.send_output().await.unwrap_or_else(|error| {
+                        eprintln!("[party {my_id}] coordinator output start failed: {error}");
+                        exit(13);
+                    });
+                }
+                coord
+                    .wait_for_round(Round::OutputDistribution)
+                    .await
+                    .unwrap_or_else(|error| {
+                        eprintln!("[party {my_id}] wait for OutputDistribution failed: {error}");
+                        exit(13);
+                    });
+
+                for (cid, output_shares) in output_ids.iter().zip(output_shares_by_client) {
+                    if output_shares.is_empty() {
+                        continue;
+                    }
+                    if let Err(e) = coord
+                        .send_output_shares(cid.clone(), cid.clone(), output_shares)
+                        .await
+                    {
+                        eprintln!(
+                            "Warning: failed to submit output shares for client {:?}: {}",
+                            cid, e
+                        );
+                    }
+                }
+                if as_leader {
+                    coord.finalize().await.unwrap_or_else(|error| {
+                        eprintln!("[party {my_id}] coordinator finalize failed: {error}");
+                        exit(13);
+                    });
+                }
+            }
+
+            print_vm_result(&mut vm, result);
+            wait_for_hb_run_complete_barrier(
+                &persistent_net,
+                &mut run_complete_rx,
+                my_id,
+                n,
+                run_id,
+                run_instance_id,
+            )
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("[party {my_id}] persistent run-complete barrier failed: {error}");
+                exit(13);
+            });
+        }
+
+        return;
     }
 
     // Coordinator: signal MPC execution phase

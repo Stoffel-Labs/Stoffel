@@ -12,6 +12,7 @@ use std::sync::{atomic::Ordering, Arc};
 use stoffel_vm_types::core_types::{
     ClearShareInput, ClearShareValue, ShareData, ShareType, BOOLEAN_SECRET_INT_BITS,
 };
+use stoffelmpc_mpc::avss_mpc::triple_gen::BeaverTriple;
 use stoffelmpc_mpc::avss_mpc::{AvssMPCNode as AvssMpcNode, AvssSessionId};
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
@@ -111,6 +112,33 @@ where
         Self::share_to_share_data(&product)
     }
 
+    pub(super) async fn run_standing_multiply_round(
+        &self,
+        left_share_bytes: Vec<u8>,
+        right_share_bytes: Vec<u8>,
+    ) -> Result<ShareData, String> {
+        let left_share = Self::decode_feldman_share(&left_share_bytes)?;
+        let right_share = Self::decode_feldman_share(&right_share_bytes)?;
+        let mut triples = self.reserve_beaver_triples(1).await?;
+        Self::normalize_multiply_triples(&mut triples);
+
+        let mut node = self.clone_avss_node().await;
+        node.preprocessing_material
+            .lock()
+            .await
+            .add(Some(triples), None);
+        let result = node
+            .mul(vec![left_share], vec![right_share], self.net.clone())
+            .await
+            .map_err(|e| format!("Multiplication failed: {:?}", e))?;
+
+        let product = result
+            .into_iter()
+            .next()
+            .ok_or_else(|| "Multiplication returned no result".to_string())?;
+        Self::share_to_share_data(&product)
+    }
+
     async fn ensure_multiply_preprocessing_ids(
         node: &mut AvssMpcNode<F, Avid<AvssSessionId>, G>,
         net: Arc<QuicNetworkManager>,
@@ -141,16 +169,20 @@ where
                 .map_err(|e| format!("take multiplication triples: {:?}", e))?
         };
 
-        for triple in &mut triples {
+        Self::normalize_multiply_triples(&mut triples);
+
+        let mut store = node.preprocessing_material.lock().await;
+        store.add(Some(triples), None);
+        Ok(())
+    }
+
+    fn normalize_multiply_triples(triples: &mut [BeaverTriple<F, G>]) {
+        for triple in triples {
             // mpc-protocols builds the triple c-share with a 0-based party id,
             // while AVSS/Feldman shares are evaluated at 1-based ids.
             let share_id = triple.a.feldmanshare.id;
             triple.c.feldmanshare.id = share_id;
         }
-
-        let mut store = node.preprocessing_material.lock().await;
-        store.add(Some(triples), None);
-        Ok(())
     }
 
     pub(super) async fn broadcast_open_registry_payload(
@@ -179,7 +211,7 @@ where
         self.ready.store(true, Ordering::SeqCst);
         info!(
             "AVSS engine started: instance={}, party={}, n={}, t={}",
-            self.topology.instance_id(),
+            self.current_instance_id(),
             self.topology.party_id(),
             self.topology.n_parties(),
             self.topology.threshold()
@@ -198,7 +230,7 @@ where
     }
 
     fn topology(&self) -> MpcSessionTopology {
-        self.topology
+        AvssMpcEngine::topology(self)
     }
 
     fn local_identity(&self) -> DurableIdentityDigest {
@@ -240,13 +272,13 @@ where
                 }
             };
 
-            let seq = self.open_registry.insert_single_next(
+            let seq = self.open_registry().insert_single_next(
                 &type_key,
                 self.topology.party_id(),
                 share_bytes.to_vec(),
             )?;
             let wire_message = crate::net::open_registry::encode_single_share_wire_message(
-                self.topology.instance_id(),
+                self.current_instance_id(),
                 seq,
                 &type_key,
                 self.topology.party_id(),
@@ -258,7 +290,7 @@ where
             let t = self.topology.threshold();
             let required = Self::byzantine_open_contribution_count(n, t)?;
 
-            self.open_registry.open_share_at_wait(
+            self.open_registry().open_share_at_wait(
                 self.topology.party_id(),
                 &type_key,
                 seq,
@@ -293,13 +325,13 @@ where
                 }
             };
 
-            let seq = self.open_registry.insert_batch_next(
+            let seq = self.open_registry().insert_batch_next(
                 &type_key,
                 self.topology.party_id(),
                 shares.to_vec(),
             )?;
             let wire_message = crate::net::open_registry::encode_batch_share_wire_message(
-                self.topology.instance_id(),
+                self.current_instance_id(),
                 seq,
                 &type_key,
                 self.topology.party_id(),
@@ -311,7 +343,7 @@ where
             let t = self.topology.threshold();
             let required = Self::byzantine_open_contribution_count(n, t)?;
 
-            self.open_registry.batch_open_at_wait(
+            self.open_registry().batch_open_at_wait(
                 self.topology.party_id(),
                 &type_key,
                 seq,

@@ -2,7 +2,7 @@ use super::HoneyBadgerMpcEngine;
 use crate::net::curve::SupportedMpcField;
 use crate::net::mpc_engine::{MpcEngineOperationResultExt, MpcEngineReservation, MpcEngineResult};
 use crate::net::reservation::{ReservationGrant, ReservationRegistry};
-use crate::storage::preproc::{self, PreprocKeyScope};
+use crate::storage::preproc::{self, PoolAvailability, PreprocKeyScope};
 use ark_ec::{CurveGroup, PrimeGroup};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelnet::network_utils::ClientId;
@@ -38,6 +38,17 @@ where
         program_hash: [u8; 32],
         capacity: u64,
     ) -> MpcEngineResult<()> {
+        self.init_reservations_for_run(program_hash, capacity, 0, PoolAvailability::default())
+            .await
+    }
+
+    async fn init_reservations_for_run(
+        &self,
+        program_hash: [u8; 32],
+        capacity: u64,
+        run_id: u64,
+        mut preproc_offset: PoolAvailability,
+    ) -> MpcEngineResult<()> {
         async {
             let store = self.preproc_store.read().await.clone();
             let persistent_identity = self.persistent_identity();
@@ -47,15 +58,56 @@ where
                         .await
                         .map_err(|e| e.to_string())?
                 {
-                    *self.reservation.write().await = Some(restored);
-                    return Ok::<(), String>(());
+                    if restored.run_id().await == run_id {
+                        *self.reservation.write().await = Some(restored);
+                        return Ok::<(), String>(());
+                    }
+                }
+
+                if preproc_offset == PoolAvailability::default() && self.is_standing() {
+                    let scope = PreprocKeyScope::new(
+                        program_hash,
+                        F::field_kind(),
+                        self.topology.n_parties(),
+                        self.topology.threshold(),
+                        persistent_identity,
+                    );
+                    preproc_offset = PoolAvailability {
+                        beaver: store
+                            .meta(&scope.beaver_triple())
+                            .await
+                            .map_err(|e| e.to_string())?
+                            .map(|meta| meta.consumed)
+                            .unwrap_or(0),
+                        random: store
+                            .meta(&scope.random_share())
+                            .await
+                            .map_err(|e| e.to_string())?
+                            .map(|meta| meta.consumed)
+                            .unwrap_or(0),
+                        prand_bit: store
+                            .meta(&scope.prand_bit())
+                            .await
+                            .map_err(|e| e.to_string())?
+                            .map(|meta| meta.consumed)
+                            .unwrap_or(0),
+                        prand_int: store
+                            .meta(&scope.prand_int())
+                            .await
+                            .map_err(|e| e.to_string())?
+                            .map(|meta| meta.consumed)
+                            .unwrap_or(0),
+                    };
                 }
             }
-            *self.reservation.write().await = Some(ReservationRegistry::new(
+            *self.reservation.write().await = Some(ReservationRegistry::new_for_run(
                 program_hash,
                 persistent_identity,
                 capacity,
+                run_id,
+                preproc_offset,
             ));
+            self.persist_reservation_state_if_configured().await?;
             Ok::<(), String>(())
         }
         .await
@@ -101,7 +153,19 @@ where
             )
             .random_share();
             let blob = store.load(&key).await?.ok_or("no random shares stored")?;
-            let index = preproc::u32_index(index, "preprocessing random share index")?;
+            let preproc_offset = {
+                let guard = self.reservation.read().await;
+                let offset = guard
+                    .as_ref()
+                    .map(|reg| reg.preproc_offset())
+                    .ok_or("reservations not initialized")?
+                    .await;
+                offset
+            };
+            let physical = index
+                .checked_add(u64::from(preproc_offset.random))
+                .ok_or_else(|| "preprocessing random share physical index overflow".to_owned())?;
+            let index = preproc::u32_index(physical, "preprocessing random share index")?;
             store.reserve_at(&key, index, 1).await?;
             let share =
                 preproc::deserialize_one_robust_share::<F>(&blob.data, blob.meta.item_size, index)?;
@@ -166,10 +230,23 @@ where
             )
             .random_share();
             let blob = store.load(&key).await?.ok_or("no random shares stored")?;
+            let preproc_offset = {
+                let reg_guard = self.reservation.read().await;
+                reg_guard
+                    .as_ref()
+                    .ok_or("reservations not initialized")?
+                    .preproc_offset()
+                    .await
+            };
 
             let mut result = Vec::with_capacity(indices.len());
             for (idx, masked_input_bytes) in &masked_inputs {
-                let mask_index = preproc::u32_index(*idx, "preprocessing masked input index")?;
+                let physical = idx
+                    .checked_add(u64::from(preproc_offset.random))
+                    .ok_or_else(|| {
+                        "preprocessing masked input physical index overflow".to_owned()
+                    })?;
+                let mask_index = preproc::u32_index(physical, "preprocessing masked input index")?;
                 let mask_share = preproc::deserialize_one_robust_share::<F>(
                     &blob.data,
                     blob.meta.item_size,
@@ -194,7 +271,10 @@ where
                 reg.all_reserved_slots_consumed().await
             };
             // Keep the mask blob while any allocated slot may still need it for unmasking.
-            if all_reserved_slots_consumed && store.available(&key).await? == 0 {
+            if !self.is_standing()
+                && all_reserved_slots_consumed
+                && store.available(&key).await? == 0
+            {
                 store.delete(&key).await?;
             }
             Ok::<Vec<(u64, Vec<u8>)>, String>(result)

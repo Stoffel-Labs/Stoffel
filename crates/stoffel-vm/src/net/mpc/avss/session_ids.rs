@@ -6,7 +6,7 @@ use stoffelmpc_mpc::common::ProtocolSessionId;
 use crate::net::mpc::protocol_ids::derive_protocol_instance_id_u32;
 
 pub(super) struct AvssSessionIds {
-    instance_id: u64,
+    instance_id: AtomicU64,
     party_id: usize,
     local_counter: AtomicU64,
 }
@@ -14,15 +14,24 @@ pub(super) struct AvssSessionIds {
 impl AvssSessionIds {
     pub fn new(instance_id: u64, party_id: usize, _n_parties: usize) -> Self {
         Self {
-            instance_id,
+            instance_id: AtomicU64::new(instance_id),
             party_id,
             local_counter: AtomicU64::new(0),
         }
     }
 
+    pub fn reset(&self, instance_id: u64) {
+        self.instance_id.store(instance_id, Ordering::SeqCst);
+        self.local_counter.store(0, Ordering::SeqCst);
+    }
+
     pub fn next_dealer_session(&self) -> Result<AvssSessionId, String> {
         let counter = next_u16_domain_counter(&self.local_counter, "AVSS local session counter")?;
-        allocate_local_avss_session(self.instance_id, self.party_id, counter)
+        allocate_local_avss_session(
+            self.instance_id.load(Ordering::SeqCst),
+            self.party_id,
+            counter,
+        )
     }
 }
 
@@ -120,6 +129,20 @@ mod tests {
             protocol_instance_id_u32(instance_id),
             protocol_instance_id_u32(instance_id)
         );
+    }
+
+    #[test]
+    fn reset_rotates_instance_and_restarts_local_counter() {
+        let sessions = AvssSessionIds::new(1, 2, 4);
+        let first = sessions.next_dealer_session().expect("first session");
+
+        sessions.reset(9);
+        let after_reset = sessions.next_dealer_session().expect("reset session");
+
+        assert_ne!(first.as_u128(), after_reset.as_u128());
+        assert_eq!(after_reset.exec_id(), 0);
+        assert_eq!(after_reset.round_id(), 0);
+        assert_eq!(after_reset.sub_id(), 2);
     }
 
     #[test]

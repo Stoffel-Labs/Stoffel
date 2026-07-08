@@ -238,6 +238,12 @@ impl VirtualMachine {
         })
     }
 
+    /// Clear configured LocalStorage for a new isolated runtime execution.
+    pub fn clear_local_storage(&mut self) -> VirtualMachineResult<()> {
+        self.state.clear_local_storage()?;
+        Ok(())
+    }
+
     fn foreign_entry_error(function: &str) -> VmError {
         VmError::CannotExecuteForeignFunction {
             function: function.to_owned(),

@@ -17,11 +17,11 @@ where
 {
     fn rbc_broadcast(&self, message: &[u8]) -> MpcEngineResult<RbcSessionId> {
         let session_id = self
-            .open_registry
+            .open_registry()
             .rbc_broadcast(self.topology.party_id(), message)
             .map_mpc_engine_operation("rbc_broadcast")?;
         let wire_message = crate::net::open_registry::encode_rbc_wire_message(
-            self.topology.instance_id(),
+            self.current_instance_id(),
             session_id,
             self.topology.party_id(),
             message,
@@ -35,13 +35,13 @@ where
     }
 
     fn rbc_receive(&self, from_party: MpcPartyId, timeout_ms: u64) -> MpcEngineResult<Vec<u8>> {
-        self.open_registry
+        self.open_registry()
             .rbc_receive(self.topology.party_id(), from_party.id(), timeout_ms)
             .map_mpc_engine_operation("rbc_receive")
     }
 
     fn rbc_receive_any(&self, timeout_ms: u64) -> MpcEngineResult<(MpcPartyId, Vec<u8>)> {
-        self.open_registry
+        self.open_registry()
             .rbc_receive_any(self.topology.party_id(), timeout_ms)
             .map(|(party_id, message)| (MpcPartyId::new(party_id), message))
             .map_mpc_engine_operation("rbc_receive_any")
@@ -56,12 +56,12 @@ where
 {
     async fn rbc_broadcast_async(&self, message: &[u8]) -> MpcEngineResult<RbcSessionId> {
         let session_id = self
-            .open_registry
+            .open_registry()
             .rbc_broadcast_async(self.topology.party_id(), message)
             .await
             .map_mpc_engine_operation("async_rbc_broadcast")?;
         let wire_message = crate::net::open_registry::encode_rbc_wire_message(
-            self.topology.instance_id(),
+            self.current_instance_id(),
             session_id,
             self.topology.party_id(),
             message,
@@ -80,7 +80,7 @@ where
         from_party: MpcPartyId,
         timeout_ms: u64,
     ) -> MpcEngineResult<Vec<u8>> {
-        self.open_registry
+        self.open_registry()
             .rbc_receive_async(self.topology.party_id(), from_party.id(), timeout_ms)
             .await
             .map_mpc_engine_operation("async_rbc_receive")
@@ -90,7 +90,7 @@ where
         &self,
         timeout_ms: u64,
     ) -> MpcEngineResult<(MpcPartyId, Vec<u8>)> {
-        self.open_registry
+        self.open_registry()
             .rbc_receive_any_async(self.topology.party_id(), timeout_ms)
             .await
             .map(|(party_id, message)| (MpcPartyId::new(party_id), message))

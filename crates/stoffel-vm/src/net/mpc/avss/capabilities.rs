@@ -63,14 +63,14 @@ where
         let partial_bytes =
             Self::encode_verified_exp_contribution(&share, generator, partial_point)?;
 
-        let seq = self.open_registry.insert_exp_next(
+        let seq = self.open_registry().insert_exp_next(
             ExpOpenRegistryKind::G1,
             self.topology.party_id(),
             share_id,
             partial_bytes.clone(),
         )?;
         let wire_message = crate::net::open_registry::encode_avss_open_exp_wire_message(
-            self.topology.instance_id(),
+            self.current_instance_id(),
             seq,
             self.topology.party_id(),
             share_id,
@@ -83,7 +83,7 @@ where
             self.topology.n_parties(),
             self.topology.threshold(),
         )?;
-        self.open_registry.exp_open_wait(
+        self.open_registry().exp_open_wait(
             ExpOpenRequest {
                 kind: ExpOpenRegistryKind::G1,
                 sequence: Some(seq),
@@ -129,14 +129,14 @@ where
         let partial_bytes =
             Self::encode_verified_exp_contribution(&share, generator, partial_point)?;
 
-        let seq = self.open_registry.insert_exp_next(
+        let seq = self.open_registry().insert_exp_next(
             ExpOpenRegistryKind::G1,
             self.topology.party_id(),
             share_id,
             partial_bytes.clone(),
         )?;
         let wire_message = crate::net::open_registry::encode_avss_open_exp_wire_message(
-            self.topology.instance_id(),
+            self.current_instance_id(),
             seq,
             self.topology.party_id(),
             share_id,
@@ -149,7 +149,7 @@ where
             self.topology.n_parties(),
             self.topology.threshold(),
         )?;
-        self.open_registry
+        self.open_registry()
             .exp_open_async(
                 ExpOpenRequest {
                     kind: ExpOpenRegistryKind::G1,
@@ -211,14 +211,14 @@ where
         let partial_point: G2Projective = generator_g2 * share_value;
         let partial_bytes = Self::encode_verified_g2_exp_contribution(partial_point)?;
 
-        let seq = self.open_registry.insert_exp_next(
+        let seq = self.open_registry().insert_exp_next(
             ExpOpenRegistryKind::G2,
             self.topology.party_id(),
             share_id,
             partial_bytes.clone(),
         )?;
         let wire_payload = crate::net::open_registry::encode_avss_g2_open_exp_wire_message(
-            self.topology.instance_id(),
+            self.current_instance_id(),
             seq,
             self.topology.party_id(),
             share_id,
@@ -238,7 +238,7 @@ where
             self.topology.n_parties(),
             self.topology.threshold(),
         )?;
-        self.open_registry.exp_open_wait(
+        self.open_registry().exp_open_wait(
             ExpOpenRequest {
                 kind: ExpOpenRegistryKind::G2,
                 sequence: Some(seq),
@@ -302,14 +302,14 @@ where
         let partial_point: G2Projective = generator_g2 * share_value;
         let partial_bytes = Self::encode_verified_g2_exp_contribution(partial_point)?;
 
-        let seq = self.open_registry.insert_exp_next(
+        let seq = self.open_registry().insert_exp_next(
             ExpOpenRegistryKind::G2,
             self.topology.party_id(),
             share_id,
             partial_bytes.clone(),
         )?;
         let wire_payload = crate::net::open_registry::encode_avss_g2_open_exp_wire_message(
-            self.topology.instance_id(),
+            self.current_instance_id(),
             seq,
             self.topology.party_id(),
             share_id,
@@ -330,7 +330,7 @@ where
             self.topology.n_parties(),
             self.topology.threshold(),
         )?;
-        self.open_registry
+        self.open_registry()
             .exp_open_async(
                 ExpOpenRequest {
                     kind: ExpOpenRegistryKind::G2,
@@ -378,12 +378,23 @@ where
         right: &[u8],
     ) -> MpcEngineResult<ShareData> {
         (|| -> Result<ShareData, String> {
-            let avss_node = self.avss_node.clone();
-            let net = self.net.clone();
             let left_bytes = left.to_vec();
             let right_bytes = right.to_vec();
 
-            let fut = Self::run_multiply_round(avss_node, net, left_bytes, right_bytes);
+            let fut = async move {
+                if self.is_standing() {
+                    self.run_standing_multiply_round(left_bytes, right_bytes)
+                        .await
+                } else {
+                    Self::run_multiply_round(
+                        self.avss_node.clone(),
+                        self.net.clone(),
+                        left_bytes,
+                        right_bytes,
+                    )
+                    .await
+                }
+            };
 
             match tokio::runtime::Handle::try_current() {
                 Ok(handle) => {
@@ -394,15 +405,22 @@ where
                             tokio::task::block_in_place(|| handle.block_on(fut))
                         }
                         tokio::runtime::RuntimeFlavor::CurrentThread => {
-                            std::thread::spawn(move || {
-                                let rt = tokio::runtime::Builder::new_current_thread()
-                                    .enable_all()
-                                    .build()
-                                    .map_err(|e| format!("failed to create Tokio runtime: {e}"))?;
-                                rt.block_on(fut)
+                            std::thread::scope(move |scope| {
+                                scope
+                                    .spawn(move || {
+                                        let rt = tokio::runtime::Builder::new_current_thread()
+                                            .enable_all()
+                                            .build()
+                                            .map_err(|e| {
+                                                format!("failed to create Tokio runtime: {e}")
+                                            })?;
+                                        rt.block_on(fut)
+                                    })
+                                    .join()
+                                    .map_err(|_| {
+                                        "AVSS multiply worker thread panicked".to_string()
+                                    })?
                             })
-                            .join()
-                            .map_err(|_| "AVSS multiply worker thread panicked".to_string())?
                         }
                         _ => Err("operation requires a multi-thread Tokio runtime".to_string()),
                     }
@@ -455,13 +473,13 @@ where
                 }
             };
 
-            let seq = self.open_registry.insert_single_next(
+            let seq = self.open_registry().insert_single_next(
                 &type_key,
                 self.topology.party_id(),
                 share_bytes.to_vec(),
             )?;
             let wire_message = crate::net::open_registry::encode_single_share_wire_message(
-                self.topology.instance_id(),
+                self.current_instance_id(),
                 seq,
                 &type_key,
                 self.topology.party_id(),
@@ -473,7 +491,7 @@ where
             let t = self.topology.threshold();
             let required = Self::byzantine_open_contribution_count(n, t)?;
 
-            self.open_registry.open_bytes_at_wait(
+            self.open_registry().open_bytes_at_wait(
                 self.topology.party_id(),
                 &type_key,
                 seq,
@@ -507,9 +525,15 @@ where
     fn random_share(&self, _ty: ShareType) -> MpcEngineResult<ShareData> {
         (|| -> Result<ShareData, String> {
             let share = crate::net::block_on_current(async {
+                if self.is_standing() {
+                    let shares = self.reserve_random_shares(1).await?;
+                    return shares.into_iter().next().ok_or_else(|| {
+                        "standing AVSS random reservation returned no share".to_string()
+                    });
+                }
                 let mut node_clone = self.clone_avss_node().await;
                 MPCProtocol::<F, FeldmanShamirShare<F, G>, QuicNetworkManager>::rand(
-                    &mut node_clone,
+                    &mut *node_clone,
                     self.net.clone(),
                 )
                 .await
@@ -692,6 +716,12 @@ where
         Some(self)
     }
 
+    async fn reset_for_next_run(&self, new_instance_id: u64) -> MpcEngineResult<()> {
+        self.reset_state_for_next_run(new_instance_id)
+            .await
+            .map_mpc_engine_operation("reset_for_next_run")
+    }
+
     async fn input_share_async(&self, clear: ClearShareInput) -> MpcEngineResult<ShareData> {
         async {
             let secret = Self::clear_input_to_field(clear)?;
@@ -708,13 +738,18 @@ where
         left: &[u8],
         right: &[u8],
     ) -> MpcEngineResult<ShareData> {
-        Self::run_multiply_round(
-            self.avss_node.clone(),
-            self.net.clone(),
-            left.to_vec(),
-            right.to_vec(),
-        )
-        .await
+        if self.is_standing() {
+            self.run_standing_multiply_round(left.to_vec(), right.to_vec())
+                .await
+        } else {
+            Self::run_multiply_round(
+                self.avss_node.clone(),
+                self.net.clone(),
+                left.to_vec(),
+                right.to_vec(),
+            )
+            .await
+        }
         .map_mpc_engine_operation("async_multiply_share")
     }
 
@@ -732,13 +767,13 @@ where
                 }
             };
 
-            let seq = self.open_registry.insert_single_next(
+            let seq = self.open_registry().insert_single_next(
                 &type_key,
                 self.topology.party_id(),
                 share_bytes.to_vec(),
             )?;
             let wire_message = crate::net::open_registry::encode_single_share_wire_message(
-                self.topology.instance_id(),
+                self.current_instance_id(),
                 seq,
                 &type_key,
                 self.topology.party_id(),
@@ -750,7 +785,7 @@ where
             let t = self.topology.threshold();
             let required = Self::byzantine_open_contribution_count(n, t)?;
 
-            self.open_registry
+            self.open_registry()
                 .open_share_at_async(
                     self.topology.party_id(),
                     type_key,
@@ -788,13 +823,13 @@ where
                 }
             };
 
-            let seq = self.open_registry.insert_batch_next(
+            let seq = self.open_registry().insert_batch_next(
                 &type_key,
                 self.topology.party_id(),
                 shares.to_vec(),
             )?;
             let wire_message = crate::net::open_registry::encode_batch_share_wire_message(
-                self.topology.instance_id(),
+                self.current_instance_id(),
                 seq,
                 &type_key,
                 self.topology.party_id(),
@@ -806,7 +841,7 @@ where
             let t = self.topology.threshold();
             let required = Self::byzantine_open_contribution_count(n, t)?;
 
-            self.open_registry
+            self.open_registry()
                 .batch_open_at_async(
                     self.topology.party_id(),
                     type_key,
@@ -837,9 +872,16 @@ where
 
     async fn random_share_async(&self, _ty: ShareType) -> MpcEngineResult<ShareData> {
         async {
+            if self.is_standing() {
+                let shares = self.reserve_random_shares(1).await?;
+                let share = shares.into_iter().next().ok_or_else(|| {
+                    "standing AVSS random reservation returned no share".to_string()
+                })?;
+                return Self::share_to_share_data(&share);
+            }
             let mut node_clone = self.clone_avss_node().await;
             let share = MPCProtocol::<F, FeldmanShamirShare<F, G>, QuicNetworkManager>::rand(
-                &mut node_clone,
+                &mut *node_clone,
                 self.net.clone(),
             )
             .await
@@ -864,13 +906,13 @@ where
                 }
             };
 
-            let seq = self.open_registry.insert_single_next(
+            let seq = self.open_registry().insert_single_next(
                 &type_key,
                 self.topology.party_id(),
                 share_bytes.to_vec(),
             )?;
             let wire_message = crate::net::open_registry::encode_single_share_wire_message(
-                self.topology.instance_id(),
+                self.current_instance_id(),
                 seq,
                 &type_key,
                 self.topology.party_id(),
@@ -882,7 +924,7 @@ where
             let t = self.topology.threshold();
             let required = Self::byzantine_open_contribution_count(n, t)?;
 
-            self.open_registry
+            self.open_registry()
                 .open_bytes_at_async(
                     self.topology.party_id(),
                     type_key,
