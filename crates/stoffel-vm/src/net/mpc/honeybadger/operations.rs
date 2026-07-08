@@ -103,13 +103,27 @@ where
             let y = SecretFixedPoint::new_with_precision(right_share, proto_precision);
 
             let mut node = self.clone_node().await;
-            const PRANDBIT_POOL_MULS: usize = 16;
             let f = precision.fractional_bits();
-            let pool = f.saturating_mul(PRANDBIT_POOL_MULS);
-            node.params.n_prandbit = node.params.n_prandbit.max(pool);
-            node.params.n_prandint = node.params.n_prandint.max(PRANDBIT_POOL_MULS);
-            node.params.n_triples = node.params.n_triples.saturating_add(pool);
-            node.params.n_random_shares = node.params.n_random_shares.saturating_add(pool);
+            if self.is_standing() {
+                let triples = self.reserve_beaver_triples(1).await?;
+                let prandbits = self.reserve_prandbit_shares(f).await?;
+                let prandints = self.reserve_prandint_shares(1, ty).await?;
+                node.preprocessing_material.lock().await.add(
+                    Some(triples),
+                    None,
+                    None,
+                    None,
+                    Some(prandbits),
+                    Some(prandints),
+                );
+            } else {
+                const PRANDBIT_POOL_MULS: usize = 16;
+                let pool = f.saturating_mul(PRANDBIT_POOL_MULS);
+                node.params.n_prandbit = node.params.n_prandbit.max(pool);
+                node.params.n_prandint = node.params.n_prandint.max(PRANDBIT_POOL_MULS);
+                node.params.n_triples = node.params.n_triples.saturating_add(pool);
+                node.params.n_random_shares = node.params.n_random_shares.saturating_add(pool);
+            }
 
             let result = node
                 .mul_fixed(x, y, self.net.clone())
@@ -133,8 +147,20 @@ where
                 // regenerates from params on demand; `.max` never shrinks an
                 // already-sized estimate (e.g. AES/CBC). Triple generation pulls
                 // 2 randoms each, which run_preprocessing adds automatically.
-                const TRIPLE_POOL_MULS: usize = 64;
-                node.params.n_triples = node.params.n_triples.max(TRIPLE_POOL_MULS);
+                if self.is_standing() {
+                    let triples = self.reserve_beaver_triples(1).await?;
+                    node.preprocessing_material.lock().await.add(
+                        Some(triples),
+                        None,
+                        None,
+                        None,
+                        None,
+                        None,
+                    );
+                } else {
+                    const TRIPLE_POOL_MULS: usize = 64;
+                    node.params.n_triples = node.params.n_triples.max(TRIPLE_POOL_MULS);
+                }
                 let trace = Self::trace_multiply_enabled();
                 let started_at = Instant::now();
                 if trace {
@@ -215,28 +241,29 @@ where
         let y = ClearFixedPoint::new_with_precision(divisor_field, proto_precision);
 
         let mut node = self.clone_node().await;
-        // Each division's truncation consumes `f` random bits and one random
-        // integer, which the VM's baseline preprocessing does not generate
-        // (`honeybadger_node_opts` requests zero prandbit/prandint). The
-        // protocol regenerates them on demand, but re-running that per division
-        // collides across parties; so on the first division (empty pool) we
-        // provision a pool covering several divisions in one preprocessing pass.
-        // The preprocessing-material store is shared across node clones, so
-        // later divisions consume from the pool and skip regeneration.
-        //
-        // Crucially, prandbit generation itself consumes one beaver triple and
-        // one random share per bit, and the protocol's preprocessing budget does
-        // NOT account for that. So we must also grow the triple/random targets
-        // by the pool size; otherwise prandbit generation exhausts the triples
-        // the computation needs (or fails outright). Configuring the demand here
-        // is what makes division self-sufficient without any protocol change.
-        const PRANDBIT_POOL_DIVS: usize = 16;
         let f = precision.fractional_bits();
-        let pool = f.saturating_mul(PRANDBIT_POOL_DIVS);
-        node.params.n_prandbit = node.params.n_prandbit.max(pool);
-        node.params.n_prandint = node.params.n_prandint.max(PRANDBIT_POOL_DIVS);
-        node.params.n_triples = node.params.n_triples.saturating_add(pool);
-        node.params.n_random_shares = node.params.n_random_shares.saturating_add(pool);
+        if self.is_standing() {
+            let prandbits = self.reserve_prandbit_shares(f).await?;
+            let prandints = self.reserve_prandint_shares(1, ty).await?;
+            node.preprocessing_material.lock().await.add(
+                None,
+                None,
+                None,
+                None,
+                Some(prandbits),
+                Some(prandints),
+            );
+        } else {
+            // Each division's truncation consumes `f` random bits and one random
+            // integer. One-shot mode preserves the legacy behavior of
+            // provisioning a local pool and letting the protocol regenerate it.
+            const PRANDBIT_POOL_DIVS: usize = 16;
+            let pool = f.saturating_mul(PRANDBIT_POOL_DIVS);
+            node.params.n_prandbit = node.params.n_prandbit.max(pool);
+            node.params.n_prandint = node.params.n_prandint.max(PRANDBIT_POOL_DIVS);
+            node.params.n_triples = node.params.n_triples.saturating_add(pool);
+            node.params.n_random_shares = node.params.n_random_shares.saturating_add(pool);
+        }
         let result = node
             .div_with_const_fixed(x, y, self.net.clone())
             .await
@@ -277,7 +304,9 @@ where
 
                 let mut encoded_results = Vec::with_capacity(pairs.len());
                 let mut node = self.clone_node().await;
-                node.params.n_triples = node.params.n_triples.max(max_pairs_per_session);
+                if !self.is_standing() {
+                    node.params.n_triples = node.params.n_triples.max(max_pairs_per_session);
+                }
                 for (chunk_index, chunk) in pairs.chunks(max_pairs_per_session).enumerate() {
                     let mut left_shares = Vec::with_capacity(chunk.len());
                     let mut right_shares = Vec::with_capacity(chunk.len());
@@ -285,6 +314,18 @@ where
                     for (left, right) in chunk {
                         left_shares.push(Self::decode_share(left)?);
                         right_shares.push(Self::decode_share(right)?);
+                    }
+
+                    if self.is_standing() {
+                        let triples = self.reserve_beaver_triples(chunk.len()).await?;
+                        node.preprocessing_material.lock().await.add(
+                            Some(triples),
+                            None,
+                            None,
+                            None,
+                            None,
+                            None,
+                        );
                     }
 
                     let chunk_started_at = Instant::now();
@@ -366,13 +407,13 @@ where
             }
         };
 
-        let seq = self.open_registry.insert_single_next(
+        let seq = self.open_registry().insert_single_next(
             &type_key,
             self.topology.party_id(),
             share_bytes.to_vec(),
         )?;
         let wire_message = crate::net::open_registry::encode_single_share_wire_message(
-            self.topology.instance_id(),
+            self.current_instance_id(),
             seq,
             &type_key,
             self.topology.party_id(),
@@ -384,7 +425,7 @@ where
         let n = self.topology.n_parties();
         let t = self.topology.threshold();
 
-        self.open_registry
+        self.open_registry()
             .open_share_at_async(
                 self.topology.party_id(),
                 type_key,
@@ -427,13 +468,13 @@ where
             }
         };
 
-        let seq = self.open_registry.insert_single_next(
+        let seq = self.open_registry().insert_single_next(
             &type_key,
             self.topology.party_id(),
             share_bytes.to_vec(),
         )?;
         let wire_message = crate::net::open_registry::encode_single_share_wire_message(
-            self.topology.instance_id(),
+            self.current_instance_id(),
             seq,
             &type_key,
             self.topology.party_id(),
@@ -445,7 +486,7 @@ where
         let n = self.topology.n_parties();
         let t = self.topology.threshold();
 
-        self.open_registry
+        self.open_registry()
             .open_bytes_at_async(
                 self.topology.party_id(),
                 type_key,
@@ -487,13 +528,13 @@ where
             }
         };
 
-        let seq = self.open_registry.insert_batch_next(
+        let seq = self.open_registry().insert_batch_next(
             &type_key,
             self.topology.party_id(),
             shares.to_vec(),
         )?;
         let wire_message = crate::net::open_registry::encode_batch_share_wire_message(
-            self.topology.instance_id(),
+            self.current_instance_id(),
             seq,
             &type_key,
             self.topology.party_id(),
@@ -505,7 +546,7 @@ where
         let n = self.topology.n_parties();
         let t = self.topology.threshold();
 
-        self.open_registry
+        self.open_registry()
             .batch_open_at_async(
                 self.topology.party_id(),
                 type_key,
@@ -584,14 +625,14 @@ where
             .serialize_compressed(&mut partial_bytes)
             .map_err(|e| format!("serialize partial point: {}", e))?;
 
-        let seq = self.open_registry.insert_exp_next(
+        let seq = self.open_registry().insert_exp_next(
             ExpOpenRegistryKind::G1,
             self.topology.party_id(),
             share.id,
             partial_bytes.clone(),
         )?;
         let wire_message = crate::net::open_registry::encode_hb_open_exp_wire_message(
-            self.topology.instance_id(),
+            self.current_instance_id(),
             seq,
             self.topology.party_id(),
             share.id,
@@ -604,7 +645,7 @@ where
         let domain = GeneralEvaluationDomain::<F>::new(n)
             .ok_or_else(|| "No suitable FFT domain".to_string())?;
 
-        self.open_registry.exp_open_wait(
+        self.open_registry().exp_open_wait(
             ExpOpenRequest {
                 kind: ExpOpenRegistryKind::G1,
                 sequence: Some(seq),
@@ -643,14 +684,14 @@ where
             .serialize_compressed(&mut partial_bytes)
             .map_err(|e| format!("serialize partial point: {}", e))?;
 
-        let seq = self.open_registry.insert_exp_next(
+        let seq = self.open_registry().insert_exp_next(
             ExpOpenRegistryKind::G1,
             self.topology.party_id(),
             share.id,
             partial_bytes.clone(),
         )?;
         let wire_message = crate::net::open_registry::encode_hb_open_exp_wire_message(
-            self.topology.instance_id(),
+            self.current_instance_id(),
             seq,
             self.topology.party_id(),
             share.id,
@@ -663,7 +704,7 @@ where
         let domain = GeneralEvaluationDomain::<F>::new(n)
             .ok_or_else(|| "No suitable FFT domain".to_string())?;
 
-        self.open_registry
+        self.open_registry()
             .exp_open_async(
                 ExpOpenRequest {
                     kind: ExpOpenRegistryKind::G1,
@@ -720,14 +761,14 @@ where
             .serialize_compressed(&mut partial_bytes)
             .map_err(|e| format!("serialize G2 partial point: {}", e))?;
 
-        let seq = self.open_registry.insert_exp_next(
+        let seq = self.open_registry().insert_exp_next(
             ExpOpenRegistryKind::G1,
             self.topology.party_id(),
             share.id,
             partial_bytes.clone(),
         )?;
         let wire_message = crate::net::open_registry::encode_hb_open_exp_wire_message(
-            self.topology.instance_id(),
+            self.current_instance_id(),
             seq,
             self.topology.party_id(),
             share.id,
@@ -740,7 +781,7 @@ where
         let domain = GeneralEvaluationDomain::<Fr>::new(n)
             .ok_or_else(|| "No suitable FFT domain".to_string())?;
 
-        self.open_registry.exp_open_wait(
+        self.open_registry().exp_open_wait(
             ExpOpenRequest {
                 kind: ExpOpenRegistryKind::G1,
                 sequence: Some(seq),
@@ -799,14 +840,14 @@ where
             .serialize_compressed(&mut partial_bytes)
             .map_err(|e| format!("serialize G2 partial point: {}", e))?;
 
-        let seq = self.open_registry.insert_exp_next(
+        let seq = self.open_registry().insert_exp_next(
             ExpOpenRegistryKind::G1,
             self.topology.party_id(),
             share.id,
             partial_bytes.clone(),
         )?;
         let wire_message = crate::net::open_registry::encode_hb_open_exp_wire_message(
-            self.topology.instance_id(),
+            self.current_instance_id(),
             seq,
             self.topology.party_id(),
             share.id,
@@ -819,7 +860,7 @@ where
         let domain = GeneralEvaluationDomain::<Fr>::new(n)
             .ok_or_else(|| "No suitable FFT domain".to_string())?;
 
-        self.open_registry
+        self.open_registry()
             .exp_open_async(
                 ExpOpenRequest {
                     kind: ExpOpenRegistryKind::G1,

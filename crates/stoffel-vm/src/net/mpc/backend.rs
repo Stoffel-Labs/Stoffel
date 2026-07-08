@@ -38,7 +38,7 @@ impl From<MpcBackendError> for String {
 }
 
 /// Available MPC backend implementations.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum MpcBackendKind {
     HoneyBadger,
     Avss,

@@ -223,7 +223,7 @@ if [ "$RUN_LOCAL_MPC" -eq 1 ]; then
   CLI="${WORKSPACE_DIR}/target/debug/stoffel"
   if [ ! -x "$CLI" ]; then
     echo "Building stoffel CLI..."
-    cargo build --quiet --manifest-path "${WORKSPACE_DIR}/Cargo.toml" -p stoffel-cli
+    cargo build --quiet --manifest-path "${WORKSPACE_DIR}/Cargo.toml" -p stoffel
   fi
   CAP="${STOFFEL_LOCAL_MPC_TIMEOUT:-120}"
   lm_pass=0

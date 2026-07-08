@@ -5,7 +5,7 @@
 //! sequential index allocation via an advancing cursor.
 
 use crate::net::mpc_engine::DurableIdentityDigest;
-use crate::storage::preproc::{PreprocStore, PreprocStoreError};
+use crate::storage::preproc::{PoolAvailability, PreprocStore, PreprocStoreError};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use tokio::sync::RwLock;
@@ -42,6 +42,10 @@ impl ReservationGrant {
 pub struct RegistryState {
     pub program_hash: [u8; 32],
     pub node_identity: DurableIdentityDigest,
+    #[serde(default)]
+    pub run_id: u64,
+    #[serde(default)]
+    pub preproc_offset: PoolAvailability,
     pub capacity: u64,
     pub next_index: u64,
     pub slots: BTreeMap<u64, SlotStatus>,
@@ -151,6 +155,29 @@ impl ReservationRegistry {
             state: RwLock::new(RegistryState {
                 program_hash,
                 node_identity,
+                run_id: 0,
+                preproc_offset: PoolAvailability::default(),
+                capacity,
+                next_index: 0,
+                slots: BTreeMap::new(),
+                masked_inputs: BTreeMap::new(),
+            }),
+        }
+    }
+
+    pub fn new_for_run(
+        program_hash: [u8; 32],
+        node_identity: DurableIdentityDigest,
+        capacity: u64,
+        run_id: u64,
+        preproc_offset: PoolAvailability,
+    ) -> Self {
+        Self {
+            state: RwLock::new(RegistryState {
+                program_hash,
+                node_identity,
+                run_id,
+                preproc_offset,
                 capacity,
                 next_index: 0,
                 slots: BTreeMap::new(),
@@ -248,6 +275,14 @@ impl ReservationRegistry {
     pub async fn available(&self) -> u64 {
         let s = self.state.read().await;
         s.capacity.saturating_sub(s.next_index)
+    }
+
+    pub async fn run_id(&self) -> u64 {
+        self.state.read().await.run_id
+    }
+
+    pub async fn preproc_offset(&self) -> PoolAvailability {
+        self.state.read().await.preproc_offset
     }
 
     pub async fn all_reserved_slots_consumed(&self) -> bool {
@@ -414,6 +449,8 @@ mod tests {
         let reg = ReservationRegistry::from_state(RegistryState {
             program_hash: [0; 32],
             node_identity: identity(0),
+            run_id: 0,
+            preproc_offset: PoolAvailability::default(),
             capacity: 1,
             next_index: 2,
             slots: BTreeMap::new(),
@@ -432,6 +469,8 @@ mod tests {
         let state = RegistryState {
             program_hash,
             node_identity: identity(0),
+            run_id: 0,
+            preproc_offset: PoolAvailability::default(),
             capacity: 1,
             next_index: 2,
             slots: BTreeMap::new(),
@@ -455,6 +494,8 @@ mod tests {
         let state = RegistryState {
             program_hash: [0; 32],
             node_identity: identity(0),
+            run_id: 0,
+            preproc_offset: PoolAvailability::default(),
             capacity: 1,
             next_index: 0,
             slots: BTreeMap::new(),

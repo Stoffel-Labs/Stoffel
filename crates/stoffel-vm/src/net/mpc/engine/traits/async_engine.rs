@@ -105,6 +105,10 @@ pub trait AsyncMpcEngine: MpcEngine {
         None
     }
 
+    async fn reset_for_next_run(&self, _new_instance_id: u64) -> MpcEngineResult<()> {
+        Ok(())
+    }
+
     /// Obtain async consensus operations or return a capability-aware error.
     fn async_consensus_ops(&self) -> MpcEngineResult<&dyn AsyncMpcEngineConsensus> {
         self.as_async_consensus_ops().ok_or_else(|| {

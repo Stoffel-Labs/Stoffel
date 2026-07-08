@@ -185,6 +185,52 @@ def main() -> int64:
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts a persistent localhost coordinator, MPC party mesh, and coordinator client"]
+async fn local_offchain_coordinator_persistent_runs_reuse_nodes_and_reset_node_rpc() {
+    let source = r#"
+def main() -> int64:
+  var share = ClientStore.take_share(0, 0)
+  var opened: int64 = share.open()
+  return opened + 5
+"#;
+    let options = stoffellang::CompilerOptions {
+        mpc_backend: stoffel_vm_types::compiled_binary::MpcBackend::HoneyBadger,
+        ..Default::default()
+    };
+    let compiled = stoffellang::compile(source, "<local-runner-persistent-e2e>", &options)
+        .expect("compile persistent client input program");
+    let binary = stoffellang::convert_to_binary(&compiled);
+
+    let output = LocalCoordinatorRunner::builder(env!("CARGO_BIN_EXE_stoffel-run"), binary)
+        .parties(5)
+        .threshold(1)
+        .timeout(Duration::from_secs(300))
+        .client_inputs([LocalClientInput::raw(0, ["42"])])
+        .persistent_runs(3)
+        .build()
+        .expect("local persistent runner config")
+        .run()
+        .await
+        .expect("local persistent coordinator run");
+
+    assert_eq!(
+        output.consistent_returned_values().unwrap(),
+        vec!["47", "47", "47"]
+    );
+    assert_eq!(output.returned_values().len(), 15);
+    assert!(
+        output.combined_output.contains("persistent run 2")
+            && output.combined_output.contains("persistent run 3")
+            && output.combined_output.contains("node RPC reset complete")
+            && output
+                .combined_output
+                .contains("persistent run 2: all parties complete"),
+        "expected persistent reset and completion-barrier markers in output:\n{}",
+        output.combined_output
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts a real localhost coordinator and long-running MPC AES party mesh"]
 async fn local_offchain_coordinator_runs_optimized_aes_circuit_without_docker_compose() {
     // Compiling the optimized AES circuit recurses deeply (the inlined S-box

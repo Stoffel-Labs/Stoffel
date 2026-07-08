@@ -15,13 +15,18 @@
 // Only tested pairs from `MpcCurveConfig` should be used; arbitrary pairs are not guaranteed
 // to work correctly with the AVSS protocol.
 
-use crate::net::engine_config::MpcSessionConfig;
+use crate::net::engine_config::{DeploymentMode, MpcSessionConfig};
 use crate::net::mpc_engine::{DurableIdentityDigest, MpcPartyId, MpcSessionTopology};
 use ark_ec::CurveGroup;
 use ark_ff::{FftField, PrimeField};
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
-use std::sync::{atomic::AtomicBool, Arc};
+use std::ops::{Deref, DerefMut};
+use std::sync::{
+    atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
+    Arc, RwLock as StdRwLock,
+};
+use std::time::Duration;
 use stoffelmpc_mpc::avss_mpc::{
     AvssMPCNode as AvssMpcNode, AvssMPCNodeOpts as AvssMpcNodeOpts, AvssSessionId,
 };
@@ -48,6 +53,7 @@ pub type Bls12381AvssField = ark_bls12_381::Fr;
 pub type Bls12381AvssGroup = ark_bls12_381::G1Projective;
 pub type Bls12381AvssShare = FeldmanShamirShare<Bls12381AvssField, Bls12381AvssGroup>;
 use session_ids::{field_from_usize, protocol_instance_id_u32, usize_seed, AvssSessionIds};
+const DEFAULT_RESET_DRAIN_TIMEOUT_MS: u64 = 30_000;
 
 pub fn decode_bls12381_avss_field(bytes: &[u8]) -> Result<Bls12381AvssField, String> {
     use ark_ff::PrimeField;
@@ -118,10 +124,13 @@ where
     G: CurveGroup<ScalarField = F>,
 {
     topology: MpcSessionTopology,
+    current_instance_id: AtomicU64,
     local_identity: DurableIdentityDigest,
     net: Arc<QuicNetworkManager>,
+    input_ids: Vec<ClientId>,
     /// Full AVSS MPC node (share gen, multiplication, preprocessing, message routing)
     avss_node: Arc<Mutex<AvssMpcNode<F, Avid<AvssSessionId>, G>>>,
+    in_flight: Arc<AtomicUsize>,
     /// Generated Feldman shares indexed by user-defined key name
     stored_shares: Arc<Mutex<BTreeMap<String, FeldmanShamirShare<F, G>>>>,
     /// Allocates AVSS protocol session IDs in the engine's instance namespace.
@@ -135,6 +144,7 @@ where
     /// Retained for potential node re-creation; read by the inner `AvssMpcNode`.
     #[allow(dead_code)]
     sk_i: F,
+    public_keys: Arc<Vec<G>>,
     _marker: PhantomData<G>,
     /// Persistent preprocessing store.
     preproc_store: tokio::sync::RwLock<Option<Arc<dyn crate::storage::preproc::PreprocStore>>>,
@@ -147,7 +157,50 @@ where
     /// Router that owns open-message accumulation for this AVSS runtime.
     open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
     /// Per-instance open share accumulation registry.
-    open_registry: Arc<crate::net::open_registry::InstanceRegistry>,
+    open_registry: StdRwLock<Arc<crate::net::open_registry::InstanceRegistry>>,
+    /// Deployment lifetime semantics. OneShot preserves legacy load/delete/RAM behavior.
+    deployment_mode: DeploymentMode,
+}
+
+pub(super) struct AvssNodeLease<F, G>
+where
+    F: FftField + PrimeField,
+    G: CurveGroup<ScalarField = F>,
+{
+    node: AvssMpcNode<F, Avid<AvssSessionId>, G>,
+    in_flight: Arc<AtomicUsize>,
+}
+
+impl<F, G> Deref for AvssNodeLease<F, G>
+where
+    F: FftField + PrimeField,
+    G: CurveGroup<ScalarField = F>,
+{
+    type Target = AvssMpcNode<F, Avid<AvssSessionId>, G>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.node
+    }
+}
+
+impl<F, G> DerefMut for AvssNodeLease<F, G>
+where
+    F: FftField + PrimeField,
+    G: CurveGroup<ScalarField = F>,
+{
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.node
+    }
+}
+
+impl<F, G> Drop for AvssNodeLease<F, G>
+where
+    F: FftField + PrimeField,
+    G: CurveGroup<ScalarField = F>,
+{
+    fn drop(&mut self) {
+        self.in_flight.fetch_sub(1, Ordering::SeqCst);
+    }
 }
 
 #[derive(Clone)]
@@ -165,8 +218,111 @@ where
     F: FftField + PrimeField + Send + Sync + 'static,
     G: CurveGroup<ScalarField = F> + Send + Sync + 'static,
 {
-    pub(super) async fn clone_avss_node(&self) -> AvssMpcNode<F, Avid<AvssSessionId>, G> {
-        self.avss_node.lock().await.clone()
+    pub(super) async fn clone_avss_node(&self) -> AvssNodeLease<F, G> {
+        self.in_flight.fetch_add(1, Ordering::SeqCst);
+        let node = self.avss_node.lock().await.clone();
+        AvssNodeLease {
+            node,
+            in_flight: self.in_flight.clone(),
+        }
+    }
+
+    fn reset_drain_timeout() -> Duration {
+        let millis = std::env::var("STOFFEL_DRAIN_TIMEOUT_MS")
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_RESET_DRAIN_TIMEOUT_MS);
+        Duration::from_millis(millis)
+    }
+
+    async fn await_inflight_drained(&self) -> Result<(), String> {
+        let timeout = Self::reset_drain_timeout();
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            if self.in_flight.load(Ordering::SeqCst) == 0 {
+                return Ok(());
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "timed out after {:?} waiting for AVSS in-flight operations to drain",
+                    timeout
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    async fn build_node_for_instance(
+        &self,
+        new_instance_id: u64,
+    ) -> Result<AvssMpcNode<F, Avid<AvssSessionId>, G>, String> {
+        let (n_random_shares, n_triples) = {
+            let node = self.avss_node.lock().await;
+            (node.params.n_v_random_shares, node.params.n_triples)
+        };
+        let opts = AvssMpcNodeOpts::new(
+            self.topology.n_parties(),
+            self.topology.threshold(),
+            n_random_shares,
+            n_triples,
+            self.sk_i,
+            self.public_keys.clone(),
+            protocol_instance_id_u32(new_instance_id),
+            std::time::Duration::from_secs(60),
+        )
+        .map_err(|e| format!("Failed to recreate AvssMpcNodeOpts: {:?}", e))?;
+        <AvssMpcNode<F, Avid<AvssSessionId>, G> as MPCProtocol<
+            F,
+            FeldmanShamirShare<F, G>,
+            QuicNetworkManager,
+        >>::setup(self.topology.party_id(), opts, self.input_ids.clone())
+        .map_err(|e| format!("Failed to recreate AvssMpcNode: {:?}", e))
+    }
+
+    pub(crate) async fn reset_state_for_next_run(
+        &self,
+        new_instance_id: u64,
+    ) -> Result<(), String> {
+        let was_ready = self.ready.swap(false, Ordering::SeqCst);
+        self.await_inflight_drained().await?;
+
+        let new_node = self.build_node_for_instance(new_instance_id).await?;
+        {
+            let mut node = self.avss_node.lock().await;
+            *node = new_node;
+        }
+        self.session_ids.reset(new_instance_id);
+
+        let new_registry = self.open_message_router.register_instance(new_instance_id);
+        let old_registry = {
+            let mut slot = self
+                .open_registry
+                .write()
+                .expect("open registry lock poisoned");
+            std::mem::replace(&mut *slot, new_registry)
+        };
+        let old_ref_count = Arc::strong_count(&old_registry);
+        if old_ref_count > 1 {
+            tracing::warn!(
+                instance_id = old_registry.instance_id(),
+                strong_count = old_ref_count,
+                "old AVSS open registry still has external references after reset"
+            );
+        }
+        drop(old_registry);
+
+        self.current_instance_id
+            .store(new_instance_id, Ordering::SeqCst);
+        self.client_output_id_map.write().await.clear();
+        {
+            let mut capture = self.client_output_capture.lock().await;
+            if capture.is_some() {
+                *capture = Some(Vec::new());
+            }
+        }
+        self.ready.store(was_ready, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Create a new AVSS engine from a named backend configuration.
@@ -175,6 +331,7 @@ where
             session,
             secret_key,
             public_keys,
+            deployment_mode,
         } = config;
         let (topology, local_identity, network, input_ids, open_message_router) =
             session.into_parts();
@@ -191,7 +348,7 @@ where
             DEFAULT_N_RANDOM_SHARES,
             DEFAULT_N_TRIPLES,
             secret_key,
-            public_keys,
+            public_keys.clone(),
             instance_id_u32,
             std::time::Duration::from_secs(60),
         )
@@ -200,26 +357,31 @@ where
             F,
             FeldmanShamirShare<F, G>,
             QuicNetworkManager,
-        >>::setup(party_id, opts, input_ids)
+        >>::setup(party_id, opts, input_ids.clone())
         .map_err(|e| format!("Failed to create AvssMpcNode: {:?}", e))?;
 
         Ok(Arc::new(Self {
             topology,
+            current_instance_id: AtomicU64::new(instance_id),
             local_identity,
             net: network,
+            input_ids: input_ids.clone(),
             avss_node: Arc::new(Mutex::new(avss_node)),
+            in_flight: Arc::new(AtomicUsize::new(0)),
             stored_shares: Arc::new(Mutex::new(BTreeMap::new())),
             session_ids: AvssSessionIds::new(instance_id, party_id, n_parties),
             ready: AtomicBool::new(false),
             share_notify: Arc::new(tokio::sync::Notify::new()),
             sk_i: secret_key,
+            public_keys,
             _marker: PhantomData,
             preproc_store: tokio::sync::RwLock::new(None),
             preproc_config: tokio::sync::RwLock::new(None),
             client_output_id_map: RwLock::new(Vec::new()),
             client_output_capture: Mutex::new(None),
             open_message_router: open_message_router.clone(),
-            open_registry: open_message_router.register_instance(instance_id),
+            open_registry: StdRwLock::new(open_message_router.register_instance(instance_id)),
+            deployment_mode,
         }))
     }
 
@@ -296,6 +458,21 @@ where
         self.open_message_router.clone()
     }
 
+    pub(crate) fn open_registry(&self) -> Arc<crate::net::open_registry::InstanceRegistry> {
+        self.open_registry
+            .read()
+            .expect("open registry lock poisoned")
+            .clone()
+    }
+
+    pub fn deployment_mode(&self) -> DeploymentMode {
+        self.deployment_mode
+    }
+
+    pub fn is_standing(&self) -> bool {
+        self.deployment_mode == DeploymentMode::Standing
+    }
+
     /// Returns a handle to the inner MPC node for direct access (e.g., InputServer init).
     pub fn node_handle(&self) -> &Arc<Mutex<AvssMpcNode<F, Avid<AvssSessionId>, G>>> {
         &self.avss_node
@@ -304,6 +481,11 @@ where
     /// Get the validated MPC session topology.
     pub fn topology(&self) -> MpcSessionTopology {
         self.topology
+            .with_instance(self.current_instance_id.load(Ordering::SeqCst))
+    }
+
+    pub fn current_instance_id(&self) -> u64 {
+        self.current_instance_id.load(Ordering::SeqCst)
     }
 
     /// Get the typed party identity.

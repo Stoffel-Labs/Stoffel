@@ -264,6 +264,15 @@ impl MpcSessionTopology {
     pub const fn threshold(self) -> usize {
         self.threshold.value()
     }
+
+    pub const fn with_instance(self, instance_id: u64) -> Self {
+        Self {
+            instance_id: MpcInstanceId::new(instance_id),
+            party_id: self.party_id,
+            party_count: self.party_count,
+            threshold: self.threshold,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
