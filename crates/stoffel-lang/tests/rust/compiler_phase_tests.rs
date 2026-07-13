@@ -4685,8 +4685,24 @@ def main() -> int64:
     );
     assert_eq!(demand.randoms, 1);
     assert_eq!(demand.prandints, 2);
+    assert_eq!(demand.prandint_bits, 64);
     assert_eq!(demand.triples, 0);
     assert_eq!(demand.prandbits, 0);
+    assert!(!demand.dynamic);
+}
+
+#[test]
+fn contextual_random_bool_records_one_bit_prandint_width() {
+    let demand = demand_of_for_backend(
+        r#"
+def main() -> bool:
+  var bit: secret bool = Share.random()
+  return bit.reveal()
+"#,
+        MpcBackend::HoneyBadger,
+    );
+    assert_eq!(demand.prandints, 1);
+    assert_eq!(demand.prandint_bits, 1);
     assert!(!demand.dynamic);
 }
 
@@ -4740,6 +4756,7 @@ def main() -> int64:
     );
     assert_eq!(demand.randoms, 4);
     assert_eq!(demand.prandints, 8);
+    assert_eq!(demand.prandint_bits, 64);
     assert_eq!(demand.triples, 0);
     assert_eq!(demand.prandbits, 0);
     assert!(!demand.dynamic);
@@ -4750,8 +4767,8 @@ fn secret_multiplication_emits_one_triple() {
     let demand = demand_of(
         r#"
 def main() -> int64:
-  var a: secret int64 = Share.from_clear(3)
-  var b: secret int64 = Share.from_clear(4)
+  var a: secret int64 = ClientStore.take_share(0, 0)
+  var b: secret int64 = ClientStore.take_share(1, 0)
   var c: secret int64 = a * b
   return c.reveal()
 "#,
@@ -4777,6 +4794,7 @@ def main() -> fix64:
     assert_eq!(demand.triples, 0);
     assert_eq!(demand.prandbits, 16);
     assert_eq!(demand.prandints, 1);
+    assert_eq!(demand.prandint_bits, 64);
     assert!(!demand.dynamic);
 }
 
@@ -4796,6 +4814,7 @@ def main() -> fix64:
     );
     assert_eq!(demand.prandbits, 64);
     assert_eq!(demand.prandints, 4);
+    assert_eq!(demand.prandint_bits, 64);
     assert_eq!(demand.triples, 0);
     assert!(!demand.dynamic);
 }

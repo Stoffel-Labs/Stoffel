@@ -215,6 +215,12 @@ fn bls12381_share_to_sdk(key_name: &str, share: &Bls12381AvssShare) -> Result<Sh
         stoffel_vm_types::core_types::ShareData::Opaque(data) => {
             Ok(Share::opaque(key_name, data.to_vec()))
         }
+        stoffel_vm_types::core_types::ShareData::Deferred(_) => Err(Error::Computation(
+            "AVSS backend returned an unresolved deferred share".to_owned(),
+        )),
+        stoffel_vm_types::core_types::ShareData::Public(_) => Err(Error::Computation(
+            "AVSS backend returned an unmaterialized public share".to_owned(),
+        )),
     }
 }
 

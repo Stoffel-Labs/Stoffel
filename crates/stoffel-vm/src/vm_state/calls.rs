@@ -12,10 +12,10 @@ use crate::net::share_runtime::ensure_matching_share_data_format;
 use crate::program::{CallTarget, VmCallTarget};
 use crate::runtime_hooks::{HookCallTarget, HookEvent};
 use crate::runtime_instruction::RuntimeRegister;
-use crate::standard_library::encode_output_share_list;
 use crate::value_conversions::value_to_usize;
 use crate::vm_state::mpc_operation::{
-    PendingMpcBuiltinCall, PendingMpcBuiltinOperation, PendingMpcOperation,
+    PendingMpcBuiltinCall, PendingMpcBuiltinOperation, PendingMpcOperation, TypedShareBatch,
+    TypedSharePairBatch,
 };
 use smallvec::SmallVec;
 use std::sync::Arc;
@@ -569,47 +569,66 @@ impl VMState {
                     return Err("Share.batch_mul requires arrays with the same length".into());
                 }
 
-                // Pairs with a clear integer operand are local scalings and
-                // are computed immediately; only share-by-share pairs go to
-                // the engine.
-                let mut share_type: Option<ShareType> = None;
-                let mut precomputed: Vec<Option<ShareData>> = Vec::with_capacity(lefts.len());
-                let mut left_data: Vec<ShareData> = Vec::new();
-                let mut right_data: Vec<ShareData> = Vec::new();
+                // Compiler fusion is allowed to combine independent scalar
+                // operations. Preserve that legality even when their runtime
+                // widths differ: partition interactive pairs by exact
+                // `ShareType`, while keeping one result slot per source lane.
+                let output_len = lefts.len();
+                let mut precomputed: Vec<Option<(ShareType, ShareData)>> = vec![None; output_len];
+                let mut groups: Vec<TypedSharePairBatch> = Vec::new();
+                let mut first_type = None;
+                let mut homogeneous = true;
 
-                let mut require_type = |ty: ShareType| -> Result<(), ForeignFunctionCallbackError> {
-                    match share_type {
-                        None => {
-                            share_type = Some(ty);
-                            Ok(())
-                        }
-                        Some(existing) if existing == ty => Ok(()),
-                        Some(_) => {
-                            Err("Share.batch_mul requires arrays with matching share types".into())
-                        }
+                let mut observe_type = |ty: ShareType| {
+                    if let Some(first) = first_type {
+                        homogeneous &= first == ty;
+                    } else {
+                        first_type = Some(ty);
                     }
                 };
 
-                let mut local_products: Vec<(usize, ShareType, ShareData, i64)> = Vec::new();
                 for (index, (left, right)) in lefts.into_iter().zip(rights).enumerate() {
                     match (left, right) {
                         (ShareOrScalar::Share(lt, ld), ShareOrScalar::Share(rt, rd)) => {
-                            require_type(lt)?;
-                            require_type(rt)?;
+                            if lt != rt {
+                                return Err(format!(
+                                    "Share.batch_mul pair {index} has mismatched share types: {lt:?} and {rt:?}"
+                                )
+                                .into());
+                            }
+                            observe_type(lt);
                             ensure_matching_share_data_format(
                                 "async_batch_multiply_share",
                                 &ld,
                                 &rd,
                             )?;
-                            precomputed.push(None);
-                            left_data.push(ld);
-                            right_data.push(rd);
+                            let group = if let Some(group) = groups.iter_mut().find(|group| {
+                                group.share_type == lt
+                                    && group
+                                        .left_data
+                                        .first()
+                                        .is_none_or(|data| data.format() == ld.format())
+                            }) {
+                                group
+                            } else {
+                                groups.push(TypedSharePairBatch {
+                                    share_type: lt,
+                                    output_indices: Vec::new(),
+                                    left_data: Vec::new(),
+                                    right_data: Vec::new(),
+                                });
+                                groups.last_mut().expect("just inserted a type group")
+                            };
+                            group.output_indices.push(index);
+                            group.left_data.push(ld);
+                            group.right_data.push(rd);
                         }
                         (ShareOrScalar::Share(ty, data), ShareOrScalar::Scalar(scalar))
                         | (ShareOrScalar::Scalar(scalar), ShareOrScalar::Share(ty, data)) => {
-                            require_type(ty)?;
-                            precomputed.push(None); // placeholder, filled below
-                            local_products.push((index, ty, data, scalar));
+                            observe_type(ty);
+                            let scaled =
+                                self.share_runtime()?.mul_scalar_data(ty, &data, scalar)?;
+                            precomputed[index] = Some((ty, scaled));
                         }
                         (ShareOrScalar::Scalar(_), ShareOrScalar::Scalar(_)) => {
                             return Err(
@@ -619,29 +638,42 @@ impl VMState {
                     }
                 }
 
-                for (index, ty, data, scalar) in local_products {
-                    let scaled = self.share_runtime()?.mul_scalar_data(ty, &data, scalar)?;
-                    precomputed[index] = Some(scaled);
-                }
-
-                let share_type =
-                    share_type.expect("non-empty batch always sees at least one share");
-
-                if precomputed.iter().all(Option::is_none) {
-                    // Pure share-by-share batch: keep the original operation
-                    // shape (and its effect accounting).
-                    return Ok(PendingMpcBuiltinOperation::BatchMul {
+                if homogeneous && groups.len() <= 1 {
+                    // Preserve the compact fast path used by ordinary
+                    // single-type batches.
+                    let share_type =
+                        first_type.expect("non-empty batch always sees at least one share");
+                    let (left_data, right_data) = groups
+                        .pop()
+                        .map(|group| (group.left_data, group.right_data))
+                        .unwrap_or_default();
+                    let precomputed: Vec<Option<ShareData>> = precomputed
+                        .into_iter()
+                        .map(|slot| {
+                            slot.map(|(ty, data)| {
+                                debug_assert_eq!(ty, share_type);
+                                data
+                            })
+                        })
+                        .collect();
+                    if precomputed.iter().all(Option::is_none) {
+                        return Ok(PendingMpcBuiltinOperation::BatchMul {
+                            share_type,
+                            left_data,
+                            right_data,
+                        });
+                    }
+                    return Ok(PendingMpcBuiltinOperation::BatchMulMixed {
                         share_type,
+                        precomputed,
                         left_data,
                         right_data,
                     });
                 }
 
-                Ok(PendingMpcBuiltinOperation::BatchMulMixed {
-                    share_type,
+                Ok(PendingMpcBuiltinOperation::BatchMulHeterogeneous {
                     precomputed,
-                    left_data,
-                    right_data,
+                    groups,
                 })
             }
             MpcOnlineBuiltin::Open => {
@@ -656,20 +688,45 @@ impl VMState {
             MpcOnlineBuiltin::BatchOpen => {
                 args.require_exact(1, "1 argument: shares_array")?;
                 let shares_arg = args.cloned(0)?;
-                let Some((share_type, share_data)) = self.extract_homogeneous_share_array(
-                    &shares_arg,
-                    "Share.batch_open shares_array",
-                )?
-                else {
+                let shares =
+                    self.extract_share_array(&shares_arg, "Share.batch_open shares_array")?;
+                if shares.is_empty() {
                     return Ok(PendingMpcBuiltinOperation::BatchOpen {
                         share_type: ShareType::default_secret_int(),
                         share_data: Vec::new(),
                     });
-                };
-                Ok(PendingMpcBuiltinOperation::BatchOpen {
-                    share_type,
-                    share_data,
-                })
+                }
+                let output_len = shares.len();
+                let mut groups: Vec<TypedShareBatch> = Vec::new();
+                for (index, (share_type, share_data)) in shares.into_iter().enumerate() {
+                    let group = if let Some(group) = groups.iter_mut().find(|group| {
+                        group.share_type == share_type
+                            && group
+                                .share_data
+                                .first()
+                                .is_none_or(|data| data.format() == share_data.format())
+                    }) {
+                        group
+                    } else {
+                        groups.push(TypedShareBatch {
+                            share_type,
+                            output_indices: Vec::new(),
+                            share_data: Vec::new(),
+                        });
+                        groups.last_mut().expect("just inserted a type group")
+                    };
+                    group.output_indices.push(index);
+                    group.share_data.push(share_data);
+                }
+                if groups.len() == 1 {
+                    let group = groups.pop().expect("one group");
+                    Ok(PendingMpcBuiltinOperation::BatchOpen {
+                        share_type: group.share_type,
+                        share_data: group.share_data,
+                    })
+                } else {
+                    Ok(PendingMpcBuiltinOperation::BatchOpenHeterogeneous { output_len, groups })
+                }
             }
             MpcOnlineBuiltin::SendToClient => {
                 args.require_min(2, "2 arguments: share, client_id")?;
@@ -679,7 +736,8 @@ impl VMState {
                 let client_id = value_to_usize(&client_id_value, "client_id")?;
                 Ok(PendingMpcBuiltinOperation::SendToClient {
                     client_id,
-                    share_bytes: share_data.as_bytes().to_vec(),
+                    share_data: vec![share_data],
+                    encode_share_list: false,
                     output_share_count: ClientOutputShareCount::one(),
                 })
             }
@@ -688,7 +746,7 @@ impl VMState {
                 let client_id = args.usize(0, "client_id")?;
                 let output_value = args.cloned(1)?;
 
-                let (share_bytes, output_share_count) = match &output_value {
+                let (share_data, encode_share_list, output_share_count) = match &output_value {
                     Value::Array(_) => {
                         let Some((_share_type, share_data)) = self
                             .extract_homogeneous_share_array(
@@ -703,20 +761,18 @@ impl VMState {
                         };
                         let output_share_count = ClientOutputShareCount::try_new(share_data.len())
                             .map_err(|error| error.to_string())?;
-                        (encode_output_share_list(&share_data)?, output_share_count)
+                        (share_data, true, output_share_count)
                     }
                     _ => {
                         let (_share_type, share_data) = self.extract_share_data(&output_value)?;
-                        (
-                            share_data.as_bytes().to_vec(),
-                            ClientOutputShareCount::one(),
-                        )
+                        (vec![share_data], false, ClientOutputShareCount::one())
                     }
                 };
 
                 Ok(PendingMpcBuiltinOperation::SendToClient {
                     client_id,
-                    share_bytes,
+                    share_data,
+                    encode_share_list,
                     output_share_count,
                 })
             }

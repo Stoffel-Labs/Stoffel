@@ -27,6 +27,7 @@ impl From<CCompilerOptions> for CompilerOptions {
             inline_budget: None,
             unroll_budget: None,
             unroll_max_expansion: None,
+            mpc_mul_batch_capacity: None,
         }
     }
 }

@@ -42,6 +42,18 @@ pub trait MpcEngine: Send + Sync {
     /// Check if the engine is ready for MPC operations.
     fn is_ready(&self) -> bool;
 
+    /// Maximum number of same-type products that one native multiplication
+    /// session can execute concurrently. `None` means the backend accepts an
+    /// unbounded vector in one session.
+    ///
+    /// The conservative default is one because `AsyncMpcEngine`'s fallback
+    /// batch implementation executes scalar multiplications sequentially.
+    /// Backends with a native vector protocol must override this capability so
+    /// the VM scheduler can legally pack singular products into one round.
+    fn multiplication_batch_capacity(&self) -> Option<usize> {
+        Some(1)
+    }
+
     /// Start the engine, which may trigger preprocessing.
     fn start(&self) -> MpcEngineResult<()>;
 

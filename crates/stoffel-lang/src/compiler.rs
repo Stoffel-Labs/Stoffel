@@ -37,6 +37,10 @@ pub struct CompilerOptions {
     pub unroll_budget: Option<usize>,
     /// Override for the per-loop unroll expansion cap (`None` = default).
     pub unroll_max_expansion: Option<usize>,
+    /// Scalar secret-pair products the MPC backend can execute in one online
+    /// multiply round. `None` selects the backend default (HoneyBadger assumes
+    /// the default threshold of one; AVSS is treated as unbounded).
+    pub mpc_mul_batch_capacity: Option<usize>,
     // Add more options as needed: output_path, target_platform, etc.
 }
 
@@ -47,6 +51,16 @@ impl CompilerOptions {
             inline: self.inline_budget,
             unroll: self.unroll_budget,
             unroll_max_expansion: self.unroll_max_expansion,
+        }
+    }
+
+    pub fn mpc_scheduling_options(&self) -> optimizations::MpcSchedulingOptions {
+        let multiply_batch_capacity = self.mpc_mul_batch_capacity.or_else(|| {
+            (self.mpc_backend == MpcBackend::HoneyBadger)
+                .then(|| stoffel_vm_types::mpc::honeybadger_mul_batch_capacity(1, None))
+        });
+        optimizations::MpcSchedulingOptions {
+            multiply_batch_capacity,
         }
     }
 }
@@ -128,10 +142,11 @@ pub fn compile(
 
     // 5. Optimization Passes
     let optimized_ast = if options.optimize {
-        let ast = optimizations::optimize_all_with_budgets(
+        let ast = optimizations::optimize_all_with_options(
             analyzed_ast,
             options.optimization_level,
             options.opt_budgets(),
+            options.mpc_scheduling_options(),
         );
         if options.print_ir {
             println!("--- Optimized AST (full optimize_all pipeline) ---");

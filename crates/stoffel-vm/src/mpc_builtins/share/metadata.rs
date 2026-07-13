@@ -83,6 +83,7 @@ fn share_get_commitment(mut ctx: ForeignFunctionContext) -> ForeignFunctionCallb
         let index = value_to_usize(&index_value, "index")?;
         (share_data, index)
     };
+    let share_data = ctx.materialize_public_share_data(&share_data)?;
     let commitments = share_data
         .commitments()
         .ok_or("Share does not have Feldman commitments (requires AVSS backend)")?;
@@ -103,6 +104,7 @@ fn share_commitment_count(mut ctx: ForeignFunctionContext) -> ForeignFunctionCal
         args.cloned(0)?
     };
     let (_, share_data) = ctx.extract_share_data(&share_value)?;
+    let share_data = ctx.materialize_public_share_data(&share_data)?;
     match share_data.commitments() {
         Some(commitments) => Ok(Value::I64(usize_to_vm_i64(
             commitments.len(),
@@ -119,5 +121,6 @@ fn share_has_commitments(mut ctx: ForeignFunctionContext) -> ForeignFunctionCall
         args.cloned(0)?
     };
     let (_, share_data) = ctx.extract_share_data(&share_value)?;
+    let share_data = ctx.materialize_public_share_data(&share_data)?;
     Ok(Value::Bool(share_data.has_commitments()))
 }

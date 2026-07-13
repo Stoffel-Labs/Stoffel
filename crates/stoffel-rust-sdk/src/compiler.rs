@@ -19,6 +19,8 @@ pub struct CompilationOptions {
     pub optimization_level: u8,
     pub print_ir: bool,
     pub entry_points: Vec<String>,
+    /// Override the backend's scalar multiply capacity per online round.
+    pub mpc_mul_batch_capacity: Option<usize>,
 }
 
 pub fn compile_source(source: &str, filename: &str, backend: MpcBackend) -> Result<Program> {
@@ -84,5 +86,12 @@ fn compiler_options(
         inline_budget: env_budget("STOFFEL_INLINE_BUDGET"),
         unroll_budget: env_budget("STOFFEL_UNROLL_BUDGET"),
         unroll_max_expansion: env_budget("STOFFEL_UNROLL_MAX_EXPANSION"),
+        mpc_mul_batch_capacity: options.mpc_mul_batch_capacity.or_else(|| {
+            matches!(backend, MpcBackend::HoneyBadger)
+                .then(|| {
+                    env_budget(stoffel_vm_types::mpc::HONEYBADGER_MUL_MAX_PAIRS_PER_SESSION_ENV)
+                })
+                .flatten()
+        }),
     }
 }

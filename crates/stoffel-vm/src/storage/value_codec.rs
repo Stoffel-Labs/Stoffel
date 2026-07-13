@@ -360,6 +360,9 @@ impl Encoder<'_> {
     }
 
     fn write_share_envelope(&mut self, share_data: &ShareData) -> PersistentValueResult<()> {
+        let share_data = share_data
+            .materialized()
+            .ok_or_else(|| invalid_data("cannot persist an unresolved deferred MPC share"))?;
         let context = self
             .share_context
             .ok_or(PersistentValueError::MissingShareContext)?;
@@ -378,6 +381,9 @@ impl Encoder<'_> {
     }
 
     fn write_share_data(&mut self, share_data: &ShareData) -> PersistentValueResult<()> {
+        let share_data = share_data
+            .materialized()
+            .ok_or_else(|| invalid_data("cannot persist an unresolved deferred MPC share"))?;
         match share_data {
             ShareData::Opaque(bytes) => {
                 self.write_u8(SHARE_DATA_OPAQUE);
@@ -390,6 +396,9 @@ impl Encoder<'_> {
                 for commitment in commitments.iter() {
                     self.write_bytes(commitment)?;
                 }
+            }
+            ShareData::Public(_) | ShareData::Deferred(_) => {
+                unreachable!("materialized shares carry backend data")
             }
         }
         Ok(())
@@ -830,6 +839,9 @@ fn digest_bytes(bytes: &[u8]) -> [u8; 32] {
 }
 
 fn share_commitment_digest(share_data: &ShareData) -> PersistentValueResult<Option<[u8; 32]>> {
+    let share_data = share_data
+        .materialized()
+        .ok_or_else(|| invalid_data("cannot inspect an unresolved deferred MPC share"))?;
     match share_data {
         ShareData::Opaque(_) => Ok(None),
         ShareData::Feldman { commitments, .. } => {
@@ -837,6 +849,9 @@ fn share_commitment_digest(share_data: &ShareData) -> PersistentValueResult<Opti
                 .first()
                 .ok_or_else(|| invalid_data("Feldman share is missing commitment[0]"))?;
             Ok(Some(digest_bytes(commitment)))
+        }
+        ShareData::Public(_) | ShareData::Deferred(_) => {
+            unreachable!("materialized shares carry backend data")
         }
     }
 }

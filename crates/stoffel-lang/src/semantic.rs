@@ -4509,7 +4509,16 @@ impl<'a> SemanticAnalyzer<'a> {
                                     .symbol_table
                                     .lookup_builtin_method(obj_name, method_name)
                                 {
-                                    let call_name = if crate::builtin_registry::builtin_registry()
+                                    let is_scheduler_interactive = method_info.qualified_name
+                                        == "Share.mul"
+                                        || (method_info.qualified_name == "Share.open"
+                                            && matches!(method_name, "open" | "reveal"));
+                                    let call_name = if is_scheduler_interactive {
+                                        // Preserve the resolved identity of interactive calls so
+                                        // scheduling never has to infer it from an overloaded base
+                                        // name such as `mul` or `open`.
+                                        method_info.qualified_name.clone()
+                                    } else if crate::builtin_registry::builtin_registry()
                                         .is_receiver_bound_method(obj_name, method_name)
                                     {
                                         method_name.to_string()
@@ -4566,8 +4575,17 @@ impl<'a> SemanticAnalyzer<'a> {
                                     .symbol_table
                                     .lookup_builtin_method_for_receiver(receiver_type, name)
                                 {
+                                    let is_scheduler_interactive = method_info.qualified_name
+                                        == "Share.mul"
+                                        || (method_info.qualified_name == "Share.open"
+                                            && matches!(name.as_str(), "open" | "reveal"));
+                                    let call_name = if is_scheduler_interactive {
+                                        method_info.qualified_name.clone()
+                                    } else {
+                                        name.clone()
+                                    };
                                     (
-                                        name.clone(),
+                                        call_name,
                                         method_info.parameters.clone(),
                                         method_info.return_type.clone(),
                                         true,

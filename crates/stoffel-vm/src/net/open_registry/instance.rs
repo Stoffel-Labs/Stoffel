@@ -59,6 +59,16 @@ impl InstanceRegistry {
         self.instance_id
     }
 
+    #[cfg(all(test, feature = "avss_itest"))]
+    pub(crate) fn protocol_session_counts(&self) -> (usize, usize, usize, usize) {
+        (
+            self.single.lock().len(),
+            self.batch.lock().len(),
+            self.exp.lock().len(),
+            self.exp_g2.lock().len(),
+        )
+    }
+
     fn missing_sequence_error(operation: &str) -> String {
         format!("{operation} registry sequence was not assigned after local insertion")
     }

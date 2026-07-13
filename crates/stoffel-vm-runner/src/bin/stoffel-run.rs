@@ -24,8 +24,9 @@ use stoffel_vm::net::mpc_engine::{
     AsyncMpcEngine, DurableIdentityDigest, MpcEngine, MpcSessionTopology,
 };
 use stoffel_vm::net::{
-    avss_protocol_instance_id, honeybadger_node_opts_with_truncation,
-    honeybadger_protocol_instance_id, honeybadger_protocol_timeout, spawn_receive_loops_split,
+    avss_protocol_instance_id, honeybadger_node_opts_with_truncation_width,
+    honeybadger_protocol_instance_id, honeybadger_protocol_timeout, mpc_protocol_sender_id,
+    spawn_receive_loops_split,
 };
 use stoffel_vm::net::{
     program_id_from_bytes, register_and_wait_for_session, run_bootnode_with_config,
@@ -74,6 +75,17 @@ struct PlannedPreprocessing {
     n_random: usize,
     n_prandbit: usize,
     n_prandint: usize,
+    preprocessing_bit_width: usize,
+}
+
+/// AVSS preprocessing targets for one program execution. Unlike HoneyBadger,
+/// AVSS accepts program-visible random and Beaver targets directly; its
+/// protocol implementation generates and consumes any extra random shares
+/// needed to construct triples, and rounds triple generation to party groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PlannedAvssPreprocessing {
+    n_random: usize,
+    n_triples: usize,
 }
 
 fn read_trimmed_u64(path: &str) -> Option<u64> {
@@ -187,6 +199,48 @@ fn plan_preprocessing(
         n_random: n_random as usize,
         n_prandbit: prandbits as usize,
         n_prandint: prandints as usize,
+        preprocessing_bit_width: if prandbits > 0 || prandints > 0 {
+            match demand.prandint_bits {
+                0 => stoffel_vm_types::core_types::DEFAULT_FIXED_POINT_TOTAL_BITS,
+                bits => usize::from(bits),
+            }
+        } else {
+            stoffel_vm_types::core_types::DEFAULT_FIXED_POINT_TOTAL_BITS
+        },
+    }
+}
+
+/// Translate the compiler manifest into AVSS preprocessing targets.
+///
+/// Client input masks are runtime infrastructure and therefore are not part of
+/// the program-visible compiler demand; add them exactly once here. Current
+/// AVSS-aware binaries put all direct randomness in `randoms`. Folding legacy
+/// PRand fields into the same pool keeps older binaries conservatively safe.
+fn plan_avss_preprocessing(
+    demand: &stoffel_vm_types::compiled_binary::PreprocessingDemand,
+    n_client_random: usize,
+) -> PlannedAvssPreprocessing {
+    let with_headroom = |count: u64| {
+        if demand.dynamic {
+            count.saturating_mul(2)
+        } else {
+            count
+        }
+    };
+    let program_random = demand
+        .randoms
+        .saturating_add(demand.prandbits)
+        .saturating_add(demand.prandints);
+    let n_random = with_headroom(program_random)
+        .saturating_add(n_client_random as u64)
+        .try_into()
+        .unwrap_or(usize::MAX);
+    let n_triples = with_headroom(demand.triples)
+        .try_into()
+        .unwrap_or(usize::MAX);
+    PlannedAvssPreprocessing {
+        n_random,
+        n_triples,
     }
 }
 
@@ -2701,24 +2755,27 @@ where
     let n_random = plan.n_random;
     let n_prandbit = plan.n_prandbit;
     let n_prandint = plan.n_prandint;
+    let preprocessing_bit_width = plan.preprocessing_bit_width;
     let protocol_timeout = honeybadger_protocol_timeout();
     eprintln!(
-        "[party {}] Creating MPC node opts (n_triples={}, n_random={}, n_prandbit={}, n_prandint={}, dynamic={}, timeout={}s)",
+        "[party {}] Creating MPC node opts (n_triples={}, n_random={}, n_prandbit={}, n_prandint={}, preprocessing_bits={}, dynamic={}, timeout={}s)",
         my_id,
         n_triples,
         n_random,
         n_prandbit,
         n_prandint,
+        preprocessing_bit_width,
         preprocessing_demand.dynamic,
         protocol_timeout.as_secs()
     );
-    let mpc_opts = honeybadger_node_opts_with_truncation(
+    let mpc_opts = honeybadger_node_opts_with_truncation_width(
         n,
         t,
         n_triples,
         n_random,
         n_prandbit,
         n_prandint,
+        preprocessing_bit_width,
         instance_id,
     )
     .unwrap_or_else(|e| {
@@ -3052,8 +3109,10 @@ struct AvssPartySetup<'a> {
     t: usize,
     instance_id: u64,
     expected_client_count: Option<usize>,
+    coordinator_client_count_hint: usize,
     client_input_count: usize,
     client_input_types: &'a std::collections::BTreeMap<usize, Vec<ShareType>>,
+    preprocessing_demand: stoffel_vm_types::compiled_binary::PreprocessingDemand,
 }
 async fn setup_avss_party_for_curve<F, G>(
     vm: &mut VirtualMachine,
@@ -3071,8 +3130,10 @@ where
         t,
         instance_id,
         expected_client_count,
+        coordinator_client_count_hint,
         client_input_count,
         client_input_types,
+        preprocessing_demand,
     } = setup;
 
     // ---- Phase 1: Wait for clients ----
@@ -3292,7 +3353,22 @@ where
         .map_err(|error| format!("Invalid AVSS MPC topology: {error}"))?
         .with_local_identity(local_identity)
         .with_input_ids(mpc_input_ids);
-    let engine = AvssMpcEngine::<F, G>::from_config(AvssEngineConfig::new(session, sk_i, pk_map))
+    let client_count = input_ids.len().max(coordinator_client_count_hint);
+    let n_client_random = client_count.saturating_mul(client_input_count);
+    let preprocessing_plan = plan_avss_preprocessing(&preprocessing_demand, n_client_random);
+    eprintln!(
+        "[party {}] AVSS preprocessing plan: compiler_triples={} compiler_randoms={} client_masks={} requested_triples={} requested_randoms={} dynamic={}",
+        my_id,
+        preprocessing_demand.triples,
+        preprocessing_demand.randoms,
+        n_client_random,
+        preprocessing_plan.n_triples,
+        preprocessing_plan.n_random,
+        preprocessing_demand.dynamic,
+    );
+    let config = AvssEngineConfig::new(session, sk_i, pk_map)
+        .with_preprocessing_counts(preprocessing_plan.n_random, preprocessing_plan.n_triples);
+    let engine = AvssMpcEngine::<F, G>::from_config(config)
         .await
         .map_err(|e| format!("Failed to create AVSS engine: {}", e))?;
     engine.set_client_output_id_map(input_ids.clone()).await;
@@ -3309,16 +3385,20 @@ where
     let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<(usize, Vec<u8>)>(4096);
 
     for (peer_id, conn) in &connections {
-        if *peer_id == my_id {
+        let Some(authenticated_sender_id) =
+            mpc_protocol_sender_id(*peer_id, conn.remote_party_id(), n)
+        else {
+            eprintln!(
+                "[AVSS] Ignoring protocol connection with out-of-session transport ID {}",
+                peer_id
+            );
             continue;
-        }
-        let peer_id = *peer_id;
+        };
         let engine = engine.clone();
         let open_message_router = engine.open_message_router();
         let tx = msg_tx.clone();
         let conn = conn.clone();
         let net_clone = net.clone();
-        let authenticated_sender_id = conn.remote_party_id().unwrap_or(peer_id);
         tokio::spawn(async move {
             while let Ok(data) = conn.receive().await {
                 if let Ok(true) =
@@ -3417,8 +3497,13 @@ where
     // ---- Phase 5: Preprocessing ----
     tokio::time::sleep(Duration::from_secs(2)).await;
     eprintln!("[party {}] Starting AVSS preprocessing...", my_id);
+    let preprocessing_started_at = std::time::Instant::now();
     engine.preprocess().await?;
-    eprintln!("[party {}] AVSS preprocessing complete!", my_id);
+    eprintln!(
+        "[party {}] AVSS preprocessing complete! elapsed_ms={}",
+        my_id,
+        preprocessing_started_at.elapsed().as_millis()
+    );
 
     // ---- Phase 6: Client input initialization ----
     if !input_ids.is_empty() {
@@ -3533,6 +3618,7 @@ async fn run_avss_coordinated_party_for_curve<F, G>(
     expected_clients: &[String],
     as_leader: bool,
     agreed_entry: &str,
+    preprocessing_demand: stoffel_vm_types::compiled_binary::PreprocessingDemand,
 ) -> Result<(), String>
 where
     F: SupportedMpcField,
@@ -3584,8 +3670,10 @@ where
             t,
             instance_id,
             expected_client_count: None,
+            coordinator_client_count_hint: input_ids.len(),
             client_input_count: 1,
             client_input_types: &client_input_types,
+            preprocessing_demand,
         },
     )
     .await?;
@@ -3689,9 +3777,14 @@ where
         .map_err(|e| e.to_string())?;
 
     eprintln!("Starting VM execution of '{}'...", agreed_entry);
+    let online_started_at = std::time::Instant::now();
     let result = vm
         .execute(agreed_entry)
         .map_err(|err| format!("Execution error in '{}': {}", agreed_entry, err))?;
+    eprintln!(
+        "online VM execution complete! elapsed_ms={}",
+        online_started_at.elapsed().as_millis()
+    );
 
     let captured_outputs = engine.drain_client_output_records().await;
     if !captured_outputs.is_empty() {
@@ -3740,6 +3833,7 @@ async fn run_avss_coordinated_party(
     expected_clients: &[String],
     as_leader: bool,
     agreed_entry: &str,
+    preprocessing_demand: stoffel_vm_types::compiled_binary::PreprocessingDemand,
 ) -> Result<(), String> {
     match curve_config {
         MpcCurveConfig::Bls12_381 => {
@@ -3757,6 +3851,7 @@ async fn run_avss_coordinated_party(
                 expected_clients,
                 as_leader,
                 agreed_entry,
+                preprocessing_demand,
             )
             .await
         }
@@ -3775,6 +3870,7 @@ async fn run_avss_coordinated_party(
                 expected_clients,
                 as_leader,
                 agreed_entry,
+                preprocessing_demand,
             )
             .await
         }
@@ -3796,6 +3892,7 @@ async fn run_avss_coordinated_party(
                 expected_clients,
                 as_leader,
                 agreed_entry,
+                preprocessing_demand,
             )
             .await
         }
@@ -3814,6 +3911,7 @@ async fn run_avss_coordinated_party(
                 expected_clients,
                 as_leader,
                 agreed_entry,
+                preprocessing_demand,
             )
             .await
         }
@@ -3832,6 +3930,7 @@ async fn run_avss_coordinated_party(
                 expected_clients,
                 as_leader,
                 agreed_entry,
+                preprocessing_demand,
             )
             .await
         }
@@ -3850,6 +3949,7 @@ async fn run_avss_coordinated_party(
                 expected_clients,
                 as_leader,
                 agreed_entry,
+                preprocessing_demand,
             )
             .await
         }
@@ -5261,6 +5361,7 @@ async fn main() {
                         &expected_clients,
                         as_leader,
                         &agreed_entry,
+                        preprocessing_demand,
                     )
                     .await
                     {
@@ -5284,8 +5385,10 @@ async fn main() {
                                 t,
                                 instance_id,
                                 expected_client_count,
+                                coordinator_client_count_hint: 0,
                                 client_input_count,
                                 client_input_types: &client_input_types,
+                                preprocessing_demand,
                             },
                         )
                         .await
@@ -5815,8 +5918,8 @@ Examples:
 mod tests {
     use super::{
         band_pow2, client_transport_recipient, client_transport_targets, field_outputs_to_hex,
-        format_coordinator_outputs, input_client_ids_from_output_ids, plan_preprocessing,
-        render_fixed_point_i64, CoordinatorOutputFormat,
+        format_coordinator_outputs, input_client_ids_from_output_ids, plan_avss_preprocessing,
+        plan_preprocessing, render_fixed_point_i64, CoordinatorOutputFormat,
     };
     use stoffel_vm::net::MpcCurveConfig;
     use stoffel_vm_types::compiled_binary::PreprocessingDemand;
@@ -5827,6 +5930,7 @@ mod tests {
             randoms: 0,
             prandbits,
             prandints,
+            prandint_bits: u16::from(prandints > 0) * 31,
             dynamic,
         }
     }
@@ -5884,6 +5988,7 @@ mod tests {
         assert_eq!(plan.n_prandint, 1);
         assert_eq!(plan.n_triples, 16);
         assert_eq!(plan.n_random, 18);
+        assert_eq!(plan.preprocessing_bit_width, 31);
     }
 
     #[test]
@@ -5917,6 +6022,37 @@ mod tests {
         assert_eq!(stat.n_prandbit, 16);
         assert_eq!(dyn_.n_prandbit, 32);
         assert!(dyn_.n_triples >= stat.n_triples);
+    }
+
+    #[test]
+    fn avss_plan_uses_compiler_demand_and_adds_client_masks() {
+        let demand = PreprocessingDemand {
+            triples: 2,
+            randoms: 3,
+            ..PreprocessingDemand::default()
+        };
+        let plan = plan_avss_preprocessing(&demand, 4);
+        assert_eq!(plan.n_triples, 2);
+        assert_eq!(plan.n_random, 7);
+    }
+
+    #[test]
+    fn avss_plan_has_no_hardcoded_minimum_and_heads_up_dynamic_work() {
+        let clear = plan_avss_preprocessing(&PreprocessingDemand::default(), 0);
+        assert_eq!(clear.n_triples, 0);
+        assert_eq!(clear.n_random, 0);
+
+        let dynamic = PreprocessingDemand {
+            triples: 2,
+            randoms: 3,
+            prandbits: 5,
+            prandints: 1,
+            dynamic: true,
+            ..PreprocessingDemand::default()
+        };
+        let plan = plan_avss_preprocessing(&dynamic, 4);
+        assert_eq!(plan.n_triples, 4);
+        assert_eq!(plan.n_random, 22);
     }
 
     #[test]

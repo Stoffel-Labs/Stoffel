@@ -19,7 +19,8 @@ use smallvec::SmallVec;
 use std::any::Any;
 use std::fmt;
 use std::hash::{Hash, Hasher};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, OnceLock};
 
 const ARRAY_DENSE_INLINE_CAPACITY: usize = 16;
 const ARRAY_DENSE_INDEX_LIMIT: usize = 32;
@@ -810,6 +811,62 @@ pub struct ClearShareInput {
     value: ClearShareValue,
 }
 
+/// A compile/runtime-known public value carried in the secret-share domain.
+///
+/// Keeping this provenance beside the value lets the VM perform public/public
+/// arithmetic exactly and lower secret/public multiplication to local scalar
+/// algebra even after the value crosses function and loop boundaries. The
+/// backend representation is created lazily only when an operation genuinely
+/// needs share bytes (for example persistence or a commitment observer).
+pub struct PublicShare {
+    input: ClearShareInput,
+    materialized: OnceLock<ShareData>,
+}
+
+impl PublicShare {
+    pub fn new(input: ClearShareInput) -> Self {
+        Self {
+            input,
+            materialized: OnceLock::new(),
+        }
+    }
+
+    pub const fn input(&self) -> ClearShareInput {
+        self.input
+    }
+
+    pub fn materialized(&self) -> Option<&ShareData> {
+        self.materialized.get()
+    }
+
+    pub fn set_materialized(&self, share: ShareData) -> Result<(), ShareData> {
+        self.materialized.set(share)
+    }
+}
+
+impl PartialEq for PublicShare {
+    fn eq(&self, other: &Self) -> bool {
+        self.input == other.input
+    }
+}
+
+impl Eq for PublicShare {}
+
+impl Hash for PublicShare {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.input.hash(state);
+    }
+}
+
+impl fmt::Debug for PublicShare {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PublicShare")
+            .field("input", &self.input)
+            .field("materialized", &self.materialized.get())
+            .finish()
+    }
+}
+
 impl ClearShareInput {
     pub const fn new(share_type: ShareType, value: ClearShareValue) -> Self {
         Self { share_type, value }
@@ -852,8 +909,155 @@ impl ShareDataFormat {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
+/// A process-local share expression whose interactive multiplications have not
+/// necessarily been issued to the MPC backend yet.
+///
+/// Deferred expressions are an execution detail, never a wire format. Their
+/// monotonically increasing identity makes shared subexpressions cheap to
+/// recognize without comparing (potentially very large) expression trees.
+pub struct DeferredShare {
+    id: u64,
+    share_type: ShareType,
+    format: ShareDataFormat,
+    operation: DeferredShareOperation,
+    resolved: OnceLock<ShareData>,
+}
+
+impl DeferredShare {
+    fn new(
+        share_type: ShareType,
+        format: ShareDataFormat,
+        operation: DeferredShareOperation,
+    ) -> Self {
+        static NEXT_DEFERRED_SHARE_ID: AtomicU64 = AtomicU64::new(1);
+
+        Self {
+            id: NEXT_DEFERRED_SHARE_ID.fetch_add(1, Ordering::Relaxed),
+            share_type,
+            format,
+            operation,
+            resolved: OnceLock::new(),
+        }
+    }
+
+    pub const fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub const fn share_type(&self) -> ShareType {
+        self.share_type
+    }
+
+    pub const fn format(&self) -> ShareDataFormat {
+        self.format
+    }
+
+    pub const fn operation(&self) -> &DeferredShareOperation {
+        &self.operation
+    }
+
+    pub fn resolved(&self) -> Option<&ShareData> {
+        self.resolved.get()
+    }
+
+    /// Cache the materialized value of this expression. A second resolver may
+    /// race with the first one, so callers should treat an already-filled cell
+    /// as success and read the winner through [`Self::resolved`].
+    pub fn set_resolved(&self, share_data: ShareData) -> Result<(), ShareData> {
+        self.resolved.set(share_data)
+    }
+}
+
+impl PartialEq for DeferredShare {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
+impl Eq for DeferredShare {}
+
+impl Hash for DeferredShare {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        self.id.hash(state);
+    }
+}
+
+impl fmt::Debug for DeferredShare {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DeferredShare")
+            .field("id", &self.id)
+            .field("share_type", &self.share_type)
+            .field("format", &self.format)
+            .field("operation", &self.operation.kind_name())
+            .field("resolved", &self.resolved.get().is_some())
+            .finish()
+    }
+}
+
+/// Pure share-algebra nodes retained around deferred interactive products.
+/// Only `Multiply` consumes an MPC communication round; every other variant is
+/// evaluated locally once its operands have become materialized.
+#[derive(Clone, Debug)]
+pub enum DeferredShareOperation {
+    Multiply { left: ShareData, right: ShareData },
+    Add { left: ShareData, right: ShareData },
+    Sub { left: ShareData, right: ShareData },
+    Neg { share: ShareData },
+    AddScalar { share: ShareData, scalar: i64 },
+    SubScalar { share: ShareData, scalar: i64 },
+    ScalarSub { scalar: i64, share: ShareData },
+    DivScalar { share: ShareData, scalar: i64 },
+    MulScalar { share: ShareData, scalar: i64 },
+    MulField { share: ShareData, scalar: Arc<[u8]> },
+    AddField { share: ShareData, field: Arc<[u8]> },
+}
+
+impl DeferredShareOperation {
+    pub const fn is_multiply(&self) -> bool {
+        matches!(self, Self::Multiply { .. })
+    }
+
+    pub const fn kind_name(&self) -> &'static str {
+        match self {
+            Self::Multiply { .. } => "multiply",
+            Self::Add { .. } => "add",
+            Self::Sub { .. } => "subtract",
+            Self::Neg { .. } => "negate",
+            Self::AddScalar { .. } => "add-scalar",
+            Self::SubScalar { .. } => "subtract-scalar",
+            Self::ScalarSub { .. } => "scalar-subtract",
+            Self::DivScalar { .. } => "divide-scalar",
+            Self::MulScalar { .. } => "multiply-scalar",
+            Self::MulField { .. } => "multiply-field",
+            Self::AddField { .. } => "add-field",
+        }
+    }
+
+    pub fn visit_operands(&self, mut visit: impl FnMut(&ShareData)) {
+        match self {
+            Self::Multiply { left, right }
+            | Self::Add { left, right }
+            | Self::Sub { left, right } => {
+                visit(left);
+                visit(right);
+            }
+            Self::Neg { share }
+            | Self::AddScalar { share, .. }
+            | Self::SubScalar { share, .. }
+            | Self::ScalarSub { share, .. }
+            | Self::DivScalar { share, .. }
+            | Self::MulScalar { share, .. }
+            | Self::MulField { share, .. }
+            | Self::AddField { share, .. } => visit(share),
+        }
+    }
+}
+
+#[derive(Clone)]
 pub enum ShareData {
+    /// A value publicly known to all parties but represented in the share type
+    /// domain. Backend bytes are materialized lazily when required.
+    Public(Arc<PublicShare>),
     /// Opaque share bytes (e.g., HoneyBadger RobustShare).
     ///
     /// Stored as `Arc<[u8]>` so cloning a share — which happens on every
@@ -869,44 +1073,171 @@ pub enum ShareData {
         /// Extracted Feldman commitments — commitment\[0\] is the public key
         commitments: Arc<[Vec<u8>]>,
     },
+    /// Process-local deferred share expression. This variant must be resolved
+    /// before serialization, persistence, or a protocol observation.
+    Deferred(Arc<DeferredShare>),
 }
 
 impl ShareData {
+    pub fn public(input: ClearShareInput) -> Self {
+        Self::Public(Arc::new(PublicShare::new(input)))
+    }
+
+    pub fn public_input(&self) -> Option<ClearShareInput> {
+        match self {
+            Self::Public(public) => Some(public.input()),
+            Self::Deferred(node) => node.resolved().and_then(ShareData::public_input),
+            Self::Opaque(_) | Self::Feldman { .. } => None,
+        }
+    }
+
+    pub fn deferred(
+        share_type: ShareType,
+        format: ShareDataFormat,
+        operation: DeferredShareOperation,
+    ) -> Self {
+        Self::Deferred(Arc::new(DeferredShare::new(share_type, format, operation)))
+    }
+
+    pub fn deferred_multiply(share_type: ShareType, left: ShareData, right: ShareData) -> Self {
+        debug_assert_eq!(left.format(), right.format());
+        let format = left.format();
+        Self::deferred(
+            share_type,
+            format,
+            DeferredShareOperation::Multiply { left, right },
+        )
+    }
+
+    pub fn deferred_node(&self) -> Option<&Arc<DeferredShare>> {
+        match self {
+            Self::Deferred(node) => Some(node),
+            Self::Public(_) | Self::Opaque(_) | Self::Feldman { .. } => None,
+        }
+    }
+
+    pub fn is_deferred(&self) -> bool {
+        matches!(self, Self::Deferred(node) if node.resolved().is_none())
+    }
+
+    pub fn materialized(&self) -> Option<&ShareData> {
+        match self {
+            Self::Opaque(_) | Self::Feldman { .. } => Some(self),
+            Self::Public(public) => public.materialized().and_then(ShareData::materialized),
+            Self::Deferred(node) => node.resolved().and_then(ShareData::materialized),
+        }
+    }
+
     /// Share bytes for MPC engine operations (multiply, open, etc.)
     pub fn as_bytes(&self) -> &[u8] {
-        match self {
+        match self
+            .materialized()
+            .unwrap_or_else(|| panic!("attempted to access unresolved deferred share bytes"))
+        {
             ShareData::Opaque(b) => b,
             ShareData::Feldman { data, .. } => data,
+            ShareData::Public(_) => unreachable!("materialized public shares carry backend data"),
+            ShareData::Deferred(_) => unreachable!("materialized shares cannot be deferred"),
         }
     }
 
     /// Consume and return the share bytes.
     pub fn into_bytes(self) -> Vec<u8> {
         match self {
+            ShareData::Public(public) => public
+                .materialized()
+                .cloned()
+                .expect("attempted to consume unmaterialized public share bytes")
+                .into_bytes(),
             ShareData::Opaque(b) => b.to_vec(),
             ShareData::Feldman { data, .. } => data.to_vec(),
+            ShareData::Deferred(node) => node
+                .resolved()
+                .cloned()
+                .expect("attempted to consume unresolved deferred share bytes")
+                .into_bytes(),
         }
     }
 
     /// Feldman commitments, if available.
     pub fn commitments(&self) -> Option<&[Vec<u8>]> {
         match self {
+            ShareData::Public(public) => public.materialized().and_then(ShareData::commitments),
             ShareData::Opaque(_) => None,
             ShareData::Feldman { commitments, .. } => Some(commitments),
+            ShareData::Deferred(node) => node.resolved().and_then(ShareData::commitments),
         }
     }
 
     /// Representation format carried by this share payload.
     pub fn format(&self) -> ShareDataFormat {
         match self {
+            ShareData::Public(public) => public
+                .materialized()
+                .map(ShareData::format)
+                .unwrap_or(ShareDataFormat::Opaque),
             ShareData::Opaque(_) => ShareDataFormat::Opaque,
             ShareData::Feldman { .. } => ShareDataFormat::Feldman,
+            ShareData::Deferred(node) => node.format(),
         }
     }
 
     /// Whether this share carries Feldman commitments.
     pub fn has_commitments(&self) -> bool {
         self.format() == ShareDataFormat::Feldman
+    }
+}
+
+impl PartialEq for ShareData {
+    fn eq(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Public(left), Self::Public(right)) => left == right,
+            (Self::Opaque(left), Self::Opaque(right)) => left == right,
+            (
+                Self::Feldman {
+                    data: left_data,
+                    commitments: left_commitments,
+                },
+                Self::Feldman {
+                    data: right_data,
+                    commitments: right_commitments,
+                },
+            ) => left_data == right_data && left_commitments == right_commitments,
+            (Self::Deferred(left), Self::Deferred(right)) => left == right,
+            _ => false,
+        }
+    }
+}
+
+impl Eq for ShareData {}
+
+impl Hash for ShareData {
+    fn hash<H: Hasher>(&self, state: &mut H) {
+        std::mem::discriminant(self).hash(state);
+        match self {
+            Self::Public(public) => public.hash(state),
+            Self::Opaque(bytes) => bytes.hash(state),
+            Self::Feldman { data, commitments } => {
+                data.hash(state);
+                commitments.hash(state);
+            }
+            Self::Deferred(node) => node.hash(state),
+        }
+    }
+}
+
+impl fmt::Debug for ShareData {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Public(public) => f.debug_tuple("Public").field(public).finish(),
+            Self::Opaque(bytes) => f.debug_tuple("Opaque").field(bytes).finish(),
+            Self::Feldman { data, commitments } => f
+                .debug_struct("Feldman")
+                .field("data", data)
+                .field("commitments", commitments)
+                .finish(),
+            Self::Deferred(node) => f.debug_tuple("Deferred").field(node).finish(),
+        }
     }
 }
 

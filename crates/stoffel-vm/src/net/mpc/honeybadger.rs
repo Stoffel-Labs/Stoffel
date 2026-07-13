@@ -1,5 +1,5 @@
 use crate::net::curve::SupportedMpcField;
-use crate::net::mpc::{honeybadger_node_opts, honeybadger_node_opts_with_truncation};
+use crate::net::mpc::{honeybadger_node_opts, honeybadger_node_opts_with_truncation_width};
 use crate::net::mpc_engine::{DurableIdentityDigest, MpcPartyId, MpcSessionTopology};
 use crate::net::reservation::ReservationRegistry;
 use crate::storage::preproc::PreprocStore;
@@ -203,22 +203,24 @@ where
         &self,
         new_instance_id: u64,
     ) -> Result<HoneyBadgerMPCNode<F, RBCImpl>, String> {
-        let (n_triples, n_random_shares, n_prandbit, n_prandint) = {
+        let (n_triples, n_random_shares, n_prandbit, n_prandint, preprocessing_bit_width) = {
             let node = self.node.lock().await;
             (
                 node.params.n_triples,
                 node.params.n_random_shares,
                 node.params.n_prandbit,
                 node.params.n_prandint,
+                node.params.l,
             )
         };
-        let mpc_opts = honeybadger_node_opts_with_truncation(
+        let mpc_opts = honeybadger_node_opts_with_truncation_width(
             self.topology.n_parties(),
             self.topology.threshold(),
             n_triples,
             n_random_shares,
             n_prandbit,
             n_prandint,
+            preprocessing_bit_width,
             new_instance_id,
         )?;
         <HoneyBadgerMPCNode<F, RBCImpl> as MPCProtocol<

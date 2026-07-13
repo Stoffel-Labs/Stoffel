@@ -315,6 +315,8 @@ pub(crate) trait ForeignMpcServices {
 
     fn input_share_data(&self, clear: ClearShareInput) -> VmResult<ShareData>;
 
+    fn materialize_public_share_data(&self, share: &ShareData) -> VmResult<ShareData>;
+
     fn open_share_data(&self, ty: ShareType, share_data: &ShareData) -> VmResult<ClearShareValue>;
 
     fn batch_open_share_data(
@@ -472,6 +474,10 @@ impl ForeignMpcServices for VMState {
         VMState::input_share_data(self, clear)
     }
 
+    fn materialize_public_share_data(&self, share: &ShareData) -> VmResult<ShareData> {
+        VMState::materialize_public_share_data(self, share)
+    }
+
     fn open_share_data(&self, ty: ShareType, share_data: &ShareData) -> VmResult<ClearShareValue> {
         VMState::open_share_data(self, ty, share_data)
     }
@@ -616,6 +622,12 @@ pub(crate) trait ForeignShareObjectServices {
         context: &'static str,
     ) -> VmResult<Option<(ShareType, Vec<ShareData>)>>;
 
+    fn extract_share_array(
+        &mut self,
+        value: &Value,
+        context: &'static str,
+    ) -> VmResult<Vec<(ShareType, ShareData)>>;
+
     fn share_type(&mut self, value: &Value) -> VmResult<ShareType>;
 
     fn share_party_id(&mut self, value: &Value) -> VmResult<Option<usize>>;
@@ -652,6 +664,14 @@ impl ForeignShareObjectServices for VMState {
         context: &'static str,
     ) -> VmResult<Option<(ShareType, Vec<ShareData>)>> {
         VMState::extract_homogeneous_share_array(self, value, context)
+    }
+
+    fn extract_share_array(
+        &mut self,
+        value: &Value,
+        context: &'static str,
+    ) -> VmResult<Vec<(ShareType, ShareData)>> {
+        VMState::extract_share_array(self, value, context)
     }
 
     fn share_type(&mut self, value: &Value) -> VmResult<ShareType> {

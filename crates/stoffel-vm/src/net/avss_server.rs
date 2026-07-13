@@ -31,6 +31,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use super::avss_engine::{AvssEngineConfig, AvssMpcEngine};
+use super::mpc_protocol_sender_id;
 
 fn is_duplicate_connection_tiebreaker_error(error: &str) -> bool {
     error.contains("duplicate connection: tie-breaker")
@@ -678,10 +679,15 @@ where
 
         let connections = net.get_all_server_connections();
         for (peer_id, conn) in &connections {
-            let authenticated_sender_id = Self::connection_party_id(*peer_id, conn);
-            if authenticated_sender_id == self.node_id || authenticated_sender_id >= self.n {
+            let Some(authenticated_sender_id) =
+                mpc_protocol_sender_id(*peer_id, conn.remote_party_id(), self.n)
+            else {
+                warn!(
+                    "[AVSS] Ignoring protocol connection with out-of-session transport ID {}",
+                    peer_id
+                );
                 continue;
-            }
+            };
             let peer_id = authenticated_sender_id;
             let engine = engine.clone();
             let tx = msg_tx.clone();
@@ -799,10 +805,15 @@ where
         // Server connection receive loops
         let connections = net.get_all_server_connections();
         for (peer_id, conn) in &connections {
-            let authenticated_sender_id = Self::connection_party_id(*peer_id, conn);
-            if authenticated_sender_id == self.node_id || authenticated_sender_id >= self.n {
+            let Some(authenticated_sender_id) =
+                mpc_protocol_sender_id(*peer_id, conn.remote_party_id(), self.n)
+            else {
+                warn!(
+                    "[AVSS] Ignoring protocol connection with out-of-session transport ID {}",
+                    peer_id
+                );
                 continue;
-            }
+            };
             let peer_id = authenticated_sender_id;
             let engine = engine.clone();
             let tx = server_tx.clone();

@@ -320,6 +320,10 @@ where
         self.ready.load(Ordering::SeqCst)
     }
 
+    fn multiplication_batch_capacity(&self) -> Option<usize> {
+        None
+    }
+
     fn start(&self) -> crate::net::mpc_engine::MpcEngineResult<()> {
         self.ready.store(true, Ordering::SeqCst);
         Ok(())

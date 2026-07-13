@@ -28,8 +28,26 @@ impl<'engine> MpcShareRuntime<'engine> {
 
     pub(crate) fn input_share(&self, clear: ClearShareInput) -> VmResult<ShareData> {
         self.ensure_ready()?;
-        self.engine
-            .input_share(clear)
-            .map_mpc_backend_err("input_share")
+        Ok(ShareData::public(clear))
+    }
+
+    /// Obtain backend bytes for a public-domain share only when an operation
+    /// cannot remain symbolic. The `OnceLock` on `PublicShare` guarantees stable
+    /// backend identity for repeated observers without eagerly discarding public
+    /// provenance at construction time.
+    pub(crate) fn materialize_public_share(&self, share: &ShareData) -> VmResult<ShareData> {
+        let ShareData::Public(public) = share else {
+            return Ok(share.materialized().unwrap_or(share).clone());
+        };
+        if let Some(materialized) = public.materialized() {
+            return Ok(materialized.clone());
+        }
+        self.ensure_ready()?;
+        let materialized = self
+            .engine
+            .input_share(public.input())
+            .map_mpc_backend_err("input_share")?;
+        let _ = public.set_materialized(materialized.clone());
+        Ok(public.materialized().unwrap_or(&materialized).clone())
     }
 }

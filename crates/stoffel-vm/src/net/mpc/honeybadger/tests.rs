@@ -196,6 +196,10 @@ async fn get_mask_share_reserves_requested_persistent_index_once() {
         .unwrap();
 
     let reservation = engine.reservation_ops().unwrap();
+    reservation
+        .init_reservations(program_hash, shares.len() as u64)
+        .await
+        .unwrap();
     let first = reservation.get_mask_share(0).await.unwrap();
     assert!(!first.is_empty());
     assert_eq!(store.available(&key).await.unwrap(), 1);

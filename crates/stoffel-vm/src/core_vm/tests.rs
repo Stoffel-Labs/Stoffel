@@ -47,9 +47,13 @@ fn callback_error(error: &VirtualMachineError) -> &ForeignFunctionCallbackError 
 }
 
 fn compile_vm_source(source: &str) -> VirtualMachine {
+    compile_vm_source_at(source, 0)
+}
+
+fn compile_vm_source_at(source: &str, optimization_level: u8) -> VirtualMachine {
     let options = stoffellang::CompilerOptions {
-        optimize: false,
-        optimization_level: 0,
+        optimize: optimization_level > 0,
+        optimization_level,
         print_ir: false,
         mpc_backend: MpcBackend::HoneyBadger,
         mpc_curve: MpcCurve::default(),
@@ -57,6 +61,7 @@ fn compile_vm_source(source: &str) -> VirtualMachine {
         inline_budget: None,
         unroll_budget: None,
         unroll_max_expansion: None,
+        mpc_mul_batch_capacity: None,
     };
     let program =
         stoffellang::compile(source, "vm-test.stfl", &options).expect("test source should compile");
@@ -584,17 +589,30 @@ impl AsyncMpcEngine for AsyncBatchOpenEngine {
 }
 
 struct AsyncBatchMulEngine {
+    batch_capacity: Option<usize>,
     sync_mul_calls: AtomicUsize,
     sync_batch_calls: AtomicUsize,
     async_batch_calls: AtomicUsize,
+    async_batch_sizes: Mutex<Vec<usize>>,
+    async_batch_open_calls: AtomicUsize,
 }
 
 impl AsyncBatchMulEngine {
     fn new() -> Self {
         Self {
+            batch_capacity: None,
             sync_mul_calls: AtomicUsize::new(0),
             sync_batch_calls: AtomicUsize::new(0),
             async_batch_calls: AtomicUsize::new(0),
+            async_batch_sizes: Mutex::new(Vec::new()),
+            async_batch_open_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn with_capacity(batch_capacity: usize) -> Self {
+        Self {
+            batch_capacity: Some(batch_capacity),
+            ..Self::new()
         }
     }
 }
@@ -612,6 +630,10 @@ impl MpcEngine for AsyncBatchMulEngine {
         true
     }
 
+    fn multiplication_batch_capacity(&self) -> Option<usize> {
+        self.batch_capacity
+    }
+
     fn start(&self) -> MpcEngineResult<()> {
         Ok(())
     }
@@ -620,8 +642,34 @@ impl MpcEngine for AsyncBatchMulEngine {
         Ok(ShareData::Opaque(Vec::new().into()))
     }
 
+    fn mul_share_scalar_local(
+        &self,
+        _ty: ShareType,
+        share_bytes: &[u8],
+        scalar: i64,
+    ) -> crate::net::share_algebra::ShareAlgebraResult<Vec<u8>> {
+        Ok(vec![share_bytes
+            .first()
+            .copied()
+            .unwrap_or_default()
+            .wrapping_mul(scalar as u8)])
+    }
+
     fn open_share(&self, _ty: ShareType, _share_bytes: &[u8]) -> MpcEngineResult<ClearShareValue> {
         Err(MpcEngineError::operation_failed("open_share", "not used"))
+    }
+
+    fn batch_open_shares(
+        &self,
+        _ty: ShareType,
+        shares: &[Vec<u8>],
+    ) -> MpcEngineResult<Vec<ClearShareValue>> {
+        Ok(shares
+            .iter()
+            .map(
+                |share| ClearShareValue::Integer(share.first().copied().unwrap_or_default() as i64),
+            )
+            .collect())
     }
 
     fn capabilities(&self) -> MpcCapabilities {
@@ -684,6 +732,7 @@ impl AsyncMpcEngine for AsyncBatchMulEngine {
         pairs: &[(Vec<u8>, Vec<u8>)],
     ) -> MpcEngineResult<Vec<ShareData>> {
         self.async_batch_calls.fetch_add(1, Ordering::SeqCst);
+        self.async_batch_sizes.lock().push(pairs.len());
         Ok(pairs
             .iter()
             .map(|(left, right)| {
@@ -697,13 +746,213 @@ impl AsyncMpcEngine for AsyncBatchMulEngine {
     async fn open_share_async(
         &self,
         _ty: ShareType,
-        _share_bytes: &[u8],
+        share_bytes: &[u8],
     ) -> MpcEngineResult<ClearShareValue> {
-        Err(MpcEngineError::operation_failed(
-            "async_open_share",
-            "not used",
+        Ok(ClearShareValue::Integer(
+            share_bytes.first().copied().unwrap_or_default() as i64,
         ))
     }
+
+    async fn batch_open_shares_async(
+        &self,
+        _ty: ShareType,
+        shares: &[Vec<u8>],
+    ) -> MpcEngineResult<Vec<ClearShareValue>> {
+        self.async_batch_open_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(shares
+            .iter()
+            .map(
+                |share| ClearShareValue::Integer(share.first().copied().unwrap_or_default() as i64),
+            )
+            .collect())
+    }
+}
+
+#[tokio::test]
+async fn runtime_scheduler_batches_independent_singular_multiplications() {
+    let source = r#"
+def main(a: secret int64, b: secret int64, c: secret int64, d: secret int64) -> list[secret int64]:
+  var first = Share.mul(a, b)
+  var second = Share.mul(c, d)
+  return [first, second]
+"#;
+    let engine = Arc::new(AsyncBatchMulEngine::new());
+    let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+    let mut vm = compile_vm_source_at(source, 0);
+    vm.set_mpc_engine(runtime_engine);
+    let ty = ShareType::secret_int(64);
+
+    let result = vm
+        .execute_async_with_args(
+            "main",
+            &[
+                Value::Share(ty, ShareData::Opaque(vec![2].into())),
+                Value::Share(ty, ShareData::Opaque(vec![3].into())),
+                Value::Share(ty, ShareData::Opaque(vec![4].into())),
+                Value::Share(ty, ShareData::Opaque(vec![5].into())),
+            ],
+            engine.as_ref(),
+        )
+        .await
+        .expect("singular products should be deferred and batched at return");
+
+    assert_eq!(
+        read_vm_array(&mut vm, result),
+        vec![
+            Value::Share(ty, ShareData::Opaque(vec![6].into())),
+            Value::Share(ty, ShareData::Opaque(vec![20].into())),
+        ]
+    );
+    assert_eq!(*engine.async_batch_sizes.lock(), vec![2]);
+}
+
+#[tokio::test]
+async fn runtime_scheduler_respects_singular_multiplication_dependencies() {
+    let source = r#"
+def main(a: secret int64, b: secret int64, c: secret int64, d: secret int64) -> secret int64:
+  var first = Share.mul(a, b)
+  var second = Share.mul(c, d)
+  return Share.mul(first, second)
+"#;
+    let engine = Arc::new(AsyncBatchMulEngine::new());
+    let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+    let mut vm = compile_vm_source_at(source, 0);
+    vm.set_mpc_engine(runtime_engine);
+    let ty = ShareType::secret_int(64);
+
+    let result = vm
+        .execute_async_with_args(
+            "main",
+            &[
+                Value::Share(ty, ShareData::Opaque(vec![2].into())),
+                Value::Share(ty, ShareData::Opaque(vec![3].into())),
+                Value::Share(ty, ShareData::Opaque(vec![4].into())),
+                Value::Share(ty, ShareData::Opaque(vec![5].into())),
+            ],
+            engine.as_ref(),
+        )
+        .await
+        .expect("dependent singular products should resolve in legal rounds");
+
+    assert_eq!(
+        result,
+        Value::Share(ty, ShareData::Opaque(vec![120].into()))
+    );
+    assert_eq!(*engine.async_batch_sizes.lock(), vec![2, 1]);
+}
+
+#[tokio::test]
+async fn runtime_scheduler_honors_backend_multiplication_capacity() {
+    let source = r#"
+def main(a: secret int64, b: secret int64, c: secret int64, d: secret int64) -> list[secret int64]:
+  return [Share.mul(a, b), Share.mul(a, c), Share.mul(a, d)]
+"#;
+    let engine = Arc::new(AsyncBatchMulEngine::with_capacity(2));
+    let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+    let mut vm = compile_vm_source_at(source, 0);
+    vm.set_mpc_engine(runtime_engine);
+    let ty = ShareType::secret_int(64);
+
+    let result = vm
+        .execute_async_with_args(
+            "main",
+            &[
+                Value::Share(ty, ShareData::Opaque(vec![2].into())),
+                Value::Share(ty, ShareData::Opaque(vec![3].into())),
+                Value::Share(ty, ShareData::Opaque(vec![4].into())),
+                Value::Share(ty, ShareData::Opaque(vec![5].into())),
+            ],
+            engine.as_ref(),
+        )
+        .await
+        .expect("capacity-bounded singular products should execute");
+
+    assert_eq!(
+        read_vm_array(&mut vm, result),
+        vec![
+            Value::Share(ty, ShareData::Opaque(vec![6].into())),
+            Value::Share(ty, ShareData::Opaque(vec![8].into())),
+            Value::Share(ty, ShareData::Opaque(vec![10].into())),
+        ]
+    );
+    assert_eq!(*engine.async_batch_sizes.lock(), vec![2, 1]);
+}
+
+#[tokio::test]
+async fn public_products_and_reveals_do_not_start_online_mpc_rounds() {
+    let source = r#"
+def main() -> int64:
+  var left = Share.from_clear_int(6, 64)
+  var right = Share.from_clear_int(7, 64)
+  return Share.open(Share.mul(left, right))
+"#;
+    let engine = Arc::new(AsyncBatchMulEngine::new());
+    let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+    let mut vm = compile_vm_source_at(source, 0);
+    vm.set_mpc_engine(runtime_engine);
+
+    let result = vm
+        .execute_async("main", engine.as_ref())
+        .await
+        .expect("public product should remain local through its reveal");
+
+    assert_eq!(result, Value::I64(42));
+    assert!(engine.async_batch_sizes.lock().is_empty());
+    assert_eq!(engine.async_batch_open_calls.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn public_products_do_not_require_a_multiplication_backend_capability() {
+    let source = r#"
+def main() -> int64:
+  var left = Share.from_clear_int(6, 64)
+  var right = Share.from_clear_int(7, 64)
+  return Share.open(Share.mul(left, right))
+"#;
+    let engine = Arc::new(BarrierInputEngine::new(1));
+    let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+    let mut vm = compile_vm_source_at(source, 0);
+    vm.set_mpc_engine(runtime_engine);
+
+    let result = vm
+        .execute_async("main", engine.as_ref())
+        .await
+        .expect("a public product should not require Beaver multiplication support");
+
+    assert_eq!(result, Value::I64(42));
+    assert_eq!(engine.input_started.load(Ordering::SeqCst), 0);
+}
+
+#[tokio::test]
+async fn public_share_provenance_crosses_loops_and_calls() {
+    let source = r#"
+def scale(value: secret int64, factor: secret int64) -> secret int64:
+  return Share.mul(value, factor)
+
+def main(value: secret int64) -> int64:
+  var factor = Share.from_clear_int(1, 64)
+  var two = Share.from_clear_int(2, 64)
+  for i in 0..3:
+    factor = Share.mul(factor, two)
+  return Share.open(scale(value, factor))
+"#;
+    let engine = Arc::new(AsyncBatchMulEngine::new());
+    let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+    let mut vm = compile_vm_source_at(source, 0);
+    vm.set_mpc_engine(runtime_engine);
+    let ty = ShareType::secret_int(64);
+
+    let result = vm
+        .execute_async_with_args(
+            "main",
+            &[Value::Share(ty, ShareData::Opaque(vec![6].into()))],
+            engine.as_ref(),
+        )
+        .await
+        .expect("secret by public multiplication should lower to local algebra");
+
+    assert_eq!(result, Value::I64(48));
+    assert!(engine.async_batch_sizes.lock().is_empty());
 }
 
 struct BarrierConsensusEngine {
@@ -3067,7 +3316,7 @@ async fn execute_many_async_single_invocation_uses_async_entry_path() {
 }
 
 #[tokio::test]
-async fn execute_many_async_yields_on_share_from_clear_builtin_call() {
+async fn execute_many_async_keeps_share_from_clear_and_reveal_local() {
     let engine = Arc::new(BarrierInputEngine::new(2));
     let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
     let mut vm = VirtualMachine::builder()
@@ -3088,13 +3337,13 @@ async fn execute_many_async_yields_on_share_from_clear_builtin_call() {
         vm.execute_many_async(["from_clear_first", "from_clear_second"], engine.as_ref()),
     )
     .await
-    .expect("Share.from_clear calls should both reach the async input barrier")
-    .expect("batched async share construction should succeed");
+    .expect("public share operations should complete without waiting on the input barrier")
+    .expect("batched public share construction should succeed");
 
     assert_eq!(result, vec![Value::I64(17), Value::I64(23)]);
     assert_eq!(engine.sync_input_calls.load(Ordering::SeqCst), 0);
-    assert_eq!(engine.input_started.load(Ordering::SeqCst), 2);
-    assert_eq!(engine.input_finished.load(Ordering::SeqCst), 2);
+    assert_eq!(engine.input_started.load(Ordering::SeqCst), 0);
+    assert_eq!(engine.input_finished.load(Ordering::SeqCst), 0);
 }
 
 #[tokio::test]
@@ -3613,8 +3862,7 @@ fn turmoil_async_mpc_builtins_cover_every_async_backend_operation() -> turmoil::
 }
 
 #[test]
-fn turmoil_secret_register_program_resumes_across_networked_input_mul_and_open() -> turmoil::Result
-{
+fn turmoil_public_secret_register_math_avoids_network_rounds() -> turmoil::Result {
     let mut sim = turmoil::Builder::new()
         .rng_seed(0x5241_4d31)
         .simulation_duration(Duration::from_secs(10))
@@ -3658,12 +3906,12 @@ fn turmoil_secret_register_program_resumes_across_networked_input_mul_and_open()
             .execute_async("secret_register_math", engine.as_ref())
             .await?;
         assert_eq!(result, Value::I64(52));
-        assert_eq!(engine.started(TurmoilAsyncOperation::InputShare), 2);
-        assert_eq!(engine.finished(TurmoilAsyncOperation::InputShare), 2);
-        assert_eq!(engine.started(TurmoilAsyncOperation::Multiply), 1);
-        assert_eq!(engine.finished(TurmoilAsyncOperation::Multiply), 1);
-        assert_eq!(engine.started(TurmoilAsyncOperation::Open), 1);
-        assert_eq!(engine.finished(TurmoilAsyncOperation::Open), 1);
+        assert_eq!(engine.started(TurmoilAsyncOperation::InputShare), 0);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::InputShare), 0);
+        assert_eq!(engine.started(TurmoilAsyncOperation::Multiply), 0);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::Multiply), 0);
+        assert_eq!(engine.started(TurmoilAsyncOperation::Open), 0);
+        assert_eq!(engine.finished(TurmoilAsyncOperation::Open), 0);
         Ok(())
     });
 
@@ -3743,9 +3991,9 @@ fn turmoil_execute_many_async_runs_mixed_programs_under_randomized_network_order
                 Value::I64(32),
             ]
         );
-        assert_eq!(engine.started(TurmoilAsyncOperation::InputShare), 2);
-        assert_eq!(engine.started(TurmoilAsyncOperation::Multiply), 1);
-        assert_eq!(engine.started(TurmoilAsyncOperation::Open), 2);
+        assert_eq!(engine.started(TurmoilAsyncOperation::InputShare), 0);
+        assert_eq!(engine.started(TurmoilAsyncOperation::Multiply), 0);
+        assert_eq!(engine.started(TurmoilAsyncOperation::Open), 1);
         assert_eq!(engine.started(TurmoilAsyncOperation::RbcReceive), 1);
         Ok(())
     });
@@ -4072,6 +4320,62 @@ async fn share_batch_open_builtin_uses_async_batch_open() {
 }
 
 #[tokio::test]
+async fn share_batch_open_partitions_mixed_runtime_types_and_restores_order() {
+    let engine = Arc::new(AsyncBatchOpenEngine::new());
+    let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+    let bool_ty = ShareType::boolean();
+    let int_ty = ShareType::secret_int(64);
+    let mut vm = VirtualMachine::builder()
+        .with_standard_library(false)
+        .with_mpc_engine(runtime_engine)
+        .build();
+    let shares = vm.create_array_ref(3).expect("create shares array");
+    vm.push_array_values(
+        shares,
+        &[
+            Value::Share(bool_ty, ShareData::Opaque(vec![1].into())),
+            Value::Share(int_ty, ShareData::Opaque(vec![8].into())),
+            Value::Share(bool_ty, ShareData::Opaque(vec![0].into())),
+        ],
+    )
+    .expect("seed mixed shares array");
+    vm.register_function(VMFunction::new(
+        "mixed_batch_open".to_string(),
+        vec!["shares".to_string()],
+        Vec::new(),
+        None,
+        1,
+        vec![
+            Instruction::PUSHARG(0),
+            Instruction::CALL("Share.batch_open".to_string()),
+            Instruction::RET(0),
+        ],
+        HashMap::new(),
+    ));
+
+    let result = vm
+        .execute_async_with_args("mixed_batch_open", &[Value::from(shares)], engine.as_ref())
+        .await
+        .expect("mixed Share.batch_open should partition by type");
+    let Value::Array(result_ref) = result else {
+        panic!("Share.batch_open should return an array");
+    };
+    let values = (0..3)
+        .map(|index| {
+            vm.read_table_field(TableRef::from(result_ref), &Value::I64(index))
+                .expect("read mixed open result")
+                .expect("mixed open result present")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(values, vec![Value::I64(1), Value::I64(8), Value::I64(0)]);
+    assert_eq!(
+        engine.async_batch_calls.load(Ordering::SeqCst),
+        2,
+        "one homogeneous protocol batch per runtime share type"
+    );
+}
+
+#[tokio::test]
 async fn share_batch_mul_builtin_uses_async_batch_multiply() {
     let engine = Arc::new(AsyncBatchMulEngine::new());
     let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
@@ -4138,6 +4442,246 @@ async fn share_batch_mul_builtin_uses_async_batch_multiply() {
     );
     assert_eq!(engine.sync_mul_calls.load(Ordering::SeqCst), 0);
     assert_eq!(engine.async_batch_calls.load(Ordering::SeqCst), 1);
+}
+
+#[tokio::test]
+async fn share_batch_mul_partitions_mixed_runtime_types_and_restores_order() {
+    let engine = Arc::new(AsyncBatchMulEngine::new());
+    let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+    let bool_ty = ShareType::boolean();
+    let int_ty = ShareType::secret_int(64);
+    let mut vm = VirtualMachine::builder()
+        .with_standard_library(false)
+        .with_mpc_engine(runtime_engine)
+        .build();
+    let lefts = vm.create_array_ref(3).expect("create left shares array");
+    vm.push_array_values(
+        lefts,
+        &[
+            Value::Share(bool_ty, ShareData::Opaque(vec![1].into())),
+            Value::Share(int_ty, ShareData::Opaque(vec![3].into())),
+            Value::Share(bool_ty, ShareData::Opaque(vec![0].into())),
+        ],
+    )
+    .expect("seed mixed left shares");
+    let rights = vm.create_array_ref(3).expect("create right shares array");
+    vm.push_array_values(
+        rights,
+        &[
+            Value::Share(bool_ty, ShareData::Opaque(vec![1].into())),
+            Value::Share(int_ty, ShareData::Opaque(vec![4].into())),
+            Value::Share(bool_ty, ShareData::Opaque(vec![1].into())),
+        ],
+    )
+    .expect("seed mixed right shares");
+    vm.register_function(VMFunction::new(
+        "mixed_batch_mul".to_string(),
+        vec!["lefts".to_string(), "rights".to_string()],
+        Vec::new(),
+        None,
+        2,
+        vec![
+            Instruction::PUSHARG(0),
+            Instruction::PUSHARG(1),
+            Instruction::CALL("Share.batch_mul".to_string()),
+            Instruction::RET(0),
+        ],
+        HashMap::new(),
+    ));
+
+    let result = vm
+        .execute_async_with_args(
+            "mixed_batch_mul",
+            &[Value::from(lefts), Value::from(rights)],
+            engine.as_ref(),
+        )
+        .await
+        .expect("mixed Share.batch_mul should partition by type");
+    let Value::Array(result_ref) = result else {
+        panic!("Share.batch_mul should return an array");
+    };
+    let values = (0..3)
+        .map(|index| {
+            vm.read_table_field(TableRef::from(result_ref), &Value::I64(index))
+                .expect("read mixed multiply result")
+                .expect("mixed multiply result present")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        values,
+        vec![
+            Value::Share(bool_ty, ShareData::Opaque(vec![1].into())),
+            Value::Share(int_ty, ShareData::Opaque(vec![12].into())),
+            Value::Share(bool_ty, ShareData::Opaque(vec![0].into())),
+        ]
+    );
+    assert_eq!(engine.sync_batch_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        engine.async_batch_calls.load(Ordering::SeqCst),
+        2,
+        "one homogeneous protocol batch per runtime share type"
+    );
+}
+
+#[tokio::test]
+async fn o3_executes_independent_same_type_scalar_mul_and_reveal_in_one_round_each() {
+    let source = r#"
+def main(a: secret bool, b: secret bool, c: secret bool, d: secret bool) -> list[int64]:
+  var first_product = Share.mul(a, b)
+  var second_product = Share.mul(c, d)
+  var first_opened = Share.open(first_product)
+  var second_opened = Share.open(second_product)
+  return [first_opened, second_opened]
+"#;
+    let options = stoffellang::CompilerOptions {
+        optimize: true,
+        optimization_level: 3,
+        mpc_backend: MpcBackend::HoneyBadger,
+        mpc_mul_batch_capacity: Some(256),
+        ..Default::default()
+    };
+    let compiled = stoffellang::compile(source, "same-type-scalar-batch.stfl", &options)
+        .expect("same-type scalar batch source should compile at O3");
+    assert_eq!(compiled.client_io_manifest.preprocessing_demand.triples, 2);
+    let call_count = |name: &str| {
+        compiled
+            .main_chunk
+            .instructions
+            .iter()
+            .filter(
+                |instruction| matches!(instruction, Instruction::CALL(callee) if callee == name),
+            )
+            .count()
+    };
+    assert_eq!(call_count("Share.batch_mul"), 1);
+    assert_eq!(call_count("Share.mul"), 0);
+    assert_eq!(call_count("Share.batch_open"), 1);
+    assert_eq!(call_count("Share.open"), 0);
+
+    let engine = Arc::new(AsyncBatchMulEngine::new());
+    let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+    let mut vm = compile_vm_source_at(source, 3);
+    vm.set_mpc_engine(runtime_engine);
+
+    let result = vm
+        .execute_async_with_args(
+            "main",
+            &[
+                Value::Share(ShareType::boolean(), ShareData::Opaque(vec![1].into())),
+                Value::Share(ShareType::boolean(), ShareData::Opaque(vec![1].into())),
+                Value::Share(ShareType::boolean(), ShareData::Opaque(vec![1].into())),
+                Value::Share(ShareType::boolean(), ShareData::Opaque(vec![0].into())),
+            ],
+            engine.as_ref(),
+        )
+        .await
+        .expect("O3 same-type scalar operations should batch safely");
+    let Value::Array(result_ref) = result else {
+        panic!("main should return an array");
+    };
+    let values = (0..2)
+        .map(|index| {
+            vm.read_table_field(TableRef::from(result_ref), &Value::I64(index))
+                .expect("read compiled result")
+                .expect("compiled result present")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(values, vec![Value::I64(1), Value::I64(0)]);
+    assert_eq!(engine.sync_mul_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        engine.async_batch_calls.load(Ordering::SeqCst),
+        1,
+        "independent same-type multiplies must share one protocol session"
+    );
+    assert_eq!(
+        engine.async_batch_open_calls.load(Ordering::SeqCst),
+        1,
+        "independent same-type reveals must share one protocol session"
+    );
+}
+
+#[tokio::test]
+async fn o3_batches_explicit_scalar_mul_and_reveal_with_runtime_type_partitioning() {
+    let source = r#"
+def main(a: secret bool, b: secret bool, x: secret int64, y: secret int64) -> list[int64]:
+  var bit_product = Share.mul(a, b)
+  var int_product = Share.mul(x, y)
+  var opened_bit = Share.open(bit_product)
+  var opened_int = Share.open(int_product)
+  return [opened_bit, opened_int]
+"#;
+    let options = stoffellang::CompilerOptions {
+        optimize: true,
+        optimization_level: 3,
+        mpc_backend: MpcBackend::HoneyBadger,
+        mpc_mul_batch_capacity: Some(256),
+        ..Default::default()
+    };
+    let compiled = stoffellang::compile(source, "mixed-scalar-batch.stfl", &options)
+        .expect("mixed scalar batch source should compile at O3");
+    assert_eq!(
+        compiled.client_io_manifest.preprocessing_demand.triples, 2,
+        "batch lowering must preserve the exact two-product preprocessing demand"
+    );
+    assert!(
+        !compiled.client_io_manifest.preprocessing_demand.dynamic,
+        "statically sized scalar batching must not require online top-ups"
+    );
+    let call_count = |name: &str| {
+        compiled
+            .main_chunk
+            .instructions
+            .iter()
+            .filter(
+                |instruction| matches!(instruction, Instruction::CALL(callee) if callee == name),
+            )
+            .count()
+    };
+    assert_eq!(call_count("Share.batch_mul"), 1);
+    assert_eq!(call_count("Share.mul"), 0);
+    assert_eq!(call_count("Share.batch_open"), 1);
+    assert_eq!(call_count("Share.open"), 0);
+
+    let engine = Arc::new(AsyncBatchMulEngine::new());
+    let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+    let mut vm = compile_vm_source_at(source, 3);
+    vm.set_mpc_engine(runtime_engine);
+
+    let result = vm
+        .execute_async_with_args(
+            "main",
+            &[
+                Value::Share(ShareType::boolean(), ShareData::Opaque(vec![1].into())),
+                Value::Share(ShareType::boolean(), ShareData::Opaque(vec![1].into())),
+                Value::Share(ShareType::secret_int(64), ShareData::Opaque(vec![3].into())),
+                Value::Share(ShareType::secret_int(64), ShareData::Opaque(vec![4].into())),
+            ],
+            engine.as_ref(),
+        )
+        .await
+        .expect("O3 mixed-type scalar operations should batch safely");
+    let Value::Array(result_ref) = result else {
+        panic!("main should return an array");
+    };
+    let values = (0..2)
+        .map(|index| {
+            vm.read_table_field(TableRef::from(result_ref), &Value::I64(index))
+                .expect("read compiled result")
+                .expect("compiled result present")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(values, vec![Value::I64(1), Value::I64(12)]);
+    assert_eq!(engine.sync_mul_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        engine.async_batch_calls.load(Ordering::SeqCst),
+        2,
+        "one multiply partition for bool and one for int64"
+    );
+    assert_eq!(
+        engine.async_batch_open_calls.load(Ordering::SeqCst),
+        2,
+        "one reveal partition for bool and one for int64"
+    );
 }
 
 #[test]

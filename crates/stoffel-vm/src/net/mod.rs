@@ -5,6 +5,7 @@ pub mod avss_server;
 pub(crate) mod broadcast;
 pub mod client_store;
 pub mod curve;
+pub(crate) mod deferred_mpc;
 pub mod deployment_epoch;
 pub mod deployment_manifest;
 pub mod discovery;
@@ -40,6 +41,23 @@ pub mod hb_engine {
 
 pub mod mpc_engine {
     pub use super::mpc::engine::*;
+}
+
+/// Resolve the authenticated sender identity for an MPC protocol connection.
+///
+/// Transport map keys are derived from certificates and are not necessarily in
+/// the same identity domain as the canonical `0..n_parties` IDs assigned to an
+/// MPC session. Once assigned, `remote_party_id` is authoritative. This helper
+/// deliberately retains the local party's loopback connection: reliable
+/// broadcast and other MPC protocols must process their own broadcasts just as
+/// they would with an in-memory network.
+pub fn mpc_protocol_sender_id(
+    transport_peer_id: usize,
+    remote_party_id: Option<usize>,
+    n_parties: usize,
+) -> Option<usize> {
+    let sender_id = remote_party_id.unwrap_or(transport_peer_id);
+    (sender_id < n_parties).then_some(sender_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -144,8 +162,8 @@ pub use mpc_engine::{
 // Re-export MPC helpers (HB-specific helpers gated)
 pub use mpc::{
     avss_protocol_instance_id, default_node_opts, honeybadger_node_opts,
-    honeybadger_node_opts_with_truncation, honeybadger_protocol_instance_id,
-    honeybadger_protocol_timeout,
+    honeybadger_node_opts_with_truncation, honeybadger_node_opts_with_truncation_width,
+    honeybadger_protocol_instance_id, honeybadger_protocol_timeout,
 };
 // Re-export HoneyBadger QUIC server
 pub use hb_server::{
@@ -219,5 +237,25 @@ mod tests {
             .expect("multi-thread runtime should support blocking bridge");
 
         assert_eq!(result, 7);
+    }
+
+    #[test]
+    fn protocol_sender_uses_canonical_identity_instead_of_transport_identity() {
+        assert_eq!(mpc_protocol_sender_id(91, Some(2), 5), Some(2));
+    }
+
+    #[test]
+    fn protocol_sender_retains_loopback_for_identity_and_permuted_assignments() {
+        // Physical and canonical IDs coincide (the assignment that exposed the
+        // AVSS deadlock) and differ (a non-identity assignment). Both represent
+        // valid loopback protocol connections and must have receive loops.
+        assert_eq!(mpc_protocol_sender_id(2, Some(2), 5), Some(2));
+        assert_eq!(mpc_protocol_sender_id(91, Some(2), 5), Some(2));
+    }
+
+    #[test]
+    fn protocol_sender_rejects_ids_outside_the_session() {
+        assert_eq!(mpc_protocol_sender_id(91, None, 5), None);
+        assert_eq!(mpc_protocol_sender_id(91, Some(5), 5), None);
     }
 }

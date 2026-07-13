@@ -438,6 +438,21 @@ impl Stoffel {
         }
         mpc_config.validate()?;
 
+        let mut compiler_options = self.compiler_options;
+        if compiler_options.mpc_mul_batch_capacity.is_none()
+            && matches!(mpc_config.backend, MpcBackend::HoneyBadger)
+        {
+            let override_pairs =
+                std::env::var(stoffel_vm_types::mpc::HONEYBADGER_MUL_MAX_PAIRS_PER_SESSION_ENV)
+                    .ok()
+                    .and_then(|raw| raw.parse::<usize>().ok());
+            compiler_options.mpc_mul_batch_capacity =
+                Some(stoffel_vm_types::mpc::honeybadger_mul_batch_capacity(
+                    mpc_config.threshold,
+                    override_pairs,
+                ));
+        }
+
         let source = self
             .source
             .ok_or_else(|| Error::Configuration("no program source configured".to_owned()))?;
@@ -446,13 +461,11 @@ impl Stoffel {
                 &source,
                 &filename,
                 mpc_config.backend,
-                self.compiler_options,
+                compiler_options,
             )?,
-            ProgramSource::File { path } => compiler::compile_file_with_options(
-                &path,
-                mpc_config.backend,
-                self.compiler_options,
-            )?,
+            ProgramSource::File { path } => {
+                compiler::compile_file_with_options(&path, mpc_config.backend, compiler_options)?
+            }
             ProgramSource::Bytecode(bytecode) => {
                 let program = Program::from_bytecode(&bytecode)?;
                 let bytecode_backend =

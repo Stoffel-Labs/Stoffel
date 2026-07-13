@@ -55,6 +55,21 @@ impl VMState {
         )?)
     }
 
+    /// Extract an array of shares without requiring a common runtime share
+    /// type. Interactive batch builtins use this to partition a compiler-fused
+    /// batch into homogeneous protocol calls while preserving source order.
+    pub(crate) fn extract_share_array(
+        &mut self,
+        value: &Value,
+        context: &'static str,
+    ) -> VmResult<Vec<(ShareType, ShareData)>> {
+        Ok(share_object::extract_share_array(
+            self.table_memory.as_mut(),
+            value,
+            context,
+        )?)
+    }
+
     pub(crate) fn extract_share_or_scalar_array(
         &mut self,
         value: &Value,

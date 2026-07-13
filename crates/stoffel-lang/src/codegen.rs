@@ -2376,10 +2376,19 @@ impl CodeGenerator {
                     };
 
                 // 2. Map source-level builtin aliases to actual VM function names.
-                let function_name = crate::builtin_registry::builtin_registry()
-                    .vm_symbol_for_call(&raw_function_name)
-                    .map(str::to_string)
-                    .unwrap_or(raw_function_name);
+                let function_name = match raw_function_name.as_str() {
+                    // Semantic IR keeps these canonical while the MPC scheduler
+                    // runs, preventing collisions with user functions named
+                    // `mul`/`open`. Singular receiver calls still use the VM's
+                    // established dynamic method-dispatch ABI; native batches
+                    // (`Share.batch_mul`/`Share.batch_open`) remain qualified.
+                    "Share.mul" => "mul".to_string(),
+                    "Share.open" => "open".to_string(),
+                    _ => crate::builtin_registry::builtin_registry()
+                        .vm_symbol_for_call(&raw_function_name)
+                        .map(str::to_string)
+                        .unwrap_or(raw_function_name),
+                };
 
                 self.record_client_io_call(&function_name, arguments);
                 self.record_share_list_append_call(&function_name, arguments);
@@ -3519,16 +3528,26 @@ pub fn generate_bytecode_with_opt_level_and_backend(
     opt_level: u8,
     mpc_backend: MpcBackend,
 ) -> CompilerResult<CompiledProgram> {
+    let timing =
+        std::env::var("STOFFEL_OPT_TIMING").is_ok_and(|value| value != "0" && !value.is_empty());
+    let codegen_start = std::time::Instant::now();
     let mut generator = CodeGenerator::new();
     generator.opt_level = opt_level;
     collect_reassigned_vars(node, &mut generator.reassigned_vars);
     let (_result_vr, _result_is_secret) = generator.compile_node(node)?;
     let mut program = generator.finalize_program()?;
+    let codegen_elapsed = codegen_start.elapsed().as_secs_f64();
     // Compute the program's MPC preprocessing demand interprocedurally over the
     // whole AST (call-multiplicity- and list-length-aware) and stamp it into the
     // client-IO manifest, replacing the placeholder set during finalisation.
+    let planner_start = std::time::Instant::now();
     program.client_io_manifest.preprocessing_demand =
         crate::preprocessing_planner::plan_preprocessing_demand_for_backend(node, mpc_backend);
+    let planner_elapsed = planner_start.elapsed().as_secs_f64();
+    if timing {
+        eprintln!("[compiler-timing] bytecode_generation: {codegen_elapsed:.3}s");
+        eprintln!("[compiler-timing] preprocessing_planner: {planner_elapsed:.3}s");
+    }
     program.client_io_manifest.mpc_backend = mpc_backend;
     if std::env::var("STOFFEL_DEBUG_DEMAND").is_ok() {
         eprintln!(

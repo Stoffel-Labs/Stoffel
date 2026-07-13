@@ -30,6 +30,16 @@ pub struct OptBudgets {
     pub unroll_max_expansion: Option<usize>,
 }
 
+/// Backend execution limits that affect legal MPC batching.
+///
+/// A capacity is a number of scalar pairwise products that the selected backend
+/// can execute concurrently in one online multiply round. `None` means the
+/// backend exposes no compiler-visible width limit.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MpcSchedulingOptions {
+    pub multiply_batch_capacity: Option<usize>,
+}
+
 thread_local! {
     /// Per-thread, per-`optimize_all`-call snapshot of the active budgets. Set at
     /// the start of `optimize_all` and cleared at the end, so the value is only
@@ -41,10 +51,58 @@ thread_local! {
         unroll: None,
         unroll_max_expansion: None,
     }) };
+
+    /// Per-compilation MPC scheduling capability. Like the expansion budgets,
+    /// this is scoped to one synchronous optimizer invocation so parallel
+    /// compilations cannot influence one another.
+    static ACTIVE_MPC_SCHEDULING: Cell<MpcSchedulingOptions> = const {
+        Cell::new(MpcSchedulingOptions { multiply_batch_capacity: None })
+    };
+
+    /// Exact widths of interactive results, keyed by the result binding and the
+    /// statement location that produced it. The location component prevents an
+    /// unrelated same-named local in another scope from inheriting the fact.
+    /// Optimizer-generated bindings also have globally unique names.
+    static INTERACTIVE_WIDTHS: RefCell<HashMap<(String, SourceLocation), usize>> =
+        RefCell::new(HashMap::new());
+
+    /// Exact list shapes proven for shape-specialized function parameters.
+    /// The optimizer creates these variants after general loop unrolling, then
+    /// seeds the compact map-loop vectorizer from this table. Keeping the facts
+    /// out of the AST avoids turning a public shape proof into runtime code.
+    static SPECIALIZED_FUNCTION_SHAPES: RefCell<HashMap<String, Vec<Shape>>> =
+        RefCell::new(HashMap::new());
 }
 
 fn active_budgets() -> OptBudgets {
     ACTIVE_BUDGETS.with(|c| c.get())
+}
+
+fn active_mpc_scheduling() -> MpcSchedulingOptions {
+    ACTIVE_MPC_SCHEDULING.with(|c| c.get())
+}
+
+fn multiply_batch_capacity() -> Option<usize> {
+    active_mpc_scheduling()
+        .multiply_batch_capacity
+        .map(|capacity| capacity.max(1))
+}
+
+fn record_interactive_width(name: &str, location: &SourceLocation, width: usize) {
+    INTERACTIVE_WIDTHS.with(|widths| {
+        widths
+            .borrow_mut()
+            .insert((name.to_string(), location.clone()), width);
+    });
+}
+
+fn interactive_width(name: &str, location: &SourceLocation) -> Option<usize> {
+    INTERACTIVE_WIDTHS.with(|widths| {
+        widths
+            .borrow()
+            .get(&(name.to_string(), location.clone()))
+            .copied()
+    })
 }
 
 thread_local! {
@@ -72,6 +130,8 @@ fn generate_named_temp_name(prefix: &str) -> String {
 #[allow(dead_code)]
 pub fn reset_temp_counter() {
     BATCH_TEMP_COUNTER.store(0, Ordering::SeqCst);
+    INTERACTIVE_WIDTHS.with(|widths| widths.borrow_mut().clear());
+    SPECIALIZED_FUNCTION_SHAPES.with(|shapes| shapes.borrow_mut().clear());
 }
 
 /// Represents a detected Share.open() call that can potentially be batched
@@ -130,6 +190,10 @@ struct MultiplyCandidate {
     /// concatenating operand lists and re-slicing the wide result, rather than
     /// by building a list literal of scalar operands.
     is_batched: bool,
+    /// Exact scalar pair count contributed by this operation, when proven.
+    /// Scalar gates always contribute one; optimizer-generated vector calls
+    /// carry their exact lane count in `INTERACTIVE_WIDTHS`.
+    work: Option<usize>,
 }
 
 /// Collects all variable names referenced in an expression
@@ -430,8 +494,27 @@ fn secret_multiply_operands(value: &AstNode) -> Option<(&str, &AstNode, &AstNode
         } if op == "*" || op == "and" || op == "or" || op == "xor" => {
             Some((op.as_str(), left.as_ref(), right.as_ref()))
         }
+        AstNode::FunctionCall { arguments, .. }
+            if arguments.len() == 2 && call_resolves_to_vm_symbol(value, "Share.mul") =>
+        {
+            Some(("mul", &arguments[0], &arguments[1]))
+        }
         _ => None,
     }
+}
+
+/// Resolve a call through the builtin registry and compare its full VM symbol.
+/// Full-symbol matching is important for `mul`: `Field.mul` is a clear local
+/// operation and must never be classified as the interactive `Share.mul` merely
+/// because both have the same unqualified base name.
+fn call_resolves_to_vm_symbol(value: &AstNode, expected: &str) -> bool {
+    let Some(name) = call_name(value) else {
+        return false;
+    };
+    let canonical = crate::builtin_registry::builtin_registry()
+        .vm_symbol_for_call(name)
+        .unwrap_or(name);
+    canonical == expected
 }
 
 /// Detects a call-form `Share.batch_mul(L, R)` and returns its two list
@@ -446,10 +529,10 @@ fn batch_mul_call_operands(value: &AstNode) -> Option<(&AstNode, &AstNode)> {
     } = value
     {
         if arguments.len() == 2 {
-            if let AstNode::Identifier(name, _) = function.as_ref() {
-                if builtin_base_name(name) == "batch_mul" {
-                    return Some((&arguments[0], &arguments[1]));
-                }
+            if matches!(function.as_ref(), AstNode::Identifier(_, _))
+                && call_resolves_to_vm_symbol(value, "Share.batch_mul")
+            {
+                return Some((&arguments[0], &arguments[1]));
             }
         }
     }
@@ -539,6 +622,34 @@ fn expr_yields_secret(node: &AstNode, secret_lvalues: &HashSet<String>) -> bool 
     }
 }
 
+/// Exact number of scalar elements contributed by a batch operand when that
+/// fact is structural or was emitted by an optimizer transformation.
+fn exact_batch_operand_width(node: &AstNode) -> Option<usize> {
+    match node {
+        AstNode::ListLiteral { .. } => flatten_list_literal_leaves(node).map(|v| v.len()),
+        AstNode::FunctionCall { arguments, .. }
+            if call_name(node).is_some_and(|name| builtin_base_name(name) == "copy") =>
+        {
+            arguments.first().and_then(exact_batch_operand_width)
+        }
+        _ => None,
+    }
+}
+
+fn exact_batch_mul_work(
+    target: &str,
+    location: &SourceLocation,
+    left: &AstNode,
+    right: &AstNode,
+) -> Option<usize> {
+    if let Some(width) = interactive_width(target, location) {
+        return Some(width);
+    }
+    let left = exact_batch_operand_width(left)?;
+    let right = exact_batch_operand_width(right)?;
+    (left == right).then_some(left)
+}
+
 /// Extracts consecutive statement-level secret multiply candidates.
 fn extract_multiply_candidates(statements: &[AstNode]) -> Vec<MultiplyCandidate> {
     let mut candidates = Vec::new();
@@ -568,8 +679,12 @@ fn extract_multiply_candidates(statements: &[AstNode]) -> Vec<MultiplyCandidate>
                 // secret lvalue so a downstream multiply that consumes it is in turn
                 // recognized, flattening a whole nested gate tree.
                 let multiply = secret_multiply_operands(value);
-                let secret_multiply = multiply.is_some_and(|(_, left, right)| {
-                    declared_secret
+                let secret_multiply = multiply.is_some_and(|(op, left, right)| {
+                    // `Share.mul` is intrinsically an interactive share result;
+                    // semantic return metadata confirms it when present. The
+                    // exact VM-symbol check above excludes clear `Field.mul`.
+                    (op == "mul" && node_resolved_contains_secret(value).unwrap_or(true))
+                        || declared_secret
                         || expr_yields_secret(left, &secret_lvalues)
                         || expr_yields_secret(right, &secret_lvalues)
                 });
@@ -596,6 +711,7 @@ fn extract_multiply_candidates(statements: &[AstNode]) -> Vec<MultiplyCandidate>
                             is_mutable: *is_mutable,
                             is_secret: *is_secret,
                             is_batched: false,
+                            work: Some(1),
                         });
                     }
                 } else if !declared_secret && batch_mul_call_operands(value).is_some() {
@@ -622,6 +738,7 @@ fn extract_multiply_candidates(statements: &[AstNode]) -> Vec<MultiplyCandidate>
                             is_mutable: *is_mutable,
                             is_secret: *is_secret,
                             is_batched: true,
+                            work: exact_batch_mul_work(name, location, left, right),
                         });
                     }
                 }
@@ -653,6 +770,7 @@ fn extract_multiply_candidates(statements: &[AstNode]) -> Vec<MultiplyCandidate>
                                 is_mutable: false,
                                 is_secret: true,
                                 is_batched: false,
+                                work: Some(1),
                             });
                         }
                     }
@@ -821,22 +939,35 @@ fn group_batchable_multiplies(
     let mut defined_vars: HashSet<String> = HashSet::new();
     let mut last_index = None;
 
+    let fits_backend_round = |group: &[MultiplyCandidate], next: &MultiplyCandidate| {
+        let Some(capacity) = multiply_batch_capacity() else {
+            return true;
+        };
+        let Some(next_work) = next.work else {
+            // An unproven width cannot safely share a capacity-bounded call.
+            return false;
+        };
+        group
+            .iter()
+            .try_fold(next_work, |used, candidate| {
+                used.checked_add(candidate.work?)
+            })
+            .is_some_and(|used| used <= capacity)
+    };
+
     for candidate in candidates {
         let can_batch = match last_index {
             None => true,
             Some(last_idx) => {
-                // Scalar (`and`/`or`/`xor`) and batched (`Share.batch_mul`)
-                // candidates fuse with different output shapes, so never mix them
-                // in one group.
-                current_group
-                    .first()
-                    .is_none_or(|g| g.is_batched == candidate.is_batched)
-                    // A candidate whose operands cannot be flattened in alignment
-                    // (a malformed/unprovable nested-list shape) must never be
-                    // concatenated into a fused accumulator — keep it (and anything
-                    // anchored on it) as its own singleton call.
-                    && candidate_is_fuse_safe(&candidate)
+                // A candidate whose operands cannot be flattened in alignment
+                // (a malformed/unprovable nested-list shape) must never be
+                // concatenated into a fused accumulator — keep it (and anything
+                // anchored on it) as its own singleton call. Scalar products are
+                // represented as one-element contributions, so they can share a
+                // backend round with vector products when capacity permits.
+                candidate_is_fuse_safe(&candidate)
                     && current_group.first().is_none_or(candidate_is_fuse_safe)
+                    && fits_backend_round(&current_group, &candidate)
                     && candidate.statement_index > last_idx
                     && !candidate.referenced_vars.iter().any(|var| {
                         defined_vars
@@ -884,13 +1015,14 @@ fn group_batchable_multiplies(
 ///   var a: secret bool = __batch_mul_results_K[0]
 ///   var b: secret bool = __batch_mul_results_K[1]
 fn create_batch_multiply_statements(group: &[MultiplyCandidate]) -> Vec<AstNode> {
-    if group.first().is_some_and(|c| c.is_batched) {
+    if group.iter().any(|candidate| candidate.is_batched) {
         return create_batched_call_fusion(group);
     }
     let lefts_name = generate_named_temp_name("batch_mul_lefts");
     let rights_name = generate_named_temp_name("batch_mul_rights");
     let results_name = generate_named_temp_name("batch_mul_results");
     let location = group[0].location.clone();
+    record_interactive_width(&results_name, &location, group.len());
 
     let lefts_decl = AstNode::VariableDeclaration {
         name: lefts_name.clone(),
@@ -1189,11 +1321,11 @@ fn emit_batched_target(candidate: &MultiplyCandidate, value_expr: AstNode) -> As
     }
 }
 
-/// Fuses a group of independent call-form `Share.batch_mul(L, R)` candidates into
-/// a single wide `Share.batch_mul`. Each candidate's list operands are
-/// concatenated into one pair of accumulator lists, multiplied once, then the
-/// per-candidate products are recovered by slicing the wide result back at the
-/// cumulative operand-length offsets.
+/// Fuses independent scalar and/or call-form `Share.batch_mul(L, R)` candidates
+/// into one wide `Share.batch_mul`. Vector operands are concatenated and scalar
+/// operands contribute singleton lists. Each vector result is recovered by
+/// slicing at cumulative offsets; each scalar result reads one element and then
+/// applies the local XOR/OR reconstruction when needed.
 ///
 /// Transforms (operands/results are `list[secret bool]`, multiplied element-wise):
 ///   var m1 = Share.batch_mul(a, b)
@@ -1227,6 +1359,7 @@ fn create_batched_call_fusion(group: &[MultiplyCandidate]) -> Vec<AstNode> {
             let rights = flatten_list_literal_leaves(&c.right_expr)
                 .expect("nested operand is a list literal");
             let results_name = generate_named_temp_name("bm_results");
+            record_interactive_width(&results_name, &location, lefts.len());
             let mut result = Vec::new();
             result.push(AstNode::VariableDeclaration {
                 name: results_name.clone(),
@@ -1260,13 +1393,22 @@ fn create_batched_call_fusion(group: &[MultiplyCandidate]) -> Vec<AstNode> {
     let lefts_name = generate_named_temp_name("bm_lefts");
     let rights_name = generate_named_temp_name("bm_rights");
     let results_name = generate_named_temp_name("bm_results");
+    if let Some(work) = group.iter().try_fold(0usize, |total, candidate| {
+        total.checked_add(candidate.work?)
+    }) {
+        record_interactive_width(&results_name, &location, work);
+    }
 
-    // The accumulator contribution for an operand: a nested list literal is
-    // flattened to its scalar leaves (so `extend` never appends a whole sub-list,
-    // which would reach `Share.batch_mul` as a nested `Array` element); a flat or
-    // opaque operand is contributed verbatim — byte-identical to the legacy path
-    // for the AES/CTR/CBC operands, which are opaque identifiers.
-    let contribution = |operand: &AstNode| -> AstNode {
+    // The accumulator contribution for an operand: a scalar becomes a singleton
+    // list; a nested vector literal is flattened to scalar leaves (so `extend`
+    // never appends a whole sub-list); a flat/opaque vector stays unchanged.
+    let contribution = |candidate: &MultiplyCandidate, operand: &AstNode| -> AstNode {
+        if !candidate.is_batched {
+            return AstNode::ListLiteral {
+                elements: vec![operand.clone()],
+                location: location.clone(),
+            };
+        }
         if list_literal_is_nested(operand) {
             AstNode::ListLiteral {
                 elements: flatten_list_literal_leaves(operand)
@@ -1288,7 +1430,7 @@ fn create_batched_call_fusion(group: &[MultiplyCandidate]) -> Vec<AstNode> {
         type_annotation: None,
         value: Some(Box::new(make_unary_builtin_call(
             "copy",
-            contribution(&group[0].left_expr),
+            contribution(&group[0], &group[0].left_expr),
             &location,
         ))),
         is_mutable: true,
@@ -1300,7 +1442,7 @@ fn create_batched_call_fusion(group: &[MultiplyCandidate]) -> Vec<AstNode> {
         type_annotation: None,
         value: Some(Box::new(make_unary_builtin_call(
             "copy",
-            contribution(&group[0].right_expr),
+            contribution(&group[0], &group[0].right_expr),
             &location,
         ))),
         is_mutable: true,
@@ -1310,12 +1452,12 @@ fn create_batched_call_fusion(group: &[MultiplyCandidate]) -> Vec<AstNode> {
     for candidate in &group[1..] {
         result.push(make_extend_call(
             &lefts_name,
-            contribution(&candidate.left_expr),
+            contribution(candidate, &candidate.left_expr),
             &location,
         ));
         result.push(make_extend_call(
             &rights_name,
-            contribution(&candidate.right_expr),
+            contribution(candidate, &candidate.right_expr),
             &location,
         ));
     }
@@ -1342,8 +1484,10 @@ fn create_batched_call_fusion(group: &[MultiplyCandidate]) -> Vec<AstNode> {
     // recovery.
     let mut cur_off = make_int_literal(0, &location);
     for candidate in group {
-        let nested = list_literal_is_nested(&candidate.left_expr);
-        let len_expr = if nested {
+        let nested = candidate.is_batched && list_literal_is_nested(&candidate.left_expr);
+        let len_expr = if !candidate.is_batched {
+            make_int_literal(1, &location)
+        } else if nested {
             make_int_literal(
                 flatten_list_literal_leaves(&candidate.left_expr)
                     .expect("nested operand is a list literal")
@@ -1363,7 +1507,10 @@ fn create_batched_call_fusion(group: &[MultiplyCandidate]) -> Vec<AstNode> {
             location: location.clone(),
         });
         let end_ident = AstNode::Identifier(end_name, location.clone());
-        let value = if nested {
+        let value = if !candidate.is_batched {
+            let product = batch_result_access_at(&results_name, cur_off.clone(), &location);
+            batched_boolean_value_from_product(candidate, product)
+        } else if nested {
             let mut cursor = 0usize;
             renest_results_like(
                 &candidate.left_expr,
@@ -1383,18 +1530,24 @@ fn create_batched_call_fusion(group: &[MultiplyCandidate]) -> Vec<AstNode> {
 }
 
 fn batch_result_access(results_name: &str, idx: usize, location: &SourceLocation) -> AstNode {
+    batch_result_access_at(
+        results_name,
+        make_int_literal(idx as u128, location),
+        location,
+    )
+}
+
+fn batch_result_access_at(
+    results_name: &str,
+    index: AstNode,
+    location: &SourceLocation,
+) -> AstNode {
     AstNode::IndexAccess {
         base: Box::new(AstNode::Identifier(
             results_name.to_string(),
             location.clone(),
         )),
-        index: Box::new(AstNode::Literal {
-            value: crate::ast::Value::Int {
-                value: idx as u128,
-                kind: None,
-            },
-            location: location.clone(),
-        }),
+        index: Box::new(index),
         location: location.clone(),
     }
 }
@@ -1444,7 +1597,11 @@ fn batched_boolean_value_expr(
 ) -> AstNode {
     let location = &candidate.location;
     let product = batch_result_access(results_name, idx, location);
+    batched_boolean_value_from_product(candidate, product)
+}
 
+fn batched_boolean_value_from_product(candidate: &MultiplyCandidate, product: AstNode) -> AstNode {
+    let location = &candidate.location;
     match candidate.op.as_str() {
         "or" => {
             let sum = make_share_binary_call(
@@ -1587,13 +1744,15 @@ pub fn optimize_multiplies(node: AstNode) -> AstNode {
     }
 }
 
-/// Re-run dependency scheduling and multiply fusion until batching no longer
-/// changes the program. A first fusion can normalize scalar Boolean gates into
-/// `Share.batch_mul`, making them compatible with an adjacent call-form batch
-/// only on the next iteration.
+/// Re-run multiply fusion until batching no longer changes the program. The
+/// dependency scheduler has already chosen the protocol-round order; repeating
+/// it after batches become opaque nodes would discard their per-operation
+/// critical-path priorities and can coarsen a good scalar schedule. Fusion can
+/// legally cross its own reconstruction plumbing, so no second scheduling pass
+/// is needed to normalize scalar Boolean groups with call-form batches.
 fn optimize_multiply_batches_to_fixpoint(mut node: AstNode) -> AstNode {
     for _ in 0..8 {
-        let next = optimize_multiplies(schedule_for_batching(node.clone()));
+        let next = optimize_multiplies(node.clone());
         if next == node {
             break;
         }
@@ -1604,16 +1763,9 @@ fn optimize_multiply_batches_to_fixpoint(mut node: AstNode) -> AstNode {
 
 /// Checks if an AST node is a Share.open() receiver method call.
 fn is_share_open_call(node: &AstNode) -> Option<&AstNode> {
-    if let AstNode::FunctionCall {
-        function,
-        arguments,
-        ..
-    } = node
-    {
-        if let AstNode::Identifier(name, _) = function.as_ref() {
-            if matches!(builtin_base_name(name), "open" | "reveal") && arguments.len() == 1 {
-                return Some(&arguments[0]);
-            }
+    if let AstNode::FunctionCall { arguments, .. } = node {
+        if arguments.len() == 1 && call_resolves_to_vm_symbol(node, "Share.open") {
+            return Some(&arguments[0]);
         }
     }
     None
@@ -2017,7 +2169,8 @@ pub fn optimize_reveals(node: AstNode) -> AstNode {
 //   var x = a * 2            // uses a - FLUSH! (both a and b batched)
 //   var y = b * 3            // uses b - already revealed
 
-use std::collections::HashMap;
+use std::cmp::Reverse;
+use std::collections::{BinaryHeap, HashMap};
 use std::rc::Rc;
 
 /// Information about a statement for reordering purposes
@@ -2031,6 +2184,15 @@ struct StatementInfo {
     is_reveal: bool,
     /// Does this statement use a revealed variable in a computation (triggers flush)?
     uses_revealed_var: bool,
+}
+
+/// Deterministic work performed by reveal reordering. Tests use these units to
+/// catch algorithmic regressions without depending on wall-clock timings.
+#[derive(Debug, Clone, Copy, Default)]
+struct RevealReorderWork {
+    dependency_key_probes: u64,
+    dependency_edges: u64,
+    ready_queue_operations: u64,
 }
 
 /// Collects variables defined by a statement
@@ -2147,13 +2309,6 @@ fn reveal_dep_keys(node: &AstNode) -> (HashSet<String>, HashSet<String>) {
     (reads, writes)
 }
 
-/// Two location keys (as produced by `reveal_dep_keys`) conflict when they name
-/// the same location, or when either is the catch-all `global:*` write target
-/// (`global_key()`), which aliases everything.
-fn reveal_keys_conflict(a: &str, b: &str) -> bool {
-    a == b || a == GLOBAL_KEY || b == GLOBAL_KEY
-}
-
 /// Checks if a statement is an implicit reveal (clear variable assigned from secret)
 fn is_implicit_reveal(node: &AstNode, secret_vars: &HashSet<String>) -> bool {
     match node {
@@ -2253,6 +2408,41 @@ fn uses_revealed_in_computation(node: &AstNode, revealed_vars: &HashSet<String>)
 
 /// Builds dependency graph and reorders statements to maximize reveal batching
 fn reorder_block_for_reveals(statements: Vec<AstNode>) -> Vec<AstNode> {
+    reorder_block_for_reveals_with_work(statements, &mut RevealReorderWork::default())
+}
+
+fn reorder_block_for_reveals_with_work(
+    statements: Vec<AstNode>,
+    work: &mut RevealReorderWork,
+) -> Vec<AstNode> {
+    // Abrupt control transfer is an ordering boundary, not an ordinary neutral
+    // statement. Scheduling a later/earlier `return`, `break`, `continue`, or
+    // `yield` by data dependencies alone can make preceding MPC work
+    // unreachable or execute work from a path that should not be taken. Split
+    // the block into independent regions and retain every transfer (including
+    // one nested in structured control) at its exact source position.
+    if statements.iter().any(has_abrupt_loop_control) {
+        let mut reordered = Vec::with_capacity(statements.len());
+        let mut run = Vec::new();
+        for statement in statements {
+            if has_abrupt_loop_control(&statement) {
+                if !run.is_empty() {
+                    reordered.extend(reorder_block_for_reveals_with_work(
+                        std::mem::take(&mut run),
+                        work,
+                    ));
+                }
+                reordered.push(statement);
+            } else {
+                run.push(statement);
+            }
+        }
+        if !run.is_empty() {
+            reordered.extend(reorder_block_for_reveals_with_work(run, work));
+        }
+        return reordered;
+    }
+
     if statements.len() < 2 {
         return statements;
     }
@@ -2315,33 +2505,77 @@ fn reorder_block_for_reveals(statements: Vec<AstNode>) -> Vec<AstNode> {
     // earlier RAW-only graph was a latent miscompile: a neutral reassignment
     // (or an index/field/mutator write, which the old graph ignored entirely)
     // could hoist ahead of a reveal that read the old value.
-    let mut must_precede: HashMap<usize, HashSet<usize>> = HashMap::new();
+    let mut successors: Vec<Vec<usize>> = vec![Vec::new(); stmt_infos.len()];
+    let mut indegree = vec![0usize; stmt_infos.len()];
     let mut last_writer: HashMap<String, usize> = HashMap::new();
     let mut active_readers: HashMap<String, Vec<usize>> = HashMap::new();
+    let mut last_global_writer: Option<usize> = None;
+    let mut last_global_reader: Option<usize> = None;
+    // Statements that wrote since the latest catch-all read. A later global
+    // read consumes this list once, making global barriers amortized-linear
+    // rather than repeatedly scanning the entire location map.
+    let mut writes_since_global_reader: Vec<usize> = Vec::new();
 
     for info in &stmt_infos {
         let (reads, writes) = reveal_dep_keys(&info.node);
         let mut predecessors = HashSet::new();
 
-        // RAW: depend on the latest writer of any conflicting location.
+        // RAW: exact locations use direct hash lookups. A catch-all read is a
+        // barrier after the prior global read and every write since it.
         for read in &reads {
-            for (key, &widx) in &last_writer {
-                if reveal_keys_conflict(key, read) {
-                    predecessors.insert(widx);
+            if read == GLOBAL_KEY {
+                work.dependency_key_probes = work.dependency_key_probes.saturating_add(1);
+                if let Some(reader) = last_global_reader {
+                    predecessors.insert(reader);
+                }
+                for &writer in &writes_since_global_reader {
+                    work.dependency_key_probes = work.dependency_key_probes.saturating_add(1);
+                    predecessors.insert(writer);
+                }
+            } else {
+                work.dependency_key_probes = work.dependency_key_probes.saturating_add(1);
+                if let Some(&writer) = last_writer.get(read) {
+                    predecessors.insert(writer);
+                } else if let Some(writer) = last_global_writer {
+                    predecessors.insert(writer);
                 }
             }
         }
-        // WAR + WAW: a write stays after earlier reads and the latest writer of
-        // any conflicting location.
+
+        // WAR + WAW: exact writes query only their own reader/writer state and
+        // the latest global barriers. A global write consumes all live state;
+        // those entries are subsequently cleared, so total scan work remains
+        // proportional to the number of accesses and emitted dependency edges.
         for write in &writes {
-            for (key, readers) in &active_readers {
-                if reveal_keys_conflict(key, write) {
+            if write == GLOBAL_KEY {
+                for readers in active_readers.values() {
+                    for &reader in readers {
+                        work.dependency_key_probes = work.dependency_key_probes.saturating_add(1);
+                        predecessors.insert(reader);
+                    }
+                }
+                for &writer in last_writer.values() {
+                    work.dependency_key_probes = work.dependency_key_probes.saturating_add(1);
+                    predecessors.insert(writer);
+                }
+                if let Some(writer) = last_global_writer {
+                    predecessors.insert(writer);
+                }
+                if let Some(reader) = last_global_reader {
+                    predecessors.insert(reader);
+                }
+            } else {
+                work.dependency_key_probes = work.dependency_key_probes.saturating_add(1);
+                if let Some(readers) = active_readers.get(write) {
                     predecessors.extend(readers.iter().copied());
                 }
-            }
-            for (key, &widx) in &last_writer {
-                if reveal_keys_conflict(key, write) {
-                    predecessors.insert(widx);
+                if let Some(&writer) = last_writer.get(write) {
+                    predecessors.insert(writer);
+                } else if let Some(writer) = last_global_writer {
+                    predecessors.insert(writer);
+                }
+                if let Some(reader) = last_global_reader {
+                    predecessors.insert(reader);
                 }
             }
         }
@@ -2349,20 +2583,44 @@ fn reorder_block_for_reveals(statements: Vec<AstNode>) -> Vec<AstNode> {
         // A read-modify-write statement may have keyed itself on both sides;
         // it must never depend on itself.
         predecessors.remove(&info.index);
-        must_precede.insert(info.index, predecessors);
+        indegree[info.index] = predecessors.len();
+        work.dependency_edges = work
+            .dependency_edges
+            .saturating_add(predecessors.len() as u64);
+        for predecessor in predecessors {
+            debug_assert!(predecessor < info.index);
+            successors[predecessor].push(info.index);
+        }
 
         // Advance the live state. A write retires the reads it now orders ahead
         // of itself (later statements reach them transitively through this
         // write) and becomes the latest writer of its location.
-        for write in &writes {
-            active_readers.retain(|key, _| !reveal_keys_conflict(key, write));
-            last_writer.insert(write.clone(), info.index);
+        if writes.contains(GLOBAL_KEY) {
+            active_readers.clear();
+            last_writer.clear();
+            last_global_writer = Some(info.index);
+            // This write is ordered after the global reader and now dominates
+            // it for every future write.
+            last_global_reader = None;
+        } else {
+            for write in &writes {
+                active_readers.remove(write);
+                last_writer.insert(write.clone(), info.index);
+            }
+        }
+        if !writes.is_empty() {
+            writes_since_global_reader.push(info.index);
         }
         for read in &reads {
-            active_readers
-                .entry(read.clone())
-                .or_default()
-                .push(info.index);
+            if read == GLOBAL_KEY {
+                last_global_reader = Some(info.index);
+                writes_since_global_reader.clear();
+            } else {
+                active_readers
+                    .entry(read.clone())
+                    .or_default()
+                    .push(info.index);
+            }
         }
     }
 
@@ -2371,75 +2629,58 @@ fn reorder_block_for_reveals(statements: Vec<AstNode>) -> Vec<AstNode> {
     // 2. Non-flush-triggering statements
     // 3. Flush-triggering statements last
 
-    let mut result: Vec<AstNode> = Vec::with_capacity(stmt_infos.len());
-    let mut scheduled: HashSet<usize> = HashSet::new();
-    let mut remaining: Vec<usize> = (0..stmt_infos.len()).collect();
-
-    while !remaining.is_empty() {
-        // Find candidates that can be scheduled (all predecessors already scheduled)
-        let mut candidates: Vec<usize> = remaining
-            .iter()
-            .filter(|&&idx| {
-                must_precede
-                    .get(&idx)
-                    .map(|preds| preds.iter().all(|p| scheduled.contains(p)))
-                    .unwrap_or(true)
-            })
-            .copied()
-            .collect();
-
-        if candidates.is_empty() {
-            // Cycle detected or error - just emit remaining in order
-            for idx in remaining {
-                result.push(stmt_infos[idx].node.clone());
-            }
-            break;
+    let priority = |info: &StatementInfo| -> u8 {
+        if info.uses_revealed_var {
+            2
+        } else if info.is_reveal {
+            1
+        } else {
+            0
         }
-
-        // Sort candidates by priority:
-        // 1. Neutral statements first (includes secret declarations that feed into reveals)
-        // 2. Reveals second (to group them together before flush triggers)
-        // 3. Flush-triggering statements last (to allow maximum batching)
-        candidates.sort_by(|&a, &b| {
-            let info_a = &stmt_infos[a];
-            let info_b = &stmt_infos[b];
-
-            // Priority: neutral > reveal > flush_trigger
-            // This ensures secret declarations come before reveals,
-            // and reveals come before computations that use them
-            let priority = |info: &StatementInfo| -> u8 {
-                if info.uses_revealed_var {
-                    2
-                }
-                // Flush triggers last
-                else if info.is_reveal {
-                    1
-                }
-                // Reveals second
-                else {
-                    0
-                } // Neutral first (includes secret declarations)
-            };
-
-            let pa = priority(info_a);
-            let pb = priority(info_b);
-
-            if pa != pb {
-                pa.cmp(&pb)
-            } else {
-                // Same priority: preserve original order
-                a.cmp(&b)
-            }
-        });
-
-        // Schedule the best candidate
-        let best = candidates[0];
-        result.push(stmt_infos[best].node.clone());
-        scheduled.insert(best);
-        remaining.retain(|&x| x != best);
+    };
+    let mut ready: BinaryHeap<Reverse<(u8, usize)>> = BinaryHeap::new();
+    for (index, &degree) in indegree.iter().enumerate() {
+        if degree == 0 {
+            ready.push(Reverse((priority(&stmt_infos[index]), index)));
+            work.ready_queue_operations = work.ready_queue_operations.saturating_add(1);
+        }
     }
 
-    result
+    let mut order = Vec::with_capacity(stmt_infos.len());
+    let mut scheduled = vec![false; stmt_infos.len()];
+    while let Some(Reverse((_, index))) = ready.pop() {
+        work.ready_queue_operations = work.ready_queue_operations.saturating_add(1);
+        scheduled[index] = true;
+        order.push(index);
+        for &successor in &successors[index] {
+            indegree[successor] -= 1;
+            if indegree[successor] == 0 {
+                ready.push(Reverse((priority(&stmt_infos[successor]), successor)));
+                work.ready_queue_operations = work.ready_queue_operations.saturating_add(1);
+            }
+        }
+    }
+
+    if order.len() != stmt_infos.len() {
+        // Edges always point from an earlier statement to a later one, so a
+        // cycle indicates an internal bookkeeping bug. Preserve the source
+        // order of anything not yet emitted as a conservative release fallback.
+        debug_assert!(
+            false,
+            "reveal dependency graph unexpectedly contains a cycle"
+        );
+        order.extend((0..stmt_infos.len()).filter(|&index| !scheduled[index]));
+    }
+
+    // Move each AST node into its scheduled position. The old implementation
+    // cloned every statement subtree during scheduling, amplifying both time
+    // and peak memory on fully unrolled programs.
+    let mut nodes: Vec<Option<AstNode>> =
+        stmt_infos.into_iter().map(|info| Some(info.node)).collect();
+    order
+        .into_iter()
+        .map(|index| nodes[index].take().expect("statement scheduled once"))
+        .collect()
 }
 
 /// Applies instruction reordering optimization to maximize implicit reveal batching
@@ -2522,10 +2763,986 @@ pub fn optimize_all_with_budgets(
     optimization_level: u8,
     budgets: OptBudgets,
 ) -> AstNode {
+    optimize_all_with_options(
+        node,
+        optimization_level,
+        budgets,
+        MpcSchedulingOptions::default(),
+    )
+}
+
+/// Optimize with explicit expansion budgets and backend MPC batching limits.
+pub fn optimize_all_with_options(
+    node: AstNode,
+    optimization_level: u8,
+    budgets: OptBudgets,
+    scheduling: MpcSchedulingOptions,
+) -> AstNode {
     let previous = ACTIVE_BUDGETS.with(|c| c.replace(budgets));
+    let previous_scheduling = ACTIVE_MPC_SCHEDULING.with(|c| c.replace(scheduling));
+    INTERACTIVE_WIDTHS.with(|widths| widths.borrow_mut().clear());
+    SPECIALIZED_FUNCTION_SHAPES.with(|shapes| shapes.borrow_mut().clear());
     let result = optimize_all_inner(node, optimization_level);
+    INTERACTIVE_WIDTHS.with(|widths| widths.borrow_mut().clear());
+    SPECIALIZED_FUNCTION_SHAPES.with(|shapes| shapes.borrow_mut().clear());
+    ACTIVE_MPC_SCHEDULING.with(|c| c.set(previous_scheduling));
     ACTIVE_BUDGETS.with(|c| c.set(previous));
     result
+}
+
+// ===========================================================================
+// Bounded interprocedural MPC shape specialization
+//
+// A capacity-bounded scheduler must know how many scalar products a vector
+// multiply contributes. A generic map helper such as `map(xs)` only exposes a
+// symbolic `xs.len()` inside its body, even when every caller knows the exact
+// length. Guessing is unsound, while inlining the circuit at every call site is
+// prohibitively large. This pass instead clones only the compact, still-rolled
+// helper for a bounded set of exact call shapes and rewrites matching calls.
+// The vectorizer that follows seeds its shape environment for each clone and
+// therefore emits exact batch widths without scalar-unrolling the map.
+//
+// The policy mirrors LLVM's general specialization discipline: require a
+// concrete profitability signal, cap variants per function, and charge every
+// clone against one compilation-wide code-growth budget. If any proof or budget
+// check fails, the generic call is retained unchanged.
+// ===========================================================================
+
+const MPC_SHAPE_MAX_VARIANTS_PER_FUNCTION: usize = 4;
+const MPC_SHAPE_MAX_VARIANTS_TOTAL: usize = 32;
+const MPC_SHAPE_MAX_ADDED_NODES: usize = 100_000;
+const MPC_SHAPE_GROWTH_DENOMINATOR: usize = 3;
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct ShapeSignature(Vec<Shape>);
+
+#[derive(Clone)]
+struct ShapeFunctionTemplate {
+    parameters: Vec<crate::ast::Parameter>,
+    body: AstNode,
+    size: usize,
+    own_shape_sensitive_mpc: bool,
+    calls: HashSet<String>,
+}
+
+fn has_shape_sensitive_mpc(node: &AstNode) -> bool {
+    match node {
+        AstNode::ForLoop { iterable, body, .. }
+            if range_bounds(iterable, &LenEnv::default()).is_none()
+                && vec_stmt_contains_multiply(body) =>
+        {
+            true
+        }
+        AstNode::FunctionCall { arguments, .. }
+            if call_name(node).is_some_and(|name| builtin_base_name(name) == "batch_mul")
+                && arguments
+                    .first()
+                    .is_none_or(|operand| exact_batch_operand_width(operand).is_none()) =>
+        {
+            true
+        }
+        AstNode::FunctionDefinition { .. } => false,
+        _ => {
+            let mut found = false;
+            for_each_child(node, &mut |child| {
+                if !found {
+                    found = has_shape_sensitive_mpc(child);
+                }
+            });
+            found
+        }
+    }
+}
+
+fn collect_shape_specialization_calls(
+    node: &AstNode,
+    defined: &HashSet<String>,
+    out: &mut HashSet<String>,
+) {
+    if let Some(name) = call_name(node) {
+        if defined.contains(name) {
+            out.insert(name.to_string());
+        }
+    }
+    if matches!(node, AstNode::FunctionDefinition { .. }) {
+        return;
+    }
+    for_each_child(node, &mut |child| {
+        collect_shape_specialization_calls(child, defined, out)
+    });
+}
+
+/// Gather only one lexical definition scope. Stoffel's compiled program
+/// functions live in the root block; declining nested/duplicate names keeps
+/// identifier rewriting unambiguous and preserves closures unchanged.
+fn gather_shape_function_templates(root: &AstNode) -> HashMap<String, ShapeFunctionTemplate> {
+    let AstNode::Block(statements) = root else {
+        return HashMap::new();
+    };
+    let mut counts = HashMap::<String, usize>::new();
+    for statement in statements {
+        if let AstNode::FunctionDefinition {
+            name: Some(name), ..
+        } = statement
+        {
+            *counts.entry(name.clone()).or_default() += 1;
+        }
+    }
+    let defined: HashSet<String> = counts
+        .iter()
+        .filter(|(_, count)| **count == 1)
+        .map(|(name, _)| name.clone())
+        .collect();
+    let mut templates = HashMap::new();
+    for statement in statements {
+        let AstNode::FunctionDefinition {
+            name: Some(name),
+            parameters,
+            body,
+            ..
+        } = statement
+        else {
+            continue;
+        };
+        if !defined.contains(name)
+            || parameters
+                .iter()
+                .any(|parameter| parameter.is_variadic || parameter.default_value.is_some())
+        {
+            continue;
+        }
+        let mut calls = HashSet::new();
+        collect_shape_specialization_calls(body, &defined, &mut calls);
+        templates.insert(
+            name.clone(),
+            ShapeFunctionTemplate {
+                parameters: parameters.clone(),
+                body: body.as_ref().clone(),
+                size: node_size(body),
+                own_shape_sensitive_mpc: has_shape_sensitive_mpc(body),
+                calls,
+            },
+        );
+    }
+    templates
+}
+
+fn shape_specialization_reachable(
+    templates: &HashMap<String, ShapeFunctionTemplate>,
+) -> HashSet<String> {
+    let mut useful: HashSet<String> = templates
+        .iter()
+        .filter(|(_, template)| template.own_shape_sensitive_mpc)
+        .map(|(name, _)| name.clone())
+        .collect();
+
+    // Walk the reverse call graph from directly shape-sensitive functions.
+    // The former whole-map fixpoint rescanned every function once per call-chain
+    // level, making a chain of F helpers O(F²).
+    let mut callers = HashMap::<String, Vec<String>>::new();
+    for (caller, template) in templates {
+        for callee in &template.calls {
+            if templates.contains_key(callee) {
+                callers
+                    .entry(callee.clone())
+                    .or_default()
+                    .push(caller.clone());
+            }
+        }
+    }
+    let mut queue: std::collections::VecDeque<String> = useful.iter().cloned().collect();
+    while let Some(callee) = queue.pop_front() {
+        if let Some(reverse_edges) = callers.get(&callee) {
+            for caller in reverse_edges {
+                if useful.insert(caller.clone()) {
+                    queue.push_back(caller.clone());
+                }
+            }
+        }
+    }
+    useful
+}
+
+fn shape_signature_for_call(
+    name: &str,
+    arguments: &[AstNode],
+    env: &LenEnv,
+    templates: &HashMap<String, ShapeFunctionTemplate>,
+) -> Option<ShapeSignature> {
+    let template = templates.get(name)?;
+    if arguments.len() != template.parameters.len()
+        || arguments
+            .iter()
+            .any(|argument| matches!(argument, AstNode::NamedArgument { .. }))
+    {
+        return None;
+    }
+    let signature = ShapeSignature(
+        arguments
+            .iter()
+            .map(|argument| eval_shape(argument, env))
+            .collect(),
+    );
+    signature
+        .0
+        .iter()
+        .any(|shape| shape.count().is_some())
+        .then_some(signature)
+}
+
+fn seed_shape_function_env(template: &ShapeFunctionTemplate, signature: &ShapeSignature) -> LenEnv {
+    let mut env = LenEnv::default();
+    for (parameter, shape) in template.parameters.iter().zip(&signature.0) {
+        if !matches!(shape, Shape::Unknown) {
+            env.shapes.insert(parameter.name.clone(), shape.clone());
+        }
+    }
+    env
+}
+
+fn shape_context_can_reduce_rounds(signature: &ShapeSignature, capacity: usize) -> bool {
+    // At least two equal-width products must fit in one backend session. Width
+    // zero carries no interactive work; an oversized width is already forced to
+    // span backend sessions and cannot profit from static coalescing here.
+    signature.0.iter().any(|shape| {
+        shape
+            .count()
+            .is_some_and(|width| width > 0 && width <= capacity / 2)
+    })
+}
+
+#[derive(Clone)]
+struct ShapeCallContext {
+    ordinal: usize,
+    callee: String,
+    signature: ShapeSignature,
+}
+
+fn collect_shape_call_contexts(
+    node: &AstNode,
+    env: &mut LenEnv,
+    templates: &HashMap<String, ShapeFunctionTemplate>,
+    useful: &HashSet<String>,
+    out: &mut Vec<ShapeCallContext>,
+    call_ordinal: &mut usize,
+    fuel: &mut usize,
+) {
+    match node {
+        AstNode::Block(statements) => {
+            for statement in statements {
+                collect_shape_call_contexts(
+                    statement,
+                    env,
+                    templates,
+                    useful,
+                    out,
+                    call_ordinal,
+                    fuel,
+                );
+                if !transfer_len_env(statement, env, fuel) {
+                    // Precision loss only disables specialization. Never retain
+                    // a fact after the abstract interpreter declined the proof.
+                    *env = LenEnv::default();
+                    *fuel = 0;
+                }
+            }
+        }
+        AstNode::FunctionDefinition { .. } => {}
+        AstNode::FunctionCall { arguments, .. } => {
+            let ordinal = *call_ordinal;
+            *call_ordinal = call_ordinal.saturating_add(1);
+            if let Some(name) = call_name(node) {
+                if useful.contains(name) {
+                    if let Some(signature) =
+                        shape_signature_for_call(name, arguments, env, templates)
+                    {
+                        out.push(ShapeCallContext {
+                            ordinal,
+                            callee: name.to_string(),
+                            signature,
+                        });
+                    }
+                }
+            }
+            for argument in arguments {
+                collect_shape_call_contexts(
+                    argument,
+                    env,
+                    templates,
+                    useful,
+                    out,
+                    call_ordinal,
+                    fuel,
+                );
+            }
+        }
+        AstNode::ForLoop {
+            variables,
+            iterable,
+            body,
+            ..
+        } => {
+            collect_shape_call_contexts(iterable, env, templates, useful, out, call_ordinal, fuel);
+            let mut body_env = scoped_len_env(env, &[body, iterable]);
+            bind_loop_var(&mut body_env, variables, iterable);
+            collect_shape_call_contexts(
+                body,
+                &mut body_env,
+                templates,
+                useful,
+                out,
+                call_ordinal,
+                fuel,
+            );
+        }
+        AstNode::WhileLoop {
+            condition, body, ..
+        } => {
+            collect_shape_call_contexts(condition, env, templates, useful, out, call_ordinal, fuel);
+            let mut body_env = scoped_len_env(env, &[body]);
+            collect_shape_call_contexts(
+                body,
+                &mut body_env,
+                templates,
+                useful,
+                out,
+                call_ordinal,
+                fuel,
+            );
+        }
+        AstNode::IfExpression {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            collect_shape_call_contexts(condition, env, templates, useful, out, call_ordinal, fuel);
+            let mut then_env = scoped_len_env(env, &[then_branch]);
+            collect_shape_call_contexts(
+                then_branch,
+                &mut then_env,
+                templates,
+                useful,
+                out,
+                call_ordinal,
+                fuel,
+            );
+            if let Some(branch) = else_branch {
+                let mut else_env = scoped_len_env(env, &[branch]);
+                collect_shape_call_contexts(
+                    branch,
+                    &mut else_env,
+                    templates,
+                    useful,
+                    out,
+                    call_ordinal,
+                    fuel,
+                );
+            }
+        }
+        _ => for_each_child(node, &mut |child| {
+            collect_shape_call_contexts(child, env, templates, useful, out, call_ordinal, fuel)
+        }),
+    }
+}
+
+fn rewrite_shape_specialized_calls(
+    node: AstNode,
+    env: &mut LenEnv,
+    templates: &HashMap<String, ShapeFunctionTemplate>,
+    variants: &HashMap<(String, ShapeSignature), String>,
+    fuel: &mut usize,
+) -> AstNode {
+    match node {
+        AstNode::Block(statements) => {
+            let mut rewritten = Vec::with_capacity(statements.len());
+            for statement in statements {
+                let statement =
+                    rewrite_shape_specialized_calls(statement, env, templates, variants, fuel);
+                if !transfer_len_env(&statement, env, fuel) {
+                    *env = LenEnv::default();
+                    *fuel = 0;
+                }
+                rewritten.push(statement);
+            }
+            AstNode::Block(rewritten)
+        }
+        AstNode::FunctionCall {
+            function,
+            arguments,
+            location,
+            resolved_return_type,
+        } => {
+            let replacement = if let AstNode::Identifier(name, call_location) = function.as_ref() {
+                shape_signature_for_call(name, &arguments, env, templates)
+                    .and_then(|signature| variants.get(&(name.clone(), signature)))
+                    .map(|variant| AstNode::Identifier(variant.clone(), call_location.clone()))
+            } else {
+                None
+            };
+            let function = replacement.unwrap_or_else(|| *function);
+            let arguments = arguments
+                .into_iter()
+                .map(|argument| {
+                    rewrite_shape_specialized_calls(argument, env, templates, variants, fuel)
+                })
+                .collect();
+            AstNode::FunctionCall {
+                function: Box::new(function),
+                arguments,
+                location,
+                resolved_return_type,
+            }
+        }
+        AstNode::ForLoop {
+            variables,
+            iterable,
+            body,
+            location,
+        } => {
+            let iterable = Box::new(rewrite_shape_specialized_calls(
+                *iterable, env, templates, variants, fuel,
+            ));
+            let mut body_env = scoped_len_env(env, &[&body, &iterable]);
+            bind_loop_var(&mut body_env, &variables, &iterable);
+            let body = Box::new(rewrite_shape_specialized_calls(
+                *body,
+                &mut body_env,
+                templates,
+                variants,
+                fuel,
+            ));
+            AstNode::ForLoop {
+                variables,
+                iterable,
+                body,
+                location,
+            }
+        }
+        AstNode::WhileLoop {
+            condition,
+            body,
+            location,
+        } => {
+            let condition = Box::new(rewrite_shape_specialized_calls(
+                *condition, env, templates, variants, fuel,
+            ));
+            let mut body_env = scoped_len_env(env, &[&body]);
+            let body = Box::new(rewrite_shape_specialized_calls(
+                *body,
+                &mut body_env,
+                templates,
+                variants,
+                fuel,
+            ));
+            AstNode::WhileLoop {
+                condition,
+                body,
+                location,
+            }
+        }
+        AstNode::IfExpression {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            let condition = Box::new(rewrite_shape_specialized_calls(
+                *condition, env, templates, variants, fuel,
+            ));
+            let mut then_env = scoped_len_env(env, &[&then_branch]);
+            let then_branch = Box::new(rewrite_shape_specialized_calls(
+                *then_branch,
+                &mut then_env,
+                templates,
+                variants,
+                fuel,
+            ));
+            let else_branch = else_branch.map(|branch| {
+                let mut else_env = scoped_len_env(env, &[&branch]);
+                Box::new(rewrite_shape_specialized_calls(
+                    *branch,
+                    &mut else_env,
+                    templates,
+                    variants,
+                    fuel,
+                ))
+            });
+            AstNode::IfExpression {
+                condition,
+                then_branch,
+                else_branch,
+            }
+        }
+        AstNode::FunctionDefinition { .. } => node,
+        other => map_children(other, &mut |child| {
+            rewrite_shape_specialized_calls(child, env, templates, variants, fuel)
+        }),
+    }
+}
+
+/// Rewrite using the exact call-site contexts already computed during variant
+/// discovery. The body is unchanged between discovery and cloning, so preorder
+/// call ordinals are stable and avoid running the same shape interpreter a
+/// second time merely to rediscover identical signatures.
+fn rewrite_shape_specialized_calls_from_context(
+    node: AstNode,
+    contexts: &[ShapeCallContext],
+    variants: &HashMap<(String, ShapeSignature), String>,
+) -> AstNode {
+    let replacements: HashMap<usize, String> = contexts
+        .iter()
+        .filter_map(|context| {
+            variants
+                .get(&(context.callee.clone(), context.signature.clone()))
+                .cloned()
+                .map(|variant| (context.ordinal, variant))
+        })
+        .collect();
+
+    fn rewrite(
+        node: AstNode,
+        replacements: &HashMap<usize, String>,
+        call_ordinal: &mut usize,
+    ) -> AstNode {
+        match node {
+            AstNode::FunctionCall {
+                function,
+                arguments,
+                location,
+                resolved_return_type,
+            } => {
+                let ordinal = *call_ordinal;
+                *call_ordinal = call_ordinal.saturating_add(1);
+                let function = match (replacements.get(&ordinal), *function) {
+                    (Some(variant), AstNode::Identifier(_, call_location)) => {
+                        AstNode::Identifier(variant.clone(), call_location)
+                    }
+                    (_, function) => function,
+                };
+                AstNode::FunctionCall {
+                    function: Box::new(function),
+                    arguments: arguments
+                        .into_iter()
+                        .map(|argument| rewrite(argument, replacements, call_ordinal))
+                        .collect(),
+                    location,
+                    resolved_return_type,
+                }
+            }
+            // The discovery traversal treats nested functions as separate
+            // templates, so their call ordinals belong to their own context.
+            AstNode::FunctionDefinition { .. } => node,
+            other => map_children(other, &mut |child| {
+                rewrite(child, replacements, call_ordinal)
+            }),
+        }
+    }
+
+    let mut call_ordinal = 0;
+    rewrite(node, &replacements, &mut call_ordinal)
+}
+
+fn shape_variant_stem(name: &str) -> String {
+    name.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                character
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+fn specialize_mpc_call_shapes(root: AstNode) -> AstNode {
+    SPECIALIZED_FUNCTION_SHAPES.with(|shapes| shapes.borrow_mut().clear());
+    let Some(capacity) = multiply_batch_capacity() else {
+        return root;
+    };
+    if capacity < 2 {
+        return root;
+    }
+    let templates = gather_shape_function_templates(&root);
+    let useful = shape_specialization_reachable(&templates);
+    if useful.is_empty() {
+        return root;
+    }
+
+    let program_size = program_code_size(&root);
+    let growth_budget =
+        (program_size / MPC_SHAPE_GROWTH_DENOMINATOR).min(MPC_SHAPE_MAX_ADDED_NODES);
+    if growth_budget == 0 {
+        return root;
+    }
+
+    let mut queue = std::collections::VecDeque::new();
+    let mut analyzed = HashSet::<(String, ShapeSignature)>::new();
+    // Analyze each useful generic body once. These are discovery contexts only;
+    // the all-unknown signature never creates a variant.
+    let mut names: Vec<String> = useful.iter().cloned().collect();
+    names.sort();
+    for name in names {
+        let arity = templates[&name].parameters.len();
+        queue.push_back((name, ShapeSignature(vec![Shape::Unknown; arity])));
+    }
+
+    let mut accepted = Vec::<(String, ShapeSignature)>::new();
+    let mut accepted_set = HashSet::<(String, ShapeSignature)>::new();
+    let mut variants_per_function = HashMap::<String, usize>::new();
+    let mut discovered_calls = HashMap::<(String, ShapeSignature), Vec<ShapeCallContext>>::new();
+    let mut added_nodes = 0usize;
+    let mut analyzed_contexts = 0usize;
+    let mut discovery_body_nodes = 0usize;
+    let mut discovery_transfer_steps = 0usize;
+
+    while let Some((name, signature)) = queue.pop_front() {
+        let analysis_key = (name.clone(), signature.clone());
+        if !analyzed.insert(analysis_key.clone()) {
+            continue;
+        }
+        let Some(template) = templates.get(&name) else {
+            continue;
+        };
+        // A shape-sensitive leaf cannot discover a callee context. Its variants
+        // are created from the concrete call sites found in its callers, so
+        // interpreting the leaf here only burns the per-context transfer budget
+        // without changing the accepted variant set.
+        if !template.calls.iter().any(|callee| useful.contains(callee)) {
+            continue;
+        }
+        analyzed_contexts += 1;
+        discovery_body_nodes = discovery_body_nodes.saturating_add(template.size);
+        let mut env = seed_shape_function_env(template, &signature);
+        let mut contexts = Vec::new();
+        let mut call_ordinal = 0usize;
+        let mut fuel = 500_000usize;
+        collect_shape_call_contexts(
+            &template.body,
+            &mut env,
+            &templates,
+            &useful,
+            &mut contexts,
+            &mut call_ordinal,
+            &mut fuel,
+        );
+        discovery_transfer_steps =
+            discovery_transfer_steps.saturating_add(500_000usize.saturating_sub(fuel));
+        discovered_calls.insert(analysis_key, contexts.clone());
+        for context in contexts {
+            let callee = context.callee;
+            let signature = context.signature;
+            let key = (callee.clone(), signature.clone());
+            if analyzed.contains(&key) || accepted_set.contains(&key) {
+                continue;
+            }
+            let Some(callee_template) = templates.get(&callee) else {
+                continue;
+            };
+            let count = variants_per_function.get(&callee).copied().unwrap_or(0);
+            let fits_policy = accepted.len() < MPC_SHAPE_MAX_VARIANTS_TOTAL
+                && count < MPC_SHAPE_MAX_VARIANTS_PER_FUNCTION
+                && added_nodes.saturating_add(callee_template.size) <= growth_budget
+                && shape_context_can_reduce_rounds(&signature, capacity);
+            if !fits_policy {
+                continue;
+            }
+            added_nodes = added_nodes.saturating_add(callee_template.size);
+            variants_per_function.insert(callee.clone(), count + 1);
+            accepted_set.insert(key.clone());
+            accepted.push(key.clone());
+            queue.push_back(key);
+        }
+    }
+    if accepted.is_empty() {
+        if opt_timing_enabled() {
+            eprintln!(
+                "[opt-work] specialize_mpc_call_shapes: templates={} useful={} contexts={analyzed_contexts} discovery_nodes={discovery_body_nodes} transfer_steps={discovery_transfer_steps} variants=0 added_nodes=0",
+                templates.len(),
+                useful.len(),
+            );
+        }
+        return root;
+    }
+
+    let mut occupied: HashSet<String> = templates.keys().cloned().collect();
+    let mut variants = HashMap::<(String, ShapeSignature), String>::new();
+    for (ordinal, key) in accepted.iter().cloned().enumerate() {
+        let stem = shape_variant_stem(&key.0);
+        let mut discriminator = ordinal;
+        let variant = loop {
+            let candidate = format!("__stoffel_mpc_shape_{stem}_{discriminator}");
+            if occupied.insert(candidate.clone()) {
+                break candidate;
+            }
+            discriminator += 1;
+        };
+        variants.insert(key, variant);
+    }
+    let accepted_bases: HashSet<String> = accepted.iter().map(|(name, _)| name.clone()).collect();
+
+    let AstNode::Block(statements) = root else {
+        return root;
+    };
+    let mut expanded = Vec::with_capacity(statements.len() + accepted.len());
+    let mut top_env = LenEnv::default();
+    let mut top_fuel = 500_000usize;
+    let mut rewrite_body_nodes = 0usize;
+    let mut rewrite_transfer_steps = 0usize;
+    for statement in statements {
+        let AstNode::FunctionDefinition {
+            name: Some(name),
+            type_params,
+            parameters,
+            return_type,
+            body,
+            is_secret,
+            pragmas,
+            location,
+            node_id,
+        } = statement
+        else {
+            let statement = rewrite_shape_specialized_calls(
+                statement,
+                &mut top_env,
+                &templates,
+                &variants,
+                &mut top_fuel,
+            );
+            if !transfer_len_env(&statement, &mut top_env, &mut top_fuel) {
+                top_env = LenEnv::default();
+                top_fuel = 0;
+            }
+            expanded.push(statement);
+            continue;
+        };
+
+        let Some(template) = templates.get(&name) else {
+            expanded.push(AstNode::FunctionDefinition {
+                name: Some(name),
+                type_params,
+                parameters,
+                return_type,
+                body,
+                is_secret,
+                pragmas,
+                location,
+                node_id,
+            });
+            continue;
+        };
+
+        let can_rewrite_call = template
+            .calls
+            .iter()
+            .any(|callee| accepted_bases.contains(callee));
+        let generic_body = if can_rewrite_call {
+            rewrite_body_nodes = rewrite_body_nodes.saturating_add(template.size);
+            let generic_key = (
+                name.clone(),
+                ShapeSignature(vec![Shape::Unknown; parameters.len()]),
+            );
+            if let Some(contexts) = discovered_calls.get(&generic_key) {
+                rewrite_shape_specialized_calls_from_context(*body, contexts, &variants)
+            } else {
+                // A missing cache entry is not expected for a useful caller,
+                // but recomputing retains the old fail-closed behavior.
+                let mut generic_env = LenEnv::default();
+                let mut generic_fuel = 500_000usize;
+                let rewritten = rewrite_shape_specialized_calls(
+                    *body,
+                    &mut generic_env,
+                    &templates,
+                    &variants,
+                    &mut generic_fuel,
+                );
+                rewrite_transfer_steps = rewrite_transfer_steps
+                    .saturating_add(500_000usize.saturating_sub(generic_fuel));
+                rewritten
+            }
+        } else {
+            *body
+        };
+        expanded.push(AstNode::FunctionDefinition {
+            name: Some(name.clone()),
+            type_params: type_params.clone(),
+            parameters: parameters.clone(),
+            return_type: return_type.clone(),
+            body: Box::new(generic_body),
+            is_secret,
+            pragmas: pragmas.clone(),
+            location: location.clone(),
+            node_id,
+        });
+
+        for key @ (base, signature) in &accepted {
+            if base != &name {
+                continue;
+            }
+            let variant = &variants[key];
+            let variant_body = if can_rewrite_call {
+                rewrite_body_nodes = rewrite_body_nodes.saturating_add(template.size);
+                if let Some(contexts) = discovered_calls.get(key) {
+                    rewrite_shape_specialized_calls_from_context(
+                        template.body.clone(),
+                        contexts,
+                        &variants,
+                    )
+                } else {
+                    let mut variant_env = seed_shape_function_env(template, signature);
+                    let mut variant_fuel = 500_000usize;
+                    let rewritten = rewrite_shape_specialized_calls(
+                        template.body.clone(),
+                        &mut variant_env,
+                        &templates,
+                        &variants,
+                        &mut variant_fuel,
+                    );
+                    rewrite_transfer_steps = rewrite_transfer_steps
+                        .saturating_add(500_000usize.saturating_sub(variant_fuel));
+                    rewritten
+                }
+            } else {
+                template.body.clone()
+            };
+            SPECIALIZED_FUNCTION_SHAPES.with(|shapes| {
+                shapes
+                    .borrow_mut()
+                    .insert(variant.clone(), signature.0.clone());
+            });
+            expanded.push(AstNode::FunctionDefinition {
+                name: Some(variant.clone()),
+                type_params: type_params.clone(),
+                parameters: parameters.clone(),
+                return_type: return_type.clone(),
+                body: Box::new(variant_body),
+                is_secret,
+                pragmas: pragmas.clone(),
+                location: location.clone(),
+                node_id,
+            });
+        }
+    }
+    rewrite_transfer_steps =
+        rewrite_transfer_steps.saturating_add(500_000usize.saturating_sub(top_fuel));
+    if opt_timing_enabled() {
+        eprintln!(
+            "[opt-work] specialize_mpc_call_shapes: templates={} useful={} contexts={analyzed_contexts} discovery_nodes={discovery_body_nodes} transfer_steps={discovery_transfer_steps} variants={} added_nodes={added_nodes} rewrite_nodes={rewrite_body_nodes} rewrite_transfer_steps={rewrite_transfer_steps}",
+            templates.len(),
+            useful.len(),
+            accepted.len(),
+        );
+    }
+    AstNode::Block(expanded)
+}
+
+fn specialized_function_env(name: Option<&str>, parameters: &[crate::ast::Parameter]) -> LenEnv {
+    let Some(name) = name else {
+        return LenEnv::default();
+    };
+    SPECIALIZED_FUNCTION_SHAPES.with(|shapes| {
+        let shapes = shapes.borrow();
+        let Some(signature) = shapes.get(name) else {
+            return LenEnv::default();
+        };
+        let mut env = LenEnv::default();
+        for (parameter, shape) in parameters.iter().zip(signature) {
+            if !matches!(shape, Shape::Unknown) {
+                env.shapes.insert(parameter.name.clone(), shape.clone());
+            }
+        }
+        env
+    })
+}
+
+/// Re-run the exact shape interpreter over specialized bodies after loop
+/// vectorization. This covers both batches synthesized by the vectorizer and
+/// pre-existing `Share.batch_mul` calls whose operand lists are built by public
+/// loops inside the callee. Width metadata is a proof sidecar only; failure to
+/// execute any construct simply stops recording facts for that path.
+fn record_specialized_batch_widths(node: &AstNode) {
+    fn walk(node: &AstNode, env: &mut LenEnv, fuel: &mut usize) -> bool {
+        match node {
+            AstNode::Block(statements) => {
+                for statement in statements {
+                    match statement {
+                        AstNode::IfExpression {
+                            condition,
+                            then_branch,
+                            else_branch,
+                        } => match const_eval_bool_env(condition, env) {
+                            Some(true) => {
+                                let mut branch_env = env.clone();
+                                if !walk(then_branch, &mut branch_env, fuel) {
+                                    return false;
+                                }
+                            }
+                            Some(false) => {
+                                if let Some(branch) = else_branch {
+                                    let mut branch_env = env.clone();
+                                    if !walk(branch, &mut branch_env, fuel) {
+                                        return false;
+                                    }
+                                }
+                            }
+                            None => {}
+                        },
+                        AstNode::ForLoop {
+                            variables,
+                            iterable,
+                            body,
+                            ..
+                        } => {
+                            let mut body_env = scoped_len_env(env, &[body, iterable]);
+                            bind_loop_var(&mut body_env, variables, iterable);
+                            // Recording inside a loop is useful only when the
+                            // local context itself proves a width. The transfer
+                            // below remains the authority for post-loop facts.
+                            let _ = walk(body, &mut body_env, fuel);
+                        }
+                        AstNode::WhileLoop { body, .. } => {
+                            let mut body_env = scoped_len_env(env, &[body]);
+                            let _ = walk(body, &mut body_env, fuel);
+                        }
+                        _ => {}
+                    }
+                    if !transfer_len_env(statement, env, fuel) {
+                        return false;
+                    }
+                    record_batch_result_width_from_env(statement, env);
+                }
+                true
+            }
+            other => {
+                if !transfer_len_env(other, env, fuel) {
+                    return false;
+                }
+                record_batch_result_width_from_env(other, env);
+                true
+            }
+        }
+    }
+
+    let AstNode::Block(statements) = node else {
+        return;
+    };
+    for statement in statements {
+        let AstNode::FunctionDefinition {
+            name: Some(name),
+            parameters,
+            body,
+            ..
+        } = statement
+        else {
+            continue;
+        };
+        let is_specialized =
+            SPECIALIZED_FUNCTION_SHAPES.with(|shapes| shapes.borrow().contains_key(name));
+        if !is_specialized {
+            continue;
+        }
+        let mut env = specialized_function_env(Some(name), parameters);
+        let mut fuel = 500_000usize;
+        let _ = walk(body, &mut env, &mut fuel);
+    }
 }
 
 // ===========================================================================
@@ -2549,19 +3766,141 @@ pub fn optimize_all_with_budgets(
 // multiplies into wider batches (identical netlist, different round).
 // ===========================================================================
 
+#[derive(Debug, Clone, Copy, Default)]
+struct VectorizeWork {
+    statements: u64,
+    loop_candidates: u64,
+    prefilter_steps: u64,
+    prefilter_exhaustions: u64,
+    assignment_prefilter_steps: u64,
+    assignment_prefilter_exhaustions: u64,
+    nonlocal_assignment_rejections: u64,
+    multiply_candidates: u64,
+    flattened_candidates: u64,
+    local_unroll_steps: u64,
+    flattened_statements: u64,
+    post_flatten_multiply_candidates: u64,
+    straight_line_candidates: u64,
+    recognition_failures: u64,
+    vectorized_loops: u64,
+    transfer_steps: u64,
+    scoped_env_entries: u64,
+}
+
+fn vectorizer_transfer_len_env(
+    node: &AstNode,
+    env: &mut LenEnv,
+    fuel: &mut usize,
+    work: &mut VectorizeWork,
+) -> bool {
+    let before = *fuel;
+    let result = transfer_len_env(node, env, fuel);
+    work.transfer_steps = work
+        .transfer_steps
+        .saturating_add(before.saturating_sub(*fuel) as u64);
+    result
+}
+
 /// -O3 entry point: structurally recurse, vectorizing eligible map-loops in place.
 pub fn vectorize_map_loops(node: AstNode) -> AstNode {
+    let mut env = LenEnv::default();
+    let mut fuel = 500_000usize;
+    let mut work = VectorizeWork::default();
+    let out = vectorize_map_loops_with_env(node, &mut env, &mut fuel, &mut work);
+    if opt_timing_enabled() {
+        eprintln!(
+            "[opt-work] vectorize_map_loops: statements={} loop_candidates={} prefilter_steps={} prefilter_exhaustions={} assignment_prefilter_steps={} assignment_prefilter_exhaustions={} nonlocal_assignment_rejections={} multiply_candidates={} flattened_candidates={} local_unroll_steps={} flattened_statements={} post_flatten_multiply_candidates={} straight_line_candidates={} recognition_failures={} vectorized_loops={} transfer_steps={} scoped_env_entries={}",
+            work.statements,
+            work.loop_candidates,
+            work.prefilter_steps,
+            work.prefilter_exhaustions,
+            work.assignment_prefilter_steps,
+            work.assignment_prefilter_exhaustions,
+            work.nonlocal_assignment_rejections,
+            work.multiply_candidates,
+            work.flattened_candidates,
+            work.local_unroll_steps,
+            work.flattened_statements,
+            work.post_flatten_multiply_candidates,
+            work.straight_line_candidates,
+            work.recognition_failures,
+            work.vectorized_loops,
+            work.transfer_steps,
+            work.scoped_env_entries,
+        );
+    }
+    out
+}
+
+fn vectorize_map_loops_with_env(
+    node: AstNode,
+    env: &mut LenEnv,
+    fuel: &mut usize,
+    work: &mut VectorizeWork,
+) -> AstNode {
     match node {
         AstNode::Block(stmts) => {
             let mut out: Vec<AstNode> = Vec::with_capacity(stmts.len());
             for stmt in stmts {
+                work.statements = work.statements.saturating_add(1);
                 if matches!(stmt, AstNode::ForLoop { .. }) {
-                    if let Some(replacement) = try_vectorize_for(&stmt) {
+                    work.loop_candidates = work.loop_candidates.saturating_add(1);
+                    let width = match &stmt {
+                        AstNode::ForLoop { iterable, .. } => range_bounds(iterable, env)
+                            .and_then(|(lo, hi)| hi.checked_sub(lo))
+                            .and_then(|n| usize::try_from(n).ok()),
+                        _ => None,
+                    };
+                    if let Some(replacement) = try_vectorize_for_with_width(&stmt, width, work) {
+                        work.vectorized_loops = work.vectorized_loops.saturating_add(1);
+                        // Update from the original loop: the replacement is
+                        // semantics-equivalent, while the source form is easier
+                        // for the exact shape interpreter to understand.
+                        if !vectorizer_transfer_len_env(&stmt, env, fuel, work) {
+                            *env = LenEnv::default();
+                            *fuel = 0;
+                        }
                         out.extend(replacement);
                         continue;
                     }
                 }
-                out.push(vectorize_map_loops(stmt));
+                let needs_entry_env = matches!(
+                    stmt,
+                    AstNode::Block(_)
+                        | AstNode::ForLoop { .. }
+                        | AstNode::WhileLoop { .. }
+                        | AstNode::IfExpression { .. }
+                        | AstNode::TryCatch { .. }
+                );
+                // A recursive walk can only query identifiers present in its
+                // subtree. Copy just those entry facts instead of the entire
+                // accumulated function environment; cloning the latter at every
+                // nested scope is quadratic in long alpha-renamed functions.
+                // Function definitions build their own parameter environment in
+                // the match arm below and need no caller snapshot at all.
+                let mut nested_env = needs_entry_env.then(|| {
+                    let scoped = scoped_len_env(env, &[&stmt]);
+                    work.scoped_env_entries = work.scoped_env_entries.saturating_add(
+                        (scoped.shapes.len() + scoped.ints.len() + scoped.aliases.len()) as u64,
+                    );
+                    scoped
+                });
+                if !vectorizer_transfer_len_env(&stmt, env, fuel, work) {
+                    // Shape knowledge is only a profitability/work proof. Losing
+                    // it leaves the program unchanged and makes later batching
+                    // fail closed; it must never become a guessed width.
+                    *env = LenEnv::default();
+                    *fuel = 0;
+                } else {
+                    record_batch_result_width_from_env(&stmt, env);
+                }
+                if matches!(stmt, AstNode::FunctionDefinition { .. }) {
+                    out.push(vectorize_map_loops_with_env(stmt, env, fuel, work));
+                } else if let Some(nested_env) = &mut nested_env {
+                    out.push(vectorize_map_loops_with_env(stmt, nested_env, fuel, work));
+                } else {
+                    out.push(stmt);
+                }
             }
             AstNode::Block(out)
         }
@@ -2575,17 +3914,26 @@ pub fn vectorize_map_loops(node: AstNode) -> AstNode {
             pragmas,
             location,
             node_id,
-        } => AstNode::FunctionDefinition {
-            name,
-            type_params,
-            parameters,
-            return_type,
-            body: Box::new(vectorize_map_loops(*body)),
-            is_secret,
-            pragmas,
-            location,
-            node_id,
-        },
+        } => {
+            let mut function_env = specialized_function_env(name.as_deref(), &parameters);
+            let mut function_fuel = 500_000usize;
+            AstNode::FunctionDefinition {
+                name,
+                type_params,
+                parameters,
+                return_type,
+                body: Box::new(vectorize_map_loops_with_env(
+                    *body,
+                    &mut function_env,
+                    &mut function_fuel,
+                    work,
+                )),
+                is_secret,
+                pragmas,
+                location,
+                node_id,
+            }
+        }
         AstNode::ForLoop {
             variables,
             iterable,
@@ -2594,7 +3942,7 @@ pub fn vectorize_map_loops(node: AstNode) -> AstNode {
         } => AstNode::ForLoop {
             variables,
             iterable,
-            body: Box::new(vectorize_map_loops(*body)),
+            body: Box::new(vectorize_map_loops_with_env(*body, env, fuel, work)),
             location,
         },
         AstNode::WhileLoop {
@@ -2603,7 +3951,7 @@ pub fn vectorize_map_loops(node: AstNode) -> AstNode {
             location,
         } => AstNode::WhileLoop {
             condition,
-            body: Box::new(vectorize_map_loops(*body)),
+            body: Box::new(vectorize_map_loops_with_env(*body, env, fuel, work)),
             location,
         },
         AstNode::IfExpression {
@@ -2612,8 +3960,9 @@ pub fn vectorize_map_loops(node: AstNode) -> AstNode {
             else_branch,
         } => AstNode::IfExpression {
             condition,
-            then_branch: Box::new(vectorize_map_loops(*then_branch)),
-            else_branch: else_branch.map(|e| Box::new(vectorize_map_loops(*e))),
+            then_branch: Box::new(vectorize_map_loops_with_env(*then_branch, env, fuel, work)),
+            else_branch: else_branch
+                .map(|e| Box::new(vectorize_map_loops_with_env(*e, env, fuel, work))),
         },
         AstNode::TryCatch {
             try_block,
@@ -2621,9 +3970,16 @@ pub fn vectorize_map_loops(node: AstNode) -> AstNode {
             finally_block,
             location,
         } => AstNode::TryCatch {
-            try_block: Box::new(vectorize_map_loops(*try_block)),
-            catch_clauses,
-            finally_block: finally_block.map(|b| Box::new(vectorize_map_loops(*b))),
+            try_block: Box::new(vectorize_map_loops_with_env(*try_block, env, fuel, work)),
+            catch_clauses: catch_clauses
+                .into_iter()
+                .map(|c| crate::ast::CatchClause {
+                    body: Box::new(vectorize_map_loops_with_env(*c.body, env, fuel, work)),
+                    ..c
+                })
+                .collect(),
+            finally_block: finally_block
+                .map(|b| Box::new(vectorize_map_loops_with_env(*b, env, fuel, work))),
             location,
         },
         other => other,
@@ -2672,6 +4028,348 @@ fn vec_stmt_contains_multiply(stmt: &AstNode) -> bool {
     }
 }
 
+const VECTORIZER_PREFILTER_BUDGET: usize = 1_024;
+
+/// Bounded recursive search used before the expensive local unroller. `None`
+/// means the fixed budget was exhausted, in which case the caller must retain
+/// the candidate. A fixed per-loop budget makes the total prefilter work
+/// O(number of AST nodes), even for adversarially deep loop nesting.
+fn vec_bounded_contains_multiply(node: &AstNode, budget: &mut usize) -> Option<bool> {
+    if *budget == 0 {
+        return None;
+    }
+    *budget -= 1;
+
+    if matches!(
+        node,
+        AstNode::BinaryOperation { op, .. } if matches!(op.as_str(), "xor" | "and" | "or")
+    ) || matches!(
+        node,
+        AstNode::FunctionCall { .. }
+            if matches!(call_name(node).map(builtin_base_name), Some("mul") | Some("batch_mul"))
+    ) {
+        return Some(true);
+    }
+
+    let mut exhausted = false;
+    macro_rules! scan_child {
+        ($child:expr) => {
+            match vec_bounded_contains_multiply($child, budget) {
+                Some(true) => return Some(true),
+                Some(false) => {}
+                None => exhausted = true,
+            }
+        };
+    }
+
+    match node {
+        AstNode::Assignment { target, value, .. } => {
+            scan_child!(target);
+            scan_child!(value);
+        }
+        AstNode::VariableDeclaration {
+            type_annotation,
+            value,
+            ..
+        } => {
+            if let Some(node) = type_annotation {
+                scan_child!(node);
+            }
+            if let Some(node) = value {
+                scan_child!(node);
+            }
+        }
+        AstNode::BinaryOperation { left, right, .. }
+        | AstNode::IndexAccess {
+            base: left,
+            index: right,
+            ..
+        }
+        | AstNode::DictType {
+            key_type: left,
+            value_type: right,
+            ..
+        } => {
+            scan_child!(left);
+            scan_child!(right);
+        }
+        AstNode::UnaryOperation { operand, .. }
+        | AstNode::FieldAccess {
+            object: operand, ..
+        }
+        | AstNode::NamedArgument { value: operand, .. }
+        | AstNode::TypeAlias {
+            target_type: operand,
+            ..
+        }
+        | AstNode::SecretType(operand)
+        | AstNode::ListType(operand)
+        | AstNode::DiscardStatement {
+            expression: operand,
+            ..
+        } => scan_child!(operand),
+        AstNode::FunctionCall {
+            function,
+            arguments,
+            ..
+        }
+        | AstNode::CommandCall {
+            command: function,
+            arguments,
+            ..
+        } => {
+            scan_child!(function);
+            for argument in arguments {
+                scan_child!(argument);
+            }
+        }
+        AstNode::FunctionDefinition {
+            parameters,
+            return_type,
+            body,
+            pragmas,
+            ..
+        } => {
+            for parameter in parameters {
+                if let Some(node) = &parameter.type_annotation {
+                    scan_child!(node);
+                }
+                if let Some(node) = &parameter.default_value {
+                    scan_child!(node);
+                }
+            }
+            if let Some(node) = return_type {
+                scan_child!(node);
+            }
+            for pragma in pragmas {
+                if let crate::ast::Pragma::KeyValue(_, value, _) = pragma {
+                    scan_child!(value);
+                }
+            }
+            scan_child!(body);
+        }
+        AstNode::IfExpression {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            scan_child!(condition);
+            scan_child!(then_branch);
+            if let Some(node) = else_branch {
+                scan_child!(node);
+            }
+        }
+        AstNode::WhileLoop {
+            condition, body, ..
+        } => {
+            scan_child!(condition);
+            scan_child!(body);
+        }
+        AstNode::ForLoop { iterable, body, .. } => {
+            scan_child!(iterable);
+            scan_child!(body);
+        }
+        AstNode::Block(nodes)
+        | AstNode::TupleLiteral(nodes)
+        | AstNode::SetLiteral(nodes)
+        | AstNode::TupleType(nodes) => {
+            for node in nodes {
+                scan_child!(node);
+            }
+        }
+        AstNode::Return { value, .. } | AstNode::Yield(value) => {
+            if let Some(node) = value {
+                scan_child!(node);
+            }
+        }
+        AstNode::ListLiteral { elements, .. } => {
+            for node in elements {
+                scan_child!(node);
+            }
+        }
+        AstNode::DictLiteral { pairs, .. } => {
+            for (key, value) in pairs {
+                scan_child!(key);
+                scan_child!(value);
+            }
+        }
+        AstNode::BuiltinTypeDefinition { target_type, .. } => {
+            if let Some(node) = target_type {
+                scan_child!(node);
+            }
+        }
+        AstNode::BuiltinObjectDefinition { methods, .. } => {
+            for node in methods {
+                scan_child!(node);
+            }
+        }
+        AstNode::ObjectDefinition {
+            base_type, fields, ..
+        } => {
+            if let Some(node) = base_type {
+                scan_child!(node);
+            }
+            for field in fields {
+                scan_child!(&field.type_annotation);
+            }
+        }
+        AstNode::EnumDefinition { members, .. } => {
+            for member in members {
+                if let Some(node) = &member.value {
+                    scan_child!(node);
+                }
+            }
+        }
+        AstNode::FunctionType {
+            parameter_types,
+            return_type,
+            ..
+        } => {
+            for node in parameter_types {
+                scan_child!(node);
+            }
+            scan_child!(return_type);
+        }
+        AstNode::GenericType { type_params, .. } => {
+            for node in type_params {
+                scan_child!(node);
+            }
+        }
+        AstNode::TryCatch {
+            try_block,
+            catch_clauses,
+            finally_block,
+            ..
+        } => {
+            scan_child!(try_block);
+            for clause in catch_clauses {
+                if let Some(node) = &clause.exception_type {
+                    scan_child!(node);
+                }
+                scan_child!(&clause.body);
+            }
+            if let Some(node) = finally_block {
+                scan_child!(node);
+            }
+        }
+        AstNode::Literal { .. }
+        | AstNode::Identifier(..)
+        | AstNode::Break
+        | AstNode::Continue
+        | AstNode::Import { .. } => {}
+    }
+
+    if exhausted {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+fn vec_body_may_contain_multiply(body: &AstNode, work: &mut VectorizeWork) -> bool {
+    let mut budget = VECTORIZER_PREFILTER_BUDGET;
+    let result = vec_bounded_contains_multiply(body, &mut budget);
+    work.prefilter_steps = work
+        .prefilter_steps
+        .saturating_add((VECTORIZER_PREFILTER_BUDGET - budget) as u64);
+    if result.is_none() {
+        work.prefilter_exhaustions = work.prefilter_exhaustions.saturating_add(1);
+    }
+    result.unwrap_or(true)
+}
+
+const VECTORIZER_ASSIGNMENT_PREFILTER_BUDGET: usize = 16_384;
+
+/// Detect a loop-carried scalar write before speculative local unrolling. The
+/// vectorizer's expansion can only assign loop-local temporaries; an assignment
+/// to a name not declared earlier in the body is therefore a definitive reject.
+/// The scan is budgeted per loop, and exhaustion conservatively retains the
+/// candidate. Keeping declarations from exited nested scopes in `locals` can
+/// only cause a missed early rejection, never an incorrect rejection.
+fn vec_bounded_has_nonlocal_assignment(
+    node: &AstNode,
+    budget: &mut usize,
+    locals: &mut HashSet<String>,
+) -> Option<bool> {
+    if *budget == 0 {
+        return None;
+    }
+    *budget -= 1;
+
+    match node {
+        AstNode::FunctionDefinition { .. } => return Some(false),
+        AstNode::VariableDeclaration { name, .. } => {
+            locals.insert(name.clone());
+        }
+        AstNode::ForLoop { variables, .. } => {
+            locals.extend(variables.iter().cloned());
+        }
+        AstNode::Assignment { target, .. } => {
+            if let AstNode::Identifier(name, _) = target.as_ref() {
+                if !locals.contains(name) {
+                    return Some(true);
+                }
+            }
+        }
+        _ => {}
+    }
+
+    let mut found = false;
+    let mut exhausted = false;
+    for_each_child(node, &mut |child| {
+        if found {
+            return;
+        }
+        match vec_bounded_has_nonlocal_assignment(child, budget, locals) {
+            Some(true) => found = true,
+            Some(false) => {}
+            None => exhausted = true,
+        }
+    });
+    if found {
+        Some(true)
+    } else if exhausted {
+        None
+    } else {
+        Some(false)
+    }
+}
+
+fn vec_body_has_nonlocal_assignment(
+    body: &AstNode,
+    loop_var: &str,
+    work: &mut VectorizeWork,
+) -> bool {
+    let mut budget = VECTORIZER_ASSIGNMENT_PREFILTER_BUDGET;
+    let mut locals = HashSet::from([loop_var.to_string()]);
+    let result = vec_bounded_has_nonlocal_assignment(body, &mut budget, &mut locals);
+    work.assignment_prefilter_steps = work
+        .assignment_prefilter_steps
+        .saturating_add((VECTORIZER_ASSIGNMENT_PREFILTER_BUDGET - budget) as u64);
+    if result.is_none() {
+        work.assignment_prefilter_exhaustions =
+            work.assignment_prefilter_exhaustions.saturating_add(1);
+    }
+    result.unwrap_or(false)
+}
+
+fn vec_body_needs_local_flattening(body: &AstNode) -> bool {
+    let statements = match body {
+        AstNode::Block(statements) => statements.as_slice(),
+        statement => std::slice::from_ref(statement),
+    };
+    statements.iter().any(|statement| {
+        matches!(
+            statement,
+            AstNode::Block(_)
+                | AstNode::ForLoop { .. }
+                | AstNode::WhileLoop { .. }
+                | AstNode::IfExpression { .. }
+                | AstNode::TryCatch { .. }
+        )
+    })
+}
+
 fn is_int_literal_zero(node: &AstNode) -> bool {
     matches!(
         node,
@@ -2706,6 +4404,9 @@ struct VecCtx {
     acc_alias: HashMap<String, String>,
     /// loop-length variable name (`var __veclen = HI`).
     veclen: String,
+    /// Exact number of lanes, when proven by the surrounding block's shape
+    /// environment. Every generated lane list has this same width.
+    width: Option<usize>,
     /// (output accumulator name, committed value) — set by the single commit.
     commit: Option<(String, AstNode)>,
     empty_fns: HashSet<String>,
@@ -2721,7 +4422,7 @@ struct VecCtx {
 }
 
 impl VecCtx {
-    fn new(loop_var: String, loc: SourceLocation) -> Self {
+    fn new(loop_var: String, loc: SourceLocation, width: Option<usize>) -> Self {
         let mut locals = HashSet::new();
         locals.insert(loop_var.clone());
         VecCtx {
@@ -2733,10 +4434,17 @@ impl VecCtx {
             inner_accs: HashMap::new(),
             acc_alias: HashMap::new(),
             veclen: generate_named_temp_name("veclen"),
+            width,
             commit: None,
             empty_fns: HashSet::new(),
             locals,
             writes: HashSet::new(),
+        }
+    }
+
+    fn record_lane_width(&self, name: &str) {
+        if let Some(width) = self.width {
+            record_interactive_width(name, &self.loc, width);
         }
     }
 
@@ -2878,6 +4586,7 @@ impl VecCtx {
             return None;
         }
         let res = generate_named_temp_name("vlane");
+        self.record_lane_width(&res);
         self.emitted.push(self.empty_list_decl(&res));
         let body_expr = self.subst(expr);
         let append = self.append_stmt(&res, body_expr);
@@ -2890,6 +4599,7 @@ impl VecCtx {
     /// the boolean `op` (xor/and/or). Returns the result lane-list variable.
     fn emit_binmul(&mut self, op: &str, l: &str, r: &str) -> String {
         let prod = generate_named_temp_name("vprod");
+        self.record_lane_width(&prod);
         self.emitted.push(AstNode::VariableDeclaration {
             name: prod.clone(),
             type_annotation: None,
@@ -2907,6 +4617,7 @@ impl VecCtx {
             return prod;
         }
         let res = generate_named_temp_name(if op == "or" { "vor" } else { "vxor" });
+        self.record_lane_width(&res);
         self.emitted.push(self.empty_list_decl(&res));
         let li = self.index_lane(l);
         let ri = self.index_lane(r);
@@ -2930,6 +4641,7 @@ impl VecCtx {
     /// Emit a per-lane elementwise call `Share.<base>(a[I], b[I])`.
     fn emit_share_binary(&mut self, base: &str, a: &str, b: &str) -> String {
         let res = generate_named_temp_name("vlane");
+        self.record_lane_width(&res);
         self.emitted.push(self.empty_list_decl(&res));
         let call = make_share_binary_call(
             &format!("Share.{base}"),
@@ -3004,6 +4716,7 @@ impl VecCtx {
             // `not x` with a multiply inside x: vectorize x then negate per lane.
             let x = self.vec_of(operand)?;
             let res = generate_named_temp_name("vnot");
+            self.record_lane_width(&res);
             self.emitted.push(self.empty_list_decl(&res));
             let neg = AstNode::UnaryOperation {
                 op: "not".to_string(),
@@ -3030,6 +4743,7 @@ impl VecCtx {
                 "mul_scalar" if arguments.len() == 2 => {
                     let a = self.vec_of(&arguments[0])?;
                     let res = generate_named_temp_name("vlane");
+                    self.record_lane_width(&res);
                     self.emitted.push(self.empty_list_decl(&res));
                     let call = AstNode::FunctionCall {
                         function: Box::new(self.id("Share.mul_scalar")),
@@ -3231,7 +4945,16 @@ impl VecCtx {
 
 /// Attempt to vectorize a single `ForLoop`. Returns the replacement statements
 /// on success, or `None` to leave the loop unchanged.
+#[cfg(test)]
 fn try_vectorize_for(stmt: &AstNode) -> Option<Vec<AstNode>> {
+    try_vectorize_for_with_width(stmt, None, &mut VectorizeWork::default())
+}
+
+fn try_vectorize_for_with_width(
+    stmt: &AstNode,
+    width: Option<usize>,
+    work: &mut VectorizeWork,
+) -> Option<Vec<AstNode>> {
     let AstNode::ForLoop {
         variables,
         iterable,
@@ -3271,26 +4994,59 @@ fn try_vectorize_for(stmt: &AstNode) -> Option<Vec<AstNode>> {
         return None;
     }
 
+    // Most kept-rolled loops are public data movement. Reject them before
+    // cloning, locally unrolling, and constant-folding the body. The scan is
+    // exact for straight-line bodies and conservative for nested control flow,
+    // so it can only skip work that could not have produced a vectorization.
+    if !vec_body_may_contain_multiply(body, work) {
+        return None;
+    }
+    work.multiply_candidates = work.multiply_candidates.saturating_add(1);
+    if vec_body_has_nonlocal_assignment(body, &loop_var, work) {
+        work.nonlocal_assignment_rejections = work.nonlocal_assignment_rejections.saturating_add(1);
+        return None;
+    }
+
     // Locally flatten the body (unroll inner static loops + fold constant
     // branches) with a fresh budget, so a per-iteration gate DAG that the global
     // unroller left rolled (budget spent) becomes straight-line here.
-    let body_stmts: Vec<AstNode> = match body.as_ref() {
-        AstNode::Block(s) => s.clone(),
-        single => vec![single.clone()],
-    };
-    let mut fenv = LenEnv::default();
-    bind_loop_var(&mut fenv, variables, iterable);
-    let mut budget = UNROLL_BUDGET;
-    let flat = unroll_stmt_list(body_stmts, &mut fenv, &mut budget);
-    let flat = match fold_constant_branches(AstNode::Block(flat)) {
-        AstNode::Block(s) => s,
-        x => vec![x],
+    // Already-straight-line bodies are borrowed in place. This is the common
+    // case and avoids making a full speculative copy for candidates that later
+    // fail the dependence/commit proof.
+    let owned_flat: Vec<AstNode>;
+    let flat: &[AstNode] = if vec_body_needs_local_flattening(body) {
+        work.flattened_candidates = work.flattened_candidates.saturating_add(1);
+        let body_stmts: Vec<AstNode> = match body.as_ref() {
+            AstNode::Block(s) => s.clone(),
+            single => vec![single.clone()],
+        };
+        let mut fenv = LenEnv::default();
+        bind_loop_var(&mut fenv, variables, iterable);
+        let mut budget = UNROLL_BUDGET;
+        let unrolled = unroll_stmt_list(body_stmts, &mut fenv, &mut budget);
+        work.local_unroll_steps = work
+            .local_unroll_steps
+            .saturating_add((UNROLL_BUDGET - budget) as u64);
+        owned_flat = match fold_constant_branches(AstNode::Block(unrolled)) {
+            AstNode::Block(s) => s,
+            x => vec![x],
+        };
+        work.flattened_statements = work
+            .flattened_statements
+            .saturating_add(owned_flat.len() as u64);
+        &owned_flat
+    } else {
+        match body.as_ref() {
+            AstNode::Block(statements) => statements,
+            statement => std::slice::from_ref(statement),
+        }
     };
 
     // Nothing to gain (and nothing to risk) unless the body actually multiplies.
     if !flat.iter().any(vec_stmt_contains_multiply) {
         return None;
     }
+    work.post_flatten_multiply_candidates = work.post_flatten_multiply_candidates.saturating_add(1);
     // The flattened body must be straight-line: any residual loop/branch means
     // recognition cannot prove independence, so bail.
     if flat.iter().any(|s| {
@@ -3299,11 +5055,40 @@ fn try_vectorize_for(stmt: &AstNode) -> Option<Vec<AstNode>> {
             AstNode::ForLoop { .. } | AstNode::WhileLoop { .. } | AstNode::IfExpression { .. }
         )
     }) {
+        if opt_timing_enabled() {
+            let residual = flat
+                .iter()
+                .find(|s| {
+                    matches!(
+                        s,
+                        AstNode::ForLoop { .. }
+                            | AstNode::WhileLoop { .. }
+                            | AstNode::IfExpression { .. }
+                    )
+                })
+                .map(|s| match s {
+                    AstNode::ForLoop { location, .. } => format!("for@{location}"),
+                    AstNode::WhileLoop { location, .. } => format!("while@{location}"),
+                    AstNode::IfExpression { .. } => "if".to_string(),
+                    _ => unreachable!(),
+                })
+                .unwrap_or_default();
+            eprintln!(
+                "[opt-work] vectorizer residual control: candidate@{} flat_statements={} residual={residual}",
+                location,
+                flat.len(),
+            );
+        }
         return None;
     }
+    work.straight_line_candidates = work.straight_line_candidates.saturating_add(1);
 
-    let ctx = VecCtx::new(loop_var, location.clone());
-    ctx.run(&flat, hi)
+    let ctx = VecCtx::new(loop_var, location.clone(), width);
+    let replacement = ctx.run(flat, hi);
+    if replacement.is_none() {
+        work.recognition_failures = work.recognition_failures.saturating_add(1);
+    }
+    replacement
 }
 
 /// Does `node` reference identifier `name` anywhere?
@@ -3319,13 +5104,18 @@ fn opt_timing_enabled() -> bool {
     std::env::var("STOFFEL_OPT_TIMING").is_ok_and(|v| v != "0" && !v.is_empty())
 }
 
-fn timed_pass(name: &str, f: impl FnOnce() -> AstNode) -> AstNode {
+fn timed_pass(name: &str, input: AstNode, f: impl FnOnce(AstNode) -> AstNode) -> AstNode {
     if !opt_timing_enabled() {
-        return f();
+        return f(input);
     }
+    let input_nodes = program_code_size(&input);
     let start = std::time::Instant::now();
-    let out = f();
-    eprintln!("[opt-timing] {name}: {:.3}s", start.elapsed().as_secs_f64());
+    let out = f(input);
+    let elapsed = start.elapsed().as_secs_f64();
+    let output_nodes = program_code_size(&out);
+    eprintln!(
+        "[opt-timing] {name}: {elapsed:.3}s input_nodes={input_nodes} output_nodes={output_nodes}"
+    );
     out
 }
 
@@ -3343,7 +5133,7 @@ fn optimize_all_inner(node: AstNode, optimization_level: u8) -> AstNode {
     // gated to -O3. At lower levels LICM/CSE still run; they only ever *reduce* work,
     // so they are always safe.
     let node = if optimization_level >= 3 {
-        timed_pass("inline_functions", || inline_functions(node))
+        timed_pass("inline_functions", node, inline_functions)
     } else {
         node
     };
@@ -3353,7 +5143,7 @@ fn optimize_all_inner(node: AstNode, optimization_level: u8) -> AstNode {
     // register pressure (every unrolled iteration's live shares now coexist),
     // which is why it is gated to -O3.
     let node = if optimization_level >= 3 {
-        timed_pass("unroll_literal_loops", || unroll_literal_loops(node))
+        timed_pass("unroll_literal_loops", node, unroll_literal_loops)
     } else {
         node
     };
@@ -3370,7 +5160,7 @@ fn optimize_all_inner(node: AstNode, optimization_level: u8) -> AstNode {
     // scalar `xor` multiplies guarded by `if i == 0 / if i == 2`, so without this
     // every one of those secret-bool xors runs as its own unbatched round.
     let node = if optimization_level >= 3 {
-        timed_pass("fold_constant_branches", || fold_constant_branches(node))
+        timed_pass("fold_constant_branches", node, fold_constant_branches)
     } else {
         node
     };
@@ -3380,7 +5170,22 @@ fn optimize_all_inner(node: AstNode, optimization_level: u8) -> AstNode {
     // folding (so the counter increment is straight-line) and before the
     // multiply batchers (so folded gates never reach `Share.batch_mul`). -O3 only.
     let node = if optimization_level >= 3 {
-        timed_pass("fold_public_gates", || fold_public_gates(node))
+        timed_pass("fold_public_gates", node, fold_public_gates)
+    } else {
+        node
+    };
+    // Context-specialize only shape-sensitive MPC functions whose callers prove
+    // an exact list shape. This is deliberately after general unrolling: cloned
+    // bodies retain symbolic map loops, so the vectorizer below produces one
+    // compact transposed circuit per useful shape instead of N scalar copies.
+    // A LLVM-style global growth budget and per-function variant cap bound code
+    // size; unproven or unprofitable contexts keep calling the generic function.
+    let node = if optimization_level >= 3 {
+        timed_pass(
+            "specialize_mpc_call_shapes",
+            node,
+            specialize_mpc_call_shapes,
+        )
     } else {
         node
     };
@@ -3395,13 +5200,14 @@ fn optimize_all_inner(node: AstNode, optimization_level: u8) -> AstNode {
     // with a fixed number of vector statements, so code size stays O(1) in the
     // iteration count (no unroll blow-up).
     let node = if optimization_level >= 3 {
-        timed_pass("vectorize_map_loops", || vectorize_map_loops(node))
+        timed_pass("vectorize_map_loops", node, vectorize_map_loops)
     } else {
         node
     };
-    let node = timed_pass("inline_multiply_wrappers", || {
-        inline_multiply_wrappers(node)
-    });
+    if optimization_level >= 3 {
+        record_specialized_batch_widths(&node);
+    }
+    let node = timed_pass("inline_multiply_wrappers", node, inline_multiply_wrappers);
     // Round-minimizing interactive scheduler (-O3): model singular multiplies
     // and reveals as distinct protocol nodes in one dependency DAG, then make
     // every dependency-ready group consecutive. The lowering passes collapse
@@ -3409,31 +5215,34 @@ fn optimize_all_inner(node: AstNode, optimization_level: u8) -> AstNode {
     // register pressure (a whole round's shares are live at once) for fewer
     // communication rounds, so it is gated to -O3 alongside inlining/unrolling.
     let node = if optimization_level >= 3 {
-        timed_pass("schedule_for_batching", || schedule_for_batching(node))
+        timed_pass("schedule_for_batching", node, schedule_for_batching)
     } else {
         node
     };
-    let node = timed_pass("optimize_multiplies", || optimize_multiplies(node));
+    let node = timed_pass("optimize_multiplies", node, optimize_multiplies);
     // Batching materializes accumulator setup and result-slice statements around
-    // every fused call. Those new statements can expose another legal merge that
-    // did not exist in the input graph (most commonly independently vectorized
-    // regions at the same MPC depth). Rebuild the dependency DAG on each newly
-    // materialized form until it is structurally stable. The cap is a defensive
-    // compiler-time bound; in practice the corpus converges in one extra round.
+    // every fused call. Re-run fusion (without replacing the scheduler's chosen
+    // order) until this normalization is structurally stable. The cap is a
+    // defensive compiler-time bound; mixed scalar/vector groups now normally
+    // settle in the first pass.
     let node = if optimization_level >= 3 {
-        timed_pass("batching_fixpoint", || {
-            optimize_multiply_batches_to_fixpoint(node)
-        })
+        timed_pass(
+            "batching_fixpoint",
+            node,
+            optimize_multiply_batches_to_fixpoint,
+        )
     } else {
         node
     };
-    let node = timed_pass("reorder_for_reveal_batching", || {
-        reorder_for_reveal_batching(node)
-    });
+    let node = timed_pass(
+        "reorder_for_reveal_batching",
+        node,
+        reorder_for_reveal_batching,
+    );
     // Reordering can make formerly interleaved explicit opens consecutive.
     // Materialize those newly exposed groups as native batch opens now; the
     // earlier reveal pass could not see across their clear consumers.
-    let node = timed_pass("optimize_reveals_after_reorder", || optimize_reveals(node));
+    let node = timed_pass("optimize_reveals_after_reorder", node, optimize_reveals);
     // SROA / scalarization (-O3): after the batchers settled the block shape,
     // replace constant-index reads of locally-built lists with direct element
     // references and delete the corresponding build calls, rematerializing a
@@ -3443,18 +5252,18 @@ fn optimize_all_inner(node: AstNode, optimization_level: u8) -> AstNode {
     // the emptied builds are swept. -O3 only: below -O3 loops stay rolled, so
     // indices are rarely constant and the pass would only add walk time.
     let node = if optimization_level >= 3 {
-        timed_pass("scalarize_local_arrays", || scalarize_local_arrays(node))
+        timed_pass("scalarize_local_arrays", node, scalarize_local_arrays)
     } else {
         node
     };
-    let node = timed_pass("optimize_licm_cse", || optimize_licm_cse(node));
-    let node = timed_pass("optimize_gvn", || optimize_gvn(node));
+    let node = timed_pass("optimize_licm_cse", node, optimize_licm_cse);
+    let node = timed_pass("optimize_gvn", node, optimize_gvn);
     // Finally, drop bindings whose value is never used (a pure dead store). This
     // sweeps up the intermediate temporaries that inlining, unrolling, and the
     // batchers leave behind — reducing live values (register pressure / spills)
     // and, when a dead binding's initializer was itself an MPC multiply, even
     // eliminating wasted preprocessing.
-    timed_pass("eliminate_dead_bindings", || eliminate_dead_bindings(node))
+    timed_pass("eliminate_dead_bindings", node, eliminate_dead_bindings)
 }
 
 // ===========================================================================
@@ -3524,10 +5333,8 @@ fn value_is_multiply(value: &AstNode) -> bool {
     match value {
         AstNode::BinaryOperation { op, .. } => matches!(op.as_str(), "and" | "or" | "xor"),
         AstNode::FunctionCall { .. } => {
-            let name_is_multiply = matches!(
-                call_name(value).map(builtin_base_name),
-                Some("mul") | Some("batch_mul")
-            );
+            let name_is_multiply = call_resolves_to_vm_symbol(value, "Share.mul")
+                || call_resolves_to_vm_symbol(value, "Share.batch_mul");
             // Use `contains_secret` so a batched multiply yielding a
             // `list[secret bool]` (not a scalar secret) still counts as a round.
             match node_resolved_contains_secret(value) {
@@ -3555,6 +5362,53 @@ fn interactive_kind(value: &AstNode) -> Option<InteractiveKind> {
         Some(InteractiveKind::Reveal)
     } else {
         None
+    }
+}
+
+/// Statement initializer/value for interactive work accounting.
+fn scheduled_statement_value(stmt: &AstNode) -> Option<&AstNode> {
+    match stmt {
+        AstNode::VariableDeclaration {
+            value: Some(value), ..
+        }
+        | AstNode::Assignment { value, .. } => Some(value),
+        AstNode::DiscardStatement { expression, .. } => Some(expression),
+        AstNode::FunctionCall { .. } => Some(stmt),
+        _ => None,
+    }
+}
+
+/// Exact scalar work of a singular/batched interactive statement. Unknown
+/// batch widths stay unknown; capacity-aware scheduling then isolates them
+/// instead of pretending they fit beside known work.
+fn scheduled_interactive_work(stmt: &AstNode, kind: Option<InteractiveKind>) -> Option<usize> {
+    match kind? {
+        InteractiveKind::Reveal => Some(1),
+        InteractiveKind::Multiply => {
+            let value = scheduled_statement_value(stmt)?;
+            let Some((left, right)) = batch_mul_call_operands(value) else {
+                return Some(1);
+            };
+            let target = match stmt {
+                AstNode::VariableDeclaration { name, location, .. } => {
+                    Some((name.as_str(), location))
+                }
+                AstNode::Assignment {
+                    target, location, ..
+                } => match target.as_ref() {
+                    AstNode::Identifier(name, _) => Some((name.as_str(), location)),
+                    _ => None,
+                },
+                _ => None,
+            };
+            target
+                .and_then(|(name, location)| interactive_width(name, location))
+                .or_else(|| {
+                    let left = exact_batch_operand_width(left)?;
+                    let right = exact_batch_operand_width(right)?;
+                    (left == right).then_some(left)
+                })
+        }
     }
 }
 
@@ -4105,10 +5959,28 @@ fn update_sched_env(
 /// Recurse into nested scopes, then reorder each block's statement list.
 pub fn schedule_for_batching(node: AstNode) -> AstNode {
     let pure_fns = compute_pure_functions(&node);
-    schedule_in_node(node, &pure_fns)
+    let mut fusion_stats = LoopFusionStats::default();
+    let out = schedule_in_node(node, &pure_fns, &mut fusion_stats);
+    if opt_timing_enabled() {
+        eprintln!(
+            "[opt-work] loop_fusion: candidate_probes={} fusions={}",
+            fusion_stats.candidate_probes, fusion_stats.fusions,
+        );
+    }
+    out
 }
 
-fn schedule_in_node(node: AstNode, pure_fns: &HashSet<String>) -> AstNode {
+#[derive(Debug, Default)]
+struct LoopFusionStats {
+    candidate_probes: u64,
+    fusions: u64,
+}
+
+fn schedule_in_node(
+    node: AstNode,
+    pure_fns: &HashSet<String>,
+    fusion_stats: &mut LoopFusionStats,
+) -> AstNode {
     match node {
         AstNode::Block(stmts) => {
             // Flatten statement-position nested blocks (which inlining introduces
@@ -4119,10 +5991,14 @@ fn schedule_in_node(node: AstNode, pure_fns: &HashSet<String>) -> AstNode {
             let stmts = flatten_statement_blocks(stmts);
             let stmts: Vec<AstNode> = stmts
                 .into_iter()
-                .map(|s| schedule_in_node(s, pure_fns))
+                .map(|s| schedule_in_node(s, pure_fns, fusion_stats))
                 .collect();
             let scheduled = schedule_statement_list(stmts, pure_fns);
-            AstNode::Block(fuse_independent_loops(scheduled, pure_fns))
+            AstNode::Block(fuse_independent_loops_with_stats(
+                scheduled,
+                pure_fns,
+                fusion_stats,
+            ))
         }
         AstNode::FunctionDefinition {
             name,
@@ -4139,7 +6015,7 @@ fn schedule_in_node(node: AstNode, pure_fns: &HashSet<String>) -> AstNode {
             type_params,
             parameters,
             return_type,
-            body: Box::new(schedule_in_node(*body, pure_fns)),
+            body: Box::new(schedule_in_node(*body, pure_fns, fusion_stats)),
             is_secret,
             pragmas,
             location,
@@ -4151,7 +6027,7 @@ fn schedule_in_node(node: AstNode, pure_fns: &HashSet<String>) -> AstNode {
             location,
         } => AstNode::WhileLoop {
             condition,
-            body: Box::new(schedule_in_node(*body, pure_fns)),
+            body: Box::new(schedule_in_node(*body, pure_fns, fusion_stats)),
             location,
         },
         AstNode::ForLoop {
@@ -4162,7 +6038,7 @@ fn schedule_in_node(node: AstNode, pure_fns: &HashSet<String>) -> AstNode {
         } => AstNode::ForLoop {
             variables,
             iterable,
-            body: Box::new(schedule_in_node(*body, pure_fns)),
+            body: Box::new(schedule_in_node(*body, pure_fns, fusion_stats)),
             location,
         },
         AstNode::IfExpression {
@@ -4171,8 +6047,9 @@ fn schedule_in_node(node: AstNode, pure_fns: &HashSet<String>) -> AstNode {
             else_branch,
         } => AstNode::IfExpression {
             condition,
-            then_branch: Box::new(schedule_in_node(*then_branch, pure_fns)),
-            else_branch: else_branch.map(|e| Box::new(schedule_in_node(*e, pure_fns))),
+            then_branch: Box::new(schedule_in_node(*then_branch, pure_fns, fusion_stats)),
+            else_branch: else_branch
+                .map(|e| Box::new(schedule_in_node(*e, pure_fns, fusion_stats))),
         },
         AstNode::TryCatch {
             try_block,
@@ -4180,15 +6057,16 @@ fn schedule_in_node(node: AstNode, pure_fns: &HashSet<String>) -> AstNode {
             finally_block,
             location,
         } => AstNode::TryCatch {
-            try_block: Box::new(schedule_in_node(*try_block, pure_fns)),
+            try_block: Box::new(schedule_in_node(*try_block, pure_fns, fusion_stats)),
             catch_clauses: catch_clauses
                 .into_iter()
                 .map(|c| crate::ast::CatchClause {
-                    body: Box::new(schedule_in_node(*c.body, pure_fns)),
+                    body: Box::new(schedule_in_node(*c.body, pure_fns, fusion_stats)),
                     ..c
                 })
                 .collect(),
-            finally_block: finally_block.map(|b| Box::new(schedule_in_node(*b, pure_fns))),
+            finally_block: finally_block
+                .map(|b| Box::new(schedule_in_node(*b, pure_fns, fusion_stats))),
             location,
         },
         other => other,
@@ -4214,21 +6092,20 @@ fn flatten_statement_blocks(stmts: Vec<AstNode>) -> Vec<AstNode> {
 /// and intervening statements admit a dependence-preserving partition around
 /// the fused loop. This preserves code size while exposing same-iteration
 /// interactive operations to batching.
+#[cfg(test)]
 fn fuse_independent_loops(statements: Vec<AstNode>, pure_fns: &HashSet<String>) -> Vec<AstNode> {
+    fuse_independent_loops_with_stats(statements, pure_fns, &mut LoopFusionStats::default())
+}
+
+fn fuse_independent_loops_with_stats(
+    statements: Vec<AstNode>,
+    pure_fns: &HashSet<String>,
+    fusion_stats: &mut LoopFusionStats,
+) -> Vec<AstNode> {
     fn conflicts(writes: &HashSet<String>, observed: &HashSet<String>) -> bool {
         writes
             .iter()
             .any(|write| observed.iter().any(|key| keys_conflict(write, key)))
-    }
-
-    fn independent(first: &AstNode, second: &AstNode) -> bool {
-        let (first_reads, first_writes) = statement_reads_and_writes(first);
-        let (second_reads, second_writes) = statement_reads_and_writes(second);
-        let mut first_observed = first_reads;
-        first_observed.extend(first_writes.iter().cloned());
-        let mut second_observed = second_reads;
-        second_observed.extend(second_writes.iter().cloned());
-        !conflicts(&first_writes, &second_observed) && !conflicts(&second_writes, &first_observed)
     }
 
     fn footprints_independent(
@@ -4237,14 +6114,22 @@ fn fuse_independent_loops(statements: Vec<AstNode>, pure_fns: &HashSet<String>) 
         second_reads: &HashSet<String>,
         second_writes: &HashSet<String>,
     ) -> bool {
-        let mut first_observed = first_reads.clone();
-        first_observed.extend(first_writes.iter().cloned());
-        let mut second_observed = second_reads.clone();
-        second_observed.extend(second_writes.iter().cloned());
-        !conflicts(first_writes, &second_observed) && !conflicts(second_writes, &first_observed)
+        !conflicts(first_writes, second_reads)
+            && !conflicts(first_writes, second_writes)
+            && !conflicts(second_writes, first_reads)
+            && !conflicts(second_writes, first_writes)
     }
 
-    fn fuse(first: &AstNode, second: &AstNode, pure_fns: &HashSet<String>) -> Option<AstNode> {
+    #[allow(clippy::too_many_arguments)]
+    fn fuse(
+        first: &AstNode,
+        second: &AstNode,
+        first_reads: &HashSet<String>,
+        first_writes: &HashSet<String>,
+        second_reads: &HashSet<String>,
+        second_writes: &HashSet<String>,
+        pure_fns: &HashSet<String>,
+    ) -> Option<AstNode> {
         let (
             AstNode::ForLoop {
                 variables: first_vars,
@@ -4267,7 +6152,7 @@ fn fuse_independent_loops(statements: Vec<AstNode>, pure_fns: &HashSet<String>) 
             || first_iter != second_iter
             || !loop_body_is_schedulable(first_body, pure_fns)
             || !loop_body_is_schedulable(second_body, pure_fns)
-            || !independent(first, second)
+            || !footprints_independent(first_reads, first_writes, second_reads, second_writes)
         {
             return None;
         }
@@ -4305,11 +6190,44 @@ fn fuse_independent_loops(statements: Vec<AstNode>, pure_fns: &HashSet<String>) 
     }
 
     let mut out: Vec<AstNode> = Vec::with_capacity(statements.len());
+    let mut out_footprints: Vec<(HashSet<String>, HashSet<String>)> =
+        Vec::with_capacity(statements.len());
     for statement in statements {
+        let statement_footprint = statement_reads_and_writes(&statement);
         let mut replacement = None;
         if matches!(statement, AstNode::ForLoop { .. }) {
             for position in (0..out.len()).rev() {
-                let Some(fused) = fuse(&out[position], &statement, pure_fns) else {
+                fusion_stats.candidate_probes = fusion_stats.candidate_probes.saturating_add(1);
+
+                // Iterable equality is the cheapest necessary condition. Avoid
+                // charging/walking large loop bodies for the overwhelmingly
+                // common mismatched-range candidates.
+                let same_iterable = matches!(
+                    (&out[position], &statement),
+                    (
+                        AstNode::ForLoop {
+                            iterable: first, ..
+                        },
+                        AstNode::ForLoop {
+                            iterable: second, ..
+                        }
+                    ) if first == second
+                );
+                if !same_iterable {
+                    continue;
+                }
+
+                let (first_reads, first_writes) = &out_footprints[position];
+                let (second_reads, second_writes) = &statement_footprint;
+                let Some(fused) = fuse(
+                    &out[position],
+                    &statement,
+                    first_reads,
+                    first_writes,
+                    second_reads,
+                    second_writes,
+                    pure_fns,
+                ) else {
                     continue;
                 };
                 let middle = &out[position + 1..];
@@ -4323,46 +6241,61 @@ fn fuse_independent_loops(statements: Vec<AstNode>, pure_fns: &HashSet<String>) 
                 // Compute the transitive A-dependent suffix partition in one
                 // forward pass. Once a statement observes A or any prior member
                 // of the suffix, it too must remain after the fused loop.
-                let (first_reads, first_writes) = statement_reads_and_writes(&out[position]);
                 let mut after_reads = HashSet::new();
                 let mut after_writes = HashSet::new();
                 let mut before = Vec::new();
+                let mut before_footprints = Vec::new();
                 let mut after = Vec::new();
-                for node in middle {
-                    let (reads, writes) = statement_reads_and_writes(node);
+                let mut after_footprints = Vec::new();
+                for (node, (reads, writes)) in
+                    middle.iter().zip(out_footprints[position + 1..].iter())
+                {
                     let depends_on_first =
-                        !footprints_independent(&first_reads, &first_writes, &reads, &writes);
+                        !footprints_independent(first_reads, first_writes, reads, writes);
                     let depends_on_suffix =
                         !footprints_independent(&after_reads, &after_writes, &reads, &writes);
                     if depends_on_first || depends_on_suffix {
-                        after_reads.extend(reads);
-                        after_writes.extend(writes);
+                        after_reads.extend(reads.iter().cloned());
+                        after_writes.extend(writes.iter().cloned());
                         after.push(node.clone());
+                        after_footprints.push((reads.clone(), writes.clone()));
                     } else {
                         before.push(node.clone());
+                        before_footprints.push((reads.clone(), writes.clone()));
                     }
                 }
 
-                let (second_reads, second_writes) = statement_reads_and_writes(&statement);
-                if !footprints_independent(
-                    &after_reads,
-                    &after_writes,
-                    &second_reads,
-                    &second_writes,
-                ) {
+                if !footprints_independent(&after_reads, &after_writes, second_reads, second_writes)
+                {
                     continue;
                 }
-                replacement = Some((position, before, fused, after));
+                replacement = Some((
+                    position,
+                    before,
+                    before_footprints,
+                    fused,
+                    after,
+                    after_footprints,
+                ));
+                fusion_stats.fusions = fusion_stats.fusions.saturating_add(1);
                 break;
             }
         }
-        if let Some((position, before, fused, after)) = replacement {
+        if let Some((position, before, before_footprints, fused, after, after_footprints)) =
+            replacement
+        {
             out.truncate(position);
+            out_footprints.truncate(position);
             out.extend(before);
+            out_footprints.extend(before_footprints);
+            let fused_footprint = statement_reads_and_writes(&fused);
             out.push(fused);
+            out_footprints.push(fused_footprint);
             out.extend(after);
+            out_footprints.extend(after_footprints);
         } else {
             out.push(statement);
+            out_footprints.push(statement_footprint);
         }
     }
     out
@@ -4421,21 +6354,48 @@ fn schedule_run(stmts: Vec<AstNode>) -> Vec<AstNode> {
             info
         })
         .collect();
+    let interactive_work: Vec<Option<usize>> = stmts
+        .iter()
+        .zip(&infos)
+        .map(|(stmt, info)| scheduled_interactive_work(stmt, info.interactive))
+        .collect();
+    let multiply_capacity = multiply_batch_capacity();
 
     // Intern the catch-all up front so the relevance pass can identify it
     // (no-op for the DAG: nothing reads or writes a key merely by interning).
     let global_key = interner.global();
     let key_bound = interner.key_bound();
     let order = if sched_cone_ab_check() {
-        let full = build_schedule_order(&infos, key_bound, global_key, false);
-        let pruned = build_schedule_order(&infos, key_bound, global_key, true);
+        let full = build_schedule_order(
+            &infos,
+            &interactive_work,
+            key_bound,
+            global_key,
+            false,
+            multiply_capacity,
+        );
+        let pruned = build_schedule_order(
+            &infos,
+            &interactive_work,
+            key_bound,
+            global_key,
+            true,
+            multiply_capacity,
+        );
         assert_eq!(
             full, pruned,
             "cone-pruned schedule diverged from the full-cone schedule"
         );
         pruned
     } else {
-        build_schedule_order(&infos, key_bound, global_key, sched_cone_prune_enabled())
+        build_schedule_order(
+            &infos,
+            &interactive_work,
+            key_bound,
+            global_key,
+            sched_cone_prune_enabled(),
+            multiply_capacity,
+        )
     };
 
     let Some(order) = order else {
@@ -4536,11 +6496,14 @@ fn pruned_cone(
 /// term in `schedule_for_batching`.
 fn build_schedule_order(
     infos: &[SchedInfo],
+    interactive_work: &[Option<usize>],
     key_bound: usize,
     global_key: u32,
     prune: bool,
+    multiply_capacity: Option<usize>,
 ) -> Option<Vec<usize>> {
     let n = infos.len();
+    debug_assert_eq!(interactive_work.len(), n);
     // Build the dependency DAG (deduplicated successor sets).
     let mut succ: Vec<HashSet<usize>> = vec![HashSet::new(); n];
     let mut indeg: Vec<usize> = vec![0usize; n];
@@ -4655,23 +6618,64 @@ fn build_schedule_order(
         }
     }
 
-    // List-schedule: drain ready local work, then fire all currently-ready
-    // operations of one interactive protocol kind. Multiply and reveal nodes
-    // never share a batch, but each kind automatically coalesces its independent
-    // scalar operations. Ready buckets are min-heaps on source index for stable,
-    // deterministic output.
+    // Bottom-level priority (the number of interactive rounds on the longest
+    // remaining path). This is the standard critical-path list-scheduling
+    // priority: capacity is spent first on work whose delay can lengthen the
+    // program, with source index as the deterministic tie-breaker.
+    let multiply_round_cost = |i: usize| match (multiply_capacity, interactive_work[i]) {
+        (Some(capacity), Some(work)) => work.div_ceil(capacity.max(1)).max(1),
+        _ => 1,
+    };
+    let mut bottom_level = vec![0usize; n];
+    for i in (0..n).rev() {
+        let tail = succ[i].iter().map(|&s| bottom_level[s]).max().unwrap_or(0);
+        let own = match infos[i].interactive {
+            Some(InteractiveKind::Multiply) => multiply_round_cost(i),
+            Some(InteractiveKind::Reveal) => 1,
+            None => 0,
+        };
+        bottom_level[i] = own.saturating_add(tail);
+    }
+
+    // List-schedule: exhaust ready local work, then fire one legal protocol
+    // round. Multiply rounds are capacity-bounded; reveal rounds have no
+    // compiler-visible width ceiling. Unknown multiply widths are isolated so
+    // the scheduler never obtains a false one-round proof from guessed work.
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
     let mut ready_free: BinaryHeap<Reverse<usize>> = BinaryHeap::new();
-    let mut ready_mult: BinaryHeap<Reverse<usize>> = BinaryHeap::new();
-    let mut ready_reveal: BinaryHeap<Reverse<usize>> = BinaryHeap::new();
+    let mut ready_mult: BinaryHeap<(usize, Reverse<usize>)> = BinaryHeap::new();
+    let mut ready_reveal: BinaryHeap<(usize, Reverse<usize>)> = BinaryHeap::new();
+
+    fn push_ready(
+        i: usize,
+        infos: &[SchedInfo],
+        bottom_level: &[usize],
+        ready_free: &mut BinaryHeap<Reverse<usize>>,
+        ready_mult: &mut BinaryHeap<(usize, Reverse<usize>)>,
+        ready_reveal: &mut BinaryHeap<(usize, Reverse<usize>)>,
+    ) {
+        match infos[i].interactive {
+            Some(InteractiveKind::Multiply) => {
+                ready_mult.push((bottom_level[i], Reverse(i)));
+            }
+            Some(InteractiveKind::Reveal) => {
+                ready_reveal.push((bottom_level[i], Reverse(i)));
+            }
+            None => ready_free.push(Reverse(i)),
+        }
+    }
+
     for i in 0..n {
         if indeg[i] == 0 {
-            match infos[i].interactive {
-                Some(InteractiveKind::Multiply) => ready_mult.push(Reverse(i)),
-                Some(InteractiveKind::Reveal) => ready_reveal.push(Reverse(i)),
-                None => ready_free.push(Reverse(i)),
-            }
+            push_ready(
+                i,
+                infos,
+                &bottom_level,
+                &mut ready_free,
+                &mut ready_mult,
+                &mut ready_reveal,
+            );
         }
     }
 
@@ -4682,19 +6686,45 @@ fn build_schedule_order(
             // Emit one ready free statement.
             vec![ready_free.pop().map(|Reverse(i)| i).unwrap()]
         } else if !ready_mult.is_empty() {
-            // If both protocols are ready, preserve the source order of their
-            // earliest node. The chosen kind then fires as one batch.
+            // Pick the protocol whose most-critical ready operation comes
+            // first. Equal criticality preserves source order.
             let reveal_first = matches!(
                 (ready_reveal.peek(), ready_mult.peek()),
-                (Some(Reverse(reveal)), Some(Reverse(mul))) if reveal < mul
+                (Some((rh, Reverse(reveal))), Some((mh, Reverse(mul))))
+                    if rh > mh || (rh == mh && reveal < mul)
             );
             if reveal_first {
-                std::iter::from_fn(|| ready_reveal.pop().map(|Reverse(i)| i)).collect()
+                std::iter::from_fn(|| ready_reveal.pop().map(|(_, Reverse(i))| i)).collect()
             } else {
-                std::iter::from_fn(|| ready_mult.pop().map(|Reverse(i)| i)).collect()
+                let (_, Reverse(first)) = ready_mult.pop().expect("multiply ready");
+                let mut selected = vec![first];
+                if let (Some(capacity), Some(first_work)) =
+                    (multiply_capacity, interactive_work[first])
+                {
+                    let capacity = capacity.max(1);
+                    if first_work <= capacity {
+                        let mut remaining = capacity - first_work;
+                        let mut deferred = Vec::new();
+                        while let Some(entry @ (_, Reverse(i))) = ready_mult.pop() {
+                            match interactive_work[i] {
+                                Some(work) if work <= remaining => {
+                                    selected.push(i);
+                                    remaining -= work;
+                                }
+                                _ => deferred.push(entry),
+                            }
+                        }
+                        ready_mult.extend(deferred);
+                    }
+                } else if multiply_capacity.is_none() {
+                    selected.extend(std::iter::from_fn(|| {
+                        ready_mult.pop().map(|(_, Reverse(i))| i)
+                    }));
+                }
+                selected
             }
         } else if !ready_reveal.is_empty() {
-            std::iter::from_fn(|| ready_reveal.pop().map(|Reverse(i)| i)).collect()
+            std::iter::from_fn(|| ready_reveal.pop().map(|(_, Reverse(i))| i)).collect()
         } else {
             break; // cycle (unexpected) — fall back below.
         };
@@ -4703,11 +6733,14 @@ fn build_schedule_order(
             for &s in &succ[i] {
                 indeg[s] -= 1;
                 if indeg[s] == 0 {
-                    match infos[s].interactive {
-                        Some(InteractiveKind::Multiply) => ready_mult.push(Reverse(s)),
-                        Some(InteractiveKind::Reveal) => ready_reveal.push(Reverse(s)),
-                        None => ready_free.push(Reverse(s)),
-                    }
+                    push_ready(
+                        s,
+                        infos,
+                        &bottom_level,
+                        &mut ready_free,
+                        &mut ready_mult,
+                        &mut ready_reveal,
+                    );
                 }
             }
         }
@@ -5873,6 +7906,11 @@ fn function_is_inlinable(params: &[crate::ast::Parameter], body: &AstNode) -> bo
 /// Entry point: inline non-recursive, single-return functions to a fixpoint
 /// (bounded by `INLINE_BUDGET`), so that nested calls are also inlined.
 pub fn inline_functions(node: AstNode) -> AstNode {
+    inline_functions_with_round_limit(node, 12)
+}
+
+/// A bounded number of whole-program inlining waves.
+fn inline_functions_with_round_limit(node: AstNode, round_limit: usize) -> AstNode {
     // Multi-return normalization+inlining is an aggressive transform: it enlarges
     // the functions it touches, which (stacked on the existing -O3 inline+unroll)
     // can push the post-inline program past the unroll budget into a partially
@@ -5888,7 +7926,7 @@ pub fn inline_functions(node: AstNode) -> AstNode {
     }
     let mut node = node;
     let mut budget = active_budgets().inline.unwrap_or(INLINE_BUDGET);
-    for _ in 0..12 {
+    for _ in 0..round_limit {
         let before = budget;
         node = inline_in_node(node, &infos, &mut budget);
         if budget == before {
@@ -5980,7 +8018,7 @@ fn unroll_max_expansion() -> usize {
 // ---------------------------------------------------------------------------
 
 /// Statically known list shape: a length and its recursive element shape.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 enum Shape {
     List { len: usize, elem: Box<Shape> },
     Unknown,
@@ -6436,6 +8474,46 @@ fn apply_statement_to_env(stmt: &AstNode, env: &mut LenEnv) {
         }
         AstNode::DiscardStatement { expression, .. } => apply_call_to_env(expression, env),
         other => apply_call_to_env(other, env),
+    }
+}
+
+/// Persist the exact width of a real (non-speculative) `Share.batch_mul`
+/// binding after the shape environment has executed that statement. The shape
+/// interpreter is also used speculatively by profitability proofs, so metadata
+/// recording is intentionally kept at actual pass traversal sites rather than
+/// inside `apply_statement_to_env` itself.
+fn record_batch_result_width_from_env(stmt: &AstNode, env: &LenEnv) {
+    let (target, location, value) = match stmt {
+        AstNode::VariableDeclaration {
+            name,
+            value: Some(value),
+            location,
+            ..
+        } => (Some(name.as_str()), location, value.as_ref()),
+        AstNode::Assignment {
+            target,
+            value,
+            location,
+        } => (
+            match target.as_ref() {
+                AstNode::Identifier(name, _) => Some(name.as_str()),
+                _ => None,
+            },
+            location,
+            value.as_ref(),
+        ),
+        _ => return,
+    };
+    if batch_mul_call_operands(value).is_none() {
+        return;
+    }
+    if let Some((target, width)) = target.and_then(|target| {
+        env.shapes
+            .get(target)
+            .and_then(Shape::count)
+            .map(|width| (target, width))
+    }) {
+        record_interactive_width(target, location, width);
     }
 }
 
@@ -7109,6 +9187,113 @@ enum ConstVal {
 
 type GateEnv = std::collections::HashMap<String, ConstVal>;
 
+/// A cloned, bounded view of a user function that may participate in exact
+/// public-value evaluation. Only functions independently proven pure are added
+/// to this table; evaluation still fails closed on any unsupported construct.
+#[derive(Clone)]
+struct GateFunction {
+    parameters: Vec<String>,
+    body: AstNode,
+}
+
+#[derive(Default)]
+struct GateContext {
+    functions: HashMap<String, GateFunction>,
+    pure_functions: HashSet<String>,
+}
+
+impl GateContext {
+    fn for_program(root: &AstNode) -> Self {
+        let pure_functions = compute_pure_functions(root);
+        let mut called = HashSet::new();
+        fn collect_program_calls(node: &AstNode, out: &mut HashSet<String>) {
+            if let Some(name) = call_name(node) {
+                out.insert(name.to_string());
+            }
+            match node {
+                AstNode::FunctionDefinition { body, .. } => collect_program_calls(body, out),
+                AstNode::Block(statements) => {
+                    for statement in statements {
+                        collect_program_calls(statement, out);
+                    }
+                }
+                _ => for_each_child(node, &mut |child| collect_program_calls(child, out)),
+            }
+        }
+        collect_program_calls(root, &mut called);
+        let mut functions = HashMap::new();
+
+        fn gather(
+            node: &AstNode,
+            called: &HashSet<String>,
+            pure: &HashSet<String>,
+            out: &mut HashMap<String, GateFunction>,
+        ) {
+            match node {
+                AstNode::FunctionDefinition {
+                    name: Some(name),
+                    parameters,
+                    body,
+                    ..
+                } => {
+                    // Uncalled entry points and fully-inlined dead helpers can be
+                    // enormous. They cannot affect a call expression, so avoid
+                    // cloning them into the evaluator's compact call table.
+                    if called.contains(name) && pure.contains(name) {
+                        out.insert(
+                            name.clone(),
+                            GateFunction {
+                                parameters: parameters
+                                    .iter()
+                                    .map(|parameter| parameter.name.clone())
+                                    .collect(),
+                                body: body.as_ref().clone(),
+                            },
+                        );
+                    }
+                    gather(body, called, pure, out);
+                }
+                AstNode::Block(statements) => {
+                    for statement in statements {
+                        gather(statement, called, pure, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        gather(root, &called, &pure_functions, &mut functions);
+        Self {
+            functions,
+            pure_functions,
+        }
+    }
+}
+
+thread_local! {
+    /// Scoped exactly to one `fold_public_gates` invocation. `Rc` makes reads
+    /// cheap and releases the `RefCell` borrow before recursive evaluation.
+    static ACTIVE_GATE_CONTEXT: RefCell<Option<Rc<GateContext>>> = const {
+        RefCell::new(None)
+    };
+}
+
+fn active_gate_context() -> Option<Rc<GateContext>> {
+    ACTIVE_GATE_CONTEXT.with(|context| context.borrow().clone())
+}
+
+fn gate_expr_is_pure(node: &AstNode) -> bool {
+    // The public-loop simulator is also exercised directly by unit tests and
+    // may be reused by callers outside the top-level folding driver. Builtin
+    // purity does not require a program context; only user-function purity
+    // does. Falling back to the empty proven-user-function set therefore keeps
+    // the standalone path useful without trusting an unknown call.
+    active_gate_context().map_or_else(
+        || expr_is_pure(node, &HashSet::new()),
+        |context| expr_is_pure(node, &context.pure_functions),
+    )
+}
+
 fn gate_value_is_concrete(value: &ConstVal) -> bool {
     match value {
         ConstVal::Int(_) | ConstVal::Bit { .. } => true,
@@ -7229,27 +9414,21 @@ fn gate_simulate_public_node(node: &AstNode, env: &mut GateEnv, fuel: &mut usize
             let AstNode::FunctionCall { arguments, .. } = expression else {
                 return false;
             };
-            if !arguments
-                .iter()
-                .all(|argument| expr_is_pure(argument, &HashSet::new()))
-            {
+            if !arguments.iter().all(gate_expr_is_pure) {
                 return false;
             }
             let _ = gate_process_stmt(node.clone(), env);
             true
         }
         AstNode::VariableDeclaration { value, .. } => {
-            if !value
-                .as_deref()
-                .is_none_or(|value| expr_is_pure(value, &HashSet::new()))
-            {
+            if !value.as_deref().is_none_or(gate_expr_is_pure) {
                 return false;
             }
             let _ = gate_process_stmt(node.clone(), env);
             true
         }
         AstNode::Assignment { target, value, .. } => {
-            if !expr_is_pure(target, &HashSet::new()) || !expr_is_pure(value, &HashSet::new()) {
+            if !gate_expr_is_pure(target) || !gate_expr_is_pure(value) {
                 return false;
             }
             let _ = gate_process_stmt(node.clone(), env);
@@ -7286,12 +9465,13 @@ fn try_partial_evaluate_public_for(
         .filter(|name| name != variable && !locals.contains(name))
         .collect();
     outer.sort();
-    if outer.is_empty()
-        || outer.iter().any(|name| {
-            env.get(name)
-                .is_none_or(|value| !gate_value_is_concrete(value))
-        })
-    {
+    if outer.is_empty() {
+        return None;
+    }
+    if outer.iter().any(|name| {
+        env.get(name)
+            .is_none_or(|value| !gate_value_is_concrete(value))
+    }) {
         return None;
     }
     let initial: HashMap<String, ConstVal> = outer
@@ -7376,8 +9556,18 @@ fn annotation_contains_secret_type(annotation: Option<&AstNode>) -> bool {
 
 /// Fold provably-public boolean gates throughout the program. Entry point.
 pub fn fold_public_gates(node: AstNode) -> AstNode {
+    let context = Rc::new(GateContext::for_program(&node));
+    let previous = ACTIVE_GATE_CONTEXT.with(|active| active.replace(Some(context)));
+    let result = fold_public_gates_inner(node);
+    ACTIVE_GATE_CONTEXT.with(|active| active.replace(previous));
+    result
+}
+
+fn fold_public_gates_inner(node: AstNode) -> AstNode {
     match node {
-        AstNode::Block(stmts) => AstNode::Block(stmts.into_iter().map(fold_public_gates).collect()),
+        AstNode::Block(stmts) => {
+            AstNode::Block(stmts.into_iter().map(fold_public_gates_inner).collect())
+        }
         AstNode::FunctionDefinition {
             name,
             type_params,
@@ -7424,7 +9614,7 @@ fn gate_process_node(node: AstNode, env: &mut GateEnv) -> AstNode {
     match node {
         AstNode::Block(stmts) => AstNode::Block(gate_process_stmts(stmts, env)),
         // A nested function definition (closure) starts a fresh scope.
-        def @ AstNode::FunctionDefinition { .. } => fold_public_gates(def),
+        def @ AstNode::FunctionDefinition { .. } => fold_public_gates_inner(def),
         other => gate_process_stmt(other, env),
     }
 }
@@ -7445,7 +9635,7 @@ fn gate_process_stmt(stmt: AstNode, env: &mut GateEnv) -> AstNode {
         // (inlining/unrolling wrap their output in blocks), so thread `env`
         // through it rather than leaving it unprocessed.
         AstNode::Block(stmts) => AstNode::Block(gate_process_stmts(stmts, env)),
-        AstNode::FunctionDefinition { .. } => fold_public_gates(stmt),
+        AstNode::FunctionDefinition { .. } => fold_public_gates_inner(stmt),
         AstNode::VariableDeclaration {
             name,
             type_annotation,
@@ -7932,14 +10122,17 @@ fn try_localize_public_batch_mul(
         AstNode::Identifier(name, _) if builtin_base_name(name) == "batch_mul" => {}
         _ => return None,
     }
+    // Evaluate each operand once. Large vectorized circuits routinely carry
+    // thousands of exact lane facts here, so re-walking both operands for the
+    // whole-public and mixed-public cases needlessly doubles this pass's cost.
+    let left_fact = gate_eval(&arguments[0], env);
+    let right_fact = gate_eval(&arguments[1], env);
     // Fast path: one whole operand is public. The other operand need not have a
     // materialized provenance list; the already-valid batch call proves it has
     // the same runtime length.
-    let whole_public = all_public_bits(&gate_eval(&arguments[0], env))
+    let whole_public = all_public_bits(&left_fact)
         .map(|values| (values, &arguments[1]))
-        .or_else(|| {
-            all_public_bits(&gate_eval(&arguments[1], env)).map(|values| (values, &arguments[0]))
-        });
+        .or_else(|| all_public_bits(&right_fact).map(|values| (values, &arguments[0])));
     if let Some((scalars, share_id @ AstNode::Identifier(..))) = whole_public {
         let elements = scalars
             .iter()
@@ -7965,11 +10158,11 @@ fn try_localize_public_batch_mul(
     // General mixed-list path. Every lane must be proven either public or
     // secret; one public lane is enough to make the split profitable. Unknown
     // lanes fail closed and keep the original batch untouched.
-    let mut left_values = match gate_eval(&arguments[0], env) {
+    let mut left_values = match left_fact {
         ConstVal::List(values) => values,
         _ => return None,
     };
-    let mut right_values = match gate_eval(&arguments[1], env) {
+    let mut right_values = match right_fact {
         ConstVal::List(values) => values,
         _ => return None,
     };
@@ -8095,6 +10288,201 @@ fn try_localize_public_batch_mul(
 /// Purely evaluate an expression to a provenance fact. Returns `Top` for
 /// anything not provably public — this is the crypto-safety backstop.
 fn gate_eval(node: &AstNode, env: &GateEnv) -> ConstVal {
+    let context = active_gate_context();
+    let mut state = GateEvalState {
+        fuel: 500_000,
+        stack: HashSet::new(),
+    };
+    gate_eval_with_state(node, env, context.as_deref(), &mut state)
+}
+
+struct GateEvalState {
+    fuel: usize,
+    stack: HashSet<String>,
+}
+
+enum GateExecResult {
+    Continue,
+    Return(ConstVal),
+    Failed,
+}
+
+fn gate_take_fuel(state: &mut GateEvalState) -> bool {
+    if state.fuel == 0 {
+        false
+    } else {
+        state.fuel -= 1;
+        true
+    }
+}
+
+fn gate_eval_user_function(
+    name: &str,
+    arguments: Vec<ConstVal>,
+    context: Option<&GateContext>,
+    state: &mut GateEvalState,
+) -> ConstVal {
+    let Some(context) = context else {
+        return ConstVal::Top;
+    };
+    if !context.pure_functions.contains(name) {
+        return ConstVal::Top;
+    }
+    let Some(function) = context.functions.get(name) else {
+        return ConstVal::Top;
+    };
+    if function.parameters.len() != arguments.len()
+        || arguments.iter().any(|value| !gate_value_is_concrete(value))
+        || !state.stack.insert(name.to_string())
+    {
+        return ConstVal::Top;
+    }
+
+    let mut function_env: GateEnv = function.parameters.iter().cloned().zip(arguments).collect();
+    let result = match gate_exec_node(&function.body, &mut function_env, context, state) {
+        GateExecResult::Return(value) if gate_value_is_concrete(&value) => value,
+        GateExecResult::Continue | GateExecResult::Return(_) | GateExecResult::Failed => {
+            ConstVal::Top
+        }
+    };
+    state.stack.remove(name);
+    result
+}
+
+/// Bounded exact interpreter for proven-pure user functions. It intentionally
+/// accepts only the small structured subset needed for constant dispatch and
+/// table construction; unsupported nodes fail closed.
+fn gate_exec_node(
+    node: &AstNode,
+    env: &mut GateEnv,
+    context: &GateContext,
+    state: &mut GateEvalState,
+) -> GateExecResult {
+    if !gate_take_fuel(state) {
+        return GateExecResult::Failed;
+    }
+    match node {
+        AstNode::Block(statements) => {
+            for statement in statements {
+                match gate_exec_node(statement, env, context, state) {
+                    GateExecResult::Continue => {}
+                    result => return result,
+                }
+            }
+            GateExecResult::Continue
+        }
+        AstNode::VariableDeclaration { name, value, .. } => {
+            let Some(value) = value else {
+                env.insert(name.clone(), ConstVal::Top);
+                return GateExecResult::Continue;
+            };
+            let value = gate_eval_with_state(value, env, Some(context), state);
+            if !gate_value_is_concrete(&value) {
+                return GateExecResult::Failed;
+            }
+            env.insert(name.clone(), value);
+            GateExecResult::Continue
+        }
+        AstNode::Assignment { target, value, .. } => {
+            let AstNode::Identifier(name, _) = target.as_ref() else {
+                return GateExecResult::Failed;
+            };
+            let value = gate_eval_with_state(value, env, Some(context), state);
+            if !gate_value_is_concrete(&value) {
+                return GateExecResult::Failed;
+            }
+            env.insert(name.clone(), value);
+            GateExecResult::Continue
+        }
+        AstNode::IfExpression {
+            condition,
+            then_branch,
+            else_branch,
+        } => match gate_eval_with_state(condition, env, Some(context), state) {
+            ConstVal::Bit { val: 0, .. } => else_branch
+                .as_deref()
+                .map_or(GateExecResult::Continue, |branch| {
+                    gate_exec_node(branch, env, context, state)
+                }),
+            ConstVal::Bit { .. } => gate_exec_node(then_branch, env, context, state),
+            _ => GateExecResult::Failed,
+        },
+        AstNode::Return {
+            value: Some(value), ..
+        } => {
+            let value = gate_eval_with_state(value, env, Some(context), state);
+            if gate_value_is_concrete(&value) {
+                GateExecResult::Return(value)
+            } else {
+                GateExecResult::Failed
+            }
+        }
+        AstNode::Return { value: None, .. } => GateExecResult::Failed,
+        AstNode::ForLoop {
+            variables,
+            iterable,
+            body,
+            ..
+        } => {
+            let [variable] = variables.as_slice() else {
+                return GateExecResult::Failed;
+            };
+            let AstNode::BinaryOperation {
+                op, left, right, ..
+            } = iterable.as_ref()
+            else {
+                return GateExecResult::Failed;
+            };
+            if op != ".." {
+                return GateExecResult::Failed;
+            }
+            let (ConstVal::Int(lo), ConstVal::Int(hi)) = (
+                gate_eval_with_state(left, env, Some(context), state),
+                gate_eval_with_state(right, env, Some(context), state),
+            ) else {
+                return GateExecResult::Failed;
+            };
+            if hi < lo || (hi - lo) as u128 > UNROLL_MAX_ITERATIONS {
+                return GateExecResult::Failed;
+            }
+            for value in lo..hi {
+                env.insert(variable.clone(), ConstVal::Int(value));
+                match gate_exec_node(body, env, context, state) {
+                    GateExecResult::Continue => {}
+                    result => return result,
+                }
+            }
+            env.remove(variable);
+            GateExecResult::Continue
+        }
+        // A standalone pure call has no state effect. Evaluate it so an opaque
+        // or non-terminating body still fails the exact interpreter.
+        AstNode::FunctionCall { .. } | AstNode::DiscardStatement { .. } => {
+            let expression = match node {
+                AstNode::FunctionCall { .. } => node,
+                AstNode::DiscardStatement { expression, .. } => expression.as_ref(),
+                _ => unreachable!(),
+            };
+            let value = gate_eval_with_state(expression, env, Some(context), state);
+            if gate_value_is_concrete(&value) {
+                GateExecResult::Continue
+            } else {
+                GateExecResult::Failed
+            }
+        }
+        _ => GateExecResult::Failed,
+    }
+}
+
+fn gate_eval_with_state(
+    node: &AstNode,
+    env: &GateEnv,
+    context: Option<&GateContext>,
+    state: &mut GateEvalState,
+) -> ConstVal {
+    if !gate_take_fuel(state) {
+        return ConstVal::Top;
+    }
     match node {
         AstNode::Literal {
             value: crate::ast::Value::Int { value, .. },
@@ -8110,8 +10498,10 @@ fn gate_eval(node: &AstNode, env: &GateEnv) -> ConstVal {
             from_list: false,
         },
         AstNode::Identifier(name, _) => env.get(name).cloned().unwrap_or(ConstVal::Top),
-        AstNode::UnaryOperation { op, operand, .. } => match (op.as_str(), gate_eval(operand, env))
-        {
+        AstNode::UnaryOperation { op, operand, .. } => match (
+            op.as_str(),
+            gate_eval_with_state(operand, env, context, state),
+        ) {
             ("-", ConstVal::Int(v)) => ConstVal::Int(-v),
             ("not", ConstVal::Bit { val, from_list }) => ConstVal::Bit {
                 val: (val ^ 1) & 1,
@@ -8121,9 +10511,12 @@ fn gate_eval(node: &AstNode, env: &GateEnv) -> ConstVal {
         },
         AstNode::BinaryOperation {
             op, left, right, ..
-        } => gate_eval_binop(op, left, right, env),
+        } => gate_eval_binop_with_state(op, left, right, env, context, state),
         AstNode::IndexAccess { base, index, .. } => {
-            match (gate_eval(base, env), gate_eval(index, env)) {
+            match (
+                gate_eval_with_state(base, env, context, state),
+                gate_eval_with_state(index, env, context, state),
+            ) {
                 (ConstVal::List(elems), ConstVal::Int(i))
                     if i >= 0 && (i as usize) < elems.len() =>
                 {
@@ -8145,9 +10538,12 @@ fn gate_eval(node: &AstNode, env: &GateEnv) -> ConstVal {
                 _ => ConstVal::Top,
             }
         }
-        AstNode::ListLiteral { elements, .. } => {
-            ConstVal::List(elements.iter().map(|e| gate_eval(e, env)).collect())
-        }
+        AstNode::ListLiteral { elements, .. } => ConstVal::List(
+            elements
+                .iter()
+                .map(|element| gate_eval_with_state(element, env, context, state))
+                .collect(),
+        ),
         AstNode::FunctionCall {
             function,
             arguments,
@@ -8155,15 +10551,25 @@ fn gate_eval(node: &AstNode, env: &GateEnv) -> ConstVal {
         } => {
             let call = call_name_of(function);
             let base = call.as_deref().map(builtin_base_name);
+            if call.as_deref().is_some_and(is_len_builtin) && arguments.len() == 1 {
+                if let ConstVal::List(values) =
+                    gate_eval_with_state(&arguments[0], env, context, state)
+                {
+                    return ConstVal::Int(values.len() as i128);
+                }
+            }
             if matches!(base, Some("from_clear_int") | Some("from_clear_uint"))
                 && arguments.len() >= 2
             {
-                let v = match gate_eval(&arguments[0], env) {
+                let v = match gate_eval_with_state(&arguments[0], env, context, state) {
                     ConstVal::Int(v) => Some(v),
                     ConstVal::Bit { val, .. } => Some(val as i128),
                     _ => None,
                 };
-                let width_one = matches!(gate_eval(&arguments[1], env), ConstVal::Int(1));
+                let width_one = matches!(
+                    gate_eval_with_state(&arguments[1], env, context, state),
+                    ConstVal::Int(1)
+                );
                 if let (Some(v), true) = (v, width_one) {
                     if v == 0 || v == 1 {
                         return ConstVal::Bit {
@@ -8178,8 +10584,8 @@ fn gate_eval(node: &AstNode, env: &GateEnv) -> ConstVal {
             // propagation and is required to recognize public batch operands
             // assembled from local helper calls rather than direct literals.
             if arguments.len() == 2 {
-                let lhs = gate_eval(&arguments[0], env);
-                let rhs = gate_eval(&arguments[1], env);
+                let lhs = gate_eval_with_state(&arguments[0], env, context, state);
+                let rhs = gate_eval_with_state(&arguments[1], env, context, state);
                 match base {
                     Some("add") | Some("sub") => {
                         if let (
@@ -8241,16 +10647,28 @@ fn gate_eval(node: &AstNode, env: &GateEnv) -> ConstVal {
                 }
             }
             if matches!(base, Some("copy")) && arguments.len() == 1 {
-                return gate_eval(&arguments[0], env);
+                return gate_eval_with_state(&arguments[0], env, context, state);
             }
             if matches!(base, Some("slice")) && arguments.len() == 3 {
                 if let (ConstVal::List(values), ConstVal::Int(start), ConstVal::Int(end)) = (
-                    gate_eval(&arguments[0], env),
-                    gate_eval(&arguments[1], env),
-                    gate_eval(&arguments[2], env),
+                    gate_eval_with_state(&arguments[0], env, context, state),
+                    gate_eval_with_state(&arguments[1], env, context, state),
+                    gate_eval_with_state(&arguments[2], env, context, state),
                 ) {
                     if start >= 0 && end >= start && (end as usize) <= values.len() {
                         return ConstVal::List(values[start as usize..end as usize].to_vec());
+                    }
+                }
+            }
+            if let Some(name) = call.as_deref() {
+                if context.is_some_and(|context| context.functions.contains_key(name)) {
+                    let values = arguments
+                        .iter()
+                        .map(|argument| gate_eval_with_state(argument, env, context, state))
+                        .collect();
+                    let result = gate_eval_user_function(name, values, context, state);
+                    if gate_value_is_concrete(&result) {
+                        return result;
                     }
                 }
             }
@@ -8276,9 +10694,16 @@ fn gate_eval(node: &AstNode, env: &GateEnv) -> ConstVal {
 /// Evaluate a binary operation over provenance facts. Arithmetic folds over
 /// `Int`; `and`/`or`/`xor` fold ONLY when BOTH sides are public bits (no
 /// short-circuit — that keeps the reasoning trivially sound).
-fn gate_eval_binop(op: &str, left: &AstNode, right: &AstNode, env: &GateEnv) -> ConstVal {
-    let l = gate_eval(left, env);
-    let r = gate_eval(right, env);
+fn gate_eval_binop_with_state(
+    op: &str,
+    left: &AstNode,
+    right: &AstNode,
+    env: &GateEnv,
+    context: Option<&GateContext>,
+    state: &mut GateEvalState,
+) -> ConstVal {
+    let l = gate_eval_with_state(left, env, context, state);
+    let r = gate_eval_with_state(right, env, context, state);
     match op {
         "+" | "-" | "*" | "/" | "%" => {
             if let (ConstVal::Int(a), ConstVal::Int(b)) = (&l, &r) {
@@ -8293,6 +10718,24 @@ fn gate_eval_binop(op: &str, left: &AstNode, right: &AstNode, env: &GateEnv) -> 
                 return res.map(ConstVal::Int).unwrap_or(ConstVal::Top);
             }
             ConstVal::Top
+        }
+        "==" | "!=" | "<" | "<=" | ">" | ">=" => {
+            if let (ConstVal::Int(a), ConstVal::Int(b)) = (&l, &r) {
+                let value = match op {
+                    "==" => a == b,
+                    "!=" => a != b,
+                    "<" => a < b,
+                    "<=" => a <= b,
+                    ">" => a > b,
+                    _ => a >= b,
+                };
+                ConstVal::Bit {
+                    val: u8::from(value),
+                    from_list: false,
+                }
+            } else {
+                ConstVal::Top
+            }
         }
         "and" | "or" | "xor" => {
             if let (
@@ -8669,6 +11112,7 @@ fn process_kept_statement(node: AstNode, env: &mut LenEnv, budget: &mut usize) -
         }
         _ => {
             apply_statement_to_env(&node, env);
+            record_batch_result_width_from_env(&node, env);
             node
         }
     }
@@ -12361,7 +14805,107 @@ mod tests {
     }
 
     #[test]
-    fn batching_fixpoint_fuses_newly_normalized_scalar_and_vector_multiplies() {
+    fn pure_constant_dispatch_result_propagates_across_a_call_boundary() {
+        let loc = make_loc();
+        let ident = |name: &str| AstNode::Identifier(name.to_string(), loc.clone());
+        let dispatch = AstNode::FunctionDefinition {
+            name: Some("dispatch_bit".to_string()),
+            type_params: Vec::new(),
+            parameters: vec![Parameter {
+                name: "selector".to_string(),
+                type_annotation: Some(Box::new(ident("int64"))),
+                default_value: None,
+                is_secret: false,
+                is_variadic: false,
+            }],
+            return_type: Some(Box::new(AstNode::SecretType(Box::new(ident("bool"))))),
+            body: Box::new(AstNode::Block(vec![
+                AstNode::IfExpression {
+                    condition: Box::new(AstNode::BinaryOperation {
+                        op: "==".to_string(),
+                        left: Box::new(ident("selector")),
+                        right: Box::new(super::make_int_literal(1, &loc)),
+                        location: loc.clone(),
+                    }),
+                    then_branch: Box::new(AstNode::Block(vec![AstNode::Return {
+                        value: Some(Box::new(make_from_clear_int_bit(1, &loc))),
+                        location: loc.clone(),
+                    }])),
+                    else_branch: None,
+                },
+                AstNode::Return {
+                    value: Some(Box::new(make_from_clear_int_bit(0, &loc))),
+                    location: loc.clone(),
+                },
+            ])),
+            is_secret: false,
+            pragmas: Vec::new(),
+            location: loc.clone(),
+            node_id: 0,
+        };
+        let main = AstNode::FunctionDefinition {
+            name: Some("main".to_string()),
+            type_params: Vec::new(),
+            parameters: Vec::new(),
+            return_type: None,
+            body: Box::new(AstNode::Block(vec![
+                AstNode::VariableDeclaration {
+                    name: "selected".to_string(),
+                    type_annotation: Some(Box::new(AstNode::SecretType(Box::new(ident("bool"))))),
+                    value: Some(Box::new(AstNode::FunctionCall {
+                        function: Box::new(ident("dispatch_bit")),
+                        arguments: vec![super::make_int_literal(1, &loc)],
+                        location: loc.clone(),
+                        resolved_return_type: None,
+                    })),
+                    is_mutable: false,
+                    is_secret: true,
+                    location: loc.clone(),
+                },
+                AstNode::VariableDeclaration {
+                    name: "product".to_string(),
+                    type_annotation: Some(Box::new(AstNode::SecretType(Box::new(ident("bool"))))),
+                    value: Some(Box::new(AstNode::BinaryOperation {
+                        op: "and".to_string(),
+                        left: Box::new(ident("selected")),
+                        right: Box::new(make_from_clear_int_bit(1, &loc)),
+                        location: loc.clone(),
+                    })),
+                    is_mutable: false,
+                    is_secret: true,
+                    location: loc.clone(),
+                },
+            ])),
+            is_secret: false,
+            pragmas: Vec::new(),
+            location: loc.clone(),
+            node_id: 1,
+        };
+
+        let AstNode::Block(functions) = fold_public_gates(AstNode::Block(vec![dispatch, main]))
+        else {
+            panic!("expected program block");
+        };
+        let AstNode::FunctionDefinition { body, .. } = &functions[1] else {
+            panic!("expected main function");
+        };
+        let AstNode::Block(statements) = body.as_ref() else {
+            panic!("expected main body");
+        };
+        assert!(matches!(
+            &statements[0],
+            AstNode::VariableDeclaration { value: Some(value), .. }
+                if call_name(value) == Some("dispatch_bit")
+        ));
+        assert!(matches!(
+            &statements[1],
+            AstNode::VariableDeclaration { value: Some(value), .. }
+                if call_name(value) == Some("Share.from_clear_int")
+        ));
+    }
+
+    #[test]
+    fn batcher_directly_fuses_scalar_and_vector_multiplies() {
         reset_temp_counter();
         let loc = make_loc();
         let ident = |name: &str| AstNode::Identifier(name.to_string(), loc.clone());
@@ -12409,13 +14953,13 @@ mod tests {
 
         assert_eq!(
             count_batch_calls(&once),
-            2,
-            "first pass has incompatible forms"
+            1,
+            "a scalar contributes one lane to the vector protocol call"
         );
         assert_eq!(
             count_batch_calls(&fixed),
             1,
-            "fixpoint must fuse the normalized scalar batch with the vector batch"
+            "the mixed batch must already be structurally stable"
         );
     }
 
@@ -12860,9 +15404,14 @@ mod tests {
             .collect();
         let global_key = interner.global();
         let key_bound = interner.key_bound();
+        let work: Vec<Option<usize>> = stmts
+            .iter()
+            .zip(&infos)
+            .map(|(stmt, info)| scheduled_interactive_work(stmt, info.interactive))
+            .collect();
 
-        let full = build_schedule_order(&infos, key_bound, global_key, false);
-        let pruned = build_schedule_order(&infos, key_bound, global_key, true);
+        let full = build_schedule_order(&infos, &work, key_bound, global_key, false, None);
+        let pruned = build_schedule_order(&infos, &work, key_bound, global_key, true, None);
         assert!(full.is_some(), "unexpected dependency cycle");
         assert_eq!(full, pruned);
         // The mutator calls pin the accumulator order, so appends must stay in
@@ -13306,6 +15855,18 @@ mod tests {
             resolved_return_type: None,
         };
         assert_eq!(is_share_open_call(&reveal_call), Some(&share_expr));
+
+        let user_open = AstNode::FunctionCall {
+            function: Box::new(make_identifier("open")),
+            arguments: vec![share_expr],
+            location: make_loc(),
+            resolved_return_type: Some(crate::symbol_table::SymbolType::Int64),
+        };
+        assert_eq!(
+            is_share_open_call(&user_open),
+            None,
+            "an unrelated user function named open must not be scheduled as an MPC reveal"
+        );
     }
 
     #[test]
@@ -13484,6 +16045,39 @@ mod tests {
             &batched[0],
             AstNode::VariableDeclaration { value: Some(value), .. }
                 if call_name(value) == Some("Share.batch_open")
+        ));
+    }
+
+    #[test]
+    fn reveal_reorder_preserves_abrupt_control_boundaries() {
+        let conditional_return = AstNode::IfExpression {
+            condition: Box::new(make_identifier("opened")),
+            then_branch: Box::new(AstNode::Block(vec![AstNode::Return {
+                value: Some(Box::new(make_int_literal(1))),
+                location: make_loc(),
+            }])),
+            else_branch: None,
+        };
+        let trailing_return = AstNode::Return {
+            value: Some(Box::new(make_int_literal(0))),
+            location: make_loc(),
+        };
+        let reordered = reorder_for_reveal_batching(AstNode::Block(vec![
+            make_var_decl("opened", make_share_open(make_identifier("secret"))),
+            conditional_return,
+            trailing_return,
+        ]));
+
+        let AstNode::Block(statements) = reordered else {
+            panic!("expected block");
+        };
+        assert!(matches!(
+            &statements[..],
+            [
+                AstNode::VariableDeclaration { name, .. },
+                AstNode::IfExpression { .. },
+                AstNode::Return { .. },
+            ] if name == "opened"
         ));
     }
 
@@ -13771,6 +16365,128 @@ mod tests {
     }
 
     #[test]
+    fn explicit_share_mul_calls_are_first_class_batch_candidates() {
+        reset_temp_counter();
+        let mul = |left: &str, right: &str| {
+            make_call(
+                "Share.mul",
+                vec![make_identifier(left), make_identifier(right)],
+            )
+        };
+        let block = AstNode::Block(vec![
+            make_var_decl("a", mul("x", "y")),
+            make_var_decl("b", mul("p", "q")),
+        ]);
+
+        let scheduled = schedule_for_batching(block);
+        let optimized = optimize_multiply_batches_to_fixpoint(scheduled);
+        assert_eq!(
+            count_calls_named(&optimized, "Share.batch_mul"),
+            1,
+            "independent singular Share.mul calls must lower to one native batch"
+        );
+        assert_eq!(
+            count_calls_named(&optimized, "Share.mul"),
+            0,
+            "no scalar Share.mul call should survive the fused round"
+        );
+    }
+
+    #[test]
+    fn explicit_share_mul_dependency_still_requires_two_rounds() {
+        reset_temp_counter();
+        let mul = |left: &str, right: &str| {
+            make_call(
+                "Share.mul",
+                vec![make_identifier(left), make_identifier(right)],
+            )
+        };
+        let block = AstNode::Block(vec![
+            make_var_decl("a", mul("x", "y")),
+            make_var_decl("b", mul("a", "q")),
+        ]);
+
+        let scheduled = schedule_for_batching(block);
+        let optimized = optimize_multiply_batches_to_fixpoint(scheduled);
+        assert_eq!(
+            count_calls_named(&optimized, "Share.batch_mul"),
+            2,
+            "a consumer cannot share its producer's online round"
+        );
+    }
+
+    #[test]
+    fn explicit_share_mul_batching_respects_backend_capacity() {
+        reset_temp_counter();
+        let mul = |left: &str, right: &str| {
+            make_call(
+                "Share.mul",
+                vec![make_identifier(left), make_identifier(right)],
+            )
+        };
+        let block = AstNode::Block(vec![
+            make_var_decl("a", mul("a0", "a1")),
+            make_var_decl("b", mul("b0", "b1")),
+            make_var_decl("c", mul("c0", "c1")),
+        ]);
+
+        let optimized = with_multiply_capacity(2, || {
+            let scheduled = schedule_for_batching(block);
+            optimize_multiply_batches_to_fixpoint(scheduled)
+        });
+        assert_eq!(
+            count_calls_named(&optimized, "Share.batch_mul"),
+            2,
+            "three independent products require two capacity-two protocol calls"
+        );
+    }
+
+    #[test]
+    fn clear_field_mul_is_not_an_interactive_batch_candidate() {
+        reset_temp_counter();
+        let block = AstNode::Block(vec![
+            make_var_decl(
+                "a",
+                make_call(
+                    "Field.mul",
+                    vec![make_identifier("x"), make_identifier("y")],
+                ),
+            ),
+            make_var_decl(
+                "b",
+                make_call(
+                    "Field.mul",
+                    vec![make_identifier("p"), make_identifier("q")],
+                ),
+            ),
+        ]);
+
+        let optimized = optimize_multiply_batches_to_fixpoint(schedule_for_batching(block));
+        assert_eq!(count_calls_named(&optimized, "Share.batch_mul"), 0);
+        assert_eq!(count_calls_named(&optimized, "Field.mul"), 2);
+    }
+
+    #[test]
+    fn user_defined_mul_returning_share_is_not_a_builtin_batch_candidate() {
+        use crate::symbol_table::SymbolType;
+
+        let user_mul = || AstNode::FunctionCall {
+            function: Box::new(make_identifier("mul")),
+            arguments: vec![make_identifier("x"), make_identifier("y")],
+            location: make_loc(),
+            resolved_return_type: Some(SymbolType::Object("Share".to_string())),
+        };
+        let block = AstNode::Block(vec![
+            make_var_decl("a", user_mul()),
+            make_var_decl("b", user_mul()),
+        ]);
+
+        let optimized = optimize_multiply_batches_to_fixpoint(schedule_for_batching(block));
+        assert_eq!(count_calls_named(&optimized, "Share.batch_mul"), 0);
+        assert_eq!(count_calls_named(&optimized, "mul"), 2);
+    }
+
+    #[test]
     fn test_no_batch_secret_multiply_with_dependency() {
         reset_temp_counter();
 
@@ -13958,6 +16674,41 @@ mod tests {
             assert_eq!(get_var_decl_name(&stmts[3]), Some("x"));
         } else {
             panic!("Expected Block");
+        }
+    }
+
+    fn reveal_reorder_work(units: usize) -> RevealReorderWork {
+        let mut statements = Vec::with_capacity(units * 3);
+        for index in 0..units {
+            let secret = format!("s{index}");
+            let revealed = format!("r{index}");
+            let flushed = format!("f{index}");
+            statements.push(make_secret_var_decl(
+                &secret,
+                make_identifier(&format!("input{index}")),
+            ));
+            statements.push(make_var_decl(&revealed, make_identifier(&secret)));
+            statements.push(make_var_decl(
+                &flushed,
+                make_binary_op(make_identifier(&revealed), "+", make_int_literal(1)),
+            ));
+        }
+        let mut work = RevealReorderWork::default();
+        let reordered = reorder_block_for_reveals_with_work(statements, &mut work);
+        assert_eq!(reordered.len(), units * 3);
+        work
+    }
+
+    #[test]
+    fn reveal_reorder_work_scales_with_graph_size() {
+        let small = reveal_reorder_work(64);
+        let medium = reveal_reorder_work(128);
+        let large = reveal_reorder_work(256);
+
+        for (units, work) in [(64, small), (128, medium), (256, large)] {
+            assert_eq!(work.dependency_key_probes, units * 9);
+            assert_eq!(work.dependency_edges, units * 2);
+            assert_eq!(work.ready_queue_operations, units * 6);
         }
     }
 
@@ -14516,6 +17267,17 @@ mod tests {
 
     // ===== Round-minimizing list scheduler =====
 
+    fn with_multiply_capacity<T>(capacity: usize, f: impl FnOnce() -> T) -> T {
+        let previous = ACTIVE_MPC_SCHEDULING.with(|active| {
+            active.replace(MpcSchedulingOptions {
+                multiply_batch_capacity: Some(capacity),
+            })
+        });
+        let result = f();
+        ACTIVE_MPC_SCHEDULING.with(|active| active.set(previous));
+        result
+    }
+
     #[test]
     fn test_scheduler_clusters_independent_chains_by_round() {
         // Two independent 2-deep multiply chains, interleaved by definition order:
@@ -14550,6 +17312,134 @@ mod tests {
             vec!["a1", "b1", "a2", "b2"],
             "depth-1 multiplies cluster, then depth-2 multiplies"
         );
+    }
+
+    #[test]
+    fn capacity_scheduler_prioritizes_the_critical_multiply_chain() {
+        // With capacity two, source-order scheduling would spend the first
+        // round on b1+c1 and only then start the three-deep `a` chain (4 total
+        // rounds). Bottom-level priority starts a1 immediately and fills the
+        // spare slot with b1, attaining the critical-path lower bound of 3.
+        let block = AstNode::Block(vec![
+            make_secret_var_decl(
+                "b1",
+                make_binary_op(make_identifier("bx"), "and", make_identifier("by")),
+            ),
+            make_secret_var_decl(
+                "c1",
+                make_binary_op(make_identifier("cx"), "and", make_identifier("cy")),
+            ),
+            make_secret_var_decl(
+                "a1",
+                make_binary_op(make_identifier("ax"), "and", make_identifier("ay")),
+            ),
+            make_secret_var_decl(
+                "a2",
+                make_binary_op(make_identifier("a1"), "and", make_identifier("az")),
+            ),
+            make_secret_var_decl(
+                "a3",
+                make_binary_op(make_identifier("a2"), "and", make_identifier("aw")),
+            ),
+        ]);
+
+        let scheduled = with_multiply_capacity(2, || schedule_for_batching(block));
+        let AstNode::Block(stmts) = &scheduled else {
+            panic!("expected block");
+        };
+        let names: Vec<&str> = stmts.iter().filter_map(get_var_decl_name).collect();
+        assert_eq!(names, vec!["a1", "b1", "a2", "c1", "a3"]);
+
+        let batched = with_multiply_capacity(2, || optimize_multiplies(scheduled));
+        assert_eq!(
+            count_calls_named(&batched, "Share.batch_mul"),
+            3,
+            "capacity-aware fusion must preserve the three legal rounds"
+        );
+    }
+
+    #[test]
+    fn capacity_bounded_batcher_does_not_guess_unknown_vector_widths() {
+        let block = AstNode::Block(vec![
+            make_var_decl("m1", make_typed_batch_mul("a", "b")),
+            make_var_decl("m2", make_typed_batch_mul("c", "d")),
+        ]);
+        let out = with_multiply_capacity(256, || optimize_multiplies(block));
+        assert_eq!(
+            count_calls_named(&out, "Share.batch_mul"),
+            2,
+            "opaque widths are isolated instead of being assumed to fit"
+        );
+    }
+
+    #[test]
+    fn singular_multiply_joins_an_exact_vector_round_only_when_it_fits() {
+        fn circuit() -> AstNode {
+            let list = |names: &[&str]| AstNode::ListLiteral {
+                elements: names.iter().map(|name| make_identifier(name)).collect(),
+                location: make_loc(),
+            };
+            AstNode::Block(vec![
+                make_var_decl("lefts", list(&["a", "b"])),
+                make_var_decl("rights", list(&["x", "y"])),
+                make_var_decl("vector", make_typed_batch_mul("lefts", "rights")),
+                make_secret_var_decl(
+                    "scalar",
+                    make_binary_op(make_identifier("c"), "and", make_identifier("z")),
+                ),
+            ])
+        }
+
+        let optimize = |capacity| {
+            reset_temp_counter();
+            with_multiply_capacity(capacity, || {
+                let exact = unroll_literal_loops(circuit());
+                let scheduled = schedule_for_batching(exact);
+                optimize_multiply_batches_to_fixpoint(scheduled)
+            })
+        };
+
+        assert_eq!(
+            count_calls_named(&optimize(3), "Share.batch_mul"),
+            1,
+            "two vector lanes plus one singular product fit one round"
+        );
+        assert_eq!(
+            count_calls_named(&optimize(2), "Share.batch_mul"),
+            2,
+            "the singular product must not overflow a full vector round"
+        );
+    }
+
+    #[test]
+    fn unroller_exports_exact_source_batch_work_without_scope_guessing() {
+        reset_temp_counter();
+        let list = |names: &[&str]| AstNode::ListLiteral {
+            elements: names.iter().map(|name| make_identifier(name)).collect(),
+            location: make_loc(),
+        };
+        let block = AstNode::Block(vec![
+            make_var_decl("lefts", list(&["a", "b", "c"])),
+            make_var_decl("rights", list(&["x", "y", "z"])),
+            make_var_decl("products", make_typed_batch_mul("lefts", "rights")),
+        ]);
+        let _ = unroll_literal_loops(block);
+        let location = make_loc();
+        assert_eq!(interactive_width("products", &location), Some(3));
+
+        // A same-named result at another source site is a separate fact and
+        // cannot overwrite or supply the first statement's capacity proof.
+        let other_location = SourceLocation {
+            line: location.line + 1,
+            ..location.clone()
+        };
+        record_interactive_width("products", &other_location, 4);
+        assert_eq!(
+            interactive_width("products", &location),
+            Some(3),
+            "same-named bindings at distinct sites must not share widths"
+        );
+        assert_eq!(interactive_width("products", &other_location), Some(4));
     }
 
     #[test]
@@ -14895,6 +17785,7 @@ mod tests {
         left: AstNode,
         right: AstNode,
     ) -> MultiplyCandidate {
+        let work = exact_batch_operand_width(&left);
         MultiplyCandidate {
             statement_index: idx,
             target_key: target.to_string(),
@@ -14909,6 +17800,7 @@ mod tests {
             is_mutable: false,
             is_secret: false,
             is_batched: true,
+            work,
         }
     }
 

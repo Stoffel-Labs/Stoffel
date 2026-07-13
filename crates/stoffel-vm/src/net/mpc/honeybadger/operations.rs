@@ -8,6 +8,9 @@ use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use std::any::TypeId;
 use std::time::Instant;
 use stoffel_vm_types::core_types::{ClearShareValue, ShareData, ShareType};
+use stoffel_vm_types::mpc::{
+    honeybadger_mul_batch_capacity, HONEYBADGER_MUL_MAX_PAIRS_PER_SESSION_ENV,
+};
 use stoffelmpc_mpc::common::types::fixed::{
     ClearFixedPoint, FixedPointPrecision, SecretFixedPoint,
 };
@@ -16,14 +19,6 @@ use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustS
 
 /// Env var overriding how many secret-pair multiply operands are fed to a
 /// single HoneyBadger `mul()` session. See [`max_honeybadger_mul_pairs_per_session`].
-const STOFFEL_HB_MUL_MAX_PAIRS_PER_SESSION_ENV: &str = "STOFFEL_HB_MUL_MAX_PAIRS_PER_SESSION";
-
-/// Default multiplier on `(threshold + 1)` for the pairs fed to one `mul()`
-/// session. Matches `mpc-protocols`' own per-session deserialization bound
-/// (`128 * (t+1)`), so the default stays within what the protocol already
-/// supports without a change. See [`max_honeybadger_mul_pairs_per_session`].
-const DEFAULT_MAX_HONEYBADGER_MUL_BATCH_RECON_CHUNKS: usize = 128;
-
 /// Maximum secret-pair multiply operands fed to a single HoneyBadger `mul()`
 /// session.
 ///
@@ -48,7 +43,7 @@ const DEFAULT_MAX_HONEYBADGER_MUL_BATCH_RECON_CHUNKS: usize = 128;
 /// The `(t+1)` factor only keeps the count a clean multiple so there is no RBC
 /// remainder; an explicit override (below) is used as-is.
 pub(crate) fn max_honeybadger_mul_pairs_per_session(threshold: usize) -> usize {
-    let from_env = std::env::var(STOFFEL_HB_MUL_MAX_PAIRS_PER_SESSION_ENV)
+    let from_env = std::env::var(HONEYBADGER_MUL_MAX_PAIRS_PER_SESSION_ENV)
         .ok()
         .and_then(|raw| raw.parse::<usize>().ok().map(|v| v.max(1)));
     from_env.unwrap_or_else(|| max_honeybadger_mul_pairs_per_session_with(threshold, None))
@@ -61,10 +56,7 @@ pub(crate) fn max_honeybadger_mul_pairs_per_session_with(
     threshold: usize,
     override_pairs: Option<usize>,
 ) -> usize {
-    if let Some(value) = override_pairs {
-        return value.max(1);
-    }
-    DEFAULT_MAX_HONEYBADGER_MUL_BATCH_RECON_CHUNKS.saturating_mul(threshold.saturating_add(1))
+    honeybadger_mul_batch_capacity(threshold, override_pairs)
 }
 
 impl<F, G> HoneyBadgerMpcEngine<F, G>

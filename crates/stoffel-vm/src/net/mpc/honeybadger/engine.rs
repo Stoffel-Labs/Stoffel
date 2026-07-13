@@ -36,6 +36,12 @@ where
         self.ready.load(Ordering::SeqCst)
     }
 
+    fn multiplication_batch_capacity(&self) -> Option<usize> {
+        Some(super::operations::max_honeybadger_mul_pairs_per_session(
+            self.topology.threshold(),
+        ))
+    }
+
     fn start(&self) -> crate::net::mpc_engine::MpcEngineResult<()> {
         // Mark engine as ready in test/single-process scenarios. Real deployments should call `preprocess()`.
         self.ready.store(true, Ordering::SeqCst);

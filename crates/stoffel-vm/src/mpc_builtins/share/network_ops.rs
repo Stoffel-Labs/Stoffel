@@ -8,7 +8,7 @@ use crate::net::curve::clear_share_value_to_vm_value;
 use crate::net::mpc_engine::MpcExponentGenerator;
 use crate::value_conversions::value_to_usize;
 use crate::VirtualMachineResult;
-use stoffel_vm_types::core_types::{ShareType, Value};
+use stoffel_vm_types::core_types::{ShareData, ShareType, Value};
 
 pub(super) fn register(vm: &mut VirtualMachine) -> VirtualMachineResult<()> {
     vm.try_register_mpc_online_foreign_method("Share", "mul", MpcOnlineBuiltin::Mul, share_mul)?;
@@ -73,25 +73,12 @@ fn share_batch_mul(mut ctx: ForeignFunctionContext) -> ForeignFunctionCallbackRe
         (args.cloned(0)?, args.cloned(1)?)
     };
 
-    let Some((share_type, left_data)) =
-        ctx.extract_homogeneous_share_array(&lefts_arg, "Share.batch_mul lefts_array")?
-    else {
+    let lefts = ctx.extract_share_array(&lefts_arg, "Share.batch_mul lefts_array")?;
+    let rights = ctx.extract_share_array(&rights_arg, "Share.batch_mul rights_array")?;
+    if lefts.is_empty() && rights.is_empty() {
         return ctx.create_array(0);
-    };
-    let Some((right_share_type, right_data)) =
-        ctx.extract_homogeneous_share_array(&rights_arg, "Share.batch_mul rights_array")?
-    else {
-        return ctx.create_array(0);
-    };
-
-    if share_type != right_share_type {
-        return Err(
-            crate::foreign_functions::ForeignFunctionCallbackError::Message(
-                "Share.batch_mul requires arrays with matching share types".to_string(),
-            ),
-        );
     }
-    if left_data.len() != right_data.len() {
+    if lefts.len() != rights.len() {
         return Err(
             crate::foreign_functions::ForeignFunctionCallbackError::Message(
                 "Share.batch_mul requires arrays with the same length".to_string(),
@@ -99,11 +86,61 @@ fn share_batch_mul(mut ctx: ForeignFunctionContext) -> ForeignFunctionCallbackRe
         );
     }
 
-    let results = ctx
-        .secret_share_batch_mul_data(share_type, &left_data, &right_data)?
+    type Group = (ShareType, Vec<usize>, Vec<ShareData>, Vec<ShareData>);
+    let mut groups: Vec<Group> = Vec::new();
+    for (index, ((left_type, left_data), (right_type, right_data))) in
+        lefts.into_iter().zip(rights).enumerate()
+    {
+        if left_type != right_type {
+            return Err(format!(
+                "Share.batch_mul pair {index} has mismatched share types: {left_type:?} and {right_type:?}"
+            )
+            .into());
+        }
+        let group = if let Some(group) = groups.iter_mut().find(|group| {
+            group.0 == left_type
+                && group
+                    .2
+                    .first()
+                    .is_none_or(|data| data.format() == left_data.format())
+        }) {
+            group
+        } else {
+            groups.push((left_type, Vec::new(), Vec::new(), Vec::new()));
+            groups.last_mut().expect("just inserted a type group")
+        };
+        group.1.push(index);
+        group.2.push(left_data);
+        group.3.push(right_data);
+    }
+
+    let output_len = groups.iter().map(|group| group.1.len()).sum();
+    let mut results = vec![None; output_len];
+    for (share_type, indices, left_data, right_data) in groups {
+        let products = ctx.secret_share_batch_mul_data(share_type, &left_data, &right_data)?;
+        if products.len() != indices.len() {
+            return Err(format!(
+                "Share.batch_mul backend returned {} products for {} lanes",
+                products.len(),
+                indices.len()
+            )
+            .into());
+        }
+        for (index, data) in indices.into_iter().zip(products) {
+            results[index] = Some(Value::Share(share_type, data));
+        }
+    }
+    let results = results
         .into_iter()
-        .map(|data| Value::Share(share_type, data))
-        .collect::<Vec<_>>();
+        .enumerate()
+        .map(|(index, value)| {
+            value.ok_or_else(|| {
+                crate::foreign_functions::ForeignFunctionCallbackError::Message(format!(
+                    "Share.batch_mul result lane {index} was not produced"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let result_ref = ctx.create_array_ref(results.len())?;
     ctx.push_array_ref_values(result_ref, &results)?;
@@ -132,17 +169,57 @@ fn share_batch_open(mut ctx: ForeignFunctionContext) -> ForeignFunctionCallbackR
         args.cloned(0)?
     };
 
-    let Some((share_type, share_data)) =
-        ctx.extract_homogeneous_share_array(&shares_arg, "Share.batch_open shares_array")?
-    else {
+    let shares = ctx.extract_share_array(&shares_arg, "Share.batch_open shares_array")?;
+    if shares.is_empty() {
         return ctx.create_array(0);
-    };
+    }
 
-    let revealed: Vec<Value> = ctx
-        .batch_open_share_data(share_type, &share_data)?
+    type Group = (ShareType, Vec<usize>, Vec<ShareData>);
+    let output_len = shares.len();
+    let mut groups: Vec<Group> = Vec::new();
+    for (index, (share_type, share_data)) in shares.into_iter().enumerate() {
+        let group = if let Some(group) = groups.iter_mut().find(|group| {
+            group.0 == share_type
+                && group
+                    .2
+                    .first()
+                    .is_none_or(|data| data.format() == share_data.format())
+        }) {
+            group
+        } else {
+            groups.push((share_type, Vec::new(), Vec::new()));
+            groups.last_mut().expect("just inserted a type group")
+        };
+        group.1.push(index);
+        group.2.push(share_data);
+    }
+
+    let mut revealed = vec![None; output_len];
+    for (share_type, indices, share_data) in groups {
+        let values = ctx.batch_open_share_data(share_type, &share_data)?;
+        if values.len() != indices.len() {
+            return Err(format!(
+                "Share.batch_open backend returned {} values for {} lanes",
+                values.len(),
+                indices.len()
+            )
+            .into());
+        }
+        for (index, value) in indices.into_iter().zip(values) {
+            revealed[index] = Some(clear_share_value_to_vm_value(share_type, value));
+        }
+    }
+    let revealed = revealed
         .into_iter()
-        .map(|value| clear_share_value_to_vm_value(share_type, value))
-        .collect();
+        .enumerate()
+        .map(|(index, value)| {
+            value.ok_or_else(|| {
+                crate::foreign_functions::ForeignFunctionCallbackError::Message(format!(
+                    "Share.batch_open result lane {index} was not produced"
+                ))
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     let result_ref = ctx.create_array_ref(revealed.len())?;
     ctx.push_array_ref_values(result_ref, &revealed)?;

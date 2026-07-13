@@ -5,15 +5,115 @@ use crate::net::client_store::{
     ClientInputHydrationCount, ClientInputIndex, ClientOutputShareCount, ClientShare,
     ClientShareIndex,
 };
+use crate::net::deferred_mpc::resolve_deferred_shares;
 use crate::net::mpc_engine::{
-    MpcEngine, MpcExponentGroup, MpcPartyId, MpcRuntimeInfo, RbcSessionId,
+    AsyncMpcEngine, MpcEngine, MpcExponentGroup, MpcPartyId, MpcRuntimeInfo, RbcSessionId,
 };
+use rustc_hash::FxHashSet;
 use std::sync::Arc;
-use stoffel_vm_types::core_types::{ClearShareInput, ClearShareValue, ShareData, ShareType, Value};
+use stoffel_vm_types::core_types::{
+    ClearShareInput, ClearShareValue, Closure, ShareData, ShareType, TableRef, Upvalue, Value,
+};
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelnet::network_utils::ClientId;
 
 impl VMState {
+    /// Materialize every deferred share reachable from an async entry point's
+    /// return value. All roots are collected before scheduling so products from
+    /// sibling array/object fields can share the same MPC rounds.
+    pub(crate) async fn materialize_deferred_return_value<E: AsyncMpcEngine + ?Sized>(
+        &mut self,
+        engine: &E,
+        value: Value,
+    ) -> VmResult<Value> {
+        let mut shares = Vec::new();
+        let mut tables = Vec::new();
+        let mut visited_tables = FxHashSet::default();
+        let mut pending = vec![value.clone()];
+
+        while let Some(current) = pending.pop() {
+            match current {
+                Value::Share(_, share_data) => {
+                    if share_data.deferred_node().is_some()
+                        || matches!(share_data, ShareData::Public(_))
+                    {
+                        shares.push(share_data);
+                    }
+                }
+                Value::Array(array_ref) => {
+                    let table_ref = TableRef::from(array_ref);
+                    if visited_tables.insert(table_ref) {
+                        let entries = self
+                            .table_memory
+                            .read_array_ref_entries(array_ref, usize::MAX)?;
+                        tables.push(table_ref);
+                        enqueue_table_entries(entries, &mut pending)?;
+                    }
+                }
+                Value::Object(object_ref) => {
+                    let table_ref = TableRef::from(object_ref);
+                    if visited_tables.insert(table_ref) {
+                        let entries = self
+                            .table_memory
+                            .read_object_ref_entries(object_ref, usize::MAX)?;
+                        tables.push(table_ref);
+                        enqueue_table_entries(entries, &mut pending)?;
+                    }
+                }
+                Value::Closure(closure) => {
+                    pending.extend(
+                        closure
+                            .upvalues()
+                            .iter()
+                            .map(|upvalue| upvalue.value().clone()),
+                    );
+                }
+                Value::I64(_)
+                | Value::I32(_)
+                | Value::I16(_)
+                | Value::I8(_)
+                | Value::U8(_)
+                | Value::U16(_)
+                | Value::U32(_)
+                | Value::U64(_)
+                | Value::Float(_)
+                | Value::Bool(_)
+                | Value::String(_)
+                | Value::Foreign(_)
+                | Value::Unit => {}
+            }
+        }
+
+        if shares.is_empty() {
+            return Ok(value);
+        }
+
+        self.ensure_async_engine_matches(engine)?;
+        resolve_deferred_shares(engine, &shares).await?;
+
+        // Rewrite wrappers at the API boundary. The expression nodes retain a
+        // OnceLock cache for internal aliases, while callers receive ordinary
+        // Opaque/Feldman shares with normal value equality and persistence
+        // semantics.
+        for table_ref in tables {
+            let entries = match table_ref {
+                TableRef::Array(array_ref) => self
+                    .table_memory
+                    .read_array_ref_entries(array_ref, usize::MAX)?,
+                TableRef::Object(object_ref) => self
+                    .table_memory
+                    .read_object_ref_entries(object_ref, usize::MAX)?,
+            };
+            for (key, field_value) in entries {
+                let field_value = materialize_value_shell(field_value)?;
+                self.table_memory
+                    .set_table_field(table_ref, key, field_value)?;
+            }
+        }
+
+        materialize_value_shell(value)
+    }
+
     /// Attach an MPC engine to the VM state.
     pub(crate) fn set_mpc_engine(&mut self, engine: Arc<dyn MpcEngine>) {
         self.mpc_runtime.set_engine(engine);
@@ -224,9 +324,67 @@ impl VMState {
     }
 }
 
+fn enqueue_table_entries(entries: Vec<(Value, Value)>, pending: &mut Vec<Value>) -> VmResult<()> {
+    for (key, value) in entries {
+        if value_contains_deferred_key(&key) {
+            return Err(crate::error::VmError::Message(
+                "deferred MPC shares cannot be used as table keys".to_owned(),
+            ));
+        }
+        pending.push(value);
+        pending.push(key);
+    }
+    Ok(())
+}
+
+fn value_contains_deferred_key(value: &Value) -> bool {
+    match value {
+        Value::Share(_, share_data) => share_data.deferred_node().is_some(),
+        Value::Closure(closure) => closure
+            .upvalues()
+            .iter()
+            .any(|upvalue| value_contains_deferred_key(upvalue.value())),
+        _ => false,
+    }
+}
+
+fn materialize_value_shell(value: Value) -> VmResult<Value> {
+    match value {
+        Value::Share(share_type, share_data) => {
+            let share_data = share_data.materialized().cloned().ok_or_else(|| {
+                crate::error::VmError::Message(
+                    "async entry point returned an unresolved MPC share".to_owned(),
+                )
+            })?;
+            Ok(Value::Share(share_type, share_data))
+        }
+        Value::Closure(closure) => {
+            let upvalues = closure
+                .upvalues()
+                .iter()
+                .map(|upvalue| {
+                    Ok(Upvalue::new(
+                        upvalue.name(),
+                        materialize_value_shell(upvalue.value().clone())?,
+                    ))
+                })
+                .collect::<VmResult<Vec<_>>>()?;
+            Ok(Value::Closure(Arc::new(Closure::new(
+                closure.function_id(),
+                upvalues,
+            ))))
+        }
+        other => Ok(other),
+    }
+}
+
 impl VMState {
     pub(crate) fn input_share_data(&self, clear: ClearShareInput) -> VmResult<ShareData> {
         self.share_runtime()?.input_share(clear)
+    }
+
+    pub(crate) fn materialize_public_share_data(&self, share: &ShareData) -> VmResult<ShareData> {
+        self.share_runtime()?.materialize_public_share(share)
     }
 
     pub(crate) fn open_share_data(

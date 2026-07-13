@@ -74,6 +74,13 @@ async fn local_offchain_coordinator_runs_avss_networked_vm_without_docker_compos
 
     assert_eq!(output.returned_values(), vec!["7", "7", "7", "7", "7"]);
     assert_eq!(output.consistent_returned_values().unwrap(), vec!["7"]);
+    assert!(
+        output.combined_output.contains(
+            "compiler_triples=0 compiler_randoms=0 client_masks=0 requested_triples=0 requested_randoms=0"
+        ),
+        "AVSS clear program must not use hardcoded preprocessing defaults:\n{}",
+        output.combined_output
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -143,6 +150,52 @@ def main() -> int64:
 
     assert_eq!(output.returned_values(), vec!["47", "47", "47", "47", "47"]);
     assert_eq!(output.consistent_returned_values().unwrap(), vec!["47"]);
+    assert!(
+        output.combined_output.contains(
+            "compiler_triples=0 compiler_randoms=0 client_masks=1 requested_triples=0 requested_randoms=1"
+        ),
+        "AVSS client input must provision exactly one runtime mask:\n{}",
+        output.combined_output
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts a real localhost coordinator, secp256k1 AVSS party mesh, and coordinator client"]
+async fn local_offchain_coordinator_supports_secp256k1_avss_client_io() {
+    let source = r#"
+def main() -> int64:
+  var share = ClientStore.take_share(0, 0)
+  MpcOutput.send_to_client(0, [share])
+  var opened: int64 = share.open()
+  return opened + 5
+"#;
+    let options = stoffellang::CompilerOptions {
+        mpc_backend: stoffel_vm_types::compiled_binary::MpcBackend::Avss,
+        mpc_curve: stoffel_vm_types::compiled_binary::MpcCurve::Secp256k1,
+        ..Default::default()
+    };
+    let compiled = stoffellang::compile(source, "<local-avss-secp256k1-client-e2e>", &options)
+        .expect("compile secp256k1 AVSS client IO program");
+    let binary = stoffellang::convert_to_binary(&compiled);
+
+    let output = LocalCoordinatorRunner::builder(env!("CARGO_BIN_EXE_stoffel-run"), binary)
+        .backend(MpcBackendKind::Avss)
+        .curve(MpcCurveConfig::Secp256k1)
+        .parties(5)
+        .threshold(1)
+        .timeout(Duration::from_secs(180))
+        .client_inputs([LocalClientInput::raw(0, ["42"])])
+        .build()
+        .expect("local runner config")
+        .run()
+        .await
+        .expect("local secp256k1 AVSS coordinator client IO run");
+
+    assert_eq!(output.returned_values(), vec!["47", "47", "47", "47", "47"]);
+    assert_eq!(output.consistent_returned_values().unwrap(), vec!["47"]);
+    assert_eq!(output.client_outputs.len(), 1);
+    assert_eq!(output.client_outputs[0].client_slot, 0);
+    assert_eq!(output.client_outputs[0].values, vec![42]);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

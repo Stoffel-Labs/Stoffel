@@ -38,12 +38,23 @@ fn canonical_clear_share_value(
     clear_value: &Value,
 ) -> MpcValueResult<ClearShareValue> {
     match (share_type, clear_value) {
-        (ShareType::SecretInt { .. }, Value::I64(value)) => Ok(ClearShareValue::Integer(*value)),
         (ShareType::SecretInt { bit_length }, Value::Bool(value))
             if bit_length == stoffel_vm_types::core_types::BOOLEAN_SECRET_INT_BITS =>
         {
             Ok(ClearShareValue::Boolean(*value))
         }
+        (ShareType::SecretInt { bit_length }, value)
+            if bit_length == stoffel_vm_types::core_types::BOOLEAN_SECRET_INT_BITS
+                && is_integer_value(value) =>
+        {
+            // A one-bit secret integer is the VM's boolean share type. Keep its
+            // clear representation canonical at the construction boundary so
+            // public opens and backend-materialized opens produce the same VM
+            // value (`Bool`, never an optimization-dependent `I64`). MPC
+            // backends already open a one-bit field value as `value != 0`.
+            Ok(ClearShareValue::Boolean(integer_value_is_nonzero(value)))
+        }
+        (ShareType::SecretInt { .. }, Value::I64(value)) => Ok(ClearShareValue::Integer(*value)),
         (ShareType::SecretInt { .. }, value) if is_integer_value(value) => Ok(
             ClearShareValue::Integer(value_to_i64(value, "clear integer")?),
         ),
@@ -60,6 +71,20 @@ fn canonical_clear_share_value(
             share_type,
             value: value.clone(),
         }),
+    }
+}
+
+fn integer_value_is_nonzero(value: &Value) -> bool {
+    match value {
+        Value::I64(value) => *value != 0,
+        Value::I32(value) => *value != 0,
+        Value::I16(value) => *value != 0,
+        Value::I8(value) => *value != 0,
+        Value::U64(value) => *value != 0,
+        Value::U32(value) => *value != 0,
+        Value::U16(value) => *value != 0,
+        Value::U8(value) => *value != 0,
+        _ => unreachable!("caller checks that the value is an integer"),
     }
 }
 

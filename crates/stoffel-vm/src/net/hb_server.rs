@@ -17,6 +17,8 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::Sender;
 use tracing::{error, info, warn};
 
+use super::mpc_protocol_sender_id;
+
 /// Configuration for HoneyBadger MPC over QUIC
 #[derive(Debug, Clone)]
 pub struct HoneyBadgerQuicConfig {
@@ -433,17 +435,17 @@ pub async fn spawn_receive_loops(
         loop {
             // Server-to-server connections (MPC parties)
             for (derived_id, connection) in scan_net.get_all_server_connections() {
-                let sender_id = connection.remote_party_id().unwrap_or(derived_id);
-                if sender_id >= n_parties {
+                let Some(sender_id) =
+                    mpc_protocol_sender_id(derived_id, connection.remote_party_id(), n_parties)
+                else {
                     tracing::debug!(
                         party_id = node_id,
                         derived_id,
-                        sender_id,
                         n_parties,
                         "Skipping non-party server connection"
                     );
                     continue;
-                }
+                };
 
                 if !spawned_server_ids.insert(sender_id) {
                     continue;
@@ -594,10 +596,11 @@ pub async fn spawn_receive_loops_split(
         loop {
             // Server-to-server connections (MPC parties)
             for (derived_id, connection) in scan_net.get_all_server_connections() {
-                let sender_id = connection.remote_party_id().unwrap_or(derived_id);
-                if sender_id >= n_parties {
+                let Some(sender_id) =
+                    mpc_protocol_sender_id(derived_id, connection.remote_party_id(), n_parties)
+                else {
                     continue;
-                }
+                };
                 if !spawned_server_ids.insert(sender_id) {
                     continue;
                 }
@@ -701,6 +704,7 @@ mod tests {
     use crate::net::mpc::honeybadger_node_opts;
 
     async fn test_server() -> HoneyBadgerQuicServer<Fr> {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         let (tx, _rx) = mpsc::channel(8);
         let bind_address = "127.0.0.1:0".parse().expect("valid local bind address");
         let opts = honeybadger_node_opts(4, 1, 0, 0, 0).expect("valid HB options");

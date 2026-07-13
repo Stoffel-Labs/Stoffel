@@ -27,14 +27,16 @@ use std::io::{self, Read, Write};
 // Magic bytes that identify a StoffelVM bytecode file
 pub const MAGIC_BYTES: &[u8; 4] = b"STFL";
 // Current bytecode format version
-// v9: added LDS/STS spill-slot instructions
-pub const FORMAT_VERSION: u16 = 9;
+// v10: added the maximum required PRandInt bit width to preprocessing demand
+pub const FORMAT_VERSION: u16 = 10;
 pub const CLIENT_IO_MANIFEST_FORMAT_VERSION: u16 = 2;
 pub const MPC_BACKEND_MANIFEST_FORMAT_VERSION: u16 = 3;
 pub const MPC_CURVE_MANIFEST_FORMAT_VERSION: u16 = 4;
 pub const FUNCTION_TYPE_METADATA_FORMAT_VERSION: u16 = 5;
 /// Version at which the client IO manifest carries a `PreprocessingDemand`.
 pub const PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION: u16 = 8;
+/// Version at which preprocessing demand records the maximum PRandInt width.
+pub const PREPROCESSING_PRANDINT_BITS_MANIFEST_FORMAT_VERSION: u16 = 10;
 
 const MAX_BINARY_COLLECTION_LEN: usize = 1_000_000;
 /// Per-function instruction vectors are allowed to grow far larger than the
@@ -340,6 +342,11 @@ pub struct PreprocessingDemand {
     /// typed `Share.random`, which lowers to it) and one per secret fixed-point
     /// division (truncation).
     pub prandints: u64,
+    /// Maximum bit width required by any PRandInt-backed operation. Counts and
+    /// width are independent: batching changes the former but never the latter.
+    /// Zero means no statically known requirement (or a pre-v10 binary).
+    #[serde(default)]
+    pub prandint_bits: u16,
     /// True when the static estimate may undercount (data-dependent loops,
     /// recursion, or runtime-sized batch operations).
     pub dynamic: bool,
@@ -352,6 +359,13 @@ impl PreprocessingDemand {
         self.randoms = self.randoms.saturating_add(randoms);
         self.prandbits = self.prandbits.saturating_add(prandbits);
         self.prandints = self.prandints.saturating_add(prandints);
+    }
+
+    /// Record a PRandInt width requirement, retaining the widest operation.
+    pub fn require_prandint_bits(&mut self, bit_width: usize) {
+        self.prandint_bits = self
+            .prandint_bits
+            .max(u16::try_from(bit_width).unwrap_or(u16::MAX));
     }
 }
 
@@ -1170,6 +1184,7 @@ impl CompiledBinary {
                 self.version >= MPC_BACKEND_MANIFEST_FORMAT_VERSION,
                 self.version >= MPC_CURVE_MANIFEST_FORMAT_VERSION,
                 self.version >= PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION,
+                self.version >= PREPROCESSING_PRANDINT_BITS_MANIFEST_FORMAT_VERSION,
                 writer,
             )?;
         }
@@ -1182,6 +1197,7 @@ impl CompiledBinary {
         include_backend: bool,
         include_curve: bool,
         include_demand: bool,
+        include_prandint_bits: bool,
         writer: &mut W,
     ) -> BinaryResult<()> {
         if include_backend {
@@ -1209,6 +1225,9 @@ impl CompiledBinary {
             writer.write_all(&demand.prandbits.to_le_bytes())?;
             writer.write_all(&demand.prandints.to_le_bytes())?;
             writer.write_all(&[u8::from(demand.dynamic)])?;
+            if include_prandint_bits {
+                writer.write_all(&demand.prandint_bits.to_le_bytes())?;
+            }
         }
         Ok(())
     }
@@ -1647,6 +1666,7 @@ impl CompiledBinary {
                 version >= MPC_BACKEND_MANIFEST_FORMAT_VERSION,
                 version >= MPC_CURVE_MANIFEST_FORMAT_VERSION,
                 version >= PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION,
+                version >= PREPROCESSING_PRANDINT_BITS_MANIFEST_FORMAT_VERSION,
             )?
         } else {
             ClientIoManifest::default()
@@ -1725,6 +1745,7 @@ impl CompiledBinary {
                 version >= MPC_BACKEND_MANIFEST_FORMAT_VERSION,
                 version >= MPC_CURVE_MANIFEST_FORMAT_VERSION,
                 version >= PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION,
+                version >= PREPROCESSING_PRANDINT_BITS_MANIFEST_FORMAT_VERSION,
             )?
         } else {
             ClientIoManifest::default()
@@ -1798,6 +1819,7 @@ impl CompiledBinary {
                 version >= MPC_BACKEND_MANIFEST_FORMAT_VERSION,
                 version >= MPC_CURVE_MANIFEST_FORMAT_VERSION,
                 version >= PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION,
+                version >= PREPROCESSING_PRANDINT_BITS_MANIFEST_FORMAT_VERSION,
             )?
         } else {
             ClientIoManifest::default()
@@ -1811,6 +1833,7 @@ impl CompiledBinary {
         has_backend: bool,
         has_curve: bool,
         has_demand: bool,
+        has_prandint_bits: bool,
     ) -> BinaryResult<ClientIoManifest> {
         let mpc_backend = if has_backend {
             Self::deserialize_mpc_backend(reader)?
@@ -1851,12 +1874,23 @@ impl CompiledBinary {
             });
         }
         let preprocessing_demand = if has_demand {
+            let triples = read_u64(reader)?;
+            let randoms = read_u64(reader)?;
+            let prandbits = read_u64(reader)?;
+            let prandints = read_u64(reader)?;
+            let dynamic = read_u8(reader)? != 0;
+            let prandint_bits = if has_prandint_bits {
+                read_u16(reader)?
+            } else {
+                0
+            };
             PreprocessingDemand {
-                triples: read_u64(reader)?,
-                randoms: read_u64(reader)?,
-                prandbits: read_u64(reader)?,
-                prandints: read_u64(reader)?,
-                dynamic: read_u8(reader)? != 0,
+                triples,
+                randoms,
+                prandbits,
+                prandints,
+                prandint_bits,
+                dynamic,
             }
         } else {
             PreprocessingDemand::default()
@@ -3647,7 +3681,8 @@ mod tests {
                     triples: 7,
                     randoms: 2,
                     prandbits: 0,
-                    prandints: 0,
+                    prandints: 1,
+                    prandint_bits: 31,
                     dynamic: false,
                 },
                 ..ClientIoManifest::default()
@@ -3671,6 +3706,27 @@ mod tests {
         assert_eq!(register_counts, vec![17]);
         assert_eq!(manifest.preprocessing_demand.triples, 7);
         assert_eq!(manifest.preprocessing_demand.randoms, 2);
+        assert_eq!(manifest.preprocessing_demand.prandints, 1);
+        assert_eq!(manifest.preprocessing_demand.prandint_bits, 31);
+
+        let mut legacy_binary = binary;
+        legacy_binary.version = PREPROCESSING_PRANDINT_BITS_MANIFEST_FORMAT_VERSION - 1;
+        let mut legacy_bytes = Vec::new();
+        legacy_binary.serialize(&mut legacy_bytes).unwrap();
+
+        let (_count, version, legacy_manifest) =
+            CompiledBinary::try_for_each_vm_function_from_reader(
+                &mut Cursor::new(legacy_bytes),
+                |_function| Ok(()),
+            )
+            .unwrap();
+
+        assert_eq!(
+            version,
+            PREPROCESSING_PRANDINT_BITS_MANIFEST_FORMAT_VERSION - 1
+        );
+        assert_eq!(legacy_manifest.preprocessing_demand.prandints, 1);
+        assert_eq!(legacy_manifest.preprocessing_demand.prandint_bits, 0);
     }
 
     #[test]

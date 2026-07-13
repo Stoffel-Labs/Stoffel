@@ -204,20 +204,6 @@ pub(crate) async fn execute_local_capturing_with_options(
         .ok_or_else(|| Error::Configuration("MPC configuration is required".to_owned()))?;
     let flattened_client_inputs = flatten_local_client_inputs(runtime.client_inputs())?;
     validate_flattened_local_client_inputs(runtime, &flattened_client_inputs)?;
-    if matches!(
-        mpc_config.backend,
-        MpcBackend::Avss {
-            curve: crate::config::Curve::Bn254
-                | crate::config::Curve::Curve25519
-                | crate::config::Curve::Ed25519
-        }
-    ) && !runtime.client_inputs().is_empty()
-    {
-        return Err(Error::Unsupported(
-            "SDK local coordinator execution currently supports AVSS local client inputs only for bls12_381"
-                .to_owned(),
-        ));
-    }
     let local_client_inputs = flattened_client_inputs
         .iter()
         .map(|(client_slot, values)| {

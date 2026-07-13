@@ -57,9 +57,11 @@ pub(crate) fn preserve_share_data_format_for_curve(
     template: &ShareData,
     result_bytes: Vec<u8>,
 ) -> ShareAlgebraResult<ShareData> {
-    match template {
-        ShareData::Opaque(_) => Ok(ShareData::Opaque(result_bytes.into())),
-        ShareData::Feldman { .. } => {
+    match template.format() {
+        stoffel_vm_types::core_types::ShareDataFormat::Opaque => {
+            Ok(ShareData::Opaque(result_bytes.into()))
+        }
+        stoffel_vm_types::core_types::ShareDataFormat::Feldman => {
             dispatch_share_curve_config!(
                 curve_config,
                 feldman_share_data_from_bytes_typed(result_bytes)

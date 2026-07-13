@@ -115,9 +115,16 @@ impl VmEffectSummary {
                 | PendingMpcBuiltinOperation::BatchMulMixed { left_data, .. } => {
                     Self::new(VmEffectKind::BuiltinBatchMul, left_data.len())
                 }
+                PendingMpcBuiltinOperation::BatchMulHeterogeneous { groups, .. } => Self::new(
+                    VmEffectKind::BuiltinBatchMul,
+                    groups.iter().map(|group| group.left_data.len()).sum(),
+                ),
                 PendingMpcBuiltinOperation::Open { .. } => Self::new(VmEffectKind::BuiltinOpen, 1),
                 PendingMpcBuiltinOperation::BatchOpen { share_data, .. } => {
                     Self::new(VmEffectKind::BuiltinBatchOpen, share_data.len())
+                }
+                PendingMpcBuiltinOperation::BatchOpenHeterogeneous { output_len, .. } => {
+                    Self::new(VmEffectKind::BuiltinBatchOpen, *output_len)
                 }
                 _ => Self::new(VmEffectKind::BuiltinOther, 1),
             },

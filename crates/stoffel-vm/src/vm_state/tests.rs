@@ -418,6 +418,20 @@ struct MockConversionEngine {
     input_calls: Mutex<Vec<(ShareType, Value)>>,
 }
 
+fn assert_public_secret_int(value: &Value, expected: i64) {
+    let Value::Share(share_type, share_data) = value else {
+        panic!("expected secret share, got {value:?}");
+    };
+    assert_eq!(*share_type, ShareType::secret_int(64));
+    assert_eq!(
+        share_data.public_input(),
+        Some(ClearShareInput::new(
+            *share_type,
+            ClearShareValue::Integer(expected)
+        ))
+    );
+}
+
 impl MpcEngine for MockConversionEngine {
     fn protocol_name(&self) -> &'static str {
         "mock-conversion"
@@ -1972,7 +1986,7 @@ fn implicit_function_end_uses_shared_frame_return_path() {
 }
 
 #[test]
-fn register_layout_controls_clear_to_secret_mov_boundary() {
+fn register_layout_preserves_public_provenance_at_clear_to_secret_mov_boundary() {
     let mut vm = VMState::new();
     vm.set_register_layout(RegisterLayout::new(8));
     let engine = Arc::new(MockConversionEngine::default());
@@ -1991,14 +2005,8 @@ fn register_layout_controls_clear_to_secret_mov_boundary() {
         .unwrap();
 
     let record = vm.current_activation_record().unwrap();
-    assert!(matches!(
-        record.register(r(8)),
-        Some(Value::Share(ShareType::SecretInt { bit_length: 64 }, _))
-    ));
-    assert_eq!(
-        engine.input_calls.lock().unwrap().as_slice(),
-        &[(ShareType::secret_int(64), Value::I64(5))]
-    );
+    assert_public_secret_int(record.register(r(8)).expect("secret register r8"), 5);
+    assert!(engine.input_calls.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -2177,7 +2185,7 @@ fn mov_hooks_read_source_before_overwriting_same_register() {
 }
 
 #[test]
-fn ldi_to_secret_register_uses_mpc_conversion() {
+fn ldi_to_secret_register_preserves_public_provenance() {
     let mut vm = VMState::new();
     vm.set_register_layout(RegisterLayout::new(1));
     let engine = Arc::new(MockConversionEngine::default());
@@ -2195,14 +2203,8 @@ fn ldi_to_secret_register_uses_mpc_conversion() {
         .unwrap();
 
     let record = vm.current_activation_record().unwrap();
-    assert!(matches!(
-        record.register(r(1)),
-        Some(Value::Share(ShareType::SecretInt { bit_length: 64 }, _))
-    ));
-    assert_eq!(
-        engine.input_calls.lock().unwrap().as_slice(),
-        &[(ShareType::secret_int(64), Value::I64(5))]
-    );
+    assert_public_secret_int(record.register(r(1)).expect("secret register r1"), 5);
+    assert!(engine.input_calls.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -2224,14 +2226,8 @@ fn ldi_to_secret_register_canonicalizes_vm_integer_widths() {
         .unwrap();
 
     let record = vm.current_activation_record().unwrap();
-    assert!(matches!(
-        record.register(r(1)),
-        Some(Value::Share(ShareType::SecretInt { bit_length: 64 }, _))
-    ));
-    assert_eq!(
-        engine.input_calls.lock().unwrap().as_slice(),
-        &[(ShareType::secret_int(64), Value::I64(5))]
-    );
+    assert_public_secret_int(record.register(r(1)).expect("secret register r1"), 5);
+    assert!(engine.input_calls.lock().unwrap().is_empty());
 }
 
 #[test]
@@ -2293,7 +2289,7 @@ fn secret_register_write_rejects_clear_value_without_mpc_engine() {
 }
 
 #[test]
-fn entry_argument_to_secret_register_uses_mpc_conversion() {
+fn entry_argument_to_secret_register_preserves_public_provenance() {
     let engine = Arc::new(MockConversionEngine::default());
     let mut vm = VirtualMachine::builder()
         .with_register_layout(RegisterLayout::new(0))
@@ -2314,18 +2310,12 @@ fn entry_argument_to_secret_register_uses_mpc_conversion() {
         .execute_with_args("secret_arg", &[Value::I64(5)])
         .expect("secret-register argument should be converted through MPC");
 
-    assert!(matches!(
-        result,
-        Value::Share(ShareType::SecretInt { bit_length: 64 }, _)
-    ));
-    assert_eq!(
-        engine.input_calls.lock().unwrap().as_slice(),
-        &[(ShareType::secret_int(64), Value::I64(5))]
-    );
+    assert_public_secret_int(&result, 5);
+    assert!(engine.input_calls.lock().unwrap().is_empty());
 }
 
 #[test]
-fn foreign_return_to_secret_register_uses_mpc_conversion() {
+fn foreign_return_to_secret_register_preserves_public_provenance() {
     let engine = Arc::new(MockConversionEngine::default());
     let mut vm = VirtualMachine::builder()
         .with_register_layout(RegisterLayout::new(0))
@@ -2350,14 +2340,8 @@ fn foreign_return_to_secret_register_uses_mpc_conversion() {
         .execute("call_native_secret")
         .expect("foreign return should be converted through MPC");
 
-    assert!(matches!(
-        result,
-        Value::Share(ShareType::SecretInt { bit_length: 64 }, _)
-    ));
-    assert_eq!(
-        engine.input_calls.lock().unwrap().as_slice(),
-        &[(ShareType::secret_int(64), Value::I64(7))]
-    );
+    assert_public_secret_int(&result, 7);
+    assert!(engine.input_calls.lock().unwrap().is_empty());
 }
 
 #[test]

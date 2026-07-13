@@ -89,10 +89,57 @@ pub fn honeybadger_node_opts_with_truncation(
     n_prandint: usize,
     instance_id: u64,
 ) -> Result<HoneyBadgerMPCNodeOpts, String> {
+    honeybadger_node_opts_with_truncation_width(
+        n_parties,
+        threshold,
+        n_triples,
+        n_random_shares,
+        n_prandbit,
+        n_prandint,
+        DEFAULT_FIXED_POINT_TOTAL_BITS,
+        instance_id,
+    )
+}
+
+/// Build HoneyBadger options with the exact maximum bit width required by
+/// PRandBit/PRandInt-backed operations in this program.
+pub fn honeybadger_node_opts_with_truncation_width(
+    n_parties: usize,
+    threshold: usize,
+    n_triples: usize,
+    n_random_shares: usize,
+    n_prandbit: usize,
+    n_prandint: usize,
+    preprocessing_bit_width: usize,
+    instance_id: u64,
+) -> Result<HoneyBadgerMPCNodeOpts, String> {
     validate_honeybadger_topology(n_parties, threshold)?;
 
-    let l = DEFAULT_FIXED_POINT_TOTAL_BITS;
+    let l = preprocessing_bit_width.max(1);
     let k = DEFAULT_SECURITY_PARAMETER_K;
+
+    // stoffelcrypto's PRand protocol uses a Goldilocks subfield and requires
+    // k + l + two masking bits + ceil(log2(n)) to fit strictly below its
+    // 64-bit modulus capacity. Check the same invariant before launching a
+    // network session so unsupported widths fail deterministically.
+    if n_prandbit > 0 || n_prandint > 0 {
+        const GOLDILOCKS_MODULUS_BITS: usize = 64;
+        const MASKING_MARGIN_BITS: usize = 2;
+        let party_bits = if n_parties <= 1 {
+            0
+        } else {
+            usize::BITS as usize - (n_parties - 1).leading_zeros() as usize
+        };
+        let required = k
+            .saturating_add(l)
+            .saturating_add(MASKING_MARGIN_BITS)
+            .saturating_add(party_bits);
+        if required >= GOLDILOCKS_MODULUS_BITS {
+            return Err(format!(
+                "HoneyBadger preprocessing width {l} is unsupported for {n_parties} parties: security and masking margins require {required} bits, but PRand's Goldilocks subfield requires fewer than {GOLDILOCKS_MODULUS_BITS}"
+            ));
+        }
+    }
 
     HoneyBadgerMPCNodeOpts::new(
         n_parties,
@@ -166,6 +213,30 @@ mod tests {
 
         honeybadger_node_opts(4, 1, 0, 0, 1)
             .expect("n = 3t + 1 should be accepted for HoneyBadger");
+    }
+
+    #[test]
+    fn honeybadger_node_opts_uses_exact_preprocessing_width() {
+        let opts = honeybadger_node_opts_with_truncation_width(5, 1, 0, 2, 0, 3, 1, 1)
+            .expect("one-bit PRandInt preprocessing should fit the field");
+
+        assert_eq!(opts.n_prandint, 3);
+        assert_eq!(opts.l, 1);
+    }
+
+    #[test]
+    fn honeybadger_node_opts_rejects_preprocessing_width_beyond_field_capacity() {
+        let err = honeybadger_node_opts_with_truncation_width(5, 1, 0, 2, 0, 1, 64, 1)
+            .expect_err("unsupported preprocessing widths must fail before network startup");
+
+        assert!(
+            err.contains("preprocessing width 64"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            err.contains("requires fewer than 64"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

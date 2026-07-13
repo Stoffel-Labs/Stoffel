@@ -6,9 +6,11 @@ use stoffel_vm::net::mpc_engine::{
     MpcCapabilities, MpcEngine, MpcEngineMultiplication, MpcEngineResult, MpcSessionTopology,
     ShareAlgebraResult,
 };
+use stoffel_vm::runtime_hooks::HookEvent;
 use stoffel_vm_types::core_types::{
     ClearShareInput, ClearShareValue, ShareData, ShareType, TableRef, Value,
 };
+use stoffel_vm_types::instructions::Instruction;
 
 /// HoneyBadger's default per-session pair limit at the benchmark topology
 /// threshold `t=1`: `128 * (t+1)`. Each chunk is awaited sequentially and is
@@ -85,9 +87,9 @@ fn validate_pair_dag(log: &[PairRecord]) -> usize {
         for &parent in &record.parents {
             let parent = parent as usize;
             assert!(parent < expected_id, "DAG edge must point backward");
-            assert_ne!(
-                calls[parent], record.call_id,
-                "pairs in one MPC batch cannot depend on each other"
+            assert!(
+                calls[parent] < record.call_id,
+                "a multiplication must execute strictly after every parent round"
             );
             parent_depth = parent_depth.max(depths[parent]);
         }
@@ -102,13 +104,43 @@ fn validate_pair_dag(log: &[PairRecord]) -> usize {
     depths.into_iter().max().unwrap_or(0) as usize
 }
 
+fn weak_component_sizes(log: &[PairRecord]) -> Vec<usize> {
+    fn find(parents: &mut [usize], mut node: usize) -> usize {
+        while parents[node] != node {
+            parents[node] = parents[parents[node]];
+            node = parents[node];
+        }
+        node
+    }
+
+    let mut components: Vec<_> = (0..log.len()).collect();
+    for record in log {
+        let node = record.pair_id as usize;
+        for &parent in &record.parents {
+            let left = find(&mut components, node);
+            let right = find(&mut components, parent as usize);
+            if left != right {
+                components[right] = left;
+            }
+        }
+    }
+    let mut sizes = std::collections::BTreeMap::new();
+    for node in 0..log.len() {
+        let root = find(&mut components, node);
+        *sizes.entry(root).or_insert(0usize) += 1;
+    }
+    let mut sizes: Vec<_> = sizes.into_values().collect();
+    sizes.sort_unstable_by(|left, right| right.cmp(left));
+    sizes
+}
+
 /// A legal capacity-aware list schedule of the executed multiplication DAG.
 /// Ready nodes with the longest remaining path are prioritized, which preserves
 /// scarce critical-path work while filling every protocol session when possible.
-fn dag_list_schedule_rounds(log: &[PairRecord], capacity: usize) -> usize {
+fn dag_list_schedule(log: &[PairRecord], capacity: usize) -> Vec<Vec<usize>> {
     assert!(capacity > 0);
     if log.is_empty() {
-        return 0;
+        return Vec::new();
     }
     let mut successors = vec![Vec::new(); log.len()];
     let mut indegree = vec![0usize; log.len()];
@@ -137,7 +169,7 @@ fn dag_list_schedule_rounds(log: &[PairRecord], capacity: usize) -> usize {
         }
     }
     let mut scheduled = 0usize;
-    let mut rounds = 0usize;
+    let mut rounds = Vec::new();
     while scheduled < log.len() {
         assert!(!ready.is_empty(), "multiplication graph must be acyclic");
         // Successors released by this session cannot execute until the next
@@ -150,8 +182,7 @@ fn dag_list_schedule_rounds(log: &[PairRecord], capacity: usize) -> usize {
             session.push(node);
         }
         scheduled += session.len();
-        rounds += 1;
-        for node in session {
+        for &node in &session {
             for &successor in &successors[node] {
                 indegree[successor] -= 1;
                 if indegree[successor] == 0 {
@@ -159,8 +190,918 @@ fn dag_list_schedule_rounds(log: &[PairRecord], capacity: usize) -> usize {
                 }
             }
         }
+        rounds.push(session);
     }
     rounds
+}
+
+/// Mirror-image list schedule built from the sinks backwards. A forward
+/// critical-path heuristic can make locally reasonable choices that create a
+/// sparse drain; scheduling the reversed DAG independently is a cheap generic
+/// way to expose that asymmetry. Returned rounds are restored to forward order.
+fn dag_backward_list_schedule(log: &[PairRecord], capacity: usize) -> Vec<Vec<usize>> {
+    dag_backward_priority_list_schedule(log, capacity, BackwardPriority::SourceOrder)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum BackwardPriority {
+    SourceOrder,
+    CriticalPredecessorFanIn,
+}
+
+fn dag_backward_priority_list_schedule(
+    log: &[PairRecord],
+    capacity: usize,
+    priority: BackwardPriority,
+) -> Vec<Vec<usize>> {
+    assert!(capacity > 0);
+    if log.is_empty() {
+        return Vec::new();
+    }
+    let mut remaining_successors = vec![0usize; log.len()];
+    for record in log {
+        for &parent in &record.parents {
+            remaining_successors[parent as usize] += 1;
+        }
+    }
+    let critical_predecessor_count: Vec<_> = log
+        .iter()
+        .map(|record| {
+            record
+                .parents
+                .iter()
+                .filter(|&&parent| log[parent as usize].depth + 1 == record.depth)
+                .count()
+        })
+        .collect();
+    let key = |node: usize| {
+        let ascending = usize::MAX - node;
+        match priority {
+            BackwardPriority::SourceOrder => [log[node].depth as usize, 0, 0, 0, 0, ascending],
+            BackwardPriority::CriticalPredecessorFanIn => [
+                log[node].depth as usize,
+                critical_predecessor_count[node],
+                log[node].parents.len(),
+                0,
+                0,
+                ascending,
+            ],
+        }
+    };
+
+    use std::collections::BinaryHeap;
+    let mut ready = BinaryHeap::new();
+    for node in 0..log.len() {
+        if remaining_successors[node] == 0 {
+            // `depth` is the reverse problem's bottom level.
+            ready.push((key(node), node));
+        }
+    }
+    let mut scheduled = 0usize;
+    let mut reverse_rounds = Vec::new();
+    while scheduled < log.len() {
+        assert!(!ready.is_empty(), "multiplication graph must be acyclic");
+        let mut round = Vec::with_capacity(capacity.min(ready.len()));
+        for _ in 0..capacity {
+            let Some((_, node)) = ready.pop() else {
+                break;
+            };
+            round.push(node);
+        }
+        scheduled += round.len();
+        for &node in &round {
+            for &parent in &log[node].parents {
+                let parent = parent as usize;
+                remaining_successors[parent] -= 1;
+                if remaining_successors[parent] == 0 {
+                    ready.push((key(parent), parent));
+                }
+            }
+        }
+        reverse_rounds.push(round);
+    }
+    reverse_rounds.reverse();
+    reverse_rounds
+}
+
+/// Forward list scheduling prioritized by the round assigned by an independent
+/// legal backward schedule. The reverse pass gives prerequisites of congested
+/// sink regions earlier deadlines than bottom level alone can express.
+fn dag_backward_deadline_schedule(log: &[PairRecord], capacity: usize) -> Vec<Vec<usize>> {
+    assert!(capacity > 0);
+    if log.is_empty() {
+        return Vec::new();
+    }
+    let backward = dag_backward_list_schedule(log, capacity);
+    dag_forward_from_backward_schedule(log, capacity, &backward)
+}
+
+fn dag_forward_from_backward_schedule(
+    log: &[PairRecord],
+    capacity: usize,
+    backward: &[Vec<usize>],
+) -> Vec<Vec<usize>> {
+    let mut deadline = vec![usize::MAX; log.len()];
+    for (round, nodes) in backward.iter().enumerate() {
+        for &node in nodes {
+            deadline[node] = round;
+        }
+    }
+
+    dag_forward_by_deadlines(log, capacity, &deadline)
+}
+
+fn dag_forward_by_deadlines(
+    log: &[PairRecord],
+    capacity: usize,
+    deadline: &[usize],
+) -> Vec<Vec<usize>> {
+    assert_eq!(log.len(), deadline.len());
+
+    let mut successors = vec![Vec::new(); log.len()];
+    let mut indegree = vec![0usize; log.len()];
+    for record in log {
+        let node = record.pair_id as usize;
+        for &parent in &record.parents {
+            successors[parent as usize].push(node);
+            indegree[node] += 1;
+        }
+    }
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let mut ready = BinaryHeap::new();
+    for node in 0..log.len() {
+        if indegree[node] == 0 {
+            ready.push((Reverse(deadline[node]), Reverse(node)));
+        }
+    }
+    let mut scheduled = 0usize;
+    let mut rounds = Vec::new();
+    while scheduled < log.len() {
+        assert!(!ready.is_empty(), "multiplication graph must be acyclic");
+        let mut round = Vec::with_capacity(capacity.min(ready.len()));
+        for _ in 0..capacity {
+            let Some((_, Reverse(node))) = ready.pop() else {
+                break;
+            };
+            round.push(node);
+        }
+        scheduled += round.len();
+        for &node in &round {
+            for &successor in &successors[node] {
+                indegree[successor] -= 1;
+                if indegree[successor] == 0 {
+                    ready.push((Reverse(deadline[successor]), Reverse(successor)));
+                }
+            }
+        }
+        rounds.push(round);
+    }
+    rounds
+}
+
+#[derive(Debug, Clone, Copy)]
+enum DagListPriority {
+    BottomSourceAscending,
+    BottomHighFanout,
+    BottomSuccessorPressure,
+}
+
+/// Deterministic priority variants used to challenge the production list
+/// schedule against the same legal DAG. This is intentionally generic: no
+/// source-function, AES, or lane identities participate in a priority.
+fn dag_priority_list_schedule(
+    log: &[PairRecord],
+    capacity: usize,
+    priority: DagListPriority,
+) -> (Vec<Vec<usize>>, Vec<usize>) {
+    assert!(capacity > 0);
+    let mut successors = vec![Vec::new(); log.len()];
+    let mut indegree = vec![0usize; log.len()];
+    for record in log {
+        let node = record.pair_id as usize;
+        for &parent in &record.parents {
+            successors[parent as usize].push(node);
+            indegree[node] += 1;
+        }
+    }
+    let mut bottom = vec![1usize; log.len()];
+    for node in (0..log.len()).rev() {
+        bottom[node] = 1 + successors[node]
+            .iter()
+            .map(|&successor| bottom[successor])
+            .max()
+            .unwrap_or(0);
+    }
+    let original_indegree = indegree.clone();
+    let successor_pressure: Vec<_> = successors
+        .iter()
+        .map(|children| {
+            children
+                .iter()
+                .map(|&child| 1024 / original_indegree[child].max(1))
+                .sum::<usize>()
+        })
+        .collect();
+    let key = |node: usize| {
+        let ascending = usize::MAX - node;
+        match priority {
+            DagListPriority::BottomSourceAscending => (bottom[node], 0, 0, ascending),
+            DagListPriority::BottomHighFanout => {
+                (bottom[node], successors[node].len(), 0, ascending)
+            }
+            DagListPriority::BottomSuccessorPressure => {
+                (bottom[node], successor_pressure[node], 0, ascending)
+            }
+        }
+    };
+
+    let mut ready = std::collections::BinaryHeap::new();
+    for node in 0..log.len() {
+        if indegree[node] == 0 {
+            ready.push((key(node), node));
+        }
+    }
+    let mut rounds = Vec::new();
+    let mut ready_counts = Vec::new();
+    let mut scheduled = 0usize;
+    while scheduled < log.len() {
+        assert!(!ready.is_empty(), "multiplication graph must be acyclic");
+        ready_counts.push(ready.len());
+        let mut round = Vec::with_capacity(capacity.min(ready.len()));
+        for _ in 0..capacity {
+            let Some((_, node)) = ready.pop() else {
+                break;
+            };
+            round.push(node);
+        }
+        scheduled += round.len();
+        for &node in &round {
+            for &successor in &successors[node] {
+                indegree[successor] -= 1;
+                if indegree[successor] == 0 {
+                    ready.push((key(successor), successor));
+                }
+            }
+        }
+        rounds.push(round);
+    }
+    (rounds, ready_counts)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct WindowCapacityWitness {
+    /// Candidate schedule length disproved by this witness.
+    horizon: usize,
+    /// Inclusive interval of online rounds that must contain `forced_work`.
+    first_round: usize,
+    last_round: usize,
+    forced_work: usize,
+    interval_capacity: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PivotCapacityWitness {
+    pivot: usize,
+    ancestors: usize,
+    descendants: usize,
+    lower_bound: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ChainPartitionWitness {
+    lower_bound: usize,
+    /// Multiplication node ids used as ordered separator pivots.
+    pivots: Vec<usize>,
+}
+
+/// Capacity/depth lower bound obtained by partitioning the DAG around an
+/// ordered chain of multiplication pivots.
+///
+/// For pivots `p < q`, every node that is both a descendant of `p` and an
+/// ancestor of `q` must execute strictly between their rounds. Different
+/// consecutive pivot intervals are disjoint. Each interval therefore needs at
+/// least the larger of its capacity work bound and its chain-depth bound; the
+/// same argument applies before the first and after the last pivot. Dynamic
+/// programming chooses the strongest partition of one critical chain.
+fn critical_chain_partition_lower_bound(
+    log: &[PairRecord],
+    capacity: usize,
+) -> ChainPartitionWitness {
+    assert!(!log.is_empty());
+    assert!(capacity > 0);
+
+    let mut pivot = log
+        .iter()
+        .max_by_key(|record| record.depth)
+        .expect("non-empty multiplication log")
+        .pair_id as usize;
+    let mut chain = vec![pivot];
+    while let Some(parent) = log[pivot]
+        .parents
+        .iter()
+        .copied()
+        .max_by_key(|&parent| log[parent as usize].depth)
+    {
+        pivot = parent as usize;
+        chain.push(pivot);
+    }
+    chain.reverse();
+    let chain_len = chain.len();
+    assert_eq!(
+        chain_len,
+        log.iter().map(|record| record.depth).max().unwrap() as usize,
+        "chosen parent path must realize the recorded critical depth"
+    );
+
+    let none = chain_len;
+    let mut chain_index = vec![none; log.len()];
+    for (index, &node) in chain.iter().enumerate() {
+        chain_index[node] = index;
+    }
+
+    // Greatest chain pivot known to precede each node (a chain-prefix label).
+    let mut latest_ancestor = vec![none; log.len()];
+    for node in 0..log.len() {
+        let mut latest = chain_index[node];
+        for &parent in &log[node].parents {
+            let parent_latest = latest_ancestor[parent as usize];
+            if parent_latest != none && (latest == none || parent_latest > latest) {
+                latest = parent_latest;
+            }
+        }
+        latest_ancestor[node] = latest;
+    }
+
+    // Earliest chain pivot known to succeed each node (a chain-suffix label).
+    // Reverse topological propagation avoids materializing a second successor
+    // graph for the large measured circuits.
+    let mut earliest_descendant = chain_index.clone();
+    for node in (0..log.len()).rev() {
+        let earliest = earliest_descendant[node];
+        if earliest == none {
+            continue;
+        }
+        for &parent in &log[node].parents {
+            let parent = parent as usize;
+            earliest_descendant[parent] = earliest_descendant[parent].min(earliest);
+        }
+    }
+
+    let stride = chain_len + 1;
+    let cell = |row: usize, column: usize| row * stride + column;
+    let mut between = vec![0usize; stride * stride];
+    let mut ancestors_through = vec![0usize; chain_len];
+    let mut descendants_from = vec![0usize; chain_len];
+    for node in 0..log.len() {
+        let latest = latest_ancestor[node];
+        let earliest = earliest_descendant[node];
+        if latest != none && earliest != none {
+            between[cell(latest, earliest)] += 1;
+        }
+        if earliest != none {
+            ancestors_through[earliest] += 1;
+        }
+        if latest != none {
+            descendants_from[latest] += 1;
+        }
+    }
+    for index in 1..chain_len {
+        ancestors_through[index] += ancestors_through[index - 1];
+    }
+    for index in (0..chain_len.saturating_sub(1)).rev() {
+        descendants_from[index] += descendants_from[index + 1];
+    }
+    // Query count(latest_ancestor >= i && earliest_descendant <= j).
+    for latest in (0..chain_len).rev() {
+        for earliest in 0..chain_len {
+            let below = (latest + 1 < chain_len).then(|| between[cell(latest + 1, earliest)]);
+            let left = (earliest > 0).then(|| between[cell(latest, earliest - 1)]);
+            let diagonal = (latest + 1 < chain_len && earliest > 0)
+                .then(|| between[cell(latest + 1, earliest - 1)]);
+            between[cell(latest, earliest)] =
+                between[cell(latest, earliest)] + below.unwrap_or(0) + left.unwrap_or(0)
+                    - diagonal.unwrap_or(0);
+        }
+    }
+
+    let mut best_through = vec![0usize; chain_len];
+    let mut predecessor = vec![None; chain_len];
+    for last in 0..chain_len {
+        let strict_ancestors = ancestors_through[last] - 1;
+        best_through[last] = last.max(strict_ancestors.div_ceil(capacity)) + 1;
+        for previous in 0..last {
+            let strict_interior = between[cell(previous, last)] - 2;
+            let interval_rounds = (last - previous - 1).max(strict_interior.div_ceil(capacity));
+            let candidate = best_through[previous] + interval_rounds + 1;
+            if candidate > best_through[last] {
+                best_through[last] = candidate;
+                predecessor[last] = Some(previous);
+            }
+        }
+    }
+
+    let (mut last, lower_bound) = (0..chain_len)
+        .map(|last| {
+            let strict_descendants = descendants_from[last] - 1;
+            let suffix_rounds = (chain_len - last - 1).max(strict_descendants.div_ceil(capacity));
+            (last, best_through[last] + suffix_rounds)
+        })
+        .max_by_key(|(_, bound)| *bound)
+        .expect("critical chain is non-empty");
+    let mut pivots = vec![chain[last]];
+    while let Some(previous) = predecessor[last] {
+        last = previous;
+        pivots.push(chain[last]);
+    }
+    pivots.reverse();
+    ChainPartitionWitness {
+        lower_bound,
+        pivots,
+    }
+}
+
+/// Resource lower bound around one precedence pivot. Every strict ancestor of
+/// `v` must occupy a round before `v`, and every strict descendant must occupy a
+/// round after it. Those three regions are disjoint, so
+///
+///   ceil(|anc(v)| / capacity) + 1 + ceil(|desc(v)| / capacity)
+///
+/// is a sound makespan lower bound. We evaluate every node on one longest chain;
+/// this is inexpensive for the large AES-family DAGs and each returned witness
+/// remains independently checkable without trusting the candidate selection.
+fn critical_chain_pivot_lower_bound(log: &[PairRecord], capacity: usize) -> PivotCapacityWitness {
+    assert!(!log.is_empty());
+    assert!(capacity > 0);
+    let mut successors = vec![Vec::new(); log.len()];
+    for record in log {
+        for &parent in &record.parents {
+            successors[parent as usize].push(record.pair_id as usize);
+        }
+    }
+
+    let mut pivot = log
+        .iter()
+        .max_by_key(|record| record.depth)
+        .expect("non-empty multiplication log")
+        .pair_id as usize;
+    let mut chain = vec![pivot];
+    while let Some(parent) = log[pivot]
+        .parents
+        .iter()
+        .copied()
+        .max_by_key(|&parent| log[parent as usize].depth)
+    {
+        pivot = parent as usize;
+        chain.push(pivot);
+    }
+
+    let mut visited = vec![0u32; log.len()];
+    let mut generation = 0u32;
+    let mut count_reachable = |root: usize, reverse: bool| {
+        generation = generation.wrapping_add(1);
+        if generation == 0 {
+            visited.fill(0);
+            generation = 1;
+        }
+        let mut count = 0usize;
+        let mut pending = Vec::new();
+        if reverse {
+            pending.extend(log[root].parents.iter().map(|&parent| parent as usize));
+        } else {
+            pending.extend(successors[root].iter().copied());
+        }
+        while let Some(node) = pending.pop() {
+            if visited[node] == generation {
+                continue;
+            }
+            visited[node] = generation;
+            count += 1;
+            if reverse {
+                pending.extend(log[node].parents.iter().map(|&parent| parent as usize));
+            } else {
+                pending.extend(successors[node].iter().copied());
+            }
+        }
+        count
+    };
+
+    chain
+        .into_iter()
+        .map(|pivot| {
+            let ancestors = count_reachable(pivot, true);
+            let descendants = count_reachable(pivot, false);
+            PivotCapacityWitness {
+                pivot,
+                ancestors,
+                descendants,
+                lower_bound: ancestors.div_ceil(capacity) + 1 + descendants.div_ceil(capacity),
+            }
+        })
+        .max_by_key(|witness| witness.lower_bound)
+        .expect("critical chain contains a pivot")
+}
+
+/// Return a precedence/capacity certificate that `horizon` multiply rounds are
+/// impossible, when the standard earliest/latest time-window relaxation can
+/// prove it.
+///
+/// For every unit-time multiplication `v`, `top[v]` is its earliest legal round
+/// and `horizon - bottom[v] + 1` is its latest legal round. Therefore every node
+/// whose complete legal window is contained in `[a, b]` is forced to execute in
+/// that interval. More than `capacity * (b - a + 1)` such nodes is a sound
+/// contradiction for *every* scheduler, independent of source order or the
+/// heuristic used to construct the observed schedule.
+fn window_capacity_witness(
+    log: &[PairRecord],
+    capacity: usize,
+    horizon: usize,
+) -> Option<WindowCapacityWitness> {
+    assert!(capacity > 0);
+    if log.is_empty() {
+        return None;
+    }
+
+    let mut successors = vec![Vec::new(); log.len()];
+    let mut top = vec![1usize; log.len()];
+    for record in log {
+        let node = record.pair_id as usize;
+        for &parent in &record.parents {
+            successors[parent as usize].push(node);
+            top[node] = top[node].max(top[parent as usize] + 1);
+        }
+    }
+    let mut bottom = vec![1usize; log.len()];
+    for node in (0..log.len()).rev() {
+        bottom[node] = 1 + successors[node]
+            .iter()
+            .map(|&successor| bottom[successor])
+            .max()
+            .unwrap_or(0);
+    }
+
+    window_capacity_witness_for_bounds(&top, &bottom, capacity, horizon)
+}
+
+/// Earliest possible completion round for unit jobs with individual release
+/// rounds on `capacity` identical lanes. Dependencies among those jobs are
+/// deliberately ignored, making this a relaxation and therefore a lower bound.
+fn released_work_completion_round(
+    release_rounds: impl Iterator<Item = usize>,
+    capacity: usize,
+) -> usize {
+    let mut releases: Vec<_> = release_rounds.collect();
+    if releases.is_empty() {
+        return 0;
+    }
+    releases.sort_unstable();
+    releases
+        .iter()
+        .enumerate()
+        .map(|(index, &release)| release + (releases.len() - index).div_ceil(capacity) - 1)
+        .max()
+        .expect("non-empty release list")
+}
+
+/// Strengthen precedence-only earliest/latest rounds with capacity-aware
+/// release-time facts. Every predecessor of `v` must finish before `v`; even
+/// after dependencies among those predecessors are relaxed away, their own
+/// earliest rounds and the finite lane count impose a minimum completion time.
+/// The reverse statement holds for successors. This is stronger than merely
+/// counting fan-in/fan-out and remains a scheduler-independent lower bound.
+fn resource_window_capacity_witness(
+    log: &[PairRecord],
+    capacity: usize,
+    horizon: usize,
+) -> Option<WindowCapacityWitness> {
+    assert!(capacity > 0);
+    if log.is_empty() {
+        return None;
+    }
+
+    let mut successors = vec![Vec::new(); log.len()];
+    let mut top = vec![1usize; log.len()];
+    for record in log {
+        let node = record.pair_id as usize;
+        for &parent in &record.parents {
+            let parent = parent as usize;
+            successors[parent].push(node);
+        }
+        if !record.parents.is_empty() {
+            top[node] = released_work_completion_round(
+                record.parents.iter().map(|&parent| top[parent as usize]),
+                capacity,
+            ) + 1;
+        }
+    }
+    let mut bottom = vec![1usize; log.len()];
+    for node in (0..log.len()).rev() {
+        if !successors[node].is_empty() {
+            bottom[node] = released_work_completion_round(
+                successors[node].iter().map(|&successor| bottom[successor]),
+                capacity,
+            ) + 1;
+        }
+    }
+
+    window_capacity_witness_for_bounds(&top, &bottom, capacity, horizon)
+}
+
+fn window_capacity_witness_for_bounds(
+    top: &[usize],
+    bottom: &[usize],
+    capacity: usize,
+    horizon: usize,
+) -> Option<WindowCapacityWitness> {
+    assert_eq!(top.len(), bottom.len());
+
+    // A node with an empty legal window is itself a critical-path certificate.
+    for node in 0..top.len() {
+        let Some(latest) = horizon.checked_sub(bottom[node]).map(|v| v + 1) else {
+            return Some(WindowCapacityWitness {
+                horizon,
+                first_round: top[node],
+                last_round: top[node],
+                forced_work: 1,
+                interval_capacity: 0,
+            });
+        };
+        if top[node] > latest {
+            return Some(WindowCapacityWitness {
+                horizon,
+                first_round: latest,
+                last_round: top[node],
+                forced_work: 1,
+                interval_capacity: 0,
+            });
+        }
+    }
+
+    // grid[earliest][latest] counts jobs with that complete legal window. The
+    // two-dimensional suffix/prefix sum below answers
+    //   count(earliest >= a && latest <= b)
+    // in O(1), allowing every interval to be checked in O(horizon^2).
+    let stride = horizon + 2;
+    let mut forced = vec![0usize; stride * stride];
+    let cell = |row: usize, column: usize| row * stride + column;
+    for node in 0..top.len() {
+        let latest = horizon - bottom[node] + 1;
+        forced[cell(top[node], latest)] += 1;
+    }
+    for earliest in (1..=horizon).rev() {
+        for latest in 1..=horizon {
+            forced[cell(earliest, latest)] = forced[cell(earliest, latest)]
+                + forced[cell(earliest + 1, latest)]
+                + forced[cell(earliest, latest - 1)]
+                - forced[cell(earliest + 1, latest - 1)];
+        }
+    }
+
+    let mut strongest = None;
+    for first_round in 1..=horizon {
+        for last_round in first_round..=horizon {
+            let forced_work = forced[cell(first_round, last_round)];
+            let interval_capacity = capacity * (last_round - first_round + 1);
+            if forced_work > interval_capacity
+                && strongest.is_none_or(|prior: WindowCapacityWitness| {
+                    forced_work - interval_capacity > prior.forced_work - prior.interval_capacity
+                })
+            {
+                strongest = Some(WindowCapacityWitness {
+                    horizon,
+                    first_round,
+                    last_round,
+                    forced_work,
+                    interval_capacity,
+                });
+            }
+        }
+    }
+    strongest
+}
+
+/// Strongest sound lower bound obtained by disproving candidate horizons with
+/// precedence time-window density. `legal_upper_bound` is an already-validated
+/// schedule, so the result can never exceed it.
+fn window_capacity_lower_bound(
+    log: &[PairRecord],
+    capacity: usize,
+    legal_upper_bound: usize,
+) -> (usize, Option<WindowCapacityWitness>) {
+    let critical_path = validate_pair_dag(log);
+    let work_bound = log.len().div_ceil(capacity);
+    let basic_bound = critical_path.max(work_bound);
+    let mut lower_bound = basic_bound;
+    let mut strongest_witness = None;
+    for horizon in basic_bound..legal_upper_bound {
+        if let Some(witness) = window_capacity_witness(log, capacity, horizon) {
+            lower_bound = lower_bound.max(horizon + 1);
+            strongest_witness = Some(witness);
+        }
+    }
+    (lower_bound, strongest_witness)
+}
+
+/// Strongest sound lower bound obtained from the resource-strengthened
+/// earliest/latest windows. Keep this separate from the precedence-only bound
+/// while the stronger relaxation is exercised against the exact oracle.
+fn resource_window_capacity_lower_bound(
+    log: &[PairRecord],
+    capacity: usize,
+    legal_upper_bound: usize,
+) -> (usize, Option<WindowCapacityWitness>) {
+    let critical_path = validate_pair_dag(log);
+    let work_bound = log.len().div_ceil(capacity);
+    let basic_bound = critical_path.max(work_bound);
+    let mut lower_bound = basic_bound;
+    let mut strongest_witness = None;
+    for horizon in basic_bound..legal_upper_bound {
+        if let Some(witness) = resource_window_capacity_witness(log, capacity, horizon) {
+            lower_bound = lower_bound.max(horizon + 1);
+            strongest_witness = Some(witness);
+        }
+    }
+    (lower_bound, strongest_witness)
+}
+
+/// A legal capacity-aware schedule that keeps each already-executed protocol
+/// chunk atomic. This is an intermediate oracle between the observed source
+/// order and the lane-level DAG schedule: any improvement it finds needs only
+/// chunk reordering/repacking, while the remaining gap requires splitting
+/// existing chunks into lane slices.
+fn call_dag_list_schedule(log: &[PairRecord], capacity: usize) -> Vec<Vec<usize>> {
+    assert!(capacity > 0);
+    let Some(last_call) = log.iter().map(|record| record.call_id as usize).max() else {
+        return Vec::new();
+    };
+    let call_count = last_call + 1;
+    let mut work = vec![0usize; call_count];
+    let mut successors = vec![std::collections::HashSet::new(); call_count];
+    let mut indegree = vec![0usize; call_count];
+    for record in log {
+        let call = record.call_id as usize;
+        work[call] += 1;
+        for &parent in &record.parents {
+            let parent_call = log[parent as usize].call_id as usize;
+            if parent_call != call && successors[parent_call].insert(call) {
+                indegree[call] += 1;
+            }
+        }
+    }
+    assert!(
+        work.iter().all(|&items| items > 0 && items <= capacity),
+        "recorded protocol chunks must be non-empty and capacity-bounded"
+    );
+
+    let mut bottom_level = vec![1usize; call_count];
+    for call in (0..call_count).rev() {
+        bottom_level[call] = 1 + successors[call]
+            .iter()
+            .map(|&successor| bottom_level[successor])
+            .max()
+            .unwrap_or(0);
+    }
+
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let mut ready = BinaryHeap::new();
+    for call in 0..call_count {
+        if indegree[call] == 0 {
+            ready.push((bottom_level[call], Reverse(call)));
+        }
+    }
+    let mut rounds = Vec::new();
+    let mut scheduled = 0usize;
+    while scheduled < call_count {
+        assert!(!ready.is_empty(), "call dependency graph must be acyclic");
+        let (_, Reverse(first)) = ready.pop().expect("ready call");
+        let mut round = vec![first];
+        let mut remaining = capacity - work[first];
+        let mut deferred = Vec::new();
+        while let Some(entry @ (_, Reverse(call))) = ready.pop() {
+            if work[call] <= remaining {
+                round.push(call);
+                remaining -= work[call];
+            } else {
+                deferred.push(entry);
+            }
+        }
+        ready.extend(deferred);
+
+        scheduled += round.len();
+        for &call in &round {
+            for &successor in &successors[call] {
+                indegree[successor] -= 1;
+                if indegree[successor] == 0 {
+                    ready.push((bottom_level[successor], Reverse(successor)));
+                }
+            }
+        }
+        rounds.push(round);
+    }
+    rounds
+}
+
+/// Number of contiguous source-call slices needed to encode `schedule` without
+/// scalarizing every multiply lane. A segment continues only while pair ids are
+/// adjacent and came from the same original protocol call.
+fn scheduled_source_segments(log: &[PairRecord], schedule: &[Vec<usize>]) -> (usize, usize) {
+    let mut total = 0usize;
+    let mut max_per_round = 0usize;
+    for round in schedule {
+        let mut ordered = round.clone();
+        ordered.sort_unstable();
+        let mut segments = 0usize;
+        let mut previous = None;
+        for node in ordered {
+            let starts_segment = previous.is_none_or(|prior: usize| {
+                node != prior + 1 || log[node].call_id != log[prior].call_id
+            });
+            if starts_segment {
+                segments += 1;
+            }
+            previous = Some(node);
+        }
+        total += segments;
+        max_per_round = max_per_round.max(segments);
+    }
+    (total, max_per_round)
+}
+
+/// A legality-preserving schedule that prefers whole contiguous ready runs from
+/// the original protocol calls. This measures the round/encoding tradeoff of a
+/// compact slice-based lowering; it is diagnostic and does not define the
+/// optimizer's correctness bound.
+fn dag_source_clustered_schedule(log: &[PairRecord], capacity: usize) -> Vec<Vec<usize>> {
+    assert!(capacity > 0);
+    let mut successors = vec![Vec::new(); log.len()];
+    let mut indegree = vec![0usize; log.len()];
+    for record in log {
+        let node = record.pair_id as usize;
+        for &parent in &record.parents {
+            successors[parent as usize].push(node);
+            indegree[node] += 1;
+        }
+    }
+    let mut bottom_level = vec![1usize; log.len()];
+    for node in (0..log.len()).rev() {
+        bottom_level[node] = 1 + successors[node]
+            .iter()
+            .map(|&successor| bottom_level[successor])
+            .max()
+            .unwrap_or(0);
+    }
+
+    let mut ready: std::collections::BTreeSet<usize> =
+        (0..log.len()).filter(|&node| indegree[node] == 0).collect();
+    let mut schedule = Vec::new();
+    let mut scheduled = 0usize;
+    while scheduled < log.len() {
+        assert!(!ready.is_empty(), "multiplication graph must be acyclic");
+        let mut round = Vec::with_capacity(capacity.min(ready.len()));
+        while round.len() < capacity && !ready.is_empty() {
+            let seed = *ready
+                .iter()
+                .max_by_key(|&&node| (bottom_level[node], std::cmp::Reverse(node)))
+                .expect("ready is non-empty");
+            ready.remove(&seed);
+            round.push(seed);
+
+            // Consume the rest of the seed's contiguous ready source run. The
+            // round boundary remains sound because successors are released only
+            // after the complete round below.
+            let call = log[seed].call_id;
+            let mut left = seed;
+            while round.len() < capacity && left > 0 {
+                let next = left - 1;
+                if log[next].call_id != call || !ready.remove(&next) {
+                    break;
+                }
+                round.push(next);
+                left = next;
+            }
+            let mut right = seed + 1;
+            while round.len() < capacity
+                && right < log.len()
+                && log[right].call_id == call
+                && ready.remove(&right)
+            {
+                round.push(right);
+                right += 1;
+            }
+        }
+        scheduled += round.len();
+        for &node in &round {
+            for &successor in &successors[node] {
+                indegree[successor] -= 1;
+                if indegree[successor] == 0 {
+                    ready.insert(successor);
+                }
+            }
+        }
+        schedule.push(round);
+    }
+    schedule
 }
 
 /// Exact minimum number of capacity-limited rounds for a small unit-time DAG.
@@ -399,6 +1340,10 @@ impl MpcEngine for CountingEngine {
 
     fn is_ready(&self) -> bool {
         true
+    }
+
+    fn multiplication_batch_capacity(&self) -> Option<usize> {
+        Some(MODELED_MPC_BATCH_CAPACITY)
     }
 
     fn start(&self) -> MpcEngineResult<()> {
@@ -676,6 +1621,94 @@ fn exact_capacity_scheduler_oracle_handles_precedence_and_choices() {
     assert_eq!(exact_min_rounds(&[0, 0, 0, 1 << 0, 1 << 3], 2), 3);
 }
 
+#[test]
+fn precedence_window_certificate_is_sound_for_all_five_node_dags() {
+    const NODES: usize = 5;
+    let possible_edges = NODES * (NODES - 1) / 2;
+    let mut strengthened_examples = 0usize;
+
+    for edge_set in 0u64..(1u64 << possible_edges) {
+        let mut parents = vec![0u64; NODES];
+        let mut edge_index = 0usize;
+        for node in 0..NODES {
+            for parent in 0..node {
+                if edge_set & (1u64 << edge_index) != 0 {
+                    parents[node] |= 1u64 << parent;
+                }
+                edge_index += 1;
+            }
+        }
+
+        let mut depths = vec![1u32; NODES];
+        let log: Vec<_> = parents
+            .iter()
+            .enumerate()
+            .map(|(node, &dependencies)| {
+                let parent_ids: Vec<_> = (0..node)
+                    .filter(|&parent| dependencies & (1u64 << parent) != 0)
+                    .map(|parent| parent as u32)
+                    .collect();
+                depths[node] = 1 + parent_ids
+                    .iter()
+                    .map(|&parent| depths[parent as usize])
+                    .max()
+                    .unwrap_or(0);
+                PairRecord {
+                    pair_id: node as u32,
+                    parents: parent_ids,
+                    // Sequential execution is a legal upper-bound schedule for
+                    // every topologically numbered graph.
+                    call_id: node as u32,
+                    depth: depths[node],
+                    pub_operand: false,
+                    both_public: false,
+                }
+            })
+            .collect();
+
+        for capacity in 1..=NODES {
+            let optimum = exact_min_rounds(&parents, capacity);
+            assert!(
+                window_capacity_witness(&log, capacity, optimum).is_none(),
+                "a necessary time-window condition rejected a legal optimum: \
+                 edge_set={edge_set:#x}, capacity={capacity}, optimum={optimum}"
+            );
+            assert!(
+                resource_window_capacity_witness(&log, capacity, optimum).is_none(),
+                "a resource-strengthened time-window condition rejected a legal optimum: \
+                 edge_set={edge_set:#x}, capacity={capacity}, optimum={optimum}"
+            );
+            let basic = validate_pair_dag(&log).max(NODES.div_ceil(capacity));
+            let (window_bound, _) = window_capacity_lower_bound(&log, capacity, optimum);
+            let (resource_window_bound, _) =
+                resource_window_capacity_lower_bound(&log, capacity, optimum);
+            let chain_bound = critical_chain_partition_lower_bound(&log, capacity).lower_bound;
+            assert!(
+                window_bound <= optimum,
+                "time-window lower bound exceeded the exact optimum"
+            );
+            assert!(
+                resource_window_bound <= optimum,
+                "resource-strengthened time-window lower bound exceeded the exact optimum"
+            );
+            assert!(
+                chain_bound <= optimum,
+                "chain-partition lower bound exceeded the exact optimum: \
+                 edge_set={edge_set:#x}, capacity={capacity}, optimum={optimum}, \
+                 chain_bound={chain_bound}"
+            );
+            strengthened_examples +=
+                usize::from(window_bound.max(resource_window_bound).max(chain_bound) > basic);
+        }
+    }
+
+    assert!(
+        strengthened_examples > 0,
+        "the window certificate should strictly strengthen work/critical-path \
+         bounds for at least one small DAG"
+    );
+}
+
 /// Regression test for the -O3 function inliner: a `secret`-typed helper that is
 /// inlined must keep its arguments secret, so the secret `and`/multiply still runs
 /// as an MPC multiplication (counted in `batch`/`scalar`) rather than collapsing
@@ -797,7 +1830,7 @@ async fn count_optimized_aes_batch_mul_items_impl() {
         scalar, 0,
         "optimizer should batch every secret multiply; {scalar} ran as scalar"
     );
-    assert_eq!(batch_items, 34_080);
+    assert_eq!(batch_items, 32_679);
     // This test compiles at the default optimization level (no -O3), so the
     // per-byte S-box loops are not unrolled and the round-minimizing scheduler
     // does not run. At this level the optimizer batches independent multiplies
@@ -888,6 +1921,7 @@ async fn optimized_aes_at_o3_matches_nist_vector_impl() {
     };
     let compiled = stoffellang::compile(source, "<aes-o3>", &options).expect("compile AES at -O3");
     let binary = stoffellang::convert_to_binary(&compiled);
+    let planned_triples = binary.client_io_manifest.preprocessing_demand.triples;
     let functions = binary.try_to_vm_functions().expect("vm functions");
 
     let engine = Arc::new(CountingEngine::default());
@@ -933,12 +1967,16 @@ async fn optimized_aes_at_o3_matches_nist_vector_impl() {
     let (scalar, batch_calls, batch_items) = engine.counts();
     assert_eq!(scalar, 0, "every secret multiply must be batched at -O3");
     // One proof-driven peel establishes the state shape, then the recurrence-
-    // aware unroller keeps the residual rounds rolled. That exposes additional
-    // provably-local gates without replicating the full round body: 33,280
-    // products remain interactive and are coalesced into 219 calls.
+    // aware unroller keeps the residual rounds rolled. Shape specialization
+    // exposes gates with public operands as local work without replicating the
+    // full round body: 29,275 products remain interactive.
     assert_eq!(
-        batch_items, 33_280,
+        batch_items, 29_275,
         "interactive product count must match the optimized circuit"
+    );
+    assert_eq!(
+        planned_triples, batch_items as u64,
+        "the preprocessing manifest must exactly cover executed interactive products"
     );
     assert!(
         batch_calls <= 225,
@@ -1048,7 +2086,7 @@ fn optimized_aes_full_unroll_minimizes_rounds() {
         );
         let (scalar, batch_calls, batch_items) = engine.counts();
         assert_eq!(scalar, 0);
-        assert_eq!(batch_items, 33_952);
+        assert_eq!(batch_items, 29_275);
         assert!(
             batch_calls < 1_000,
             "fully-flattened AES should reach a few hundred multiply rounds; got {batch_calls}"
@@ -1685,11 +2723,39 @@ async fn histogram_run(
     source: &str,
     level: u8,
     client_inputs: &[(usize, Vec<stoffel_vm::ClientShare>)],
-) -> Result<(usize, usize, usize, usize, Vec<i64>, Vec<PairRecord>), String> {
+) -> Result<
+    (
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        usize,
+        Vec<i64>,
+        Vec<PairRecord>,
+        Vec<(String, usize)>,
+    ),
+    String,
+> {
+    let inline_budget = std::env::var("STOFFEL_HIST_INLINE_BUDGET")
+        .ok()
+        .and_then(|value| value.parse().ok());
+    let unroll_budget = std::env::var("STOFFEL_HIST_UNROLL_BUDGET")
+        .ok()
+        .and_then(|value| value.parse().ok());
+    let unroll_max_expansion = std::env::var("STOFFEL_HIST_UNROLL_MAX_EXPANSION")
+        .ok()
+        .and_then(|value| value.parse().ok());
     let options = stoffellang::CompilerOptions {
         optimize: level > 0,
         optimization_level: level,
         mpc_backend: stoffel_vm_types::compiled_binary::MpcBackend::HoneyBadger,
+        inline_budget,
+        unroll_budget,
+        unroll_max_expansion,
         ..Default::default()
     };
     let compiled = stoffellang::compile(source, "<histogram>", &options)
@@ -1698,11 +2764,64 @@ async fn histogram_run(
     let functions = binary
         .try_to_vm_functions()
         .map_err(|e| format!("vm functions at -O{level}: {e:?}"))?;
+    let static_batch_call_sites = functions
+        .iter()
+        .flat_map(|function| function.instructions())
+        .filter(|instruction| {
+            matches!(instruction, Instruction::CALL(name) if name == "Share.batch_mul")
+        })
+        .count();
+    let static_instructions = functions
+        .iter()
+        .map(|function| function.instructions().len())
+        .sum();
+    let main_static_batch_call_sites = functions
+        .iter()
+        .find(|function| function.name() == "main")
+        .map(|function| {
+            function
+                .instructions()
+                .iter()
+                .filter(|instruction| {
+                    matches!(instruction, Instruction::CALL(name) if name == "Share.batch_mul")
+                })
+                .count()
+        })
+        .unwrap_or(0);
+    let main_static_instructions = functions
+        .iter()
+        .find(|function| function.name() == "main")
+        .map(|function| function.instructions().len())
+        .unwrap_or(0);
 
     let engine = Arc::new(CountingEngine::default());
+    let executed_call_sites = Arc::new(std::sync::Mutex::new(Vec::new()));
     let mut vm = VirtualMachine::builder()
         .with_mpc_engine(engine.clone())
         .build();
+    if std::env::var("STOFFEL_HIST_CALLSITES").is_ok_and(|value| value != "0") {
+        let call_sites = executed_call_sites.clone();
+        vm.register_hook(
+            |event| {
+                matches!(
+                    event,
+                    HookEvent::BeforeInstructionExecute(Instruction::CALL(name))
+                        if name == "Share.batch_mul"
+                )
+            },
+            move |_, context| {
+                call_sites.lock().expect("call-site trace lock").push((
+                    context
+                        .current_instruction_function_name()
+                        .unwrap_or("<unknown>")
+                        .to_owned(),
+                    context.current_instruction_index(),
+                ));
+                Ok(())
+            },
+            0,
+        );
+    }
     for function in functions {
         vm.try_register_function(function)
             .map_err(|e| format!("register function at -O{level}: {e:?}"))?;
@@ -1735,24 +2854,45 @@ async fn histogram_run(
         out.push(byte);
     }
     let (scalar_opens, batch_opens) = engine.open_protocol_breakdown();
+    let (scalar_muls, batch_calls, _batch_items) = engine.counts();
+    debug_assert_eq!(
+        scalar_muls, 0,
+        "O3 histogram should contain no scalar multiplies"
+    );
+    let executed_call_sites = executed_call_sites
+        .lock()
+        .expect("call-site trace lock")
+        .clone();
     Ok((
         engine.protocol_rounds(),
+        batch_calls,
+        static_batch_call_sites,
+        static_instructions,
+        main_static_batch_call_sites,
+        main_static_instructions,
         engine.open_protocol_rounds(),
         scalar_opens,
         batch_opens,
         out,
         engine.pair_log_snapshot(),
+        executed_call_sites,
     ))
 }
 
 fn print_depth_histogram(
     label: &str,
     rounds: usize,
+    source_batch_calls: usize,
+    static_batch_call_sites: usize,
+    static_instructions: usize,
+    main_static_batch_call_sites: usize,
+    main_static_instructions: usize,
     open_rounds: usize,
     scalar_opens: usize,
     batch_opens: usize,
     correct: bool,
     log: &[PairRecord],
+    executed_call_sites: &[(String, usize)],
 ) {
     use std::collections::BTreeMap;
     let dag_critical_path = validate_pair_dag(log);
@@ -1816,7 +2956,28 @@ fn print_depth_histogram(
     );
     let work_bound = log.len().div_ceil(MODELED_MPC_BATCH_CAPACITY);
     let sound_lower_bound = critical_path.max(work_bound);
-    let dag_list_upper = dag_list_schedule_rounds(log, MODELED_MPC_BATCH_CAPACITY);
+    let dag_schedule = dag_list_schedule(log, MODELED_MPC_BATCH_CAPACITY);
+    let dag_list_upper = dag_schedule.len();
+    let (window_lower_bound, window_witness) =
+        window_capacity_lower_bound(log, MODELED_MPC_BATCH_CAPACITY, dag_list_upper.min(rounds));
+    let (resource_window_lower_bound, resource_window_witness) =
+        resource_window_capacity_lower_bound(
+            log,
+            MODELED_MPC_BATCH_CAPACITY,
+            dag_list_upper.min(rounds),
+        );
+    let pivot_witness = critical_chain_pivot_lower_bound(log, MODELED_MPC_BATCH_CAPACITY);
+    let certified_lower_bound = sound_lower_bound
+        .max(window_lower_bound)
+        .max(resource_window_lower_bound)
+        .max(pivot_witness.lower_bound);
+    let call_schedule = call_dag_list_schedule(log, MODELED_MPC_BATCH_CAPACITY);
+    let call_list_upper = call_schedule.len();
+    let utilized = log.len() as f64 / (rounds.max(1) * MODELED_MPC_BATCH_CAPACITY) as f64 * 100.0;
+    let (source_segments, max_segments_per_round) = scheduled_source_segments(log, &dag_schedule);
+    let clustered_schedule = dag_source_clustered_schedule(log, MODELED_MPC_BATCH_CAPACITY);
+    let (clustered_segments, clustered_max_segments) =
+        scheduled_source_segments(log, &clustered_schedule);
     assert!(
         rounds >= sound_lower_bound,
         "observed schedule cannot beat its critical-path/work lower bound"
@@ -1825,19 +2986,268 @@ fn print_depth_histogram(
         dag_list_upper >= sound_lower_bound,
         "a legal DAG schedule cannot beat the sound lower bound"
     );
+    assert!(
+        rounds >= certified_lower_bound && dag_list_upper >= certified_lower_bound,
+        "legal schedules cannot beat a certified precedence/capacity lower bound"
+    );
+    assert!(
+        calls
+            .values()
+            .all(|(_, _, work)| *work <= MODELED_MPC_BATCH_CAPACITY),
+        "the observed schedule must respect backend multiply capacity"
+    );
     println!(
         "HIST {label} TOTALS actual_rounds={rounds} sound_lb={sound_lower_bound} \
-certified_gap={} dag_list_upper={dag_list_upper} dag_sched_gap={} \
+window_lb={window_lower_bound} pivot_lb={} certified_lb={certified_lower_bound} certified_gap={} \
+resource_window_lb={resource_window_lower_bound} \
+basic_gap={} dag_list_upper={dag_list_upper} dag_sched_gap={} \
 critical_path={critical_path} work_bound={work_bound} \
 distinct_depths={} singleton_rounds={singleton_rounds} mixed_depth_rounds={mixed_rounds} \
 open_rounds={open_rounds} scalar_opens={scalar_opens} batch_opens={batch_opens} \
 observed_online_sessions={}",
+        pivot_witness.lower_bound,
+        rounds.saturating_sub(certified_lower_bound),
         rounds - sound_lower_bound,
         rounds.saturating_sub(dag_list_upper),
         depths.len(),
         rounds + open_rounds,
     );
+    println!(
+        "HIST {label} PIVOT node={} ancestors={} descendants={} lower_bound={}",
+        pivot_witness.pivot,
+        pivot_witness.ancestors,
+        pivot_witness.descendants,
+        pivot_witness.lower_bound,
+    );
+    if let Some(witness) = window_witness {
+        println!(
+            "HIST {label} WINDOW horizon={} interval={}-{} forced_work={} \
+interval_capacity={} overload={}",
+            witness.horizon,
+            witness.first_round,
+            witness.last_round,
+            witness.forced_work,
+            witness.interval_capacity,
+            witness.forced_work - witness.interval_capacity,
+        );
+    }
+    if let Some(witness) = resource_window_witness {
+        println!(
+            "HIST {label} RESOURCE_WINDOW horizon={} interval={}-{} forced_work={} \
+interval_capacity={} overload={}",
+            witness.horizon,
+            witness.first_round,
+            witness.last_round,
+            witness.forced_work,
+            witness.interval_capacity,
+            witness.forced_work - witness.interval_capacity,
+        );
+    }
+    println!(
+        "HIST {label} ENCODING source_segments={source_segments} \
+max_segments_per_round={max_segments_per_round} avg_segments_per_round={:.2} \
+clustered_rounds={} clustered_segments={clustered_segments} \
+clustered_max_segments={clustered_max_segments}",
+        source_segments as f64 / dag_list_upper.max(1) as f64,
+        clustered_schedule.len(),
+    );
+    println!(
+        "HIST {label} CHUNKS actual={rounds} source_batch_calls={source_batch_calls} \
+static_batch_call_sites={static_batch_call_sites} \
+static_instructions={static_instructions} \
+main_batch_call_sites={main_static_batch_call_sites} main_instructions={main_static_instructions} \
+call_dag_upper={call_list_upper} \
+call_repack_gain={} lane_split_gain={} utilization={utilized:.1}%",
+        rounds.saturating_sub(call_list_upper),
+        call_list_upper.saturating_sub(dag_list_upper),
+    );
+    if !executed_call_sites.is_empty() {
+        assert_eq!(
+            executed_call_sites.len(),
+            calls.len(),
+            "one traced source site per executed protocol call"
+        );
+        for (call_id, (function, instruction)) in executed_call_sites.iter().enumerate() {
+            let (min_depth, max_depth, work) = calls[&(call_id as u32)];
+            println!(
+                "HIST {label} CALL id={call_id} site={function}:{instruction} work={work} depth={min_depth}-{max_depth}"
+            );
+        }
+        for (round, packed) in call_schedule.iter().enumerate() {
+            if packed.len() > 1 {
+                println!("HIST {label} CALLPACK round={round} calls={packed:?}");
+            }
+        }
+    }
     println!();
+}
+
+/// Persist the measured multiplication DAG in a compact, versioned binary
+/// format when `STOFFEL_AES_COUNT_DAG_OUT` is set. This keeps expensive
+/// compiler/VM execution separate from exact-scheduler experiments. The path
+/// may contain `{label}`, which is replaced with the lower-case program label.
+fn maybe_write_pair_dag(label: &str, log: &[PairRecord]) -> std::io::Result<()> {
+    use std::io::Write;
+
+    let Ok(path) = std::env::var("STOFFEL_AES_COUNT_DAG_OUT") else {
+        return Ok(());
+    };
+    let path = path.replace("{label}", &label.to_ascii_lowercase());
+    let mut writer = std::io::BufWriter::new(std::fs::File::create(path)?);
+    writer.write_all(b"STFDAG01")?;
+    writer.write_all(&(MODELED_MPC_BATCH_CAPACITY as u32).to_le_bytes())?;
+    writer.write_all(&(log.len() as u32).to_le_bytes())?;
+    for record in log {
+        writer.write_all(&record.pair_id.to_le_bytes())?;
+        writer.write_all(&record.call_id.to_le_bytes())?;
+        writer.write_all(&record.depth.to_le_bytes())?;
+        writer.write_all(&(record.parents.len() as u32).to_le_bytes())?;
+        for &parent in &record.parents {
+            writer.write_all(&parent.to_le_bytes())?;
+        }
+    }
+    writer.flush()
+}
+
+fn read_pair_dag(path: &std::path::Path) -> std::io::Result<(usize, Vec<PairRecord>)> {
+    use std::io::Read;
+
+    let mut reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let mut magic = [0u8; 8];
+    reader.read_exact(&mut magic)?;
+    if &magic != b"STFDAG01" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "unrecognized Stoffel pair-DAG format",
+        ));
+    }
+    let read_u32 = |reader: &mut std::io::BufReader<std::fs::File>| {
+        let mut bytes = [0u8; 4];
+        reader.read_exact(&mut bytes)?;
+        Ok::<_, std::io::Error>(u32::from_le_bytes(bytes))
+    };
+    let capacity = read_u32(&mut reader)? as usize;
+    let count = read_u32(&mut reader)? as usize;
+    let mut log = Vec::with_capacity(count);
+    for expected_id in 0..count {
+        let pair_id = read_u32(&mut reader)?;
+        let call_id = read_u32(&mut reader)?;
+        let depth = read_u32(&mut reader)?;
+        let parent_count = read_u32(&mut reader)? as usize;
+        if pair_id as usize != expected_id {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "pair-DAG ids are not dense and ordered",
+            ));
+        }
+        let mut parents = Vec::with_capacity(parent_count);
+        for _ in 0..parent_count {
+            parents.push(read_u32(&mut reader)?);
+        }
+        log.push(PairRecord {
+            pair_id,
+            parents,
+            call_id,
+            depth,
+            pub_operand: false,
+            both_public: false,
+        });
+    }
+    Ok((capacity, log))
+}
+
+#[ignore = "cached multiplication-DAG scheduler analysis; set STOFFEL_PAIR_DAG_IN"]
+#[test]
+fn cached_pair_dag_scheduler_analysis() {
+    let Some(path) = std::env::var_os("STOFFEL_PAIR_DAG_IN") else {
+        eprintln!(
+            "skipping cached pair-DAG analysis: set STOFFEL_PAIR_DAG_IN to a cache written by round_histogram"
+        );
+        return;
+    };
+    let (capacity, log) = read_pair_dag(std::path::Path::new(&path)).expect("read pair DAG");
+    let critical_path = validate_pair_dag(&log);
+    let component_sizes = weak_component_sizes(&log);
+    let work_bound = log.len().div_ceil(capacity);
+    let forward = dag_list_schedule(&log, capacity);
+    let backward = dag_backward_list_schedule(&log, capacity);
+    let backward_deadline = dag_backward_deadline_schedule(&log, capacity);
+    let critical_fan_in_backward = dag_backward_priority_list_schedule(
+        &log,
+        capacity,
+        BackwardPriority::CriticalPredecessorFanIn,
+    );
+    let critical_fan_in_forward =
+        dag_forward_from_backward_schedule(&log, capacity, &critical_fan_in_backward);
+    let chain_partition = critical_chain_partition_lower_bound(&log, capacity);
+    let pivot = critical_chain_pivot_lower_bound(&log, capacity);
+    let legal_upper_bound = critical_fan_in_forward.len();
+    let (window_lower_bound, window_witness) =
+        window_capacity_lower_bound(&log, capacity, legal_upper_bound);
+    let (resource_window_lower_bound, resource_window_witness) =
+        resource_window_capacity_lower_bound(&log, capacity, legal_upper_bound);
+    let priorities = vec![
+        DagListPriority::BottomSourceAscending,
+        DagListPriority::BottomHighFanout,
+        DagListPriority::BottomSuccessorPressure,
+    ];
+    let priority_schedules: Vec<_> = priorities
+        .into_iter()
+        .map(|priority| {
+            let (schedule, ready_counts) = dag_priority_list_schedule(&log, capacity, priority);
+            (format!("{priority:?}"), schedule, ready_counts)
+        })
+        .collect();
+    let priority_rounds: Vec<_> = priority_schedules
+        .iter()
+        .map(|(priority, schedule, _)| (priority, schedule.len()))
+        .collect();
+    let underfilled: Vec<_> = forward
+        .iter()
+        .enumerate()
+        .filter(|(_, round)| round.len() < capacity)
+        .map(|(round_index, round)| {
+            let calls: std::collections::BTreeSet<_> =
+                round.iter().map(|&node| log[node].call_id).collect();
+            (round_index, round.len(), calls)
+        })
+        .collect();
+    println!(
+        "CACHED_DAG nodes={} edges={} capacity={} critical_path={} work_bound={} \
+chain_partition_bound={} chain_partition_pivots={} \
+single_pivot_bound={} single_pivot_node={} \
+window_bound={} window_witness={:?} resource_window_bound={} resource_window_witness={:?} \
+forward_rounds={} backward_rounds={} backward_deadline_rounds={} \
+critical_fan_in_backward_rounds={} critical_fan_in_forward_rounds={} priorities={priority_rounds:?}",
+        log.len(),
+        log.iter().map(|record| record.parents.len()).sum::<usize>(),
+        capacity,
+        critical_path,
+        work_bound,
+        chain_partition.lower_bound,
+        chain_partition.pivots.len(),
+        pivot.lower_bound,
+        pivot.pivot,
+        window_lower_bound,
+        window_witness,
+        resource_window_lower_bound,
+        resource_window_witness,
+        forward.len(),
+        backward.len(),
+        backward_deadline.len(),
+        critical_fan_in_backward.len(),
+        critical_fan_in_forward.len(),
+    );
+    println!("CACHED_DAG component_sizes={component_sizes:?}");
+    println!("CACHED_DAG underfilled={underfilled:?}");
+    let (_, source_ascending, ready_counts) = &priority_schedules[0];
+    let constrained: Vec<_> = source_ascending
+        .iter()
+        .enumerate()
+        .filter(|(round, jobs)| jobs.len() < capacity || ready_counts[*round] > capacity)
+        .map(|(round, jobs)| (round, jobs.len(), ready_counts[round]))
+        .collect();
+    println!("CACHED_DAG frontier={constrained:?}");
 }
 
 #[ignore = "per-depth round histogram measurement; run manually with --ignored --nocapture"]
@@ -1872,18 +3282,47 @@ async fn round_histogram_impl() {
         ),
     ];
 
+    let label_filter = std::env::var("STOFFEL_AES_COUNT_FILTER").ok();
+
     for (label, source, inputs, expected) in &programs {
+        if label_filter
+            .as_deref()
+            .is_some_and(|filter| !label.eq_ignore_ascii_case(filter))
+        {
+            continue;
+        }
         match histogram_run(source, 3, inputs).await {
-            Ok((rounds, open_rounds, scalar_opens, batch_opens, output, log)) => {
+            Ok((
+                rounds,
+                source_batch_calls,
+                static_batch_call_sites,
+                static_instructions,
+                main_static_batch_call_sites,
+                main_static_instructions,
+                open_rounds,
+                scalar_opens,
+                batch_opens,
+                output,
+                log,
+                executed_call_sites,
+            )) => {
                 let correct = output == *expected;
+                maybe_write_pair_dag(label, &log)
+                    .unwrap_or_else(|error| panic!("write {label} DAG: {error}"));
                 print_depth_histogram(
                     label,
                     rounds,
+                    source_batch_calls,
+                    static_batch_call_sites,
+                    static_instructions,
+                    main_static_batch_call_sites,
+                    main_static_instructions,
                     open_rounds,
                     scalar_opens,
                     batch_opens,
                     correct,
                     &log,
+                    &executed_call_sites,
                 );
                 assert!(correct, "{label} O3 must match its NIST output");
             }

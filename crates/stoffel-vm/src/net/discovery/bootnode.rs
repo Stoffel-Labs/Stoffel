@@ -1,8 +1,12 @@
 use super::{registration_token_is_valid, send_ctrl, send_session_announce, DiscoveryMessage};
 use crate::net::{
-    program_sync::{send_ctrl as send_prog_ctrl, send_program_bytes, ProgramSyncMessage},
+    program_sync::{
+        program_id_from_bytes, send_ctrl as send_prog_ctrl, send_program_bytes, ProgramSyncMessage,
+    },
     session::{derive_instance_id, random_instance_id, SessionInfo, SessionMessage},
 };
+use bincode::Options;
+use serde::de::DeserializeOwned;
 use std::{collections::HashMap, net::SocketAddr, sync::Arc, time::Duration};
 use stoffelnet::network_utils::PartyId;
 use stoffelnet::transports::quic::PeerConnection;
@@ -350,11 +354,11 @@ impl BootnodeConnection {
     }
 
     async fn handle_buffer(&mut self, buf: Vec<u8>) {
-        if let Ok(message) = bincode::deserialize::<DiscoveryMessage>(&buf) {
+        if let Ok(message) = deserialize_exact::<DiscoveryMessage>(&buf) {
             self.handle_discovery_message(message).await;
-        } else if let Ok(message) = bincode::deserialize::<ProgramSyncMessage>(&buf) {
+        } else if let Ok(message) = deserialize_exact::<ProgramSyncMessage>(&buf) {
             self.handle_program_sync_message(message).await;
-        } else if let Ok(message) = bincode::deserialize::<SessionMessage>(&buf) {
+        } else if let Ok(message) = deserialize_exact::<SessionMessage>(&buf) {
             self.handle_session_message(message);
         }
     }
@@ -708,7 +712,20 @@ fn session_nonce() -> u64 {
 }
 
 fn program_id_matches_bytes(program_id: &[u8; 32], bytes: &[u8]) -> bool {
-    blake3::hash(bytes).as_bytes() == program_id
+    program_id_from_bytes(bytes) == *program_id
+}
+
+/// The bootnode control stream multiplexes several legacy bincode enums. Root
+/// `bincode::deserialize` accepts trailing bytes, which can make a longer
+/// message from one protocol look like a shorter variant from another (for
+/// example, `SessionAck` looked like `DiscoveryMessage::ProgramFetchRequest`).
+/// Requiring full-buffer consumption makes dispatch deterministic for their
+/// distinct wire shapes.
+fn deserialize_exact<T: DeserializeOwned>(bytes: &[u8]) -> bincode::Result<T> {
+    bincode::DefaultOptions::new()
+        .with_fixint_encoding()
+        .reject_trailing_bytes()
+        .deserialize(bytes)
 }
 
 #[cfg(test)]
@@ -948,6 +965,45 @@ mod tests {
             .await;
 
         assert!(state.program_bytes_for(&[4u8; 32]).await.is_none());
+    }
+
+    #[tokio::test]
+    async fn session_registration_accepts_canonical_domain_separated_program_id() {
+        let state = BootnodeState::new(None);
+        let conn = Arc::new(RecordingConnection::default());
+        let mut handler = BootnodeConnection::new(conn, state.clone(), None);
+        let bytes = b"valid stoffel bytecode".to_vec();
+        let program_id = program_id_from_bytes(&bytes);
+
+        handler
+            .handle_session_registration(registration(0, program_id), Some(bytes.clone()), None)
+            .await;
+
+        assert_eq!(
+            state.program_bytes_for(&program_id).await.as_deref(),
+            Some(&bytes)
+        );
+    }
+
+    #[test]
+    fn session_ack_is_not_misdecoded_as_program_fetch_request() {
+        let ack = SessionMessage::SessionAck {
+            party_id: 4,
+            program_id: [7u8; 32],
+            instance_id: 99,
+        };
+        let bytes = bincode::serialize(&ack).expect("serialize session ack");
+
+        assert!(deserialize_exact::<DiscoveryMessage>(&bytes).is_err());
+        assert!(deserialize_exact::<ProgramSyncMessage>(&bytes).is_err());
+        assert!(matches!(
+            deserialize_exact::<SessionMessage>(&bytes),
+            Ok(SessionMessage::SessionAck {
+                party_id,
+                program_id,
+                instance_id,
+            }) if party_id == 4 && program_id == [7u8; 32] && instance_id == 99
+        ));
     }
 
     #[tokio::test]

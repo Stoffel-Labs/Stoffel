@@ -79,6 +79,10 @@ impl<'a> ForeignFunctionContext<'a> {
         self.services.input_share_data(clear)
     }
 
+    pub(crate) fn materialize_public_share_data(&self, share: &ShareData) -> VmResult<ShareData> {
+        self.services.materialize_public_share_data(share)
+    }
+
     pub(crate) fn open_share_data(
         &self,
         ty: ShareType,

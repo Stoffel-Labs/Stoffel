@@ -178,6 +178,9 @@ fn main() {
         inline_budget: env_budget("STOFFEL_INLINE_BUDGET"),
         unroll_budget: env_budget("STOFFEL_UNROLL_BUDGET"),
         unroll_max_expansion: env_budget("STOFFEL_UNROLL_MAX_EXPANSION"),
+        mpc_mul_batch_capacity: env_budget(
+            stoffel_vm_types::mpc::HONEYBADGER_MUL_MAX_PAIRS_PER_SESSION_ENV,
+        ),
     };
 
     println!("Compiling {}...", filename);

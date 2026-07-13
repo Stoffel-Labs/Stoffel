@@ -38,7 +38,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use stoffel_vm_types::compiled_binary::{MpcBackend, MpcCurve};
+use stoffel_vm_types::compiled_binary::{MpcBackend, MpcCurve, PreprocessingDemand};
 use stoffel_vm_types::core_types::Value;
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::Instruction;
@@ -682,6 +682,39 @@ where
     results
 }
 
+/// Run an already-compiled function on every party. This is the source-example
+/// counterpart of `run_program_on_all_parties`, which builds a hand-authored
+/// instruction fixture.
+async fn run_function_on_all_parties<F, G>(
+    engines: &[Arc<AvssMpcEngine<F, G>>],
+    function: &VMFunction,
+) -> Vec<(VirtualMachine, Value)>
+where
+    F: ark_ff::FftField + PrimeField + Send + Sync + 'static,
+    G: CurveGroup<ScalarField = F> + Send + Sync + 'static,
+    AvssMpcEngine<F, G>: crate::net::mpc_engine::MpcEngine,
+{
+    let handles = engines
+        .iter()
+        .map(|engine| {
+            let engine: Arc<dyn crate::net::mpc_engine::MpcEngine> = engine.clone();
+            let function = function.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut vm = VirtualMachine::builder().with_mpc_engine(engine).build();
+                vm.register_function(function);
+                let result = vm.execute("main").expect("VM execution failed");
+                (vm, result)
+            })
+        })
+        .collect::<Vec<_>>();
+
+    futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|result| result.expect("compiled threshold-signature party task panicked"))
+        .collect()
+}
+
 #[derive(Clone, Copy, Default)]
 struct EcdsaStageMarks {
     random_calls: usize,
@@ -840,25 +873,216 @@ where
     (results, timings)
 }
 
-fn compile_optimized_secp256k1_ecdsa_source() -> VMFunction {
+fn compile_optimized_threshold_source(
+    directory: &str,
+    curve: MpcCurve,
+) -> (VMFunction, PreprocessingDemand) {
     let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../stoffel-lang/examples/threshold_signatures/threshold_ecdsa_secp256k1/main.stfl");
-    let source = std::fs::read_to_string(&path).expect("read optimized threshold ECDSA source");
+        .join("../stoffel-lang/examples/threshold_signatures")
+        .join(directory)
+        .join("main.stfl");
+    let source = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("read optimized {directory} source: {error}"));
     let options = stoffellang::CompilerOptions {
         optimize: true,
         optimization_level: 3,
         mpc_backend: MpcBackend::Avss,
-        mpc_curve: MpcCurve::Secp256k1,
+        mpc_curve: curve,
         ..Default::default()
     };
     let program = stoffellang::compile_file(&path, &source, &options)
-        .expect("compile optimized threshold ECDSA source");
-    stoffellang::convert_to_binary(&program)
+        .unwrap_or_else(|errors| panic!("compile optimized {directory} source: {errors:#?}"));
+    let binary = stoffellang::convert_to_binary(&program);
+    assert_eq!(binary.client_io_manifest.mpc_backend, MpcBackend::Avss);
+    assert_eq!(binary.client_io_manifest.mpc_curve, curve);
+    let demand = binary.client_io_manifest.preprocessing_demand;
+    let function = binary
         .try_to_vm_functions()
-        .expect("lower optimized threshold ECDSA bytecode")
+        .unwrap_or_else(|error| panic!("lower optimized {directory} bytecode: {error:?}"))
         .into_iter()
         .find(|function| function.name() == "main")
-        .expect("optimized threshold ECDSA has main")
+        .unwrap_or_else(|| panic!("optimized {directory} program has main"));
+    (function, demand)
+}
+
+fn compile_optimized_secp256k1_ecdsa_source() -> VMFunction {
+    compile_optimized_threshold_source("threshold_ecdsa_secp256k1", MpcCurve::Secp256k1).0
+}
+
+#[derive(Clone, Copy)]
+struct ExpectedAvssExecution {
+    triples: u64,
+    randoms: u64,
+    multiplication_sessions: usize,
+    single_open_sessions: usize,
+    batch_open_sessions: usize,
+    g1_exponent_open_sessions: usize,
+    g2_exponent_open_sessions: usize,
+    output_bytes: usize,
+}
+
+async fn avss_preprocessing_pool_counts<F, G>(engine: &AvssMpcEngine<F, G>) -> (usize, usize)
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + Send + Sync + 'static,
+{
+    let node = engine.node_handle().lock().await;
+    let counts = node.preprocessing_material.lock().await.len();
+    counts
+}
+
+/// Compile and execute one real source example with exactly the material from
+/// its manifest. Pool accounting proves that the AVSS protocol did not invoke
+/// its automatic refill path during online execution; registry accounting
+/// proves the concrete protocol-session shape produced by O3.
+async fn run_compiled_threshold_example_with_exact_preprocessing<F, G>(
+    directory: &str,
+    curve: MpcCurve,
+    instance_id: u64,
+    base_port: u16,
+    expected: ExpectedAvssExecution,
+) -> Vec<u8>
+where
+    F: SupportedMpcField
+        + ark_ff::FftField
+        + PrimeField
+        + UniformRand
+        + CanonicalDeserialize
+        + CanonicalSerialize
+        + Send
+        + Sync
+        + 'static,
+    G: CurveGroup<ScalarField = F>
+        + PrimeGroup
+        + CanonicalSerialize
+        + CanonicalDeserialize
+        + std::ops::Mul<F, Output = G>
+        + Send
+        + Sync
+        + 'static,
+    G::Affine: CanonicalDeserialize + CanonicalSerialize + AffineRepr,
+    AvssMpcEngine<F, G>: crate::net::mpc_engine::MpcEngine,
+{
+    init_crypto_provider();
+    setup_test_tracing();
+
+    const N: usize = 5;
+    const T: usize = 1;
+    let (function, demand) = compile_optimized_threshold_source(directory, curve);
+    assert_eq!(demand.triples, expected.triples, "{directory} triples");
+    assert_eq!(demand.randoms, expected.randoms, "{directory} randoms");
+    assert_eq!(demand.prandbits, 0, "{directory} AVSS prandbits");
+    assert_eq!(demand.prandints, 0, "{directory} AVSS prandints");
+    assert!(!demand.dynamic, "{directory} demand must be exact");
+
+    let requested_triples = usize::try_from(demand.triples).expect("triple count fits usize");
+    let requested_randoms = usize::try_from(demand.randoms).expect("random count fits usize");
+    let physically_generated_triples = if requested_triples == 0 {
+        0
+    } else {
+        requested_triples.div_ceil(N) * N
+    };
+    // RanSha emits n-2t random shares per protocol run. Triple construction
+    // consumes two random shares per physically generated (party-rounded)
+    // triple, leaving the program allocation plus at most one RanSha batch's
+    // rounding residue in the visible pool.
+    let random_batch = N - 2 * T;
+    let total_random_generation_request = requested_randoms + 2 * physically_generated_triples;
+    let physically_generated_randoms = if total_random_generation_request == 0 {
+        0
+    } else {
+        total_random_generation_request.div_ceil(random_batch) * random_batch
+    };
+    let retained_program_randoms = physically_generated_randoms - 2 * physically_generated_triples;
+
+    let mut nodes = setup_test_network::<F, G>(N, base_port)
+        .await
+        .unwrap_or_else(|error| panic!("create {directory} AVSS network: {error}"));
+    let pk_maps = exchange_ecdh_keys(&mut nodes)
+        .await
+        .unwrap_or_else(|error| panic!("exchange {directory} AVSS keys: {error}"));
+
+    let mut engines = Vec::with_capacity(N);
+    for (i, node) in nodes.iter().enumerate() {
+        let session = MpcSessionConfig::try_new(
+            instance_id,
+            node.node_id,
+            N,
+            T,
+            node.network
+                .clone()
+                .expect("threshold example network manager"),
+        )
+        .expect("threshold example topology");
+        let engine = AvssMpcEngine::from_config(
+            AvssEngineConfig::new(session, node.sk_i, pk_maps[i].clone())
+                .with_preprocessing_counts(requested_randoms, requested_triples),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("create {directory} AVSS engine: {error}"));
+        engine
+            .start_async()
+            .await
+            .unwrap_or_else(|error| panic!("start {directory} AVSS engine: {error}"));
+        engines.push(engine);
+    }
+    spawn_message_processors(&mut nodes, &engines);
+
+    futures::future::try_join_all(engines.iter().map(|engine| engine.preprocess()))
+        .await
+        .unwrap_or_else(|error| panic!("preprocess {directory}: {error}"));
+    for engine in &engines {
+        assert_eq!(
+            avss_preprocessing_pool_counts(engine).await,
+            (physically_generated_triples, retained_program_randoms),
+            "{directory} must retain exactly the protocol-rounded material before execution"
+        );
+    }
+
+    let mut results = run_function_on_all_parties(&engines, &function).await;
+    let mut byte_results = Vec::with_capacity(N);
+    for (vm, result) in &mut results {
+        byte_results.push(extract_vm_byte_array(vm, result));
+    }
+    for party in 1..N {
+        assert_eq!(
+            byte_results[0], byte_results[party],
+            "{directory} party {party} output differs from party 0"
+        );
+    }
+    assert_eq!(
+        byte_results[0].len(),
+        expected.output_bytes,
+        "{directory} output length"
+    );
+
+    for engine in &engines {
+        assert_eq!(
+            avss_preprocessing_pool_counts(engine).await,
+            (
+                physically_generated_triples - requested_triples,
+                retained_program_randoms - requested_randoms,
+            ),
+            "{directory} must consume its exact manifest demand without an online refill"
+        );
+        assert_eq!(
+            engine.multiplication_session_count().await,
+            expected.multiplication_sessions,
+            "{directory} multiplication protocol sessions"
+        );
+        assert_eq!(
+            engine.open_registry().protocol_session_counts(),
+            (
+                expected.single_open_sessions,
+                expected.batch_open_sessions,
+                expected.g1_exponent_open_sessions,
+                expected.g2_exponent_open_sessions,
+            ),
+            "{directory} open protocol sessions"
+        );
+    }
+
+    byte_results.swap_remove(0)
 }
 
 async fn run_threshold_ecdsa_case<F, G>(
@@ -1244,6 +1468,190 @@ async fn test_threshold_ecdsa_p256() {
         EcdsaThirdPartyVerifier::P256,
     )
     .await;
+}
+
+/// Execute every checked-in threshold-signature source program through the O3
+/// compiler and the real AVSS backend. Unlike the hand-authored protocol tests
+/// below, this test provisions only the manifest demand and verifies both the
+/// resulting signature and the concrete online session shape.
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "release-only exact AVSS preprocessing and online-session validation"]
+async fn optimized_threshold_signature_examples_use_exact_avss_preprocessing() {
+    let bls = run_compiled_threshold_example_with_exact_preprocessing::<
+        ark_bls12_381::Fr,
+        ark_bls12_381::G1Projective,
+    >(
+        "threshold_bls_bls12381",
+        MpcCurve::Bls12_381,
+        900_200,
+        13600,
+        ExpectedAvssExecution {
+            triples: 0,
+            randoms: 1,
+            multiplication_sessions: 0,
+            single_open_sessions: 0,
+            batch_open_sessions: 0,
+            g1_exponent_open_sessions: 1,
+            g2_exponent_open_sessions: 1,
+            output_bytes: 192,
+        },
+    )
+    .await;
+    {
+        use ark_bls12_381::{Bls12_381, G1Affine, G2Affine, G2Projective};
+        use ark_ec::pairing::Pairing;
+
+        let signature =
+            G1Affine::deserialize_compressed(&bls[..48]).expect("compiled BLS signature");
+        let public_key =
+            G2Affine::deserialize_compressed(&bls[48..144]).expect("compiled BLS public key");
+        let message_hash =
+            G1Affine::deserialize_compressed(&bls[144..]).expect("compiled BLS message hash");
+        assert_eq!(
+            Bls12_381::pairing(signature, G2Projective::generator().into_affine()),
+            Bls12_381::pairing(message_hash, public_key),
+            "compiled BLS signature must verify"
+        );
+    }
+
+    let p256 = run_compiled_threshold_example_with_exact_preprocessing::<
+        ark_secp256r1::Fr,
+        ark_secp256r1::Projective,
+    >(
+        "threshold_ecdsa_p256",
+        MpcCurve::Secp256r1,
+        900_201,
+        13700,
+        ExpectedAvssExecution {
+            triples: 2,
+            randoms: 3,
+            multiplication_sessions: 2,
+            single_open_sessions: 2,
+            batch_open_sessions: 0,
+            g1_exponent_open_sessions: 1,
+            g2_exponent_open_sessions: 0,
+            output_bytes: 97,
+        },
+    )
+    .await;
+    let digest = sha2::Sha256::digest(THRESHOLD_ECDSA_DEMO_MESSAGE_INPUT.as_bytes());
+    verify_p256_ecdsa(
+        &digest,
+        &p256[64..],
+        p256[..32].try_into().expect("compiled P-256 r"),
+        p256[32..64].try_into().expect("compiled P-256 s"),
+    );
+
+    let secp256k1 = run_compiled_threshold_example_with_exact_preprocessing::<
+        ark_secp256k1::Fr,
+        ark_secp256k1::Projective,
+    >(
+        "threshold_ecdsa_secp256k1",
+        MpcCurve::Secp256k1,
+        900_202,
+        13800,
+        ExpectedAvssExecution {
+            triples: 2,
+            randoms: 3,
+            multiplication_sessions: 1,
+            single_open_sessions: 2,
+            batch_open_sessions: 0,
+            g1_exponent_open_sessions: 0,
+            g2_exponent_open_sessions: 0,
+            output_bytes: 97,
+        },
+    )
+    .await;
+    verify_secp256k1_ecdsa(
+        &digest,
+        &secp256k1[64..],
+        secp256k1[..32].try_into().expect("compiled secp256k1 r"),
+        secp256k1[32..64].try_into().expect("compiled secp256k1 s"),
+    );
+
+    let eddsa = run_compiled_threshold_example_with_exact_preprocessing::<
+        ark_ed25519::Fr,
+        ark_ed25519::EdwardsProjective,
+    >(
+        "threshold_eddsa_ed25519",
+        MpcCurve::Ed25519,
+        900_203,
+        13900,
+        ExpectedAvssExecution {
+            triples: 0,
+            randoms: 2,
+            multiplication_sessions: 0,
+            single_open_sessions: 1,
+            batch_open_sessions: 0,
+            g1_exponent_open_sessions: 0,
+            g2_exponent_open_sessions: 0,
+            output_bytes: 96,
+        },
+    )
+    .await;
+    {
+        use ark_ed25519::{EdwardsAffine, EdwardsProjective, Fr};
+
+        let nonce: EdwardsProjective = EdwardsAffine::deserialize_compressed(&eddsa[..32])
+            .expect("compiled EdDSA nonce")
+            .into();
+        let response = Fr::deserialize_compressed(&eddsa[32..64]).expect("compiled EdDSA response");
+        let public_key: EdwardsProjective = EdwardsAffine::deserialize_compressed(&eddsa[64..])
+            .expect("compiled EdDSA public key")
+            .into();
+        let mut challenge_input = Vec::new();
+        challenge_input.extend_from_slice(&eddsa[..32]);
+        challenge_input.extend_from_slice(&eddsa[64..]);
+        challenge_input.extend_from_slice(b"test message for eddsa");
+        let challenge = Fr::from_le_bytes_mod_order(&sha2::Sha512::digest(challenge_input));
+        assert_eq!(
+            EdwardsProjective::generator() * response,
+            nonce + public_key * challenge,
+            "compiled EdDSA signature must verify"
+        );
+    }
+
+    let schnorr = run_compiled_threshold_example_with_exact_preprocessing::<
+        ark_ed25519::Fr,
+        ark_ed25519::EdwardsProjective,
+    >(
+        "threshold_schnorr_ed25519",
+        MpcCurve::Ed25519,
+        900_204,
+        14000,
+        ExpectedAvssExecution {
+            triples: 0,
+            randoms: 2,
+            multiplication_sessions: 0,
+            single_open_sessions: 1,
+            batch_open_sessions: 0,
+            g1_exponent_open_sessions: 0,
+            g2_exponent_open_sessions: 0,
+            output_bytes: 96,
+        },
+    )
+    .await;
+    {
+        use ark_ed25519::{EdwardsAffine, EdwardsProjective, Fr};
+
+        let nonce: EdwardsProjective = EdwardsAffine::deserialize_compressed(&schnorr[..32])
+            .expect("compiled Schnorr nonce")
+            .into();
+        let response =
+            Fr::deserialize_compressed(&schnorr[32..64]).expect("compiled Schnorr response");
+        let public_key: EdwardsProjective = EdwardsAffine::deserialize_compressed(&schnorr[64..])
+            .expect("compiled Schnorr public key")
+            .into();
+        let mut challenge_input = Vec::new();
+        challenge_input.extend_from_slice(&schnorr[..32]);
+        challenge_input.extend_from_slice(b"test message for schnorr");
+        let challenge = Fr::from_le_bytes_mod_order(&sha2::Sha256::digest(challenge_input));
+        assert_eq!(
+            EdwardsProjective::generator() * response,
+            nonce + public_key * challenge,
+            "compiled Schnorr signature must verify"
+        );
+    }
 }
 
 // ===========================================================================

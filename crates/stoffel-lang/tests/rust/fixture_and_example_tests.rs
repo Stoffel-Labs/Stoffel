@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use stoffel_vm_types::compiled_binary::{
     utils::{load_from_file, try_to_vm_functions},
-    MpcBackend,
+    MpcBackend, MpcCurve,
 };
 use stoffel_vm_types::instructions::Instruction;
 use stoffellang::{compile_file, convert_to_binary, save_to_file, CompilerOptions};
@@ -187,6 +187,145 @@ fn secp256k1_ecdsa_keeps_preprocessing_minimal_and_batched() {
     assert_eq!(call_count("Share.mul"), 0);
     assert_eq!(call_count("Share.open_exp"), 0);
     assert_eq!(call_count("open_exp"), 0);
+}
+
+#[test]
+fn optimized_threshold_signatures_hit_avss_material_and_mul_reveal_round_floors() {
+    struct Case {
+        directory: &'static str,
+        curve: MpcCurve,
+        triples: u64,
+        randoms: u64,
+        batch_mul_sessions: usize,
+        mandatory_field_open_sessions: usize,
+        exponent_open_sessions: usize,
+        mul_reveal_round_floor: usize,
+    }
+
+    let cases = [
+        Case {
+            directory: "threshold_bls_bls12381",
+            curve: MpcCurve::Bls12_381,
+            triples: 0,
+            randoms: 1,
+            batch_mul_sessions: 0,
+            mandatory_field_open_sessions: 0,
+            exponent_open_sessions: 2,
+            mul_reveal_round_floor: 0,
+        },
+        Case {
+            directory: "threshold_ecdsa_p256",
+            curve: MpcCurve::Secp256r1,
+            triples: 2,
+            randoms: 3,
+            batch_mul_sessions: 2,
+            mandatory_field_open_sessions: 2,
+            exponent_open_sessions: 1,
+            mul_reveal_round_floor: 4,
+        },
+        Case {
+            directory: "threshold_ecdsa_secp256k1",
+            curve: MpcCurve::Secp256k1,
+            triples: 2,
+            randoms: 3,
+            batch_mul_sessions: 1,
+            mandatory_field_open_sessions: 2,
+            exponent_open_sessions: 0,
+            mul_reveal_round_floor: 3,
+        },
+        Case {
+            directory: "threshold_eddsa_ed25519",
+            curve: MpcCurve::Ed25519,
+            triples: 0,
+            randoms: 2,
+            batch_mul_sessions: 0,
+            mandatory_field_open_sessions: 1,
+            exponent_open_sessions: 0,
+            mul_reveal_round_floor: 1,
+        },
+        Case {
+            directory: "threshold_schnorr_ed25519",
+            curve: MpcCurve::Ed25519,
+            triples: 0,
+            randoms: 2,
+            batch_mul_sessions: 0,
+            mandatory_field_open_sessions: 1,
+            exponent_open_sessions: 0,
+            mul_reveal_round_floor: 1,
+        },
+    ];
+
+    for case in cases {
+        let path = manifest_dir()
+            .join("examples/threshold_signatures")
+            .join(case.directory)
+            .join("main.stfl");
+        let source = fs::read_to_string(&path).expect("read threshold signature example");
+        let options = CompilerOptions {
+            optimize: true,
+            optimization_level: 3,
+            mpc_backend: MpcBackend::Avss,
+            mpc_curve: case.curve,
+            ..CompilerOptions::default()
+        };
+        let program = compile_file(&path, &source, &options)
+            .unwrap_or_else(|errors| panic!("{}: {errors:#?}", case.directory));
+        let demand = program.client_io_manifest.preprocessing_demand;
+        assert_eq!(demand.triples, case.triples, "{} triples", case.directory);
+        assert_eq!(demand.randoms, case.randoms, "{} randoms", case.directory);
+        assert_eq!(demand.prandbits, 0, "{} prandbits", case.directory);
+        assert_eq!(demand.prandints, 0, "{} prandints", case.directory);
+        assert!(!demand.dynamic, "{} demand must be exact", case.directory);
+
+        let calls = |symbol: &str| {
+            program
+                .main_chunk
+                .instructions
+                .iter()
+                .filter(
+                    |instruction| matches!(instruction, Instruction::CALL(name) if name == symbol),
+                )
+                .count()
+        };
+        assert_eq!(
+            calls("Share.mul") + calls("mul"),
+            0,
+            "{} must not leave singular interactive products",
+            case.directory
+        );
+        assert_eq!(
+            calls("Share.batch_mul"),
+            case.batch_mul_sessions,
+            "{} multiplication sessions",
+            case.directory
+        );
+
+        // Every example has one client-conditional field open. With no client
+        // inputs (the benchmark path), that branch is skipped; all other field
+        // opens are mandatory protocol sessions.
+        let field_open_sessions = calls("open_field") + calls("Share.open_field");
+        assert_eq!(
+            field_open_sessions.saturating_sub(1),
+            case.mandatory_field_open_sessions,
+            "{} mandatory field-open sessions",
+            case.directory
+        );
+        let exponent_open_sessions = calls("open_exp")
+            + calls("Share.open_exp")
+            + calls("open_exp_custom")
+            + calls("Share.open_exp_custom");
+        assert_eq!(
+            exponent_open_sessions, case.exponent_open_sessions,
+            "{} exponent-open sessions",
+            case.directory
+        );
+        assert_eq!(
+            case.batch_mul_sessions + case.mandatory_field_open_sessions,
+            case.mul_reveal_round_floor,
+            "{} multiply/reveal dependency-depth floor",
+            case.directory
+        );
+    }
 }
 
 #[test]

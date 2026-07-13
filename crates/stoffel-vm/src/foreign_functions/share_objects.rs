@@ -30,6 +30,14 @@ impl<'a> ForeignFunctionContext<'a> {
             .extract_homogeneous_share_array(value, context)?)
     }
 
+    pub(crate) fn extract_share_array(
+        &mut self,
+        value: &Value,
+        context: &'static str,
+    ) -> ForeignFunctionCallbackResult<Vec<(ShareType, ShareData)>> {
+        Ok(self.services.extract_share_array(value, context)?)
+    }
+
     pub(crate) fn get_share_type(
         &mut self,
         value: &Value,

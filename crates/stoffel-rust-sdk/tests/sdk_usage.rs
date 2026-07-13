@@ -1851,10 +1851,10 @@ async fn local_network_builder_rejects_zero_timeout_before_runner_lookup() -> st
     Ok(())
 }
 
-#[tokio::test]
-async fn local_execution_rejects_non_bls_avss_client_inputs_before_runner_lookup(
-) -> stoffel::Result<()> {
-    let err = Stoffel::compile(
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts a real localhost coordinator, Ed25519 AVSS party mesh, and coordinator client"]
+async fn local_execution_supports_ed25519_avss_client_inputs() -> stoffel::Result<()> {
+    let result = Stoffel::compile(
         r#"
 def main() -> int64:
   var share = ClientStore.take_share(0, 0)
@@ -1867,15 +1867,11 @@ def main() -> int64:
         curve: Curve::Ed25519,
     })
     .with_client_input(0, &[42_i64])
+    .local_runner_path("target/debug/stoffel-run")
     .execute_local()
-    .await
-    .unwrap_err();
+    .await?;
 
-    assert!(matches!(
-        err,
-        stoffel::Error::Unsupported(message)
-            if message.contains("AVSS local client inputs only for bls12_381")
-    ));
+    assert_eq!(result, vec![Value::I64(42)]);
     Ok(())
 }
 

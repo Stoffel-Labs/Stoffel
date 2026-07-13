@@ -36,6 +36,9 @@ impl AsyncEffectScheduler {
         loop {
             match state.run_until_effect_or_budget_to_depth(checkpoint, self.local_budget)? {
                 VmRunSlice::Complete(value) => {
+                    let value = state
+                        .materialize_deferred_return_value(engine, value)
+                        .await?;
                     progress.report_final();
                     return Ok(value);
                 }

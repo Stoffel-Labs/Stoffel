@@ -34,6 +34,24 @@ fn clear_share_input_canonicalizes_explicit_fixed_point_integer_input() {
 }
 
 #[test]
+fn clear_share_input_canonicalizes_explicit_boolean_integer_input() {
+    let share_type = ShareType::boolean();
+
+    for (value, expected) in [
+        (Value::I64(0), false),
+        (Value::I64(1), true),
+        (Value::I64(-1), true),
+        (Value::U64(u64::MAX), true),
+    ] {
+        let input = clear_share_input(&value, Some(share_type))
+            .expect("integer values should be canonicalized for boolean shares");
+
+        assert_eq!(input.share_type(), share_type);
+        assert_eq!(input.value(), ClearShareValue::Boolean(expected));
+    }
+}
+
+#[test]
 fn share_object_metadata_errors_are_typed() {
     let mut store = ObjectStore::new();
     let object_ref = store
