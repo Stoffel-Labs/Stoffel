@@ -26,6 +26,13 @@ where
     F: SupportedMpcField,
     G: CurveGroup<ScalarField = F> + Send + Sync + 'static,
 {
+    #[cfg(all(test, feature = "avss_itest"))]
+    pub(crate) async fn multiplication_session_count(&self) -> usize {
+        let node = self.avss_node.lock().await;
+        let count = node.mul_node.mult_storage.lock().await.len();
+        count
+    }
+
     pub(super) fn clear_input_to_field(clear: ClearShareInput) -> Result<F, String> {
         match clear.into_parts() {
             (ShareType::SecretInt { .. }, ClearShareValue::Integer(v)) => {
@@ -112,6 +119,49 @@ where
         Self::share_to_share_data(&product)
     }
 
+    pub(super) async fn run_batch_multiply_round(
+        avss_node: Arc<Mutex<AvssMpcNode<F, Avid<AvssSessionId>, G>>>,
+        net: Arc<QuicNetworkManager>,
+        pairs: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<Vec<ShareData>, String> {
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut left_shares = Vec::with_capacity(pairs.len());
+        let mut right_shares = Vec::with_capacity(pairs.len());
+        for (left, right) in pairs {
+            left_shares.push(Self::decode_feldman_share(&left)?);
+            right_shares.push(Self::decode_feldman_share(&right)?);
+        }
+
+        let mut node = {
+            let node = avss_node.lock().await;
+            node.clone()
+        };
+        Self::ensure_multiply_preprocessing_ids(&mut node, net.clone()).await?;
+        node.mul(left_shares, right_shares, net)
+            .await
+            .map_err(|e| format!("Batch multiplication failed: {:?}", e))?
+            .iter()
+            .map(Self::share_to_share_data)
+            .collect()
+    }
+
+    /// Execute one native vectorized AVSS multiplication session for all
+    /// supplied pairs. This is the async implementation shared by the async
+    /// engine capability and its synchronous compatibility adapter.
+    pub(crate) async fn batch_multiply_share_async(
+        &self,
+        pairs: &[(Vec<u8>, Vec<u8>)],
+    ) -> Result<Vec<ShareData>, String> {
+        let pairs = pairs.to_vec();
+        if self.is_standing() {
+            self.run_standing_batch_multiply_round(pairs).await
+        } else {
+            Self::run_batch_multiply_round(self.avss_node.clone(), self.net.clone(), pairs).await
+        }
+    }
+
     pub(super) async fn run_standing_multiply_round(
         &self,
         left_share_bytes: Vec<u8>,
@@ -137,6 +187,35 @@ where
             .next()
             .ok_or_else(|| "Multiplication returned no result".to_string())?;
         Self::share_to_share_data(&product)
+    }
+
+    pub(super) async fn run_standing_batch_multiply_round(
+        &self,
+        pairs: Vec<(Vec<u8>, Vec<u8>)>,
+    ) -> Result<Vec<ShareData>, String> {
+        if pairs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut left_shares = Vec::with_capacity(pairs.len());
+        let mut right_shares = Vec::with_capacity(pairs.len());
+        for (left, right) in pairs {
+            left_shares.push(Self::decode_feldman_share(&left)?);
+            right_shares.push(Self::decode_feldman_share(&right)?);
+        }
+        let mut triples = self.reserve_beaver_triples(left_shares.len()).await?;
+        Self::normalize_multiply_triples(&mut triples);
+
+        let mut node = self.clone_avss_node().await;
+        node.preprocessing_material
+            .lock()
+            .await
+            .add(Some(triples), None);
+        node.mul(left_shares, right_shares, self.net.clone())
+            .await
+            .map_err(|e| format!("Batch multiplication failed: {:?}", e))?
+            .iter()
+            .map(Self::share_to_share_data)
+            .collect()
     }
 
     async fn ensure_multiply_preprocessing_ids(

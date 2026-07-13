@@ -3511,6 +3511,14 @@ pub fn generate_bytecode_with_opt_level(
     node: &AstNode,
     opt_level: u8,
 ) -> CompilerResult<CompiledProgram> {
+    generate_bytecode_with_opt_level_and_backend(node, opt_level, MpcBackend::default())
+}
+
+pub fn generate_bytecode_with_opt_level_and_backend(
+    node: &AstNode,
+    opt_level: u8,
+    mpc_backend: MpcBackend,
+) -> CompilerResult<CompiledProgram> {
     let mut generator = CodeGenerator::new();
     generator.opt_level = opt_level;
     collect_reassigned_vars(node, &mut generator.reassigned_vars);
@@ -3520,7 +3528,8 @@ pub fn generate_bytecode_with_opt_level(
     // whole AST (call-multiplicity- and list-length-aware) and stamp it into the
     // client-IO manifest, replacing the placeholder set during finalisation.
     program.client_io_manifest.preprocessing_demand =
-        crate::preprocessing_planner::plan_preprocessing_demand(node);
+        crate::preprocessing_planner::plan_preprocessing_demand_for_backend(node, mpc_backend);
+    program.client_io_manifest.mpc_backend = mpc_backend;
     if std::env::var("STOFFEL_DEBUG_DEMAND").is_ok() {
         eprintln!(
             "[stoffel-lang] preprocessing demand: {:?}",

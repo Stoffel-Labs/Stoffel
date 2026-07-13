@@ -585,6 +585,7 @@ impl AsyncMpcEngine for AsyncBatchOpenEngine {
 
 struct AsyncBatchMulEngine {
     sync_mul_calls: AtomicUsize,
+    sync_batch_calls: AtomicUsize,
     async_batch_calls: AtomicUsize,
 }
 
@@ -592,6 +593,7 @@ impl AsyncBatchMulEngine {
     fn new() -> Self {
         Self {
             sync_mul_calls: AtomicUsize::new(0),
+            sync_batch_calls: AtomicUsize::new(0),
             async_batch_calls: AtomicUsize::new(0),
         }
     }
@@ -643,6 +645,22 @@ impl MpcEngineMultiplication for AsyncBatchMulEngine {
             "multiply_share",
             "sync multiply_share should not be used by async batch builtin calls",
         ))
+    }
+
+    fn batch_multiply_shares(
+        &self,
+        _ty: ShareType,
+        pairs: &[(Vec<u8>, Vec<u8>)],
+    ) -> MpcEngineResult<Vec<ShareData>> {
+        self.sync_batch_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(pairs
+            .iter()
+            .map(|(left, right)| {
+                let left_byte = left.first().copied().unwrap_or_default();
+                let right_byte = right.first().copied().unwrap_or_default();
+                ShareData::Opaque(vec![left_byte.wrapping_mul(right_byte)].into())
+            })
+            .collect())
     }
 }
 
@@ -4120,6 +4138,74 @@ async fn share_batch_mul_builtin_uses_async_batch_multiply() {
     );
     assert_eq!(engine.sync_mul_calls.load(Ordering::SeqCst), 0);
     assert_eq!(engine.async_batch_calls.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn share_batch_mul_builtin_uses_sync_batch_multiply() {
+    let engine = Arc::new(AsyncBatchMulEngine::new());
+    let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+    let ty = ShareType::boolean();
+    let mut vm = VirtualMachine::builder()
+        .with_standard_library(false)
+        .with_mpc_engine(runtime_engine)
+        .build();
+    let lefts = vm.create_array_ref(2).expect("create left shares array");
+    vm.push_array_values(
+        lefts,
+        &[
+            Value::Share(ty, ShareData::Opaque(vec![1].into())),
+            Value::Share(ty, ShareData::Opaque(vec![0].into())),
+        ],
+    )
+    .expect("seed left shares array");
+    let rights = vm.create_array_ref(2).expect("create right shares array");
+    vm.push_array_values(
+        rights,
+        &[
+            Value::Share(ty, ShareData::Opaque(vec![1].into())),
+            Value::Share(ty, ShareData::Opaque(vec![1].into())),
+        ],
+    )
+    .expect("seed right shares array");
+    vm.register_function(VMFunction::new(
+        "sync_builtin_batch_mul".to_string(),
+        vec!["lefts".to_string(), "rights".to_string()],
+        Vec::new(),
+        None,
+        2,
+        vec![
+            Instruction::PUSHARG(0),
+            Instruction::PUSHARG(1),
+            Instruction::CALL("Share.batch_mul".to_string()),
+            Instruction::RET(0),
+        ],
+        HashMap::new(),
+    ));
+
+    let result = vm
+        .execute_with_args(
+            "sync_builtin_batch_mul",
+            &[Value::from(lefts), Value::from(rights)],
+        )
+        .expect("Share.batch_mul should execute through synchronous batch engine");
+    let Value::Array(result_ref) = result else {
+        panic!("Share.batch_mul should return an array");
+    };
+
+    assert_eq!(vm.read_array_len(result_ref).expect("result length"), 2);
+    assert_eq!(
+        vm.read_table_field(TableRef::from(result_ref), &Value::I64(0))
+            .expect("read first result"),
+        Some(Value::Share(ty, ShareData::Opaque(vec![1].into())))
+    );
+    assert_eq!(
+        vm.read_table_field(TableRef::from(result_ref), &Value::I64(1))
+            .expect("read second result"),
+        Some(Value::Share(ty, ShareData::Opaque(vec![0].into())))
+    );
+    assert_eq!(engine.sync_mul_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(engine.sync_batch_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(engine.async_batch_calls.load(Ordering::SeqCst), 0);
 }
 
 #[test]

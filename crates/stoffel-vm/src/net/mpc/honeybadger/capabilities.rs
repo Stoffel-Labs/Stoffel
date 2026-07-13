@@ -31,6 +31,15 @@ where
             .map_mpc_engine_operation("multiply_share")
     }
 
+    fn batch_multiply_shares(
+        &self,
+        ty: ShareType,
+        pairs: &[(Vec<u8>, Vec<u8>)],
+    ) -> MpcEngineResult<Vec<ShareData>> {
+        crate::net::try_block_on_current(self.batch_multiply_share_async(ty, pairs))
+            .map_mpc_engine_operation("batch_multiply_shares")
+    }
+
     fn divide_fixed_by_constant(
         &self,
         ty: ShareType,

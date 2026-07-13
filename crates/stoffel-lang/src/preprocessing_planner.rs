@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 
 use crate::ast::{AstNode, Parameter, Value};
-use stoffel_vm_types::compiled_binary::PreprocessingDemand;
+use stoffel_vm_types::compiled_binary::{MpcBackend, PreprocessingDemand};
 use stoffel_vm_types::core_types::DEFAULT_FIXED_POINT_FRACTIONAL_BITS;
 
 /// Statically known list shape of a value: its length and, recursively, the
@@ -201,6 +201,7 @@ struct FunctionInfo<'a> {
 struct Planner<'a> {
     functions: HashMap<String, &'a FunctionInfo<'a>>,
     memo: HashMap<CallKey, CallResult>,
+    mpc_backend: MpcBackend,
 }
 
 /// Compute the total preprocessing demand of `program` (the top-level AST, a
@@ -208,6 +209,17 @@ struct Planner<'a> {
 /// top-level function's demand, so whichever entry the runtime selects is
 /// covered.
 pub fn plan_preprocessing_demand(program: &AstNode) -> PreprocessingDemand {
+    plan_preprocessing_demand_for_backend(program, MpcBackend::default())
+}
+
+/// Compute preprocessing demand using the material pools consumed by
+/// `mpc_backend`. Random integer generation is backed by PRandInt under
+/// HoneyBadger, while AVSS currently implements it using ordinary random field
+/// shares.
+pub fn plan_preprocessing_demand_for_backend(
+    program: &AstNode,
+    mpc_backend: MpcBackend,
+) -> PreprocessingDemand {
     // The analysis recurses through the program's call graph, which for large
     // straight-line circuits (e.g. the AES S-box and its callers) can nest many
     // frames deep. Run it on a dedicated thread with a generous stack so the
@@ -218,14 +230,19 @@ pub fn plan_preprocessing_demand(program: &AstNode) -> PreprocessingDemand {
         std::thread::Builder::new()
             .name("preprocessing-demand-analysis".to_string())
             .stack_size(ANALYSIS_STACK_SIZE)
-            .spawn_scoped(scope, || plan_preprocessing_demand_inner(program))
+            .spawn_scoped(scope, || {
+                plan_preprocessing_demand_inner(program, mpc_backend)
+            })
             .expect("failed to spawn preprocessing-demand analysis thread")
             .join()
             .expect("preprocessing-demand analysis thread panicked")
     })
 }
 
-fn plan_preprocessing_demand_inner(program: &AstNode) -> PreprocessingDemand {
+fn plan_preprocessing_demand_inner(
+    program: &AstNode,
+    mpc_backend: MpcBackend,
+) -> PreprocessingDemand {
     let mut infos: Vec<(String, FunctionInfo)> = Vec::new();
     collect_functions(program, &mut infos);
 
@@ -237,6 +254,7 @@ fn plan_preprocessing_demand_inner(program: &AstNode) -> PreprocessingDemand {
     let mut planner = Planner {
         functions,
         memo: HashMap::new(),
+        mpc_backend,
     };
 
     // Program entries are the functions the runtime can actually invoke as a
@@ -1007,6 +1025,16 @@ impl<'a> Planner<'a> {
                 AbstractValue::clear()
             }
 
+            // `copy` creates a distinct list object but preserves the complete
+            // abstract value shape. The O3 multiply batcher seeds each fused
+            // operand accumulator with `copy(first_operand)` and then extends
+            // it; losing the seed length here makes an otherwise fully static
+            // `Share.batch_mul` appear runtime-sized, forcing online top-ups.
+            "copy" => arg_values
+                .first()
+                .cloned()
+                .unwrap_or_else(AbstractValue::unknown),
+
             // --- List/object constructors ------------------------------------
             "create_array" => AbstractValue {
                 len: Len::flat(0),
@@ -1021,13 +1049,62 @@ impl<'a> Planner<'a> {
             | "assert"
             | "MpcOutput.send_to_client"
             | "Share.send_to_client" => AbstractValue::clear(),
-            "get_field" | "slice" => AbstractValue::unknown(),
+            "get_field" => arg_values
+                .first()
+                .map(|collection| AbstractValue {
+                    len: collection.len.element(),
+                    secrecy: collection.secrecy,
+                    int: None,
+                    frac_bits: collection.frac_bits,
+                })
+                .unwrap_or_else(AbstractValue::unknown),
+            "slice" => {
+                let source = arg_values.first();
+                let len = match (
+                    arg_values.get(1).and_then(|value| value.int),
+                    arg_values.get(2).and_then(|value| value.int),
+                ) {
+                    (Some(start), Some(end)) if end >= start => Len::Known {
+                        len: (end - start) as usize,
+                        elem: Box::new(
+                            source
+                                .map(|value| value.len.element())
+                                .unwrap_or(Len::Unknown),
+                        ),
+                    },
+                    _ => Len::Unknown,
+                };
+                AbstractValue {
+                    len,
+                    secrecy: source
+                        .map(|value| value.secrecy)
+                        .unwrap_or(Secrecy::Unknown),
+                    int: None,
+                    frac_bits: source.and_then(|value| value.frac_bits),
+                }
+            }
             "contains" => AbstractValue::clear(),
 
             // --- Client input: a secret scalar share -------------------------
             "ClientStore.take_share"
             | "ClientStore.take_share_bool"
             | "ClientStore.take_share_fixed" => AbstractValue::secret(),
+
+            // --- Operations that consume random preprocessing material -------
+            // random_field always uses the random-share pool. A typed
+            // `Share.random()` is lowered to random_int(bit_length), whose
+            // backing pool depends on the selected runtime backend.
+            "Share.random_field" => {
+                demand.add(0, 1, 0, 0);
+                AbstractValue::secret()
+            }
+            "Share.random" | "Share.random_int" => {
+                match self.mpc_backend {
+                    MpcBackend::HoneyBadger => demand.add(0, 0, 0, 1),
+                    MpcBackend::Avss => demand.add(0, 1, 0, 0),
+                }
+                AbstractValue::secret()
+            }
 
             // --- Free MPC builtins (secrecy effects only, no demand) ---------
             "Share.add" | "Share.sub" | "Share.mul_scalar" | "Share.add_constant"
@@ -1037,7 +1114,6 @@ impl<'a> Planner<'a> {
             | "Share.from_clear_uint"
             | "Share.from_clear_fixed" => AbstractValue::secret(),
             "Share.open" => AbstractValue::clear(),
-            "Share.random" | "Share.random_field" | "Share.random_int" => AbstractValue::secret(),
 
             // --- User functions: recurse with the call's argument shapes -----
             _ => {
@@ -1517,6 +1593,33 @@ def main() -> int64:
         let demand = demand_for(src);
         assert_eq!(demand.triples, 5);
         assert!(!demand.dynamic);
+    }
+
+    #[test]
+    fn copy_extend_and_slice_preserve_static_batch_lengths() {
+        let src = r#"
+def main() -> int64:
+  var xs: list[secret bool] = []
+  var ys: list[secret bool] = []
+  for i in 0..4:
+    xs.append(ClientStore.take_share_bool(0, i))
+    ys.append(ClientStore.take_share_bool(1, i))
+  var lefts = copy(xs)
+  var rights = copy(ys)
+  lefts.extend(xs)
+  rights.extend(ys)
+  var products = Share.batch_mul(lefts, rights)
+  var first = slice(products, 0, 4)
+  var first_copy = copy(first)
+  var products2 = Share.batch_mul(first_copy, first)
+  return 0
+"#;
+        let demand = demand_for(src);
+        assert_eq!(demand.triples, 12, "8-element batch plus 4-element batch");
+        assert!(
+            !demand.dynamic,
+            "shape-preserving list plumbing must not force online top-ups"
+        );
     }
 
     #[test]

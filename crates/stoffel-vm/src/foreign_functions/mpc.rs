@@ -159,6 +159,16 @@ impl<'a> ForeignFunctionContext<'a> {
         self.services.secret_share_mul_data(ty, lhs_data, rhs_data)
     }
 
+    pub(crate) fn secret_share_batch_mul_data(
+        &self,
+        ty: ShareType,
+        lhs_data: &[ShareData],
+        rhs_data: &[ShareData],
+    ) -> VmResult<Vec<ShareData>> {
+        self.services
+            .secret_share_batch_mul_data(ty, lhs_data, rhs_data)
+    }
+
     pub(crate) fn secret_share_neg_data(
         &self,
         ty: ShareType,

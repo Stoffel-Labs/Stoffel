@@ -99,11 +99,11 @@ fn share_batch_mul(mut ctx: ForeignFunctionContext) -> ForeignFunctionCallbackRe
         );
     }
 
-    let mut results = Vec::with_capacity(left_data.len());
-    for (left, right) in left_data.iter().zip(right_data.iter()) {
-        let result_data = ctx.secret_share_mul_data(share_type, left, right)?;
-        results.push(Value::Share(share_type, result_data));
-    }
+    let results = ctx
+        .secret_share_batch_mul_data(share_type, &left_data, &right_data)?
+        .into_iter()
+        .map(|data| Value::Share(share_type, data))
+        .collect::<Vec<_>>();
 
     let result_ref = ctx.create_array_ref(results.len())?;
     ctx.push_array_ref_values(result_ref, &results)?;
