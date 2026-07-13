@@ -10,6 +10,11 @@ use stoffel_vm_types::core_types::{
     ClearShareInput, ClearShareValue, ShareData, ShareType, TableRef, Value,
 };
 
+/// HoneyBadger's default per-session pair limit at the benchmark topology
+/// threshold `t=1`: `128 * (t+1)`. Each chunk is awaited sequentially and is
+/// therefore one online communication round.
+const MODELED_MPC_BATCH_CAPACITY: usize = 256;
+
 #[derive(Default)]
 struct CountingEngine {
     scalar_mul_calls: AtomicUsize,
@@ -36,12 +41,24 @@ struct CountingEngine {
     // one batch call). pair_log: one row per multiply pair executed, tagging the
     // round it ran in, the output depth, and whether it had a public operand.
     call_seq: AtomicUsize,
+    pair_seq: AtomicUsize,
     pair_log: std::sync::Mutex<Vec<PairRecord>>,
+    /// One per scalar open or native batch-open invocation. HoneyBadger's batch
+    /// open sends all shares in one broadcast and has no multiply-style width
+    /// chunking, so every non-empty call is exactly one online round.
+    open_rounds: AtomicUsize,
+    scalar_open_rounds: AtomicUsize,
+    batch_open_rounds: AtomicUsize,
 }
 
 /// One executed multiply pair, for the per-depth round histogram.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct PairRecord {
+    /// Stable multiplication-DAG node id.
+    pair_id: u32,
+    /// Multiplication nodes whose outputs feed this pair through zero or more
+    /// local operations. Redundant transitive parents are legal.
+    parents: Vec<u32>,
     /// Round id (one per scalar multiply call or per batch_multiply call).
     call_id: u32,
     /// Output (critical-path) depth of this pair: max(operand depths)+1.
@@ -52,6 +69,164 @@ struct PairRecord {
     both_public: bool,
 }
 
+/// Validate the executed multiplication DAG and return its critical-path depth.
+/// The packed frontier metadata follows dependencies through arbitrary local
+/// linear operations, so every parent edge must point to an earlier pair and
+/// reproduce the recorded `max(parent depth) + 1` depth exactly.
+fn validate_pair_dag(log: &[PairRecord]) -> usize {
+    let mut depths = Vec::with_capacity(log.len());
+    let mut calls = Vec::with_capacity(log.len());
+    for (expected_id, record) in log.iter().enumerate() {
+        assert_eq!(
+            record.pair_id as usize, expected_id,
+            "pair ids must be dense"
+        );
+        let mut parent_depth = 0u32;
+        for &parent in &record.parents {
+            let parent = parent as usize;
+            assert!(parent < expected_id, "DAG edge must point backward");
+            assert_ne!(
+                calls[parent], record.call_id,
+                "pairs in one MPC batch cannot depend on each other"
+            );
+            parent_depth = parent_depth.max(depths[parent]);
+        }
+        assert_eq!(
+            record.depth,
+            parent_depth + 1,
+            "recorded depth must equal the multiplication-DAG depth"
+        );
+        depths.push(record.depth);
+        calls.push(record.call_id);
+    }
+    depths.into_iter().max().unwrap_or(0) as usize
+}
+
+/// A legal capacity-aware list schedule of the executed multiplication DAG.
+/// Ready nodes with the longest remaining path are prioritized, which preserves
+/// scarce critical-path work while filling every protocol session when possible.
+fn dag_list_schedule_rounds(log: &[PairRecord], capacity: usize) -> usize {
+    assert!(capacity > 0);
+    if log.is_empty() {
+        return 0;
+    }
+    let mut successors = vec![Vec::new(); log.len()];
+    let mut indegree = vec![0usize; log.len()];
+    for record in log {
+        let node = record.pair_id as usize;
+        for &parent in &record.parents {
+            successors[parent as usize].push(node);
+            indegree[node] += 1;
+        }
+    }
+    let mut bottom_level = vec![1usize; log.len()];
+    for node in (0..log.len()).rev() {
+        bottom_level[node] = 1 + successors[node]
+            .iter()
+            .map(|&successor| bottom_level[successor])
+            .max()
+            .unwrap_or(0);
+    }
+
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+    let mut ready = BinaryHeap::new();
+    for node in 0..log.len() {
+        if indegree[node] == 0 {
+            ready.push((bottom_level[node], Reverse(node)));
+        }
+    }
+    let mut scheduled = 0usize;
+    let mut rounds = 0usize;
+    while scheduled < log.len() {
+        assert!(!ready.is_empty(), "multiplication graph must be acyclic");
+        // Successors released by this session cannot execute until the next
+        // communication round, even if capacity remains in the current one.
+        let mut session = Vec::with_capacity(capacity.min(ready.len()));
+        for _ in 0..capacity {
+            let Some((_, Reverse(node))) = ready.pop() else {
+                break;
+            };
+            session.push(node);
+        }
+        scheduled += session.len();
+        rounds += 1;
+        for node in session {
+            for &successor in &successors[node] {
+                indegree[successor] -= 1;
+                if indegree[successor] == 0 {
+                    ready.push((bottom_level[successor], Reverse(successor)));
+                }
+            }
+        }
+    }
+    rounds
+}
+
+/// Exact minimum number of capacity-limited rounds for a small unit-time DAG.
+/// Used as a scheduler oracle in regression/property tests; exponential by
+/// design and deliberately limited to at most 63 nodes.
+fn exact_min_rounds(parents: &[u64], capacity: usize) -> usize {
+    assert!(!parents.is_empty());
+    assert!(parents.len() <= 63);
+    assert!(capacity > 0);
+    let all = (1u64 << parents.len()) - 1;
+    let mut memo = std::collections::HashMap::new();
+
+    fn solve(
+        done: u64,
+        all: u64,
+        parents: &[u64],
+        capacity: usize,
+        memo: &mut std::collections::HashMap<u64, usize>,
+    ) -> usize {
+        if done == all {
+            return 0;
+        }
+        if let Some(&cached) = memo.get(&done) {
+            return cached;
+        }
+        let mut ready = 0u64;
+        for (node, &deps) in parents.iter().enumerate() {
+            let bit = 1u64 << node;
+            if done & bit == 0 && deps & !done == 0 {
+                ready |= bit;
+            }
+        }
+        assert_ne!(ready, 0, "input must be an acyclic graph");
+
+        let ready_count = ready.count_ones() as usize;
+        let mut best = usize::MAX;
+        if ready_count <= capacity {
+            best = 1 + solve(done | ready, all, parents, capacity, memo);
+        } else {
+            // An optimal unit-task schedule can be work-conserving. Enumerate
+            // every capacity-sized choice from the ready set; choice still
+            // matters because different nodes unlock different successors.
+            fn choose(candidates: u64, need: usize, picked: u64, visit: &mut impl FnMut(u64)) {
+                if need == 0 {
+                    visit(picked);
+                    return;
+                }
+                if (candidates.count_ones() as usize) < need {
+                    return;
+                }
+                let bit = candidates & candidates.wrapping_neg();
+                let rest = candidates ^ bit;
+                choose(rest, need - 1, picked | bit, visit);
+                choose(rest, need, picked, visit);
+            }
+            choose(ready, capacity, 0, &mut |round| {
+                best = best.min(1 + solve(done | round, all, parents, capacity, memo));
+            });
+        }
+        memo.insert(done, best);
+        best
+    }
+
+    solve(0, all, parents, capacity, &mut memo)
+}
+
 impl CountingEngine {
     fn counts(&self) -> (usize, usize, usize) {
         (
@@ -59,6 +234,31 @@ impl CountingEngine {
             self.batch_mul_calls.load(Ordering::SeqCst),
             self.batch_mul_items.load(Ordering::SeqCst),
         )
+    }
+
+    fn protocol_rounds(&self) -> usize {
+        self.call_seq.load(Ordering::SeqCst)
+    }
+
+    fn open_protocol_rounds(&self) -> usize {
+        self.open_rounds.load(Ordering::SeqCst)
+    }
+
+    fn open_protocol_breakdown(&self) -> (usize, usize) {
+        (
+            self.scalar_open_rounds.load(Ordering::SeqCst),
+            self.batch_open_rounds.load(Ordering::SeqCst),
+        )
+    }
+
+    fn record_scalar_open_round(&self) {
+        self.open_rounds.fetch_add(1, Ordering::SeqCst);
+        self.scalar_open_rounds.fetch_add(1, Ordering::SeqCst);
+    }
+
+    fn record_batch_open_round(&self) {
+        self.open_rounds.fetch_add(1, Ordering::SeqCst);
+        self.batch_open_rounds.fetch_add(1, Ordering::SeqCst);
     }
 
     /// (public_operand_muls, both_public_muls, max_mul_depth) — see field docs.
@@ -80,16 +280,24 @@ impl CountingEngine {
     }
 
     // --- Share metadata layout -------------------------------------------------
-    // Every share this engine emits is `[value, public, d0, d1, d2, d3]`:
+    // Every share this engine emits is
+    // `[value, public, d0..d3, parent_count0..3, parent_ids...]`:
     //   byte 0      : the GF(2) value bit (read by `bool_byte`, unchanged).
     //   byte 1      : public-literal taint flag (1 = traces to a literal through
     //                 only local ops).
     //   bytes 2..6  : critical-path multiply depth as u32 little-endian.
     // Legacy 1-byte shares (e.g. raw client inputs) decode as public=false,
     // depth=0, which is the correct default for a secret input.
-    fn pack(value: u8, public: bool, depth: u32) -> Vec<u8> {
+    fn pack(value: u8, public: bool, depth: u32, frontier: &[u32]) -> Vec<u8> {
         let d = depth.to_le_bytes();
-        vec![value & 1, u8::from(public), d[0], d[1], d[2], d[3]]
+        let count = (frontier.len() as u32).to_le_bytes();
+        let mut packed = Vec::with_capacity(10 + frontier.len() * 4);
+        packed.extend_from_slice(&[value & 1, u8::from(public), d[0], d[1], d[2], d[3]]);
+        packed.extend_from_slice(&count);
+        for parent in frontier {
+            packed.extend_from_slice(&parent.to_le_bytes());
+        }
+        packed
     }
 
     fn is_public(bytes: &[u8]) -> bool {
@@ -104,9 +312,33 @@ impl CountingEngine {
         }
     }
 
+    fn frontier_of(bytes: &[u8]) -> Vec<u32> {
+        if bytes.len() < 10 {
+            return Vec::new();
+        }
+        let count = u32::from_le_bytes([bytes[6], bytes[7], bytes[8], bytes[9]]) as usize;
+        let available = bytes.len().saturating_sub(10) / 4;
+        let mut frontier = Vec::with_capacity(count.min(available));
+        for chunk in bytes[10..].chunks_exact(4).take(count) {
+            frontier.push(u32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+        }
+        frontier
+    }
+
+    fn merged_frontier(left: &[u8], right: &[u8]) -> Vec<u32> {
+        let mut frontier = Self::frontier_of(left);
+        frontier.extend(Self::frontier_of(right));
+        frontier.sort_unstable();
+        frontier.dedup();
+        frontier
+    }
+
     /// Execute one secret multiply `ab`: compute its value, record lever-B and
     /// depth instrumentation, and return packed metadata for the product (a
-    /// product is never a public literal). Shared by scalar/async/batch paths.
+    /// product remains provably public when both operands are public, even if
+    /// the current compiler unnecessarily executes it interactively. Preserving
+    /// that fact exposes the complete downstream localization opportunity.
+    /// Shared by scalar/async/batch paths.
     fn record_multiply(&self, call_id: u32, left: &[u8], right: &[u8]) -> Vec<u8> {
         let value = Self::bool_byte(left) & Self::bool_byte(right);
         let out_depth = Self::depth_of(left).max(Self::depth_of(right)) + 1;
@@ -120,15 +352,19 @@ impl CountingEngine {
         if left_pub && right_pub {
             self.both_public_muls.fetch_add(1, Ordering::SeqCst);
         }
+        let pair_id = self.pair_seq.fetch_add(1, Ordering::SeqCst) as u32;
+        let parents = Self::merged_frontier(left, right);
         if let Ok(mut log) = self.pair_log.lock() {
             log.push(PairRecord {
+                pair_id,
+                parents,
                 call_id,
                 depth: out_depth,
                 pub_operand: left_pub || right_pub,
                 both_public: left_pub && right_pub,
             });
         }
-        Self::pack(value, false, out_depth)
+        Self::pack(value, left_pub && right_pub, out_depth, &[pair_id])
     }
 
     /// Allocate a fresh round id for one multiply call (scalar or batch).
@@ -144,7 +380,7 @@ impl CountingEngine {
             ClearShareValue::Boolean(value) => u8::from(value),
         };
         // A `from_clear` value is a compile-time public literal: public=true, depth 0.
-        ShareData::Opaque(Self::pack(byte, true, 0).into())
+        ShareData::Opaque(Self::pack(byte, true, 0, &[]).into())
     }
 
     fn open_bool(share_bytes: &[u8]) -> ClearShareValue {
@@ -174,7 +410,19 @@ impl MpcEngine for CountingEngine {
     }
 
     fn open_share(&self, _ty: ShareType, share_bytes: &[u8]) -> MpcEngineResult<ClearShareValue> {
+        self.record_scalar_open_round();
         Ok(Self::open_bool(share_bytes))
+    }
+
+    fn batch_open_shares(
+        &self,
+        _ty: ShareType,
+        shares: &[Vec<u8>],
+    ) -> MpcEngineResult<Vec<ClearShareValue>> {
+        if !shares.is_empty() {
+            self.record_batch_open_round();
+        }
+        Ok(shares.iter().map(|share| Self::open_bool(share)).collect())
     }
 
     fn capabilities(&self) -> MpcCapabilities {
@@ -195,7 +443,12 @@ impl MpcEngine for CountingEngine {
         let value = Self::bool_byte(lhs_bytes) ^ Self::bool_byte(rhs_bytes);
         let public = Self::is_public(lhs_bytes) && Self::is_public(rhs_bytes);
         let depth = Self::depth_of(lhs_bytes).max(Self::depth_of(rhs_bytes));
-        Ok(Self::pack(value, public, depth))
+        Ok(Self::pack(
+            value,
+            public,
+            depth,
+            &Self::merged_frontier(lhs_bytes, rhs_bytes),
+        ))
     }
 
     fn sub_share_local(
@@ -207,7 +460,12 @@ impl MpcEngine for CountingEngine {
         let value = Self::bool_byte(lhs_bytes) ^ Self::bool_byte(rhs_bytes);
         let public = Self::is_public(lhs_bytes) && Self::is_public(rhs_bytes);
         let depth = Self::depth_of(lhs_bytes).max(Self::depth_of(rhs_bytes));
-        Ok(Self::pack(value, public, depth))
+        Ok(Self::pack(
+            value,
+            public,
+            depth,
+            &Self::merged_frontier(lhs_bytes, rhs_bytes),
+        ))
     }
 
     fn neg_share_local(&self, _ty: ShareType, share_bytes: &[u8]) -> ShareAlgebraResult<Vec<u8>> {
@@ -216,6 +474,7 @@ impl MpcEngine for CountingEngine {
             Self::bool_byte(share_bytes),
             Self::is_public(share_bytes),
             Self::depth_of(share_bytes),
+            &Self::frontier_of(share_bytes),
         ))
     }
 
@@ -231,6 +490,7 @@ impl MpcEngine for CountingEngine {
             value,
             Self::is_public(share_bytes),
             Self::depth_of(share_bytes),
+            &Self::frontier_of(share_bytes),
         ))
     }
 
@@ -245,6 +505,7 @@ impl MpcEngine for CountingEngine {
             value,
             Self::is_public(share_bytes),
             Self::depth_of(share_bytes),
+            &Self::frontier_of(share_bytes),
         ))
     }
 
@@ -259,6 +520,7 @@ impl MpcEngine for CountingEngine {
             value,
             Self::is_public(share_bytes),
             Self::depth_of(share_bytes),
+            &Self::frontier_of(share_bytes),
         ))
     }
 
@@ -273,6 +535,7 @@ impl MpcEngine for CountingEngine {
             value,
             Self::is_public(share_bytes),
             Self::depth_of(share_bytes),
+            &Self::frontier_of(share_bytes),
         ))
     }
 
@@ -287,6 +550,7 @@ impl MpcEngine for CountingEngine {
             Self::bool_byte(share_bytes),
             Self::is_public(share_bytes),
             Self::depth_of(share_bytes),
+            &Self::frontier_of(share_bytes),
         ))
     }
 }
@@ -333,13 +597,14 @@ impl stoffel_vm::net::mpc_engine::AsyncMpcEngine for CountingEngine {
         self.batch_mul_calls.fetch_add(1, Ordering::SeqCst);
         self.batch_mul_items
             .fetch_add(pairs.len(), Ordering::SeqCst);
-        let call_id = self.next_call_id();
-        Ok(pairs
-            .iter()
-            .map(|(left, right)| {
+        let mut products = Vec::with_capacity(pairs.len());
+        for chunk in pairs.chunks(MODELED_MPC_BATCH_CAPACITY) {
+            let call_id = self.next_call_id();
+            products.extend(chunk.iter().map(|(left, right)| {
                 ShareData::Opaque(self.record_multiply(call_id, left, right).into())
-            })
-            .collect())
+            }));
+        }
+        Ok(products)
     }
 
     async fn open_share_async(
@@ -347,6 +612,7 @@ impl stoffel_vm::net::mpc_engine::AsyncMpcEngine for CountingEngine {
         _ty: ShareType,
         share_bytes: &[u8],
     ) -> MpcEngineResult<ClearShareValue> {
+        self.record_scalar_open_round();
         Ok(Self::open_bool(share_bytes))
     }
 
@@ -355,6 +621,9 @@ impl stoffel_vm::net::mpc_engine::AsyncMpcEngine for CountingEngine {
         _ty: ShareType,
         shares: &[Vec<u8>],
     ) -> MpcEngineResult<Vec<ClearShareValue>> {
+        if !shares.is_empty() {
+            self.record_batch_open_round();
+        }
         Ok(shares.iter().map(|share| Self::open_bool(share)).collect())
     }
 
@@ -389,6 +658,22 @@ where
         .expect("spawn large-stack test thread")
         .join()
         .expect("large-stack test thread panicked");
+}
+
+#[test]
+fn exact_capacity_scheduler_oracle_handles_precedence_and_choices() {
+    assert_eq!(exact_min_rounds(&[0, 0, 0, 0, 0], 2), 3);
+    assert_eq!(exact_min_rounds(&[0, 1 << 0, 1 << 1, 1 << 2], 2), 4);
+    assert_eq!(
+        exact_min_rounds(&[0, 1 << 0, 1 << 0, (1 << 1) | (1 << 2)], 2),
+        3
+    );
+
+    // Three roots compete for two slots. Scheduling node 0 immediately unlocks
+    // a two-node chain and finishes in three rounds; choosing roots 1+2 first
+    // takes four. The oracle must enumerate ready-set choices, not use a fixed
+    // source-order greedy policy.
+    assert_eq!(exact_min_rounds(&[0, 0, 0, 1 << 0, 1 << 3], 2), 3);
 }
 
 /// Regression test for the -O3 function inliner: a `secret`-typed helper that is
@@ -1193,9 +1478,9 @@ fn bits_as_bool_shares(bytes: &[u8]) -> Vec<stoffel_vm::ClientShare> {
 
 /// Compile `source` at the given optimization level, seed any client inputs,
 /// run `main` through the `CountingEngine`, and return
-/// `(mul_rounds, revealed_output)`. `mul_rounds` is the number of multiply
-/// communication rounds: scalar `multiply_share` calls (one round each) plus
-/// `batch_multiply_share` calls (one round each, regardless of batch size).
+/// `(mul_rounds, revealed_output)`. `mul_rounds` models backend protocol
+/// sessions: scalar calls cost one, and oversized batch calls cost one per
+/// sequential HoneyBadger capacity chunk.
 /// Lever-B / depth measurements for one (program, level) run.
 struct LeverMetrics {
     /// Multiply pairs with >=1 public-literal operand (lever B's headroom).
@@ -1260,10 +1545,9 @@ async fn round_gate_run(
         out.push(byte);
     }
 
-    let (scalar, batch_calls, _items) = engine.counts();
     let (public_operand_muls, both_public_muls, mul_depth) = engine.lever_b_counts();
     Ok((
-        scalar + batch_calls,
+        engine.protocol_rounds(),
         out,
         LeverMetrics {
             public_operand_muls,
@@ -1373,16 +1657,25 @@ async fn round_gate_impl() {
 //
 // For each program at -O3 this compiles + runs the live source through the
 // CountingEngine, then breaks the multiply ROUNDS down by critical-path output
-// depth. Each scalar multiply call or batch_multiply call is one round (one
-// `call_id`). For every output depth d it reports:
+// depth. Each backend protocol session is one round (`call_id`); an oversized
+// VM batch call contributes multiple sequential call ids. For every output
+// depth d it reports:
 //   pairs   = number of multiply pairs whose output depth is d
-//   ideal   = ceil(pairs/256)  (the minimum rounds depth d can take at the cap)
+//   layer_cap = ceil(pairs/256), a diagnostic packing count for that output
+//               depth (NOT a lower bound because one batch may mix depths)
 //   actual  = number of rounds whose pairs are (max-)at depth d
-//   waste   = actual - ideal   (recoverable rounds at this depth: lever 1/3/5)
+//   delta   = actual - layer_cap (fragmentation diagnostic only)
 //   pub     = pairs at depth d with a public operand (lever 4 headroom)
-// plus per-program totals: actual rounds, ideal floor (sum of per-depth ideals),
-// max depth, singleton rounds (a round of exactly 1 pair), and mixed-depth
-// rounds (a round whose pairs span more than one output depth).
+// The sound global lower bound is max(critical-path depth, ceil(total pairs/256)).
+// Unlike the former sum-of-depth-ceilings metric, this can never exceed a legal
+// schedule merely because a batch mixes output depths. The difference between
+// actual rounds and this bound is a certified *possible* improvement envelope,
+// not proof that every round in the envelope is achievable under precedence.
+// Opens are counted separately as full online sessions. They are not yet nodes
+// in the multiplication DAG (clear values cannot carry the opaque producer
+// frontier), so the certified lower/upper bounds below remain multiply-only and
+// `observed_online_sessions` is deliberately reported without claiming a full
+// interactive-DAG optimum.
 //
 // Run with:
 //   cargo test --release -p stoffel-vm --test aes_count round_histogram \
@@ -1392,7 +1685,7 @@ async fn histogram_run(
     source: &str,
     level: u8,
     client_inputs: &[(usize, Vec<stoffel_vm::ClientShare>)],
-) -> Result<(usize, Vec<i64>, Vec<PairRecord>), String> {
+) -> Result<(usize, usize, usize, usize, Vec<i64>, Vec<PairRecord>), String> {
     let options = stoffellang::CompilerOptions {
         optimize: level > 0,
         optimization_level: level,
@@ -1441,12 +1734,28 @@ async fn histogram_run(
         };
         out.push(byte);
     }
-    let (scalar, batch_calls, _items) = engine.counts();
-    Ok((scalar + batch_calls, out, engine.pair_log_snapshot()))
+    let (scalar_opens, batch_opens) = engine.open_protocol_breakdown();
+    Ok((
+        engine.protocol_rounds(),
+        engine.open_protocol_rounds(),
+        scalar_opens,
+        batch_opens,
+        out,
+        engine.pair_log_snapshot(),
+    ))
 }
 
-fn print_depth_histogram(label: &str, rounds: usize, correct: bool, log: &[PairRecord]) {
+fn print_depth_histogram(
+    label: &str,
+    rounds: usize,
+    open_rounds: usize,
+    scalar_opens: usize,
+    batch_opens: usize,
+    correct: bool,
+    log: &[PairRecord],
+) {
     use std::collections::BTreeMap;
+    let dag_critical_path = validate_pair_dag(log);
     // Per output depth: total pairs, pairs with a public operand.
     let mut pairs_at: BTreeMap<u32, usize> = BTreeMap::new();
     let mut pub_at: BTreeMap<u32, usize> = BTreeMap::new();
@@ -1481,7 +1790,6 @@ fn print_depth_histogram(label: &str, rounds: usize, correct: bool, log: &[PairR
             mixed_rounds += 1;
         }
     }
-    let mut ideal_total = 0usize;
     let depths: Vec<u32> = pairs_at.keys().copied().collect();
     println!(
         "HIST {label} O3 rounds={rounds} correct={correct} pairs={} max_depth={} pub_pairs={} both_public={}",
@@ -1490,23 +1798,44 @@ fn print_depth_histogram(label: &str, rounds: usize, correct: bool, log: &[PairR
         total_pub,
         total_both,
     );
-    println!("HIST {label} depth | pairs | ideal | actual | waste | pub");
+    println!("HIST {label} depth | pairs | layer_cap | actual | delta | pub");
     for d in &depths {
         let pairs = pairs_at[d];
-        let ideal = pairs.div_ceil(256);
-        ideal_total += ideal;
+        let layer_cap = pairs.div_ceil(256);
         let actual = actual_at.get(d).copied().unwrap_or(0);
         let pub_pairs = pub_at.get(d).copied().unwrap_or(0);
-        let waste = actual as i64 - ideal as i64;
+        let delta = actual as i64 - layer_cap as i64;
         println!(
-            "HIST {label}  {d:>4} | {pairs:>5} | {ideal:>5} | {actual:>6} | {waste:>5} | {pub_pairs:>5}"
+            "HIST {label}  {d:>4} | {pairs:>5} | {layer_cap:>9} | {actual:>6} | {delta:>5} | {pub_pairs:>5}"
         );
     }
-    let total_waste = rounds as i64 - ideal_total as i64;
+    let critical_path = depths.last().copied().unwrap_or(0) as usize;
+    assert_eq!(
+        critical_path, dag_critical_path,
+        "histogram and explicit DAG critical paths must agree"
+    );
+    let work_bound = log.len().div_ceil(MODELED_MPC_BATCH_CAPACITY);
+    let sound_lower_bound = critical_path.max(work_bound);
+    let dag_list_upper = dag_list_schedule_rounds(log, MODELED_MPC_BATCH_CAPACITY);
+    assert!(
+        rounds >= sound_lower_bound,
+        "observed schedule cannot beat its critical-path/work lower bound"
+    );
+    assert!(
+        dag_list_upper >= sound_lower_bound,
+        "a legal DAG schedule cannot beat the sound lower bound"
+    );
     println!(
-        "HIST {label} TOTALS actual_rounds={rounds} ideal_floor={ideal_total} waste={total_waste} \
-distinct_depths={} singleton_rounds={singleton_rounds} mixed_depth_rounds={mixed_rounds}",
+        "HIST {label} TOTALS actual_rounds={rounds} sound_lb={sound_lower_bound} \
+certified_gap={} dag_list_upper={dag_list_upper} dag_sched_gap={} \
+critical_path={critical_path} work_bound={work_bound} \
+distinct_depths={} singleton_rounds={singleton_rounds} mixed_depth_rounds={mixed_rounds} \
+open_rounds={open_rounds} scalar_opens={scalar_opens} batch_opens={batch_opens} \
+observed_online_sessions={}",
+        rounds - sound_lower_bound,
+        rounds.saturating_sub(dag_list_upper),
         depths.len(),
+        rounds + open_rounds,
     );
     println!();
 }
@@ -1545,9 +1874,17 @@ async fn round_histogram_impl() {
 
     for (label, source, inputs, expected) in &programs {
         match histogram_run(source, 3, inputs).await {
-            Ok((rounds, output, log)) => {
+            Ok((rounds, open_rounds, scalar_opens, batch_opens, output, log)) => {
                 let correct = output == *expected;
-                print_depth_histogram(label, rounds, correct, &log);
+                print_depth_histogram(
+                    label,
+                    rounds,
+                    open_rounds,
+                    scalar_opens,
+                    batch_opens,
+                    correct,
+                    &log,
+                );
                 assert!(correct, "{label} O3 must match its NIST output");
             }
             Err(error) => {

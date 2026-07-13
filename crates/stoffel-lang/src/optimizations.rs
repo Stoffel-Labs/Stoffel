@@ -1611,7 +1611,7 @@ fn is_share_open_call(node: &AstNode) -> Option<&AstNode> {
     } = node
     {
         if let AstNode::Identifier(name, _) = function.as_ref() {
-            if (name == "Share.open" || name == "open") && arguments.len() == 1 {
+            if matches!(builtin_base_name(name), "open" | "reveal") && arguments.len() == 1 {
                 return Some(&arguments[0]);
             }
         }
@@ -2027,8 +2027,8 @@ struct StatementInfo {
     index: usize,
     /// The AST node
     node: AstNode,
-    /// Is this an implicit reveal? (clear var = secret expr)
-    is_implicit_reveal: bool,
+    /// Is this an implicit secret-to-clear move or an explicit `Share.open`?
+    is_reveal: bool,
     /// Does this statement use a revealed variable in a computation (triggers flush)?
     uses_revealed_var: bool,
 }
@@ -2131,6 +2131,16 @@ fn reveal_dep_keys(node: &AstNode) -> (HashSet<String>, HashSet<String>) {
         }
         _ => {
             read_keys(node, &mut reads);
+            // Structured statements are atomic to this reorderer. Register
+            // every nested write conservatively on both scalar and heap keys,
+            // so hoisting an independent reveal across an `if` is legal while
+            // any consumer/mutation of the same location remains ordered.
+            let mut nested_writes = HashSet::new();
+            collect_written_vars(node, &mut nested_writes);
+            for name in nested_writes {
+                writes.insert(scalar_key(&name));
+                writes.insert(heap_key(&name));
+            }
         }
     }
 
@@ -2179,6 +2189,17 @@ fn is_implicit_reveal(node: &AstNode, secret_vars: &HashSet<String>) -> bool {
     }
 }
 
+fn is_explicit_reveal(node: &AstNode) -> bool {
+    match node {
+        AstNode::VariableDeclaration {
+            value: Some(value), ..
+        }
+        | AstNode::Assignment { value, .. } => is_share_open_call(value).is_some(),
+        AstNode::DiscardStatement { expression, .. } => is_share_open_call(expression).is_some(),
+        _ => false,
+    }
+}
+
 /// Checks if a statement uses a revealed variable in a way that triggers a flush
 /// This happens when a revealed (clear) variable is used in computation
 fn uses_revealed_in_computation(node: &AstNode, revealed_vars: &HashSet<String>) -> bool {
@@ -2217,7 +2238,16 @@ fn uses_revealed_in_computation(node: &AstNode, revealed_vars: &HashSet<String>)
         AstNode::DiscardStatement { expression, .. } => {
             uses_revealed_in_computation(expression, revealed_vars)
         }
-        _ => false,
+        // Structured control (most importantly `if revealed_bit`) and any
+        // future expression-bearing statement are flush triggers whenever
+        // they reference a pending clear result. Keeping this structural
+        // fallback prevents a newly supported AST node from silently
+        // fragmenting reveal batches.
+        _ => {
+            let mut refs = HashSet::new();
+            collect_referenced_vars(node, &mut refs);
+            refs.iter().any(|v| revealed_vars.contains(v))
+        }
     }
 }
 
@@ -2240,11 +2270,6 @@ fn reorder_block_for_reveals(statements: Vec<AstNode>) -> Vec<AstNode> {
         }
     }
 
-    // If no secret variables, nothing to optimize
-    if secret_vars.is_empty() {
-        return statements;
-    }
-
     // Second pass: build statement info
     let mut revealed_vars: HashSet<String> = HashSet::new();
     let mut stmt_infos: Vec<StatementInfo> = Vec::with_capacity(statements.len());
@@ -2252,7 +2277,7 @@ fn reorder_block_for_reveals(statements: Vec<AstNode>) -> Vec<AstNode> {
     for (index, node) in statements.into_iter().enumerate() {
         let defines = collect_defined_vars(&node);
 
-        let is_reveal = is_implicit_reveal(&node, &secret_vars);
+        let is_reveal = is_explicit_reveal(&node) || is_implicit_reveal(&node, &secret_vars);
 
         // Track revealed variables
         if is_reveal {
@@ -2266,13 +2291,13 @@ fn reorder_block_for_reveals(statements: Vec<AstNode>) -> Vec<AstNode> {
         stmt_infos.push(StatementInfo {
             index,
             node,
-            is_implicit_reveal: is_reveal,
+            is_reveal,
             uses_revealed_var: uses_revealed,
         });
     }
 
     // Check if reordering is beneficial
-    let has_reveals = stmt_infos.iter().any(|s| s.is_implicit_reveal);
+    let has_reveals = stmt_infos.iter().any(|s| s.is_reveal);
     let has_flush_triggers = stmt_infos.iter().any(|s| s.uses_revealed_var);
 
     if !has_reveals || !has_flush_triggers {
@@ -2387,7 +2412,7 @@ fn reorder_block_for_reveals(statements: Vec<AstNode>) -> Vec<AstNode> {
                     2
                 }
                 // Flush triggers last
-                else if info.is_implicit_reveal {
+                else if info.is_reveal {
                     1
                 }
                 // Reveals second
@@ -3377,19 +3402,17 @@ fn optimize_all_inner(node: AstNode, optimization_level: u8) -> AstNode {
     let node = timed_pass("inline_multiply_wrappers", || {
         inline_multiply_wrappers(node)
     });
-    // Round-minimizing list scheduler (-O3): within each side-effect-free region,
-    // reorder statements so that all mutually-independent multiplies at the same
-    // dependency depth become consecutive. The greedy multiply batcher that runs
-    // next then collapses each depth into a single `Share.batch_mul` — one MPC
-    // round instead of one per chain. This trades register pressure (a whole
-    // round's shares are live at once) for fewer communication rounds, so it is
-    // gated to -O3 alongside inlining/unrolling.
+    // Round-minimizing interactive scheduler (-O3): model singular multiplies
+    // and reveals as distinct protocol nodes in one dependency DAG, then make
+    // every dependency-ready group consecutive. The lowering passes collapse
+    // those groups into `Share.batch_mul` / `Share.batch_open`. This trades
+    // register pressure (a whole round's shares are live at once) for fewer
+    // communication rounds, so it is gated to -O3 alongside inlining/unrolling.
     let node = if optimization_level >= 3 {
         timed_pass("schedule_for_batching", || schedule_for_batching(node))
     } else {
         node
     };
-    let node = timed_pass("optimize_reveals", || optimize_reveals(node));
     let node = timed_pass("optimize_multiplies", || optimize_multiplies(node));
     // Batching materializes accumulator setup and result-slice statements around
     // every fused call. Those new statements can expose another legal merge that
@@ -3407,6 +3430,10 @@ fn optimize_all_inner(node: AstNode, optimization_level: u8) -> AstNode {
     let node = timed_pass("reorder_for_reveal_batching", || {
         reorder_for_reveal_batching(node)
     });
+    // Reordering can make formerly interleaved explicit opens consecutive.
+    // Materialize those newly exposed groups as native batch opens now; the
+    // earlier reveal pass could not see across their clear consumers.
+    let node = timed_pass("optimize_reveals_after_reorder", || optimize_reveals(node));
     // SROA / scalarization (-O3): after the batchers settled the block shape,
     // replace constant-index reads of locally-built lists with direct element
     // references and delete the corresponding build calls, rematerializing a
@@ -3431,13 +3458,13 @@ fn optimize_all_inner(node: AstNode, optimization_level: u8) -> AstNode {
 }
 
 // ===========================================================================
-// Round-minimizing list scheduler
+// Round-minimizing interactive scheduler
 //
 // Reorders analyzable statements within a straight-line region of a block so that all
-// mutually-independent multiplies at the same dependency depth become
-// consecutive — letting the greedy multiply batcher coalesce them into one
-// `Share.batch_mul` (one MPC round). The reorder is a topological schedule of a
-// precise dependency graph, so it preserves every observed value:
+// mutually-independent operations of one protocol kind become consecutive —
+// letting the lowering passes coalesce scalar multiplies/reveals into native
+// `Share.batch_mul` / `Share.batch_open` calls. The reorder is a topological
+// schedule of a precise dependency graph, so it preserves every observed value:
 //
 //   * Data deps: RAW / WAR / WAW over scalar and heap keys. Assignments write
 //     their target key, and known mutators write/read their receiver heap key.
@@ -3447,8 +3474,8 @@ fn optimize_all_inner(node: AstNode, optimization_level: u8) -> AstNode {
 //   * Effects: observable mutators are ordered per receiver/effect key; unknown
 //     calls, reveals, control flow, and unresolved aliasing split the block.
 //
-// Multiplies are clustered by a list scheduler: drain all ready non-multiply
-// statements, then fire every currently-ready multiply as one round, repeat.
+// Interactive nodes are clustered by a list scheduler: drain ready local work,
+// then fire every currently-ready node of one protocol kind as one round.
 // ===========================================================================
 
 /// The "root" variable of an lvalue/receiver expression (`a` for `a`, `a[i]`,
@@ -3515,6 +3542,22 @@ fn value_is_multiply(value: &AstNode) -> bool {
 }
 
 /// Per-statement scheduling facts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum InteractiveKind {
+    Multiply,
+    Reveal,
+}
+
+fn interactive_kind(value: &AstNode) -> Option<InteractiveKind> {
+    if value_is_multiply(value) {
+        Some(InteractiveKind::Multiply)
+    } else if is_share_open_call(value).is_some() {
+        Some(InteractiveKind::Reveal)
+    } else {
+        None
+    }
+}
+
 struct SchedInfo {
     direct_reads: HashSet<u32>,
     /// Materialized logical-read keys (loop aggregates; see `loop_sched_info`).
@@ -3525,7 +3568,7 @@ struct SchedInfo {
     logical_nodes: Vec<Rc<DepNode>>,
     writes: HashSet<u32>,
     effects: HashSet<u32>,
-    is_multiply: bool,
+    interactive: Option<InteractiveKind>,
 }
 
 fn scalar_key(name: &str) -> String {
@@ -3694,8 +3737,8 @@ fn loop_body_is_schedulable(body: &AstNode, pure_fns: &HashSet<String>) -> bool 
 /// the union over the iterable and every body statement (computed in body order
 /// so logical-dep tracking inside the loop is faithful), minus the loop-local
 /// induction variables. The over-approximation only ever ADDS dependency edges,
-/// so the resulting schedule preserves every observed value; `is_multiply` is
-/// false because a loop is not a single fusable multiply.
+/// so the resulting schedule preserves every observed value; `interactive` is
+/// `None` because a loop is not one directly fusable protocol operation.
 fn loop_sched_info(
     variables: &[String],
     iterable: &AstNode,
@@ -3754,24 +3797,30 @@ fn loop_sched_info(
         logical_nodes: Vec::new(),
         writes,
         effects,
-        is_multiply: false,
+        interactive: None,
     }
 }
 
-/// Whether a statement can participate in reordering. Anything else is a barrier
-/// (control flow, returns, reveals, unknown/user calls) that pins the schedule.
+/// Whether a statement can participate in reordering. Scalar multiply/reveal
+/// calls are first-class interactive nodes; anything else effectful or unknown
+/// remains a barrier.
 fn stmt_is_schedulable(stmt: &AstNode, pure_fns: &HashSet<String>) -> bool {
     match stmt {
-        AstNode::VariableDeclaration { value, .. } => value
-            .as_deref()
-            .is_none_or(|v| expr_is_reorderable(v, pure_fns)),
+        AstNode::VariableDeclaration { value, .. } => value.as_deref().is_none_or(|v| {
+            expr_is_reorderable(v, pure_fns)
+                || is_share_open_call(v).is_some_and(|share| expr_is_pure(share, pure_fns))
+        }),
         AstNode::Assignment { target, value, .. } => {
             (matches!(target.as_ref(), AstNode::Identifier(_, _)) || root_var(target).is_some())
                 && expr_is_pure(target, pure_fns)
-                && expr_is_reorderable(value, pure_fns)
+                && (expr_is_reorderable(value, pure_fns)
+                    || is_share_open_call(value).is_some_and(|share| expr_is_pure(share, pure_fns)))
         }
         AstNode::FunctionCall { arguments, .. } => call_name(stmt).is_some_and(|name| {
-            is_mutator_call_name(name) && arguments.iter().all(|arg| expr_is_pure(arg, pure_fns))
+            (is_mutator_call_name(name)
+                || is_share_open_call(stmt).is_some()
+                || is_readonly_observable_call(name))
+                && arguments.iter().all(|arg| expr_is_pure(arg, pure_fns))
         }),
         AstNode::DiscardStatement { expression, .. } => match expression.as_ref() {
             AstNode::FunctionCall { .. } => stmt_is_schedulable(expression, pure_fns),
@@ -3791,6 +3840,20 @@ fn stmt_is_schedulable(stmt: &AstNode, pure_fns: &HashSet<String>) -> bool {
         AstNode::ForLoop { iterable, body, .. } => {
             expr_is_pure(iterable, pure_fns) && loop_body_is_schedulable(body, pure_fns)
         }
+        // Pure structured control can move as one atomic region. We never
+        // speculate a branch: the condition and branch semantics remain intact;
+        // only the whole region participates in the surrounding dependency DAG.
+        AstNode::IfExpression {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            expr_is_pure(condition, pure_fns)
+                && loop_body_is_schedulable(then_branch, pure_fns)
+                && else_branch
+                    .as_deref()
+                    .is_none_or(|branch| loop_body_is_schedulable(branch, pure_fns))
+        }
         _ => false,
     }
 }
@@ -3805,23 +3868,23 @@ fn stmt_is_schedulable(stmt: &AstNode, pure_fns: &HashSet<String>) -> bool {
 /// it — see the note on `statement_reads_and_writes`.
 fn sched_info(stmt: &AstNode, env: &SchedEnv, interner: &mut KeyInterner) -> SchedInfo {
     let mut direct_reads = HashSet::new();
-    let logical_reads = HashSet::new();
+    let mut logical_reads = HashSet::new();
     let mut logical_nodes = Vec::new();
     let mut writes = HashSet::new();
     let mut effects = HashSet::new();
-    let mut is_multiply = false;
+    let mut interactive = None;
 
     match stmt {
         AstNode::VariableDeclaration { name, value, .. } => {
             writes.insert(interner.scalar(name));
             if let Some(v) = value.as_deref() {
                 collect_direct_read_keys(v, &mut direct_reads, interner);
-                is_multiply = value_is_multiply(v);
+                interactive = interactive_kind(v);
             }
         }
         AstNode::Assignment { target, value, .. } => {
             collect_direct_read_keys(value, &mut direct_reads, interner);
-            is_multiply = value_is_multiply(value);
+            interactive = interactive_kind(value);
             match target.as_ref() {
                 AstNode::Identifier(name, _) => {
                     writes.insert(interner.scalar(name));
@@ -3852,7 +3915,60 @@ fn sched_info(stmt: &AstNode, env: &SchedEnv, interner: &mut KeyInterner) -> Sch
         } => {
             return loop_sched_info(variables, iterable, body, env, interner);
         }
+        AstNode::IfExpression {
+            condition,
+            then_branch,
+            else_branch,
+        } => {
+            collect_direct_read_keys(condition, &mut direct_reads, interner);
+            for branch in
+                std::iter::once(then_branch.as_ref()).chain(else_branch.as_deref().into_iter())
+            {
+                let mut branch_env = env.clone();
+                for statement in loop_body_statements(branch) {
+                    let branch_info = sched_info(statement, &branch_env, interner);
+                    update_sched_env(statement, &mut branch_env, &branch_info, interner);
+                    direct_reads.extend(branch_info.direct_reads);
+                    logical_reads.extend(branch_info.logical_reads);
+                    logical_nodes.extend(branch_info.logical_nodes);
+                    writes.extend(branch_info.writes);
+                    effects.extend(branch_info.effects);
+                }
+            }
+        }
         AstNode::FunctionCall { arguments, .. } => {
+            if is_share_open_call(stmt).is_some() {
+                for argument in arguments {
+                    collect_direct_read_keys(argument, &mut direct_reads, interner);
+                    logical_nodes.push(logical_reads_node(argument, env, interner));
+                }
+                interactive = Some(InteractiveKind::Reveal);
+                return SchedInfo {
+                    direct_reads,
+                    logical_reads,
+                    logical_nodes,
+                    writes,
+                    effects,
+                    interactive,
+                };
+            }
+            if call_name(stmt).is_some_and(is_readonly_observable_call) {
+                for argument in arguments {
+                    collect_direct_read_keys(argument, &mut direct_reads, interner);
+                    logical_nodes.push(logical_reads_node(argument, env, interner));
+                }
+                // A dedicated effect-only key keeps print order without
+                // pretending the call writes or aliases program storage.
+                effects.insert(interner.scalar("__effect:print"));
+                return SchedInfo {
+                    direct_reads,
+                    logical_reads,
+                    logical_nodes,
+                    writes,
+                    effects,
+                    interactive,
+                };
+            }
             // A recognized mutator: first argument is the receiver (read+written),
             // the rest are read.
             if let Some(receiver) = arguments.first() {
@@ -3883,7 +3999,7 @@ fn sched_info(stmt: &AstNode, env: &SchedEnv, interner: &mut KeyInterner) -> Sch
         logical_nodes,
         writes,
         effects,
-        is_multiply,
+        interactive,
     }
 }
 
@@ -3951,6 +4067,30 @@ fn update_sched_env(
                 env.remove(var);
             }
         }
+        AstNode::IfExpression { .. } => {
+            // A branch join may select either definition. Preserve the complete
+            // input-dependency cone for every possibly-written root; exact
+            // branch value identity is intentionally not guessed.
+            let mut deps: HashSet<u32> = info
+                .direct_reads
+                .iter()
+                .chain(info.logical_reads.iter())
+                .copied()
+                .collect();
+            let mut visited = HashSet::new();
+            for node in &info.logical_nodes {
+                flatten_dep_node(node, &mut deps, &mut visited);
+            }
+            let dep_node = Rc::new(DepNode {
+                own: deps.into_iter().collect(),
+                parents: Vec::new(),
+            });
+            for &write in &info.writes {
+                if let Some(root) = interner.key_root(write) {
+                    env.insert(root.to_string(), Rc::clone(&dep_node));
+                }
+            }
+        }
         AstNode::FunctionCall { arguments, .. } => {
             if let Some(receiver) = arguments.first().and_then(root_var) {
                 env.remove(&receiver);
@@ -3981,7 +4121,8 @@ fn schedule_in_node(node: AstNode, pure_fns: &HashSet<String>) -> AstNode {
                 .into_iter()
                 .map(|s| schedule_in_node(s, pure_fns))
                 .collect();
-            AstNode::Block(schedule_statement_list(stmts, pure_fns))
+            let scheduled = schedule_statement_list(stmts, pure_fns);
+            AstNode::Block(fuse_independent_loops(scheduled, pure_fns))
         }
         AstNode::FunctionDefinition {
             name,
@@ -4069,6 +4210,164 @@ fn flatten_statement_blocks(stmts: Vec<AstNode>) -> Vec<AstNode> {
     out
 }
 
+/// Fuse counted loops when their complete read/write footprints are independent
+/// and intervening statements admit a dependence-preserving partition around
+/// the fused loop. This preserves code size while exposing same-iteration
+/// interactive operations to batching.
+fn fuse_independent_loops(statements: Vec<AstNode>, pure_fns: &HashSet<String>) -> Vec<AstNode> {
+    fn conflicts(writes: &HashSet<String>, observed: &HashSet<String>) -> bool {
+        writes
+            .iter()
+            .any(|write| observed.iter().any(|key| keys_conflict(write, key)))
+    }
+
+    fn independent(first: &AstNode, second: &AstNode) -> bool {
+        let (first_reads, first_writes) = statement_reads_and_writes(first);
+        let (second_reads, second_writes) = statement_reads_and_writes(second);
+        let mut first_observed = first_reads;
+        first_observed.extend(first_writes.iter().cloned());
+        let mut second_observed = second_reads;
+        second_observed.extend(second_writes.iter().cloned());
+        !conflicts(&first_writes, &second_observed) && !conflicts(&second_writes, &first_observed)
+    }
+
+    fn footprints_independent(
+        first_reads: &HashSet<String>,
+        first_writes: &HashSet<String>,
+        second_reads: &HashSet<String>,
+        second_writes: &HashSet<String>,
+    ) -> bool {
+        let mut first_observed = first_reads.clone();
+        first_observed.extend(first_writes.iter().cloned());
+        let mut second_observed = second_reads.clone();
+        second_observed.extend(second_writes.iter().cloned());
+        !conflicts(first_writes, &second_observed) && !conflicts(second_writes, &first_observed)
+    }
+
+    fn fuse(first: &AstNode, second: &AstNode, pure_fns: &HashSet<String>) -> Option<AstNode> {
+        let (
+            AstNode::ForLoop {
+                variables: first_vars,
+                iterable: first_iter,
+                body: first_body,
+                location,
+            },
+            AstNode::ForLoop {
+                variables: second_vars,
+                iterable: second_iter,
+                body: second_body,
+                ..
+            },
+        ) = (first, second)
+        else {
+            return None;
+        };
+        if first_vars.len() != 1
+            || second_vars.len() != 1
+            || first_iter != second_iter
+            || !loop_body_is_schedulable(first_body, pure_fns)
+            || !loop_body_is_schedulable(second_body, pure_fns)
+            || !independent(first, second)
+        {
+            return None;
+        }
+
+        let first_var = &first_vars[0];
+        let second_var = &second_vars[0];
+        let mut second_declared = HashSet::new();
+        collect_declared_names(second_body, &mut second_declared);
+        let mut second_referenced = HashSet::new();
+        collect_referenced_vars(second_body, &mut second_referenced);
+        if second_declared.contains(second_var)
+            || (first_var != second_var
+                && (second_declared.contains(first_var) || second_referenced.contains(first_var)))
+        {
+            return None;
+        }
+
+        let second_body = if first_var == second_var {
+            (**second_body).clone()
+        } else {
+            rename_in(
+                (**second_body).clone(),
+                &HashMap::from([(second_var.clone(), first_var.clone())]),
+            )
+        };
+        let mut merged = branch_into_stmts((**first_body).clone());
+        merged.extend(branch_into_stmts(second_body));
+        let merged = schedule_statement_list(flatten_statement_blocks(merged), pure_fns);
+        Some(AstNode::ForLoop {
+            variables: first_vars.clone(),
+            iterable: first_iter.clone(),
+            body: Box::new(AstNode::Block(merged)),
+            location: location.clone(),
+        })
+    }
+
+    let mut out: Vec<AstNode> = Vec::with_capacity(statements.len());
+    for statement in statements {
+        let mut replacement = None;
+        if matches!(statement, AstNode::ForLoop { .. }) {
+            for position in (0..out.len()).rev() {
+                let Some(fused) = fuse(&out[position], &statement, pure_fns) else {
+                    continue;
+                };
+                let middle = &out[position + 1..];
+                if !middle
+                    .iter()
+                    .all(|node| stmt_is_schedulable(node, pure_fns))
+                {
+                    continue;
+                }
+
+                // Compute the transitive A-dependent suffix partition in one
+                // forward pass. Once a statement observes A or any prior member
+                // of the suffix, it too must remain after the fused loop.
+                let (first_reads, first_writes) = statement_reads_and_writes(&out[position]);
+                let mut after_reads = HashSet::new();
+                let mut after_writes = HashSet::new();
+                let mut before = Vec::new();
+                let mut after = Vec::new();
+                for node in middle {
+                    let (reads, writes) = statement_reads_and_writes(node);
+                    let depends_on_first =
+                        !footprints_independent(&first_reads, &first_writes, &reads, &writes);
+                    let depends_on_suffix =
+                        !footprints_independent(&after_reads, &after_writes, &reads, &writes);
+                    if depends_on_first || depends_on_suffix {
+                        after_reads.extend(reads);
+                        after_writes.extend(writes);
+                        after.push(node.clone());
+                    } else {
+                        before.push(node.clone());
+                    }
+                }
+
+                let (second_reads, second_writes) = statement_reads_and_writes(&statement);
+                if !footprints_independent(
+                    &after_reads,
+                    &after_writes,
+                    &second_reads,
+                    &second_writes,
+                ) {
+                    continue;
+                }
+                replacement = Some((position, before, fused, after));
+                break;
+            }
+        }
+        if let Some((position, before, fused, after)) = replacement {
+            out.truncate(position);
+            out.extend(before);
+            out.push(fused);
+            out.extend(after);
+        } else {
+            out.push(statement);
+        }
+    }
+    out
+}
+
 /// Split a statement list into maximal schedulable runs separated by barriers,
 /// reorder each run, and emit barriers in place.
 fn schedule_statement_list(stmts: Vec<AstNode>, pure_fns: &HashSet<String>) -> Vec<AstNode> {
@@ -4104,8 +4403,8 @@ fn sched_cone_ab_check() -> bool {
 }
 
 /// Reorder one analyzable straight-line run via dependency-graph list scheduling,
-/// clustering same-depth multiplies. Falls back to the original order if a
-/// dependency cycle is somehow present (never expected).
+/// clustering dependency-ready multiplies and reveals by protocol kind. Falls
+/// back to source order if a dependency cycle is somehow present.
 fn schedule_run(stmts: Vec<AstNode>) -> Vec<AstNode> {
     let n = stmts.len();
     if n < 2 {
@@ -4356,19 +4655,22 @@ fn build_schedule_order(
         }
     }
 
-    // List-schedule: drain ready non-multiplies, then fire one round of all
-    // currently-ready multiplies, repeat. Ready buckets are min-heaps on the
-    // original index so the output is a stable topological order.
+    // List-schedule: drain ready local work, then fire all currently-ready
+    // operations of one interactive protocol kind. Multiply and reveal nodes
+    // never share a batch, but each kind automatically coalesces its independent
+    // scalar operations. Ready buckets are min-heaps on source index for stable,
+    // deterministic output.
     use std::cmp::Reverse;
     use std::collections::BinaryHeap;
     let mut ready_free: BinaryHeap<Reverse<usize>> = BinaryHeap::new();
     let mut ready_mult: BinaryHeap<Reverse<usize>> = BinaryHeap::new();
+    let mut ready_reveal: BinaryHeap<Reverse<usize>> = BinaryHeap::new();
     for i in 0..n {
         if indeg[i] == 0 {
-            if infos[i].is_multiply {
-                ready_mult.push(Reverse(i));
-            } else {
-                ready_free.push(Reverse(i));
+            match infos[i].interactive {
+                Some(InteractiveKind::Multiply) => ready_mult.push(Reverse(i)),
+                Some(InteractiveKind::Reveal) => ready_reveal.push(Reverse(i)),
+                None => ready_free.push(Reverse(i)),
             }
         }
     }
@@ -4380,8 +4682,19 @@ fn build_schedule_order(
             // Emit one ready free statement.
             vec![ready_free.pop().map(|Reverse(i)| i).unwrap()]
         } else if !ready_mult.is_empty() {
-            // Fire one multiply round: all currently-ready multiplies at once.
-            std::iter::from_fn(|| ready_mult.pop().map(|Reverse(i)| i)).collect()
+            // If both protocols are ready, preserve the source order of their
+            // earliest node. The chosen kind then fires as one batch.
+            let reveal_first = matches!(
+                (ready_reveal.peek(), ready_mult.peek()),
+                (Some(Reverse(reveal)), Some(Reverse(mul))) if reveal < mul
+            );
+            if reveal_first {
+                std::iter::from_fn(|| ready_reveal.pop().map(|Reverse(i)| i)).collect()
+            } else {
+                std::iter::from_fn(|| ready_mult.pop().map(|Reverse(i)| i)).collect()
+            }
+        } else if !ready_reveal.is_empty() {
+            std::iter::from_fn(|| ready_reveal.pop().map(|Reverse(i)| i)).collect()
         } else {
             break; // cycle (unexpected) — fall back below.
         };
@@ -4390,10 +4703,10 @@ fn build_schedule_order(
             for &s in &succ[i] {
                 indeg[s] -= 1;
                 if indeg[s] == 0 {
-                    if infos[s].is_multiply {
-                        ready_mult.push(Reverse(s));
-                    } else {
-                        ready_free.push(Reverse(s));
+                    match infos[s].interactive {
+                        Some(InteractiveKind::Multiply) => ready_mult.push(Reverse(s)),
+                        Some(InteractiveKind::Reveal) => ready_reveal.push(Reverse(s)),
+                        None => ready_free.push(Reverse(s)),
                     }
                 }
             }
@@ -6773,7 +7086,7 @@ fn fold_branches_in_stmts(stmts: Vec<AstNode>) -> Vec<AstNode> {
 
 /// A flow-sensitive provenance fact for a value. `Top` is the conservative
 /// unknown (possibly secret) default.
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum ConstVal {
     Top,
     /// A value proven by semantic typing to be secret, but whose clear value is
@@ -6795,6 +7108,253 @@ enum ConstVal {
 }
 
 type GateEnv = std::collections::HashMap<String, ConstVal>;
+
+fn gate_value_is_concrete(value: &ConstVal) -> bool {
+    match value {
+        ConstVal::Int(_) | ConstVal::Bit { .. } => true,
+        ConstVal::List(elements) => elements.iter().all(gate_value_is_concrete),
+        ConstVal::Top | ConstVal::Secret => false,
+    }
+}
+
+fn gate_const_to_ast(value: &ConstVal, location: &SourceLocation) -> Option<AstNode> {
+    match value {
+        ConstVal::Int(value) if *value >= 0 => Some(make_int_literal(*value as u128, location)),
+        ConstVal::Bit { val, .. } => Some(make_from_clear_int_bit(*val, location)),
+        ConstVal::List(elements) => Some(AstNode::ListLiteral {
+            elements: elements
+                .iter()
+                .map(|element| gate_const_to_ast(element, location))
+                .collect::<Option<Vec<_>>>()?,
+            location: location.clone(),
+        }),
+        _ => None,
+    }
+}
+
+fn gate_range_bounds(iterable: &AstNode, env: &GateEnv) -> Option<(i128, i128)> {
+    let AstNode::BinaryOperation {
+        op, left, right, ..
+    } = iterable
+    else {
+        return None;
+    };
+    if op != ".." {
+        return None;
+    }
+    let ConstVal::Int(lo) = gate_eval(left, env) else {
+        return None;
+    };
+    let ConstVal::Int(hi) = gate_eval(right, env) else {
+        return None;
+    };
+    (hi >= lo).then_some((lo, hi))
+}
+
+/// Abstractly execute an exact, effect-free public region. This interpreter is
+/// intentionally small and fail-closed: unsupported control/effects return
+/// false, causing the original loop to remain untouched.
+fn gate_simulate_public_node(node: &AstNode, env: &mut GateEnv, fuel: &mut usize) -> bool {
+    if *fuel == 0 {
+        return false;
+    }
+    *fuel -= 1;
+    match node {
+        AstNode::Block(statements) => statements
+            .iter()
+            .all(|statement| gate_simulate_public_node(statement, env, fuel)),
+        AstNode::ForLoop {
+            variables,
+            iterable,
+            body,
+            ..
+        } => {
+            let [variable] = variables.as_slice() else {
+                return false;
+            };
+            let Some((lo, hi)) = gate_range_bounds(iterable, env) else {
+                return false;
+            };
+            if (hi - lo) as u128 > UNROLL_MAX_ITERATIONS {
+                return false;
+            }
+            let mut locals = HashSet::new();
+            collect_declared_names(body, &mut locals);
+            for value in lo..hi {
+                for local in &locals {
+                    env.remove(local);
+                }
+                env.insert(variable.clone(), ConstVal::Int(value));
+                if !gate_simulate_public_node(body, env, fuel) {
+                    return false;
+                }
+            }
+            for local in locals {
+                env.remove(&local);
+            }
+            env.remove(variable);
+            true
+        }
+        AstNode::IfExpression {
+            condition,
+            then_branch,
+            else_branch,
+        } => match gate_eval(condition, env) {
+            ConstVal::Bit { val: 0, .. } => else_branch
+                .as_deref()
+                .is_none_or(|branch| gate_simulate_public_node(branch, env, fuel)),
+            ConstVal::Bit { .. } => gate_simulate_public_node(then_branch, env, fuel),
+            _ => false,
+        },
+        AstNode::WhileLoop { .. }
+        | AstNode::TryCatch { .. }
+        | AstNode::Return { .. }
+        | AstNode::Yield(_)
+        | AstNode::Break
+        | AstNode::Continue
+        | AstNode::FunctionDefinition { .. }
+        | AstNode::CommandCall { .. } => false,
+        AstNode::FunctionCall { .. } | AstNode::DiscardStatement { .. } => {
+            let expression = match node {
+                AstNode::FunctionCall { .. } => node,
+                AstNode::DiscardStatement { expression, .. } => expression.as_ref(),
+                _ => unreachable!("matched call/discard above"),
+            };
+            let Some(call) = call_name(expression) else {
+                return false;
+            };
+            if !is_pure_builtin(call) && !is_mutator_call_name(call) {
+                return false;
+            }
+            let AstNode::FunctionCall { arguments, .. } = expression else {
+                return false;
+            };
+            if !arguments
+                .iter()
+                .all(|argument| expr_is_pure(argument, &HashSet::new()))
+            {
+                return false;
+            }
+            let _ = gate_process_stmt(node.clone(), env);
+            true
+        }
+        AstNode::VariableDeclaration { value, .. } => {
+            if !value
+                .as_deref()
+                .is_none_or(|value| expr_is_pure(value, &HashSet::new()))
+            {
+                return false;
+            }
+            let _ = gate_process_stmt(node.clone(), env);
+            true
+        }
+        AstNode::Assignment { target, value, .. } => {
+            if !expr_is_pure(target, &HashSet::new()) || !expr_is_pure(value, &HashSet::new()) {
+                return false;
+            }
+            let _ = gate_process_stmt(node.clone(), env);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Replace a statically-bounded public loop with its final concrete mutations.
+/// List identity is preserved: only an initially-empty list is materialized via
+/// appends to the original receiver; arbitrary rebinding is rejected.
+fn try_partial_evaluate_public_for(
+    variables: &[String],
+    iterable: &AstNode,
+    body: &AstNode,
+    location: &SourceLocation,
+    env: &mut GateEnv,
+) -> Option<AstNode> {
+    let [variable] = variables else {
+        return None;
+    };
+    let (lo, hi) = gate_range_bounds(iterable, env)?;
+    if hi <= lo || (hi - lo) as u128 > UNROLL_MAX_ITERATIONS {
+        return None;
+    }
+
+    let mut written = HashSet::new();
+    collect_written_vars(body, &mut written);
+    let mut locals = HashSet::new();
+    collect_declared_names(body, &mut locals);
+    let mut outer: Vec<String> = written
+        .into_iter()
+        .filter(|name| name != variable && !locals.contains(name))
+        .collect();
+    outer.sort();
+    if outer.is_empty()
+        || outer.iter().any(|name| {
+            env.get(name)
+                .is_none_or(|value| !gate_value_is_concrete(value))
+        })
+    {
+        return None;
+    }
+    let initial: HashMap<String, ConstVal> = outer
+        .iter()
+        .map(|name| (name.clone(), env[name].clone()))
+        .collect();
+
+    let mut simulated = env.clone();
+    let mut fuel = 500_000usize;
+    for value in lo..hi {
+        for local in &locals {
+            simulated.remove(local);
+        }
+        simulated.insert(variable.clone(), ConstVal::Int(value));
+        if !gate_simulate_public_node(body, &mut simulated, &mut fuel) {
+            return None;
+        }
+    }
+    if outer.iter().any(|name| {
+        simulated
+            .get(name)
+            .is_none_or(|value| !gate_value_is_concrete(value))
+    }) {
+        return None;
+    }
+
+    let mut replacement = Vec::new();
+    for name in outer {
+        let before = &initial[&name];
+        let after = simulated.get(&name)?;
+        if before == after {
+            continue;
+        }
+        match (before, after) {
+            (ConstVal::List(before), ConstVal::List(after)) if before.is_empty() => {
+                for element in after {
+                    replacement.push(AstNode::FunctionCall {
+                        function: Box::new(AstNode::Identifier(
+                            "append".to_string(),
+                            location.clone(),
+                        )),
+                        arguments: vec![
+                            AstNode::Identifier(name.clone(), location.clone()),
+                            gate_const_to_ast(element, location)?,
+                        ],
+                        location: location.clone(),
+                        resolved_return_type: None,
+                    });
+                }
+            }
+            (ConstVal::Int(_) | ConstVal::Bit { .. }, _) => {
+                replacement.push(AstNode::Assignment {
+                    target: Box::new(AstNode::Identifier(name.clone(), location.clone())),
+                    value: Box::new(gate_const_to_ast(after, location)?),
+                    location: location.clone(),
+                });
+            }
+            _ => return None,
+        }
+        env.insert(name, after.clone());
+    }
+    Some(AstNode::Block(replacement))
+}
 
 fn annotation_contains_secret_type(annotation: Option<&AstNode>) -> bool {
     fn contains(node: &AstNode) -> bool {
@@ -7045,16 +7605,24 @@ fn gate_process_stmt(stmt: AstNode, env: &mut GateEnv) -> AstNode {
             iterable,
             body,
             location,
-        } => gate_process_loop_body(
-            |body| AstNode::ForLoop {
-                variables,
-                iterable,
-                body,
-                location,
-            },
-            *body,
-            env,
-        ),
+        } => {
+            if let Some(replacement) =
+                try_partial_evaluate_public_for(&variables, &iterable, &body, &location, env)
+            {
+                replacement
+            } else {
+                gate_process_loop_body(
+                    |body| AstNode::ForLoop {
+                        variables,
+                        iterable,
+                        body,
+                        location,
+                    },
+                    *body,
+                    env,
+                )
+            }
+        }
         other => other,
     }
 }
@@ -7627,6 +8195,24 @@ fn gate_eval(node: &AstNode, env: &GateEnv) -> ConstVal {
                         {
                             return ConstVal::Bit {
                                 val: (a ^ b) & 1,
+                                from_list: *fa || *fb,
+                            };
+                        }
+                    }
+                    Some("mul") => {
+                        if let (
+                            ConstVal::Bit {
+                                val: a,
+                                from_list: fa,
+                            },
+                            ConstVal::Bit {
+                                val: b,
+                                from_list: fb,
+                            },
+                        ) = (&lhs, &rhs)
+                        {
+                            return ConstVal::Bit {
+                                val: (a & b) & 1,
                                 from_list: *fa || *fb,
                             };
                         }
@@ -8643,6 +9229,15 @@ fn is_mutator_call_name(name: &str) -> bool {
 /// communication — so it is pure too.)
 fn is_pure_builtin(name: &str) -> bool {
     builtin_effect(name).pure
+}
+
+/// Observable calls whose arguments are read but which cannot mutate program
+/// data. They may participate in the dependency scheduler as effect nodes:
+/// same-kind effects retain source order, while independent MPC operations can
+/// be hoisted ahead. Calls that can abort (`assert`) or touch external state in
+/// less transparent ways remain barriers.
+fn is_readonly_observable_call(name: &str) -> bool {
+    builtin_base_name(name) == "print"
 }
 
 fn call_name(node: &AstNode) -> Option<&str> {
@@ -11921,6 +12516,108 @@ mod tests {
         );
     }
 
+    #[test]
+    fn exact_public_loop_is_partially_evaluated_without_rebinding_lists() {
+        let loc = make_loc();
+        let body = AstNode::Block(vec![
+            make_append("out", make_identifier("carry")),
+            AstNode::Assignment {
+                target: Box::new(make_identifier("carry")),
+                value: Box::new(AstNode::UnaryOperation {
+                    op: "not".to_string(),
+                    operand: Box::new(make_identifier("carry")),
+                    location: loc.clone(),
+                }),
+                location: loc.clone(),
+            },
+        ]);
+        let mut env = GateEnv::from([
+            ("out".to_string(), ConstVal::List(Vec::new())),
+            (
+                "carry".to_string(),
+                ConstVal::Bit {
+                    val: 1,
+                    from_list: false,
+                },
+            ),
+        ]);
+
+        let replacement = try_partial_evaluate_public_for(
+            &["i".to_string()],
+            &make_range(0, 3),
+            &body,
+            &loc,
+            &mut env,
+        )
+        .expect("exact public loop should evaluate");
+        let AstNode::Block(statements) = replacement else {
+            panic!("partial evaluation should emit a statement block");
+        };
+        assert_eq!(statements.len(), 4, "three appends plus final carry");
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|statement| call_name(statement).is_some_and(|name| name == "append"))
+                .count(),
+            3
+        );
+        assert_eq!(
+            statements
+                .iter()
+                .filter(|statement| matches!(statement, AstNode::Assignment { .. }))
+                .count(),
+            1
+        );
+        assert_eq!(
+            env.get("out"),
+            Some(&ConstVal::List(vec![
+                ConstVal::Bit {
+                    val: 1,
+                    from_list: false,
+                },
+                ConstVal::Bit {
+                    val: 0,
+                    from_list: false,
+                },
+                ConstVal::Bit {
+                    val: 1,
+                    from_list: false,
+                },
+            ]))
+        );
+    }
+
+    #[test]
+    fn public_loop_partial_evaluation_rejects_observable_effects() {
+        let loc = make_loc();
+        let body = AstNode::Block(vec![
+            make_call("print", vec![make_identifier("carry")]),
+            AstNode::Assignment {
+                target: Box::new(make_identifier("carry")),
+                value: Box::new(make_identifier("carry")),
+                location: loc.clone(),
+            },
+        ]);
+        let mut env = GateEnv::from([(
+            "carry".to_string(),
+            ConstVal::Bit {
+                val: 1,
+                from_list: false,
+            },
+        )]);
+        assert!(
+            try_partial_evaluate_public_for(
+                &["i".to_string()],
+                &make_range(0, 3),
+                &body,
+                &loc,
+                &mut env,
+            )
+            .is_none(),
+            "observable effects must keep the original loop"
+        );
+    }
+
     /// SOUNDNESS regression (kept-loop guard folding): inside a while loop the
     /// unroller CANNOT flatten (unknown bound), a guard over a loop-mutated
     /// variable must NOT be folded with the variable's pre-loop entry value —
@@ -12176,6 +12873,58 @@ mod tests {
             .map(|s| order.iter().position(|i| i == s).unwrap())
             .collect();
         assert!(append_pos.windows(2).all(|w| w[0] < w[1]));
+    }
+
+    #[test]
+    fn loop_fusion_requires_whole_loop_independence() {
+        let and = |left: &str, right: &str| AstNode::BinaryOperation {
+            op: "and".to_string(),
+            left: Box::new(make_identifier(left)),
+            right: Box::new(make_identifier(right)),
+            location: make_loc(),
+        };
+        let first = make_for(
+            "i",
+            make_range(0, 4),
+            vec![make_var_decl("lane_a", and("x", "y"))],
+        );
+        let second = make_for(
+            "j",
+            make_range(0, 4),
+            vec![make_var_decl("lane_b", and("p", "q"))],
+        );
+        let fused = fuse_independent_loops(vec![first.clone(), second], &HashSet::new());
+        assert_eq!(
+            fused
+                .iter()
+                .filter(|node| matches!(node, AstNode::ForLoop { .. }))
+                .count(),
+            1,
+            "independent equal-range loops should fuse"
+        );
+
+        let dependent = make_for(
+            "j",
+            make_range(0, 4),
+            vec![make_var_decl("lane_b", and("state", "q"))],
+        );
+        let writer = make_for(
+            "i",
+            make_range(0, 4),
+            vec![AstNode::Assignment {
+                target: Box::new(make_identifier("state")),
+                value: Box::new(and("x", "y")),
+                location: make_loc(),
+            }],
+        );
+        let kept = fuse_independent_loops(vec![writer, dependent], &HashSet::new());
+        assert_eq!(
+            kept.iter()
+                .filter(|node| matches!(node, AstNode::ForLoop { .. }))
+                .count(),
+            2,
+            "a cross-loop RAW dependency must reject fusion"
+        );
     }
 
     #[test]
@@ -12549,6 +13298,14 @@ mod tests {
         let detected = is_share_open_call(&open_call);
         assert!(detected.is_some());
         assert_eq!(detected.unwrap(), &share_expr);
+
+        let reveal_call = AstNode::FunctionCall {
+            function: Box::new(make_identifier("reveal")),
+            arguments: vec![share_expr.clone()],
+            location: make_loc(),
+            resolved_return_type: None,
+        };
+        assert_eq!(is_share_open_call(&reveal_call), Some(&share_expr));
     }
 
     #[test]
@@ -12692,6 +13449,73 @@ mod tests {
         } else {
             panic!("Expected Block");
         }
+    }
+
+    #[test]
+    fn interactive_scheduler_hoists_singular_reveals_then_batches() {
+        reset_temp_counter();
+        let clear_use = AstNode::IfExpression {
+            condition: Box::new(make_identifier("a")),
+            then_branch: Box::new(AstNode::Block(Vec::new())),
+            else_branch: None,
+        };
+        let reordered = schedule_statement_list(
+            vec![
+                make_var_decl("a", make_share_open(make_identifier("s1"))),
+                clear_use,
+                make_var_decl("b", make_share_open(make_identifier("s2"))),
+            ],
+            &HashSet::new(),
+        );
+        let names: Vec<&str> = reordered
+            .iter()
+            .filter_map(|statement| match statement {
+                AstNode::VariableDeclaration { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, ["a", "b"]);
+
+        let AstNode::Block(batched) = optimize_reveals(AstNode::Block(reordered)) else {
+            panic!("expected block");
+        };
+        assert_eq!(batched.len(), 4, "one batch, two extracts, clear use");
+        assert!(matches!(
+            &batched[0],
+            AstNode::VariableDeclaration { value: Some(value), .. }
+                if call_name(value) == Some("Share.batch_open")
+        ));
+    }
+
+    #[test]
+    fn interactive_scheduler_crosses_print_but_preserves_print_order() {
+        let print = |name: &str| AstNode::FunctionCall {
+            function: Box::new(make_identifier("print")),
+            arguments: vec![make_identifier(name)],
+            location: make_loc(),
+            resolved_return_type: None,
+        };
+        let scheduled = schedule_statement_list(
+            vec![
+                make_var_decl("a", make_share_open(make_identifier("s1"))),
+                print("a"),
+                make_var_decl("b", make_share_open(make_identifier("s2"))),
+                print("b"),
+            ],
+            &HashSet::new(),
+        );
+        assert!(matches!(
+            &scheduled[..],
+            [
+                AstNode::VariableDeclaration { name: a, .. },
+                AstNode::VariableDeclaration { name: b, .. },
+                AstNode::FunctionCall { arguments: first, .. },
+                AstNode::FunctionCall { arguments: second, .. },
+            ] if a == "a"
+                && b == "b"
+                && matches!(&first[..], [AstNode::Identifier(name, _)] if name == "a")
+                && matches!(&second[..], [AstNode::Identifier(name, _)] if name == "b")
+        ));
     }
 
     #[test]
