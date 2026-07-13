@@ -365,6 +365,13 @@ pub(crate) trait ForeignMpcServices {
         rhs_data: &ShareData,
     ) -> VmResult<ShareData>;
 
+    fn secret_share_batch_mul_data(
+        &self,
+        ty: ShareType,
+        lhs_data: &[ShareData],
+        rhs_data: &[ShareData],
+    ) -> VmResult<Vec<ShareData>>;
+
     fn secret_share_neg_data(&self, ty: ShareType, share_data: &ShareData) -> VmResult<ShareData>;
 
     fn secret_share_add_scalar_data(
@@ -533,6 +540,15 @@ impl ForeignMpcServices for VMState {
         rhs_data: &ShareData,
     ) -> VmResult<ShareData> {
         VMState::secret_share_mul_data(self, ty, lhs_data, rhs_data)
+    }
+
+    fn secret_share_batch_mul_data(
+        &self,
+        ty: ShareType,
+        lhs_data: &[ShareData],
+        rhs_data: &[ShareData],
+    ) -> VmResult<Vec<ShareData>> {
+        VMState::secret_share_batch_mul_data(self, ty, lhs_data, rhs_data)
     }
 
     fn secret_share_neg_data(&self, ty: ShareType, share_data: &ShareData) -> VmResult<ShareData> {

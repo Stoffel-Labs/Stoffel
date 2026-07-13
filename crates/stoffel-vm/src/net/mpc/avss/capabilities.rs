@@ -436,6 +436,16 @@ where
         })()
         .map_mpc_engine_operation("multiply_share")
     }
+
+    fn batch_multiply_shares(
+        &self,
+        ty: ShareType,
+        pairs: &[(Vec<u8>, Vec<u8>)],
+    ) -> MpcEngineResult<Vec<ShareData>> {
+        let _ = ty;
+        crate::net::try_block_on_current(self.batch_multiply_share_async(pairs))
+            .map_mpc_engine_operation("batch_multiply_shares")
+    }
 }
 
 impl<F, G> MpcEnginePreprocPersistence for AvssMpcEngine<F, G>
@@ -751,6 +761,16 @@ where
             .await
         }
         .map_mpc_engine_operation("async_multiply_share")
+    }
+
+    async fn batch_multiply_share_async(
+        &self,
+        _ty: ShareType,
+        pairs: &[(Vec<u8>, Vec<u8>)],
+    ) -> MpcEngineResult<Vec<ShareData>> {
+        self.batch_multiply_share_async(pairs)
+            .await
+            .map_mpc_engine_operation("async_batch_multiply_share")
     }
 
     async fn open_share_async(

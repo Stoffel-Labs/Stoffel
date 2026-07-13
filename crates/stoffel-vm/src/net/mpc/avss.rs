@@ -332,6 +332,8 @@ where
             secret_key,
             public_keys,
             deployment_mode,
+            n_random_shares,
+            n_triples,
         } = config;
         let (topology, local_identity, network, input_ids, open_message_router) =
             session.into_parts();
@@ -345,8 +347,8 @@ where
         let opts = AvssMpcNodeOpts::new(
             n_parties,
             threshold,
-            DEFAULT_N_RANDOM_SHARES,
-            DEFAULT_N_TRIPLES,
+            n_random_shares,
+            n_triples,
             secret_key,
             public_keys.clone(),
             instance_id_u32,

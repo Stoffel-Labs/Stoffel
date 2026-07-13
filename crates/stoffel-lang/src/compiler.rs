@@ -149,15 +149,18 @@ pub fn compile(
     } else {
         0
     };
-    let mut compiled_program =
-        match codegen::generate_bytecode_with_opt_level(&optimized_ast, codegen_opt_level) {
-            Ok(program) => program,
-            Err(e) => {
-                error_reporter.add_error(e);
-                // Stop if codegen fails
-                return Err(error_reporter.get_all().into_iter().cloned().collect());
-            }
-        };
+    let mut compiled_program = match codegen::generate_bytecode_with_opt_level_and_backend(
+        &optimized_ast,
+        codegen_opt_level,
+        options.mpc_backend,
+    ) {
+        Ok(program) => program,
+        Err(e) => {
+            error_reporter.add_error(e);
+            // Stop if codegen fails
+            return Err(error_reporter.get_all().into_iter().cloned().collect());
+        }
+    };
     compiled_program
         .prune_unreachable_functions_with_roots(options.entry_points.iter().map(String::as_str));
     compiled_program.client_io_manifest.mpc_backend = options.mpc_backend;

@@ -4640,7 +4640,16 @@ def main() -> fix64:
 
 /// Compile `source` and return the preprocessing demand the planner reads.
 fn demand_of(source: &str) -> stoffel_vm_types::compiled_binary::PreprocessingDemand {
-    let program = compile(source, "test.stfl", &default_options()).expect("program compiles");
+    demand_of_for_backend(source, MpcBackend::HoneyBadger)
+}
+
+fn demand_of_for_backend(
+    source: &str,
+    mpc_backend: MpcBackend,
+) -> stoffel_vm_types::compiled_binary::PreprocessingDemand {
+    let mut options = default_options();
+    options.mpc_backend = mpc_backend;
+    let program = compile(source, "test.stfl", &options).expect("program compiles");
     convert_to_binary(&program)
         .client_io_manifest
         .preprocessing_demand
@@ -4660,6 +4669,79 @@ def main() -> int64:
     assert_eq!(demand.randoms, 0);
     assert_eq!(demand.prandbits, 0);
     assert_eq!(demand.prandints, 0);
+    assert!(!demand.dynamic);
+}
+
+#[test]
+fn direct_random_builtins_emit_their_backing_pool_demand() {
+    let demand = demand_of(
+        r#"
+def main() -> int64:
+  var field_random = Share.random_field()
+  var explicit_int = Share.random_int(31)
+  var contextual_int: secret int64 = Share.random()
+  return 0
+"#,
+    );
+    assert_eq!(demand.randoms, 1);
+    assert_eq!(demand.prandints, 2);
+    assert_eq!(demand.triples, 0);
+    assert_eq!(demand.prandbits, 0);
+    assert!(!demand.dynamic);
+}
+
+#[test]
+fn literal_loop_scales_direct_random_share_demand() {
+    let demand = demand_of(
+        r#"
+def main() -> int64:
+  for i in 0..4:
+    var field_random = Share.random_field()
+  return 0
+"#,
+    );
+    assert_eq!(demand.randoms, 4);
+    assert_eq!(demand.prandints, 0);
+    assert!(!demand.dynamic);
+}
+
+#[test]
+fn avss_random_methods_all_use_random_share_preprocessing() {
+    let demand = demand_of_for_backend(
+        r#"
+def main() -> int64:
+  for i in 0..4:
+    var field_random = Share.random_field()
+    var explicit_int = Share.random_int(31)
+    var contextual_int: secret int64 = Share.random()
+  return 0
+"#,
+        MpcBackend::Avss,
+    );
+    assert_eq!(demand.randoms, 12);
+    assert_eq!(demand.prandints, 0);
+    assert_eq!(demand.triples, 0);
+    assert_eq!(demand.prandbits, 0);
+    assert!(!demand.dynamic);
+}
+
+#[test]
+fn honey_badger_random_methods_use_their_distinct_pools() {
+    let demand = demand_of_for_backend(
+        r#"
+def main() -> int64:
+  for i in 0..4:
+    var field_random = Share.random_field()
+    var explicit_int = Share.random_int(31)
+    var contextual_int: secret int64 = Share.random()
+  return 0
+"#,
+        MpcBackend::HoneyBadger,
+    );
+    assert_eq!(demand.randoms, 4);
+    assert_eq!(demand.prandints, 8);
+    assert_eq!(demand.triples, 0);
+    assert_eq!(demand.prandbits, 0);
     assert!(!demand.dynamic);
 }
 

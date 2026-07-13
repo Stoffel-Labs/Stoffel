@@ -330,13 +330,15 @@ pub struct ClientIoManifest {
 pub struct PreprocessingDemand {
     /// Beaver triples — one per secret*secret multiplication.
     pub triples: u64,
-    /// Program-visible random shares — masks for inputs/reveals and direct
-    /// random-share requests. Backends may allocate extra internal randoms for
-    /// derived material such as triples.
+    /// Program-visible random field shares — masks for inputs/reveals and
+    /// direct `Share.random_field` requests. Backends may allocate extra
+    /// internal randoms for derived material such as triples.
     pub randoms: u64,
     /// Random bits — `frac_bits` per secret fixed-point division (truncation).
     pub prandbits: u64,
-    /// Random integers — one per secret fixed-point division (truncation).
+    /// Random integers — one per direct `Share.random_int` request (including
+    /// typed `Share.random`, which lowers to it) and one per secret fixed-point
+    /// division (truncation).
     pub prandints: u64,
     /// True when the static estimate may undercount (data-dependent loops,
     /// recursion, or runtime-sized batch operations).

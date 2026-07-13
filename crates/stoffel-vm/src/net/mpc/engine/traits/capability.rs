@@ -23,6 +23,22 @@ pub trait MpcEngineMultiplication: MpcEngine {
         right: &[u8],
     ) -> MpcEngineResult<ShareData>;
 
+    /// Perform secure multiplication for a batch of share pairs.
+    ///
+    /// Backends with a native vectorized protocol should override this method.
+    /// The default preserves compatibility by executing scalar multiplications
+    /// in order.
+    fn batch_multiply_shares(
+        &self,
+        ty: ShareType,
+        pairs: &[(Vec<u8>, Vec<u8>)],
+    ) -> MpcEngineResult<Vec<ShareData>> {
+        pairs
+            .iter()
+            .map(|(left, right)| self.multiply_share(ty, left, right))
+            .collect()
+    }
+
     /// Divide a secret fixed-point share by a public positive constant.
     ///
     /// `divisor_scaled` is the divisor already scaled into the share's

@@ -36,8 +36,9 @@ use ark_std::{UniformRand, Zero};
 use sha2::Digest as _;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+use stoffel_vm_types::compiled_binary::{MpcBackend, MpcCurve};
 use stoffel_vm_types::core_types::Value;
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::Instruction;
@@ -52,6 +53,7 @@ use crate::core_vm::VirtualMachine;
 use crate::net::avss_engine::{AvssEngineConfig, AvssMpcEngine};
 use crate::net::curve::SupportedMpcField;
 use crate::net::MpcSessionConfig;
+use crate::runtime_hooks::HookEvent;
 use crate::tests::avss_certificate_programs::{
     build_threshold_ecdsa_program, THRESHOLD_ECDSA_DEMO_MESSAGE_INPUT,
 };
@@ -680,6 +682,185 @@ where
     results
 }
 
+#[derive(Clone, Copy, Default)]
+struct EcdsaStageMarks {
+    random_calls: usize,
+    call_started: Option<Instant>,
+    offline_start: Option<Instant>,
+    offline_end: Option<Instant>,
+    online_end: Option<Instant>,
+    gamma_random: Duration,
+    nonce_random: Duration,
+    batch_mul: Duration,
+    delta_open: Duration,
+    nonce_commitment: Duration,
+    point_x: Duration,
+}
+
+#[derive(Clone, Copy)]
+struct EcdsaStageDurations {
+    offline: Duration,
+    online: Duration,
+    gamma_random: Duration,
+    nonce_random: Duration,
+    batch_mul: Duration,
+    delta_open: Duration,
+    nonce_commitment: Duration,
+    point_x: Duration,
+}
+
+/// Run the optimized Stoffel source and time the protocol boundary on every
+/// party. Key generation is deliberately excluded: offline starts at gamma
+/// generation and ends once public r is available; online ends when s opens.
+async fn run_timed_ecdsa_program<F, G>(
+    engines: &[Arc<AvssMpcEngine<F, G>>],
+    function: &VMFunction,
+) -> (Vec<(VirtualMachine, Value)>, Vec<EcdsaStageDurations>)
+where
+    F: ark_ff::FftField + PrimeField + Send + Sync + 'static,
+    G: CurveGroup<ScalarField = F> + Send + Sync + 'static,
+    AvssMpcEngine<F, G>: crate::net::mpc_engine::MpcEngine,
+{
+    let mut handles = Vec::with_capacity(engines.len());
+
+    for engine in engines {
+        let engine: Arc<dyn crate::net::mpc_engine::MpcEngine> = engine.clone();
+        let function = function.clone();
+        handles.push(tokio::task::spawn_blocking(move || {
+            let marks = Arc::new(Mutex::new(EcdsaStageMarks::default()));
+            let hook_marks = marks.clone();
+            let mut vm = VirtualMachine::builder().with_mpc_engine(engine).build();
+            vm.register_hook(
+                |event| {
+                    matches!(
+                        event,
+                        HookEvent::BeforeInstructionExecute(Instruction::CALL(_))
+                            | HookEvent::AfterInstructionExecute(Instruction::CALL(_))
+                    )
+                },
+                move |event, _| {
+                    let mut marks = hook_marks.lock().expect("timing marks lock");
+                    match event {
+                        HookEvent::BeforeInstructionExecute(Instruction::CALL(_)) => {
+                            marks.call_started = Some(Instant::now());
+                        }
+                        _ => {}
+                    }
+                    match event {
+                        HookEvent::BeforeInstructionExecute(Instruction::CALL(name))
+                            if name == "Share.random_int"
+                                || name == "Share.random_field"
+                                || name == "Share.random" =>
+                        {
+                            marks.random_calls += 1;
+                            // The first random is key generation. Gamma is the
+                            // second random and begins per-signature offline work.
+                            if marks.random_calls == 2 {
+                                marks.offline_start = Some(Instant::now());
+                            }
+                        }
+                        HookEvent::AfterInstructionExecute(Instruction::CALL(name)) => {
+                            let elapsed = marks
+                                .call_started
+                                .take()
+                                .expect("ECDSA call start mark")
+                                .elapsed();
+                            match name.as_str() {
+                                "Share.random_int" | "Share.random_field" | "Share.random" => {
+                                    if marks.random_calls == 2 {
+                                        marks.gamma_random = elapsed;
+                                    } else if marks.random_calls == 3 {
+                                        marks.nonce_random = elapsed;
+                                    }
+                                }
+                                "Share.batch_mul" => marks.batch_mul = elapsed,
+                                "open_field" | "Share.open_field"
+                                    if marks.offline_end.is_none() =>
+                                {
+                                    marks.delta_open = elapsed;
+                                }
+                                "get_commitment" | "Share.get_commitment"
+                                    if marks.offline_start.is_some()
+                                        && marks.offline_end.is_none() =>
+                                {
+                                    marks.nonce_commitment = elapsed;
+                                }
+                                "Crypto.point_x_to_field" => {
+                                    marks.point_x = elapsed;
+                                    marks.offline_end = Some(Instant::now());
+                                }
+                                "open_field" | "Share.open_field"
+                                    if marks.offline_end.is_some()
+                                        && marks.online_end.is_none() =>
+                                {
+                                    marks.online_end = Some(Instant::now());
+                                }
+                                _ => {}
+                            }
+                        }
+                        _ => {}
+                    }
+                    Ok(())
+                },
+                0,
+            );
+            vm.register_function(function);
+            let result = vm.execute("main").expect("VM execution failed");
+            let marks = *marks.lock().expect("timing marks lock");
+            let offline_start = marks.offline_start.expect("offline start mark");
+            let offline_end = marks.offline_end.expect("offline end mark");
+            let online_end = marks.online_end.expect("online end mark");
+            (
+                vm,
+                result,
+                EcdsaStageDurations {
+                    offline: offline_end.duration_since(offline_start),
+                    online: online_end.duration_since(offline_end),
+                    gamma_random: marks.gamma_random,
+                    nonce_random: marks.nonce_random,
+                    batch_mul: marks.batch_mul,
+                    delta_open: marks.delta_open,
+                    nonce_commitment: marks.nonce_commitment,
+                    point_x: marks.point_x,
+                },
+            )
+        }));
+    }
+
+    let completed = futures::future::join_all(handles)
+        .await
+        .into_iter()
+        .map(|result| result.expect("timed party task panicked"))
+        .collect::<Vec<_>>();
+    let timings = completed.iter().map(|(_, _, timing)| *timing).collect();
+    let results = completed
+        .into_iter()
+        .map(|(vm, value, _)| (vm, value))
+        .collect();
+    (results, timings)
+}
+
+fn compile_optimized_secp256k1_ecdsa_source() -> VMFunction {
+    let path = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../stoffel-lang/examples/threshold_signatures/threshold_ecdsa_secp256k1/main.stfl");
+    let source = std::fs::read_to_string(&path).expect("read optimized threshold ECDSA source");
+    let options = stoffellang::CompilerOptions {
+        optimize: true,
+        optimization_level: 3,
+        mpc_backend: MpcBackend::Avss,
+        mpc_curve: MpcCurve::Secp256k1,
+        ..Default::default()
+    };
+    let program = stoffellang::compile_file(&path, &source, &options)
+        .expect("compile optimized threshold ECDSA source");
+    stoffellang::convert_to_binary(&program)
+        .try_to_vm_functions()
+        .expect("lower optimized threshold ECDSA bytecode")
+        .into_iter()
+        .find(|function| function.name() == "main")
+        .expect("optimized threshold ECDSA has main")
+}
+
 async fn run_threshold_ecdsa_case<F, G>(
     curve_name: &str,
     instance_id: u64,
@@ -879,6 +1060,177 @@ async fn test_threshold_ecdsa_secp256k1() {
         EcdsaThirdPartyVerifier::Secp256k1,
     )
     .await;
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[ignore = "release-only protocol latency benchmark"]
+async fn benchmark_optimized_threshold_ecdsa_secp256k1() {
+    use ark_secp256k1::{Fr, Projective};
+
+    init_crypto_provider();
+    setup_test_tracing();
+
+    const N: usize = 5;
+    const T: usize = 1;
+    // Preprocessing below yields 20 triples after five-party AVSS rounding and
+    // 32 retained random shares. A complete demo execution consumes two
+    // triples and three random shares, so ten runs consume the full triple
+    // allocation without triggering a refill.
+    const RUNS: usize = 10;
+    let mut nodes = setup_test_network::<Fr, Projective>(N, 13500)
+        .await
+        .expect("create benchmark network");
+    let pk_maps = exchange_ecdh_keys(&mut nodes)
+        .await
+        .expect("benchmark PK exchange");
+    let mut engines = Vec::with_capacity(N);
+    for (i, node) in nodes.iter().enumerate() {
+        let session = MpcSessionConfig::try_new(
+            900_103,
+            node.node_id,
+            N,
+            T,
+            node.network.clone().expect("benchmark network manager"),
+        )
+        .expect("benchmark topology");
+        let engine = AvssMpcEngine::from_config(
+            AvssEngineConfig::new(session, node.sk_i, pk_maps[i].clone())
+                .with_preprocessing_counts(32, 16),
+        )
+        .await
+        .expect("create benchmark engine");
+        engine.start_async().await.expect("start benchmark engine");
+        engines.push(engine);
+    }
+    spawn_message_processors(&mut nodes, &engines);
+
+    // Literal MPCNode preprocessing: all parties cooperatively generate the
+    // complete pool before any Share.random_field() or multiplication consumes
+    // it. Wall time is the all-party critical path; divide by RUNS to report
+    // the amortized generation cost of one signature's material.
+    let preprocessing_started = Instant::now();
+    futures::future::try_join_all(engines.iter().map(|engine| engine.preprocess()))
+        .await
+        .expect("generate benchmark preprocessing pool");
+    let preprocessing_elapsed = preprocessing_started.elapsed();
+    println!(
+        "ECDSA_PREPROCESSING signature_batches={} requested_triples={} generated_triples={} retained_randoms={} total_ms={:.3} amortized_per_signature_ms={:.3}",
+        RUNS,
+        16,
+        20,
+        32,
+        preprocessing_elapsed.as_secs_f64() * 1e3,
+        preprocessing_elapsed.as_secs_f64() * 1e3 / RUNS as f64,
+    );
+
+    let function = compile_optimized_secp256k1_ecdsa_source();
+    let mut offline = Vec::with_capacity(RUNS);
+    let mut online = Vec::with_capacity(RUNS);
+    let mut gamma_random = Vec::with_capacity(RUNS);
+    let mut nonce_random = Vec::with_capacity(RUNS);
+    let mut batch_mul = Vec::with_capacity(RUNS);
+    let mut delta_open = Vec::with_capacity(RUNS);
+    let mut nonce_commitment = Vec::with_capacity(RUNS);
+    let mut point_x = Vec::with_capacity(RUNS);
+    for run in 0..RUNS {
+        let (mut results, party_timings) = run_timed_ecdsa_program(&engines, &function).await;
+        // Attribute the stage breakdown to the same critical-path party that
+        // determines offline latency, so the stage values are comparable.
+        let critical_timing = party_timings
+            .iter()
+            .max_by_key(|timing| timing.offline)
+            .expect("offline party timing");
+        let run_offline = critical_timing.offline;
+        let run_online = party_timings
+            .iter()
+            .map(|timing| timing.online)
+            .max()
+            .expect("online party timing");
+        let run_gamma_random = critical_timing.gamma_random;
+        let run_nonce_random = critical_timing.nonce_random;
+        let run_batch_mul = critical_timing.batch_mul;
+        let run_delta_open = critical_timing.delta_open;
+        let run_nonce_commitment = critical_timing.nonce_commitment;
+        let run_point_x = critical_timing.point_x;
+
+        // Validate the measured execution, not a separate hand-built fixture.
+        let (vm, value) = &mut results[0];
+        let bytes = extract_vm_byte_array(vm, value);
+        let r: [u8; 32] = bytes[..32].try_into().expect("benchmark r");
+        let s: [u8; 32] = bytes[32..64].try_into().expect("benchmark s");
+        let digest = sha2::Sha256::digest(THRESHOLD_ECDSA_DEMO_MESSAGE_INPUT.as_bytes());
+        verify_secp256k1_ecdsa(&digest, &bytes[64..], &r, &s);
+
+        println!(
+            "ECDSA_TIMING run={} presign_ms={:.3} online_ms={:.3} gamma_random_ms={:.3} nonce_random_ms={:.3} batch_mul_ms={:.3} delta_open_ms={:.3} nonce_commitment_ms={:.3} point_x_ms={:.3}",
+            run,
+            run_offline.as_secs_f64() * 1e3,
+            run_online.as_secs_f64() * 1e3,
+            run_gamma_random.as_secs_f64() * 1e3,
+            run_nonce_random.as_secs_f64() * 1e3,
+            run_batch_mul.as_secs_f64() * 1e3,
+            run_delta_open.as_secs_f64() * 1e3,
+            run_nonce_commitment.as_secs_f64() * 1e3,
+            run_point_x.as_secs_f64() * 1e3,
+        );
+        offline.push(run_offline);
+        online.push(run_online);
+        gamma_random.push(run_gamma_random);
+        nonce_random.push(run_nonce_random);
+        batch_mul.push(run_batch_mul);
+        delta_open.push(run_delta_open);
+        nonce_commitment.push(run_nonce_commitment);
+        point_x.push(run_point_x);
+    }
+
+    for engine in &engines {
+        assert_eq!(
+            engine.multiplication_session_count().await,
+            RUNS,
+            "each two-product Share.batch_mul must use one AVSS multiplication session"
+        );
+    }
+
+    offline.sort_unstable();
+    online.sort_unstable();
+    gamma_random.sort_unstable();
+    nonce_random.sort_unstable();
+    batch_mul.sort_unstable();
+    delta_open.sort_unstable();
+    nonce_commitment.sort_unstable();
+    point_x.sort_unstable();
+    let median = |samples: &[Duration]| {
+        let middle = samples.len() / 2;
+        if samples.len() % 2 == 0 {
+            (samples[middle - 1] + samples[middle]) / 2
+        } else {
+            samples[middle]
+        }
+    };
+    let mean =
+        |samples: &[Duration]| samples.iter().copied().sum::<Duration>() / samples.len() as u32;
+    println!(
+        "ECDSA_TIMING summary measured_runs={} presign_median_ms={:.3} presign_mean_ms={:.3} presign_min_ms={:.3} presign_max_ms={:.3} online_median_ms={:.3} online_mean_ms={:.3} online_min_ms={:.3} online_max_ms={:.3}",
+        offline.len(),
+        median(&offline).as_secs_f64() * 1e3,
+        mean(&offline).as_secs_f64() * 1e3,
+        offline[0].as_secs_f64() * 1e3,
+        offline[offline.len() - 1].as_secs_f64() * 1e3,
+        median(&online).as_secs_f64() * 1e3,
+        mean(&online).as_secs_f64() * 1e3,
+        online[0].as_secs_f64() * 1e3,
+        online[online.len() - 1].as_secs_f64() * 1e3,
+    );
+    println!(
+        "ECDSA_SUBPROTOCOL summary measured_runs={} gamma_random_median_ms={:.3} nonce_random_median_ms={:.3} batch_mul_median_ms={:.3} delta_open_median_ms={:.3} nonce_commitment_median_ms={:.3} point_x_median_ms={:.3}",
+        offline.len(),
+        median(&gamma_random).as_secs_f64() * 1e3,
+        median(&nonce_random).as_secs_f64() * 1e3,
+        median(&batch_mul).as_secs_f64() * 1e3,
+        median(&delta_open).as_secs_f64() * 1e3,
+        median(&nonce_commitment).as_secs_f64() * 1e3,
+        median(&point_x).as_secs_f64() * 1e3,
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

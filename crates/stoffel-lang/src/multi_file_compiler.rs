@@ -243,9 +243,12 @@ impl MultiFileCompiler {
         } else {
             0
         };
-        let mut program =
-            codegen::generate_bytecode_with_opt_level(&optimized_ast, codegen_opt_level)
-                .map_err(|e| vec![e])?;
+        let mut program = codegen::generate_bytecode_with_opt_level_and_backend(
+            &optimized_ast,
+            codegen_opt_level,
+            self.options.mpc_backend,
+        )
+        .map_err(|e| vec![e])?;
         program.client_io_manifest.mpc_backend = self.options.mpc_backend;
         program.client_io_manifest.mpc_curve = self.options.mpc_curve;
 

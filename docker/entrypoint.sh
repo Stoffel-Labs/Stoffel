@@ -271,7 +271,7 @@ run_command() {
         perf)
             exec perf record \
                 -F "${STOFFEL_PERF_FREQUENCY:-99}" \
-                -g \
+                --call-graph dwarf,16384 \
                 -o "${out_dir}/${label}.perf.data" \
                 -- $cmd
             ;;
