@@ -196,6 +196,10 @@ async fn get_mask_share_reserves_requested_persistent_index_once() {
         .unwrap();
 
     let reservation = engine.reservation_ops().unwrap();
+    reservation
+        .init_reservations(program_hash, shares.len() as u64)
+        .await
+        .unwrap();
     let first = reservation.get_mask_share(0).await.unwrap();
     assert!(!first.is_empty());
     assert_eq!(store.available(&key).await.unwrap(), 1);
@@ -214,6 +218,59 @@ async fn get_mask_share_reserves_requested_persistent_index_once() {
     let second = reservation.get_mask_share(1).await.unwrap();
     assert!(!second.is_empty());
     assert_eq!(store.available(&key).await.unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn repro_get_mask_share_without_reservation_init_returns_reported_error() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(LmdbPreprocStore::open(dir.path()).unwrap());
+    let program_hash = [0x5B; 32];
+    let party_id = 0;
+    let n = 4;
+    let t = 1;
+    let scope = PreprocKeyScope::new(
+        program_hash,
+        crate::net::curve::MpcFieldKind::Bls12_381Fr,
+        n,
+        t,
+        DurableIdentityDigest::from_legacy_party_id(party_id),
+    );
+    let key = scope.random_share();
+
+    let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(13);
+    let shares = vec![RobustShare::new(ark_bls12_381::Fr::rand(&mut rng), 1, t)];
+    let (data, item_size) = preproc::serialize_robust_shares(&shares).unwrap();
+    store
+        .store(
+            &key,
+            &PreprocBlob::try_new(data, item_size, shares.len()).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let engine = test_engine(
+        Arc::new(crate::net::open_registry::OpenMessageRouter::new()),
+        next_instance_id(),
+        party_id,
+        n,
+        t,
+    );
+    engine
+        .preproc_persistence_ops()
+        .unwrap()
+        .set_preproc_store(store, program_hash)
+        .unwrap();
+
+    let err = engine
+        .reservation_ops()
+        .unwrap()
+        .get_mask_share(0)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("reservations not initialized"),
+        "unexpected error: {err}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
