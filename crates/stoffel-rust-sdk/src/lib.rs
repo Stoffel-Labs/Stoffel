@@ -97,8 +97,8 @@ pub use program::{
 };
 pub use runtime::{LocalNetworkBuilder, RuntimeSummary, StoffelRuntime};
 pub use server::{
-    OffChainServerConfig, OffChainServerConfigBuilder, ServerBuilder, ServerState, ServerSummary,
-    StoffelServer,
+    ClientInputTopology, OffChainServerConfig, OffChainServerConfigBuilder, ServerBuilder,
+    ServerState, ServerSummary, StoffelServer,
 };
 pub use stoffel_vm_types::compiled_binary::FunctionType;
 pub use stoffel_vm_types::core_types::ShareType;
