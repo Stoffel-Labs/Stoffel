@@ -1,5 +1,7 @@
 [workspace]
 members = [
+    "crates/stoffel-client-core",
+    "crates/stoffel-browser-client",
     "crates/stoffel-cli",
     "crates/stoffel-bindgen",
     "crates/stoffel-lang",
