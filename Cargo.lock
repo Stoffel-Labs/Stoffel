@@ -2673,7 +2673,7 @@ version = "3.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "af43fadb8a98512d547e37b4e92e0ced13e205c061b87b4623eff01d918d6968"
 dependencies = [
- "gloo-timers",
+ "gloo-timers 0.4.0",
  "send_wrapper",
 ]
 
@@ -2802,6 +2802,18 @@ dependencies = [
  "wasm-bindgen",
  "wasm-bindgen-futures",
  "web-sys",
+]
+
+[[package]]
+name = "gloo-timers"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbb143cf96099802033e0d4f4963b19fd2e0b728bcf076cd9cf7f6634f092994"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "js-sys",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -5695,11 +5707,19 @@ dependencies = [
 name = "stoffel-browser-client"
 version = "0.1.0"
 dependencies = [
+ "ark-bn254",
+ "base64",
+ "getrandom 0.2.17",
+ "gloo-timers 0.3.0",
+ "hpke",
  "js-sys",
+ "jsonrpsee-core",
+ "jsonrpsee-wasm-client",
  "serde",
  "serde-wasm-bindgen",
  "stoffel-client-core",
  "wasm-bindgen",
+ "wasm-bindgen-futures",
  "wasm-bindgen-test",
  "web-sys",
 ]
@@ -5723,8 +5743,14 @@ dependencies = [
 name = "stoffel-client-core"
 version = "0.1.0"
 dependencies = [
+ "ark-bn254",
+ "ark-ff 0.5.0",
+ "ark-poly",
+ "ark-serialize 0.5.0",
+ "ark-std 0.5.0",
  "futures-executor",
  "serde",
+ "stoffelcrypto",
 ]
 
 [[package]]

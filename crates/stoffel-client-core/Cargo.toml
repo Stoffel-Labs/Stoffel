@@ -8,7 +8,13 @@ repository = "https://github.com/Stoffel-Labs/stoffel"
 publish = false
 
 [dependencies]
+ark-bn254 = "0.5"
+ark-ff = "0.5"
+ark-serialize = { version = "0.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]
+ark-poly = "0.5"
+ark-std = "0.5"
 futures-executor = "0.3"
+stoffelmpc-mpc = { package = "stoffelcrypto", version = "0.1.0" }

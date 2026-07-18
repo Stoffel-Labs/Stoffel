@@ -9,6 +9,7 @@ fn valid_config() -> ParticipantConfig {
     ParticipantConfig {
         participant_id: "browser-7".to_owned(),
         session_id: "session-42".to_owned(),
+        client_slot: 2,
         coordinator: ParticipantEndpoint::new(
             EndpointRole::Coordinator,
             "wss://coordinator.example.test/mpc",

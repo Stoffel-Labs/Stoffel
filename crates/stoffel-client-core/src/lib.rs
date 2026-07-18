@@ -14,6 +14,8 @@ use std::future::Future;
 
 use serde::{Deserialize, Serialize};
 
+pub mod bn254;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EndpointRole {
@@ -61,6 +63,7 @@ impl ParticipantEndpoint {
 pub struct ParticipantConfig {
     pub participant_id: String,
     pub session_id: String,
+    pub client_slot: u8,
     pub coordinator: ParticipantEndpoint,
     pub nodes: Vec<ParticipantEndpoint>,
     pub request_timeout_ms: u32,
