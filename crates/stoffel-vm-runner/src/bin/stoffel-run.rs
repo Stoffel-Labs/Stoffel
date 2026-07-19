@@ -1,5 +1,6 @@
 use ark_ec::{CurveGroup, PrimeGroup};
 use ark_ff::{BigInteger, PrimeField};
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::env;
@@ -206,14 +207,92 @@ fn session_registration_timeout() -> Duration {
     Duration::from_secs(seconds)
 }
 
-fn extract_pubkey_from_cert(cert_der: &[u8]) -> Vec<u8> {
-    let (_, parsed) = X509Certificate::from_der(cert_der).expect("parse X.509 cert");
-    parsed
-        .public_key()
-        .subject_public_key
-        .data
-        .as_ref()
-        .to_vec()
+const P256_HPKE_PUBLIC_KEY_LEN: usize = 65;
+
+/// Build the coordinator identity roster. Certificate identities retain their
+/// CLI order and are followed by browser identities in their CLI order.
+fn expected_client_identities(
+    cert_paths: &[String],
+    browser_public_keys: &[String],
+) -> Result<Vec<Vec<u8>>, String> {
+    let mut identities = Vec::with_capacity(cert_paths.len() + browser_public_keys.len());
+    let mut seen = HashSet::with_capacity(identities.capacity());
+
+    for (index, path) in cert_paths.iter().enumerate() {
+        if path.is_empty() {
+            return Err(format!("--expected-clients entry {} is empty", index + 1));
+        }
+        let cert_der = fs::read(path).map_err(|error| {
+            format!(
+                "failed to read --expected-clients certificate '{}': {}",
+                path, error
+            )
+        })?;
+        let (_, parsed) = X509Certificate::from_der(&cert_der).map_err(|error| {
+            format!(
+                "failed to parse --expected-clients certificate '{}': {}",
+                path, error
+            )
+        })?;
+        let identity = parsed
+            .public_key()
+            .subject_public_key
+            .data
+            .as_ref()
+            .to_vec();
+        if !seen.insert(identity.clone()) {
+            return Err(format!(
+                "duplicate client identity from --expected-clients entry '{}'",
+                path
+            ));
+        }
+        identities.push(identity);
+    }
+
+    for (index, encoded) in browser_public_keys.iter().enumerate() {
+        if encoded.is_empty() {
+            return Err(format!(
+                "--expected-browser-clients entry {} is empty",
+                index + 1
+            ));
+        }
+        if encoded.contains('=') {
+            return Err(format!(
+                "--expected-browser-clients entry {} must use unpadded base64url",
+                index + 1
+            ));
+        }
+        let identity = URL_SAFE_NO_PAD.decode(encoded).map_err(|error| {
+            format!(
+                "invalid base64url in --expected-browser-clients entry {}: {}",
+                index + 1,
+                error
+            )
+        })?;
+        if identity.len() != P256_HPKE_PUBLIC_KEY_LEN || identity.first() != Some(&0x04) {
+            return Err(format!(
+                "--expected-browser-clients entry {} must encode a {}-byte uncompressed P-256 HPKE public key",
+                index + 1,
+                P256_HPKE_PUBLIC_KEY_LEN
+            ));
+        }
+        p256::PublicKey::from_sec1_bytes(&identity).map_err(|error| {
+            format!(
+                "invalid P-256 point in --expected-browser-clients entry {}: {}",
+                index + 1,
+                error
+            )
+        })?;
+        if !seen.insert(identity.clone()) {
+            return Err(format!(
+                "duplicate or certificate-overlapping client identity in --expected-browser-clients entry {}",
+                index + 1
+            ));
+        }
+        identities.push(identity);
+    }
+
+    Ok(identities)
 }
 
 fn durable_identity_from_cert(cert_der: &[u8]) -> DurableIdentityDigest {
@@ -3246,7 +3325,7 @@ async fn run_avss_coordinated_party_for_curve<F, G>(
     rpc_addr: (String, u16),
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
-    expected_clients: &[String],
+    expected_client_ids: &[Vec<u8>],
     as_leader: bool,
     agreed_entry: &str,
 ) -> Result<(), String>
@@ -3254,10 +3333,7 @@ where
     F: SupportedMpcField,
     G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
 {
-    let input_ids: Vec<Vec<u8>> = expected_clients
-        .iter()
-        .map(|path| extract_pubkey_from_cert(&fs::read(path).expect("read client cert")))
-        .collect();
+    let input_ids = expected_client_ids.to_vec();
 
     let coord: AvssOffChainCoordinator<F, G> = AvssOffChainCoordinator::<F, G>::start_rpc_client(
         &coord_addr.0,
@@ -3452,7 +3528,7 @@ async fn run_avss_coordinated_party(
     rpc_addr: (String, u16),
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
-    expected_clients: &[String],
+    expected_client_ids: &[Vec<u8>],
     as_leader: bool,
     agreed_entry: &str,
 ) -> Result<(), String> {
@@ -3469,7 +3545,7 @@ async fn run_avss_coordinated_party(
                 rpc_addr,
                 cert_der,
                 key_der,
-                expected_clients,
+                expected_client_ids,
                 as_leader,
                 agreed_entry,
             )
@@ -3487,7 +3563,7 @@ async fn run_avss_coordinated_party(
                 rpc_addr,
                 cert_der,
                 key_der,
-                expected_clients,
+                expected_client_ids,
                 as_leader,
                 agreed_entry,
             )
@@ -3508,7 +3584,7 @@ async fn run_avss_coordinated_party(
                 rpc_addr,
                 cert_der,
                 key_der,
-                expected_clients,
+                expected_client_ids,
                 as_leader,
                 agreed_entry,
             )
@@ -3526,7 +3602,7 @@ async fn run_avss_coordinated_party(
                 rpc_addr,
                 cert_der,
                 key_der,
-                expected_clients,
+                expected_client_ids,
                 as_leader,
                 agreed_entry,
             )
@@ -3544,7 +3620,7 @@ async fn run_avss_coordinated_party(
                 rpc_addr,
                 cert_der,
                 key_der,
-                expected_clients,
+                expected_client_ids,
                 as_leader,
                 agreed_entry,
             )
@@ -3562,7 +3638,7 @@ async fn run_avss_coordinated_party(
                 rpc_addr,
                 cert_der,
                 key_der,
-                expected_clients,
+                expected_client_ids,
                 as_leader,
                 agreed_entry,
             )
@@ -3637,6 +3713,7 @@ async fn main() {
     let mut key_der: Option<Vec<u8>> = None;
     let mut cert_der: Option<Vec<u8>> = None;
     let mut expected_clients: Vec<String> = Vec::new();
+    let mut expected_browser_clients: Vec<String> = Vec::new();
     let mut client_roster: Vec<usize> = Vec::new();
     let mut client_input_slots: Vec<usize> = Vec::new();
     let mut eth_node_addr: Option<String> = None;
@@ -3691,6 +3768,7 @@ async fn main() {
         } else if let Some(_rest) = arg.strip_prefix("--key") {
         } else if let Some(_rest) = arg.strip_prefix("--cert") {
         } else if let Some(_rest) = arg.strip_prefix("--expected-clients") {
+        } else if let Some(_rest) = arg.strip_prefix("--expected-browser-clients") {
         } else if let Some(_rest) = arg.strip_prefix("--client-roster") {
         } else if let Some(_rest) = arg.strip_prefix("--client-input-slots") {
         } else if let Some(_rest) = arg.strip_prefix("--client-index") {
@@ -3894,6 +3972,11 @@ async fn main() {
             "--expected-clients" => {
                 if let Some(v) = args_iter.next() {
                     expected_clients = v.split(',').map(|s| s.trim().to_string()).collect();
+                }
+            }
+            "--expected-browser-clients" => {
+                if let Some(v) = args_iter.next() {
+                    expected_browser_clients = v.split(',').map(|s| s.trim().to_string()).collect();
                 }
             }
             "--client-roster" => {
@@ -4684,11 +4767,14 @@ async fn main() {
             });
             coord_opt = Some(coord);
 
-            output_ids = expected_clients
-                .iter()
-                .filter(|path| !path.trim().is_empty())
-                .map(|path| extract_pubkey_from_cert(&fs::read(path).expect("read client cert")))
-                .collect();
+            output_ids =
+                match expected_client_identities(&expected_clients, &expected_browser_clients) {
+                    Ok(ids) => ids,
+                    Err(error) => {
+                        eprintln!("Error: {error}");
+                        std::process::exit(1);
+                    }
+                };
             input_ids = input_client_ids_from_output_ids(
                 &output_ids,
                 &client_roster,
@@ -4996,6 +5082,16 @@ async fn main() {
                         eprintln!("Error: --key is required with AVSS coordinator mode");
                         exit(2);
                     });
+                    let expected_client_ids = match expected_client_identities(
+                        &expected_clients,
+                        &expected_browser_clients,
+                    ) {
+                        Ok(ids) => ids,
+                        Err(error) => {
+                            eprintln!("Error: {error}");
+                            std::process::exit(1);
+                        }
+                    };
                     if let Err(e) = run_avss_coordinated_party(
                         curve_config,
                         &mut vm,
@@ -5008,7 +5104,7 @@ async fn main() {
                         rpc,
                         cert,
                         key,
-                        &expected_clients,
+                        &expected_client_ids,
                         as_leader,
                         &agreed_entry,
                     )
@@ -5251,6 +5347,9 @@ Flags:
   --local-store <path>    Persistent VM local storage database
   --expected-clients <cert-paths>
                           Comma-separated client cert paths for off-chain coordinator mode
+  --expected-browser-clients <public-keys>
+                          Comma-separated unpadded base64url 65-byte uncompressed P-256
+                          HPKE public keys. Appended after certificate identities in CLI order
   -h, --help              Show this help
 
 Required environment:
@@ -5324,10 +5423,13 @@ Examples:
 #[cfg(test)]
 mod tests {
     use super::{
-        band_pow2, client_transport_recipient, client_transport_targets, field_outputs_to_hex,
-        format_coordinator_outputs, input_client_ids_from_output_ids, plan_preprocessing,
-        render_fixed_point_i64, CoordinatorOutputFormat,
+        band_pow2, client_transport_recipient, client_transport_targets,
+        expected_client_identities, field_outputs_to_hex, format_coordinator_outputs,
+        input_client_ids_from_output_ids, plan_preprocessing, render_fixed_point_i64,
+        CoordinatorOutputFormat,
     };
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
+    use p256::elliptic_curve::sec1::ToEncodedPoint;
     use stoffel_vm::net::MpcCurveConfig;
     use stoffel_vm_types::compiled_binary::PreprocessingDemand;
 
@@ -5339,6 +5441,54 @@ mod tests {
             prandints,
             dynamic,
         }
+    }
+
+    fn browser_identity(secret_byte: u8) -> (String, Vec<u8>) {
+        let secret = p256::SecretKey::from_slice(&[secret_byte; 32]).unwrap();
+        let bytes = secret
+            .public_key()
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec();
+        (URL_SAFE_NO_PAD.encode(&bytes), bytes)
+    }
+
+    #[test]
+    fn browser_client_identities_preserve_cli_order() {
+        let (first, first_bytes) = browser_identity(1);
+        let (second, second_bytes) = browser_identity(2);
+        let identities = expected_client_identities(&[], &[first, second]).unwrap();
+        assert_eq!(identities, vec![first_bytes, second_bytes]);
+    }
+
+    #[test]
+    fn browser_client_identities_reject_duplicates() {
+        let (identity, _) = browser_identity(3);
+        let error = expected_client_identities(&[], &[identity.clone(), identity]).unwrap_err();
+        assert!(error.contains("duplicate"));
+    }
+
+    #[test]
+    fn browser_client_identities_reject_padding_and_invalid_points() {
+        let (valid, _) = browser_identity(4);
+        let padded = format!("{valid}=");
+        assert!(expected_client_identities(&[], &[padded])
+            .unwrap_err()
+            .contains("unpadded"));
+
+        let invalid = URL_SAFE_NO_PAD.encode([4u8; 65]);
+        assert!(expected_client_identities(&[], &[invalid])
+            .unwrap_err()
+            .contains("invalid P-256 point"));
+    }
+
+    #[test]
+    fn browser_client_identities_reject_malformed_base64url() {
+        assert!(
+            expected_client_identities(&[], &["not+base64url".to_string()])
+                .unwrap_err()
+                .contains("invalid base64url")
+        );
     }
 
     #[test]
