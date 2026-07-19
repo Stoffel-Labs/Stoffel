@@ -5707,16 +5707,20 @@ dependencies = [
 name = "stoffel-browser-client"
 version = "0.1.0"
 dependencies = [
+ "aes-gcm",
  "ark-bls12-381",
  "base64",
  "getrandom 0.2.17",
  "gloo-timers 0.3.0",
+ "hkdf",
  "hpke",
  "js-sys",
  "jsonrpsee-core",
  "jsonrpsee-wasm-client",
+ "rand_chacha 0.9.0",
  "serde",
  "serde-wasm-bindgen",
+ "sha2",
  "stoffel-client-core",
  "wasm-bindgen",
  "wasm-bindgen-futures",

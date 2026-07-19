@@ -9,17 +9,18 @@
 
 use std::cell::Cell;
 
-#[cfg(target_arch = "wasm32")]
-use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::Serialize;
 use stoffel_client_core::{ClientState, ParticipantClient, ParticipantConfig};
 use wasm_bindgen::prelude::*;
 
 #[cfg(target_arch = "wasm32")]
-use hpke::{kem::DhP256HkdfSha256, Kem, Serializable};
+use web_sys::CryptoKey;
 
 #[cfg(target_arch = "wasm32")]
-type BrowserPrivateKey = <DhP256HkdfSha256 as Kem>::PrivateKey;
+mod vault;
+
+#[cfg(target_arch = "wasm32")]
+type BrowserPublicKey = vault::PublicKey;
 
 #[derive(Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -52,16 +53,19 @@ pub struct BrowserParticipantClient {
     identity_public_key: String,
     transport_connected: Cell<bool>,
     #[cfg(target_arch = "wasm32")]
-    #[allow(dead_code)]
-    identity_private_key: BrowserPrivateKey,
+    identity_private_key: CryptoKey,
+    #[cfg(target_arch = "wasm32")]
+    identity_public_key_material: BrowserPublicKey,
 }
 
 #[wasm_bindgen]
 impl BrowserParticipantClient {
-    /// Validate configuration, capture the real page origin, and create an
-    /// ephemeral P-256 HPKE identity from Web Crypto entropy.
+    /// Validate configuration, capture the real page origin, and create a
+    /// non-extractable Web Crypto ECDH P-256 identity. Persist the structured-
+    /// cloneable object returned by `persistentIdentity` (for example in
+    /// IndexedDB); its private key can never be exported as raw bytes.
     #[wasm_bindgen(js_name = initialize)]
-    pub fn initialize(config: JsValue) -> Result<BrowserParticipantClient, JsValue> {
+    pub async fn initialize(config: JsValue) -> Result<BrowserParticipantClient, JsValue> {
         let config: ParticipantConfig = serde_wasm_bindgen::from_value(config)
             .map_err(|error| js_error(format!("invalid participant config: {error}")))?;
         let inner = ParticipantClient::new(config).map_err(|error| js_error(error.to_string()))?;
@@ -73,25 +77,17 @@ impl BrowserParticipantClient {
                 .location()
                 .origin()
                 .map_err(|_| js_error("page origin is unavailable"))?;
-            let crypto = window
-                .crypto()
-                .map_err(|_| js_error("Web Crypto is unavailable"))?;
-            let mut seed = [0_u8; 32];
-            crypto
-                .get_random_values_with_u8_array(&mut seed)
-                .map_err(|_| js_error("Web Crypto failed to generate identity entropy"))?;
-            let (identity_private_key, identity_public_key) =
-                DhP256HkdfSha256::derive_keypair(&seed);
-            seed.fill(0);
-            let identity_public_key =
-                URL_SAFE_NO_PAD.encode(identity_public_key.to_bytes().as_slice());
-            return Ok(Self {
+            let (identity_private_key, identity_public_key_material) =
+                vault::generate_identity().await?;
+            let identity_public_key = vault::public_key_string(&identity_public_key_material);
+            Ok(Self {
                 inner,
                 origin,
                 identity_public_key,
                 transport_connected: Cell::new(false),
                 identity_private_key,
-            });
+                identity_public_key_material,
+            })
         }
 
         #[cfg(not(target_arch = "wasm32"))]
@@ -119,10 +115,86 @@ impl BrowserParticipantClient {
     }
 
     /// Public HPKE identity to bind into the server-signed browser capability.
-    /// The corresponding private key stays inside this WASM instance.
+    /// The corresponding private key remains a non-extractable CryptoKey.
     #[wasm_bindgen(getter, js_name = identityPublicKey)]
     pub fn identity_public_key(&self) -> String {
         self.identity_public_key.clone()
+    }
+
+    /// Structured-cloneable persistent identity for product-layer storage.
+    /// JavaScript receives a CryptoKey handle and the public raw-key string,
+    /// never private-key bytes. The private key is non-extractable.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(getter, js_name = persistentIdentity)]
+    pub fn persistent_identity(&self) -> Result<JsValue, JsValue> {
+        vault::identity_value(
+            &self.identity_private_key,
+            &self.identity_public_key_material,
+        )
+    }
+
+    /// Restore from a structured-cloned `{ privateKey: CryptoKey, publicKey }`.
+    /// Extractable, wrong-algorithm, wrong-curve, or unusable keys fail closed.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = initializeWithIdentity)]
+    pub async fn initialize_with_identity(
+        config: JsValue,
+        identity: JsValue,
+    ) -> Result<BrowserParticipantClient, JsValue> {
+        let config: ParticipantConfig = serde_wasm_bindgen::from_value(config)
+            .map_err(|error| js_error(format!("invalid participant config: {error}")))?;
+        let inner = ParticipantClient::new(config).map_err(|error| js_error(error.to_string()))?;
+        let window = web_sys::window().ok_or_else(|| js_error("window is unavailable"))?;
+        let origin = window
+            .location()
+            .origin()
+            .map_err(|_| js_error("page origin is unavailable"))?;
+        let (identity_private_key, identity_public_key_material) = vault::identity_parts(identity)?;
+        vault::validate_identity(&identity_private_key, &identity_public_key_material).await?;
+        let identity_public_key = vault::public_key_string(&identity_public_key_material);
+        Ok(Self {
+            inner,
+            origin,
+            identity_public_key,
+            transport_connected: Cell::new(false),
+            identity_private_key,
+            identity_public_key_material,
+        })
+    }
+
+    /// HPKE-seal a user-state byte envelope to this persistent identity.
+    /// Callers must provide non-empty authenticated context (for example a
+    /// schema/user/room tuple) and persist only the returned envelope.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = sealUserState)]
+    pub fn seal_user_state(
+        &self,
+        plaintext: js_sys::Uint8Array,
+        associated_data: js_sys::Uint8Array,
+    ) -> Result<JsValue, JsValue> {
+        vault::seal_user_state(
+            &self.identity_public_key_material,
+            &plaintext.to_vec(),
+            &associated_data.to_vec(),
+        )
+    }
+
+    /// Open an HPKE user-state envelope with this non-extractable identity. Any
+    /// algorithm/version mismatch, tampering, or AAD mismatch fails closed.
+    #[cfg(target_arch = "wasm32")]
+    #[wasm_bindgen(js_name = openUserState)]
+    pub async fn open_user_state(
+        &self,
+        envelope: JsValue,
+        associated_data: js_sys::Uint8Array,
+    ) -> Result<js_sys::Uint8Array, JsValue> {
+        vault::open_user_state(
+            &self.identity_private_key,
+            &self.identity_public_key_material,
+            envelope,
+            &associated_data.to_vec(),
+        )
+        .await
     }
 
     #[wasm_bindgen(getter, js_name = transportConnected)]
@@ -370,13 +442,14 @@ mod transport {
 #[cfg(all(test, target_arch = "wasm32"))]
 mod browser_tests {
     use super::*;
+    use js_sys::{Object, Reflect, Uint8Array};
+    use wasm_bindgen::JsCast;
     use wasm_bindgen_test::*;
 
     wasm_bindgen_test_configure!(run_in_browser);
 
-    #[wasm_bindgen_test]
-    fn initializes_with_ephemeral_browser_identity() {
-        let config = js_sys::JSON::parse(
+    fn config() -> JsValue {
+        js_sys::JSON::parse(
             r#"{
                 "participantId":"browser-1",
                 "sessionId":"session-1",
@@ -386,12 +459,91 @@ mod browser_tests {
                 "requestTimeoutMs":30000
             }"#,
         )
-        .unwrap();
-        let first = BrowserParticipantClient::initialize(config.clone()).unwrap();
-        let second = BrowserParticipantClient::initialize(config).unwrap();
+        .unwrap()
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn initializes_with_nonextractable_browser_identity() {
+        let first = BrowserParticipantClient::initialize(config())
+            .await
+            .unwrap();
+        let second = BrowserParticipantClient::initialize(config())
+            .await
+            .unwrap();
         assert!(browser_runtime_available());
         assert!(!first.transport_connected());
         assert!(!first.identity_public_key().is_empty());
         assert_ne!(first.identity_public_key(), second.identity_public_key());
+        let identity = first.persistent_identity().unwrap();
+        let private_key: CryptoKey = Reflect::get(&identity, &"privateKey".into())
+            .unwrap()
+            .unchecked_into();
+        assert!(!private_key.extractable());
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn persistent_identity_restores_and_hpke_state_fails_closed() {
+        let first = BrowserParticipantClient::initialize(config())
+            .await
+            .unwrap();
+        let public_key = first.identity_public_key();
+        let identity = first.persistent_identity().unwrap();
+        let restored = BrowserParticipantClient::initialize_with_identity(config(), identity)
+            .await
+            .unwrap();
+        assert_eq!(restored.identity_public_key(), public_key);
+
+        let plaintext = Uint8Array::from(b"persistent private state".as_slice());
+        let aad = Uint8Array::from(b"schema:user:room".as_slice());
+        let envelope = restored
+            .seal_user_state(plaintext.clone(), aad.clone())
+            .unwrap();
+        assert_eq!(
+            restored
+                .open_user_state(envelope.clone(), aad)
+                .await
+                .unwrap()
+                .to_vec(),
+            plaintext.to_vec()
+        );
+        assert!(restored
+            .open_user_state(
+                envelope,
+                Uint8Array::from(b"schema:other-user:room".as_slice()),
+            )
+            .await
+            .is_err());
+        assert!(restored
+            .seal_user_state(plaintext, Uint8Array::new_with_length(0))
+            .is_err());
+    }
+
+    #[wasm_bindgen_test(async)]
+    async fn rejects_identity_with_mismatched_public_key() {
+        let first = BrowserParticipantClient::initialize(config())
+            .await
+            .unwrap();
+        let second = BrowserParticipantClient::initialize(config())
+            .await
+            .unwrap();
+        let mismatched = Object::new();
+        let first_identity = first.persistent_identity().unwrap();
+        Reflect::set(
+            &mismatched,
+            &"privateKey".into(),
+            &Reflect::get(&first_identity, &"privateKey".into()).unwrap(),
+        )
+        .unwrap();
+        Reflect::set(
+            &mismatched,
+            &"publicKey".into(),
+            &second.identity_public_key().into(),
+        )
+        .unwrap();
+        assert!(
+            BrowserParticipantClient::initialize_with_identity(config(), mismatched.into())
+                .await
+                .is_err()
+        );
     }
 }

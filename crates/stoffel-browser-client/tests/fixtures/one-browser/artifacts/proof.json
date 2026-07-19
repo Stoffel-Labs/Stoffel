@@ -3,6 +3,10 @@
   "runtime": "chromium-wasm",
   "directTransport": true,
   "applicationServerPrivatePayloads": 0,
+  "persistentIdentityRestored": true,
+  "privateKeyExtractable": false,
+  "hpkeStateRoundTrip": true,
+  "hpkeTamperRejected": true,
   "identityPublicKey": "[REDACTED]",
   "transportConnected": true,
   "receipt": {

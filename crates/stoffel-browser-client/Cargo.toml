@@ -16,17 +16,28 @@ serde = { version = "1.0", features = ["derive"] }
 serde-wasm-bindgen = "0.6"
 stoffel-client-core = { path = "../stoffel-client-core" }
 wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+aes-gcm = "0.10"
 ark-bls12-381 = "0.5"
 gloo-timers = { version = "0.3", features = ["futures"] }
 getrandom = { version = "0.2", features = ["js"] }
 hpke = { version = "0.13", default-features = false, features = ["alloc", "p256"] }
+hkdf = "0.12"
 js-sys = "0.3"
 jsonrpsee-core = { version = "0.26", features = ["client"] }
 jsonrpsee-wasm-client = "0.26"
-wasm-bindgen-futures = "0.4"
-web-sys = { version = "0.3", features = ["Crypto", "Location", "Window"] }
+rand_chacha = "0.9"
+sha2 = "0.10"
+web-sys = { version = "0.3", features = [
+    "AesGcmParams",
+    "Crypto",
+    "CryptoKey",
+    "Location",
+    "SubtleCrypto",
+    "Window",
+] }
 
 [target.'cfg(target_arch = "wasm32")'.dev-dependencies]
 wasm-bindgen-test = "0.3"
