@@ -1,0 +1,15 @@
+{
+  "gate": "one-browser",
+  "runtime": "chromium-wasm",
+  "directTransport": true,
+  "applicationServerPrivatePayloads": 0,
+  "identityPublicKey": "[REDACTED]",
+  "transportConnected": true,
+  "receipt": {
+    "sessionId": "one-browser-real-services",
+    "clientSlot": 0,
+    "inputStartIndex": 0,
+    "inputCount": 4,
+    "state": "submitted"
+  }
+}

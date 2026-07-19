@@ -183,7 +183,7 @@ mod transport {
     use jsonrpsee_wasm_client::{Client, WasmClientBuilder};
     use serde::Deserialize;
     use stoffel_client_core::{
-        bn254::{decode_robust_share, mask_u64_input, reconstruct_mask, RobustShare},
+        bls12_381::{decode_robust_share, mask_u64_input, reconstruct_mask, RobustShare},
         ParticipantConfig,
     };
 
@@ -216,13 +216,8 @@ mod transport {
             .build(&config.coordinator.url)
             .await
             .map_err(|error| format!("coordinator WSS connection failed: {error}"))?;
-        let reservation: BrowserInputReservation = coordinator
-            .request(
-                "browser_reserve_input_range",
-                rpc_params![capability, origin],
-            )
-            .await
-            .map_err(|error| format!("input-range reservation failed: {error}"))?;
+        let reservation =
+            poll_reservation(&coordinator, capability, origin, config.request_timeout_ms).await?;
         if reservation.input_count != inputs.len() as u64 {
             return Err(format!(
                 "capability reserved {} inputs, browser requires {}",
@@ -267,6 +262,37 @@ mod transport {
         Ok(reservation)
     }
 
+    async fn poll_reservation(
+        coordinator: &Client,
+        capability: &str,
+        origin: &str,
+        timeout_ms: u32,
+    ) -> Result<BrowserInputReservation, String> {
+        let deadline = js_sys::Date::now() + f64::from(timeout_ms);
+        loop {
+            match coordinator
+                .request(
+                    "browser_reserve_input_range",
+                    rpc_params![capability, origin],
+                )
+                .await
+            {
+                Ok(reservation) => return Ok(reservation),
+                Err(error)
+                    if error
+                        .to_string()
+                        .contains("coordinator is not reserving inputs") =>
+                {
+                    if js_sys::Date::now() >= deadline {
+                        return Err("input-range reservation timed out before coordinator entered the input phase".into());
+                    }
+                    TimeoutFuture::new(100).await;
+                }
+                Err(error) => return Err(format!("input-range reservation failed: {error}")),
+            }
+        }
+    }
+
     async fn poll_masks(
         parties: &[Client],
         capability: &str,
@@ -274,7 +300,7 @@ mod transport {
         input_start: u64,
         input_count: u64,
         timeout_ms: u32,
-    ) -> Result<Vec<ark_bn254::Fr>, String> {
+    ) -> Result<Vec<ark_bls12_381::Fr>, String> {
         let deadline = js_sys::Date::now() + f64::from(timeout_ms);
         loop {
             let mut grouped: BTreeMap<u64, Vec<RobustShare>> = BTreeMap::new();

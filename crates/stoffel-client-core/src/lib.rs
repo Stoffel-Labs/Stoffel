@@ -14,6 +14,7 @@ use std::future::Future;
 
 use serde::{Deserialize, Serialize};
 
+pub mod bls12_381;
 pub mod bn254;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

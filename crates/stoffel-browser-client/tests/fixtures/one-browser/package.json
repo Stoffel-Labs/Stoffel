@@ -1,0 +1,8 @@
+{
+  "name": "stoffel-one-browser-real-services-proof",
+  "private": true,
+  "type": "module",
+  "devDependencies": {
+    "playwright": "1.55.0"
+  }
+}

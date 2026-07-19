@@ -8,6 +8,7 @@ repository = "https://github.com/Stoffel-Labs/stoffel"
 publish = false
 
 [dependencies]
+ark-bls12-381 = "0.5"
 ark-bn254 = "0.5"
 ark-ff = "0.5"
 ark-serialize = { version = "0.5", features = ["derive"] }

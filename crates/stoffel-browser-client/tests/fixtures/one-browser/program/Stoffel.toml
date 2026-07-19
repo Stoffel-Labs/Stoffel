@@ -1,0 +1,12 @@
+[package]
+name = "one-browser-private-aggregation"
+version = "0.1.0"
+
+[mpc]
+backend = "honeybadger"
+parties = 5
+threshold = 1
+
+[build]
+source = "src/private_aggregation.stfl"
+target_dir = "target"

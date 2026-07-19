@@ -1,0 +1,5 @@
+pkg/
+node_modules/
+artifacts/*
+!artifacts/proof.json
+program/target/

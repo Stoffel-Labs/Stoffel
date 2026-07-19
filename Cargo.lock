@@ -5707,7 +5707,7 @@ dependencies = [
 name = "stoffel-browser-client"
 version = "0.1.0"
 dependencies = [
- "ark-bn254",
+ "ark-bls12-381",
  "base64",
  "getrandom 0.2.17",
  "gloo-timers 0.3.0",
@@ -5743,6 +5743,7 @@ dependencies = [
 name = "stoffel-client-core"
 version = "0.1.0"
 dependencies = [
+ "ark-bls12-381",
  "ark-bn254",
  "ark-ff 0.5.0",
  "ark-poly",
@@ -5756,12 +5757,13 @@ dependencies = [
 [[package]]
 name = "stoffel-mpc-coordinator-off-chain"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1c7858f0e6da81da3f26edc1d078cd3d69f8578bbaae01cfa737c6f8bdd1eab"
 dependencies = [
  "ark-bls12-381",
  "ark-ff 0.5.0",
  "ark-serialize 0.5.0",
  "async-trait",
- "base64",
  "futures-util",
  "hpke",
  "jsonrpsee",
@@ -5772,19 +5774,19 @@ dependencies = [
  "stoffel-mpc-coordinator-shared",
  "tokio",
  "tracing",
- "url",
 ]
 
 [[package]]
 name = "stoffel-mpc-coordinator-shared"
 version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5b32fe903439fde4c12bbb662341edd8265815d6b4978b92131985ebd5efb71d"
 dependencies = [
  "ark-bls12-381",
  "ark-ec",
  "ark-ff 0.5.0",
  "ark-serialize 0.5.0",
  "async-trait",
- "base64",
  "futures-util",
  "hpke",
  "hyper",
@@ -5796,7 +5798,6 @@ dependencies = [
  "ring",
  "rustls",
  "serde",
- "serde_json",
  "stoffelcrypto",
  "stoffelnet",
  "thiserror 2.0.18",
