@@ -35,8 +35,8 @@ pub use crate::program::{
 };
 pub use crate::runtime::{LocalNetworkBuilder, RuntimeSummary, StoffelRuntime};
 pub use crate::server::{
-    ClientInputTopology, OffChainServerConfig, OffChainServerConfigBuilder, ServerBuilder,
-    ServerState, ServerSummary, StoffelServer,
+    OffChainServerConfig, OffChainServerConfigBuilder, ServerBuilder, ServerState, ServerSummary,
+    StoffelServer,
 };
 pub use crate::types::{
     ClientId, ClientInputValue, ClientOutputValue, ClientValueType, FieldElement,

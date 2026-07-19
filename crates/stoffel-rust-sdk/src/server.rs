@@ -27,65 +27,6 @@ use crate::observability::{HealthStatus, ServerMetrics};
 use crate::program::Program;
 use crate::types::{GeneratedProgramManifest, PartyId};
 
-/// Input layout expected from the off-chain client roster for one session.
-///
-/// Each entry is `(client_slot, input_count)`. Slots are the `ClientStore`
-/// slots used by the program and must be unique; every input client must
-/// contribute at least one value.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ClientInputTopology {
-    client_slots: Vec<usize>,
-    inputs_per_client: usize,
-}
-
-impl ClientInputTopology {
-    pub fn new<I>(client_slots: I, inputs_per_client: usize) -> Result<Self>
-    where
-        I: IntoIterator<Item = usize>,
-    {
-        let client_slots = client_slots.into_iter().collect::<Vec<_>>();
-        let mut slots = BTreeSet::new();
-        for slot in &client_slots {
-            if !slots.insert(*slot) {
-                return Err(Error::Configuration(format!(
-                    "client input topology contains duplicate client slot {slot}"
-                )));
-            }
-        }
-        if !client_slots.is_empty() && inputs_per_client == 0 {
-            return Err(Error::Configuration(
-                "client input topology must have at least one input per client".to_owned(),
-            ));
-        }
-        client_slots
-            .len()
-            .checked_mul(inputs_per_client)
-            .ok_or_else(|| {
-                Error::Configuration("client input topology total overflowed usize".to_owned())
-            })?;
-        Ok(Self {
-            client_slots,
-            inputs_per_client,
-        })
-    }
-
-    pub fn client_count(&self) -> usize {
-        self.client_slots.len()
-    }
-
-    pub fn inputs_per_client(&self) -> usize {
-        self.inputs_per_client
-    }
-
-    pub fn total_input_count(&self) -> usize {
-        self.client_slots.len() * self.inputs_per_client
-    }
-
-    pub fn client_slots(&self) -> impl Iterator<Item = usize> + '_ {
-        self.client_slots.iter().copied()
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ServerState {
@@ -146,7 +87,6 @@ pub struct ServerBuilder {
     triples: usize,
     random_shares: usize,
     expected_clients: usize,
-    client_input_topology: Option<ClientInputTopology>,
     consensus_timeout: Duration,
     backend: MpcBackend,
     mpc_config: Option<MpcConfig>,
@@ -169,7 +109,6 @@ impl ServerBuilder {
             triples: 1000,
             random_shares: 500,
             expected_clients: 0,
-            client_input_topology: None,
             consensus_timeout: Duration::from_secs(60),
             backend: MpcBackend::HoneyBadger,
             mpc_config: None,
@@ -232,15 +171,6 @@ impl ServerBuilder {
 
     pub fn expected_clients(mut self, n: usize) -> Self {
         self.expected_clients = n;
-        self
-    }
-
-    /// Set the explicit per-client input layout used by the live runner.
-    ///
-    /// Without this setting, `expected_clients(n)` retains the legacy layout:
-    /// slots `0..n`, with one input value per client.
-    pub fn client_input_topology(mut self, topology: ClientInputTopology) -> Self {
-        self.client_input_topology = Some(topology);
         self
     }
 
@@ -344,10 +274,6 @@ impl ServerBuilder {
 
     pub fn configured_expected_clients(&self) -> usize {
         self.expected_clients
-    }
-
-    pub fn configured_client_input_topology(&self) -> Option<&ClientInputTopology> {
-        self.client_input_topology.as_ref()
     }
 
     pub fn configured_consensus_timeout(&self) -> Duration {
@@ -522,61 +448,8 @@ impl ServerBuilder {
                 }
             }
         }
-        let client_input_topology =
-            self.client_input_topology
-                .unwrap_or_else(|| ClientInputTopology {
-                    client_slots: (0..self.expected_clients).collect(),
-                    inputs_per_client: usize::from(self.expected_clients > 0),
-                });
-        if client_input_topology.client_count() != self.expected_clients {
-            return Err(Error::Configuration(format!(
-                "client input topology contains {} slots, but expected_clients is {}",
-                client_input_topology.client_count(),
-                self.expected_clients
-            )));
-        }
-        for slot in client_input_topology.client_slots() {
-            if slot >= self.expected_clients {
-                return Err(Error::Configuration(format!(
-                    "client input topology slot {slot} is outside the expected client roster of {} clients",
-                    self.expected_clients
-                )));
-            }
-        }
         if let Some(program) = &self.program {
             program.validate_expected_clients(self.expected_clients)?;
-            if program.has_client_input_metadata() {
-                let declared_slots = program
-                    .clients()
-                    .filter(|client| client.input_count() > 0)
-                    .map(|client| client.client_slot() as usize)
-                    .collect::<Vec<_>>();
-                let declared_counts = program
-                    .clients()
-                    .filter(|client| client.input_count() > 0)
-                    .map(|client| client.input_count())
-                    .collect::<Vec<_>>();
-                if declared_slots != client_input_topology.client_slots
-                    || declared_counts
-                        .iter()
-                        .any(|count| *count != client_input_topology.inputs_per_client)
-                {
-                    return Err(Error::Configuration(format!(
-                        "client input topology (slots {:?}, {} inputs each) does not match program input topology (slots {:?}, counts {:?})",
-                        client_input_topology.client_slots,
-                        client_input_topology.inputs_per_client,
-                        declared_slots,
-                        declared_counts
-                    )));
-                }
-                if client_input_topology.total_input_count() != program.total_client_input_count() {
-                    return Err(Error::Configuration(format!(
-                        "client input topology total is {}, but program declares {} client inputs",
-                        client_input_topology.total_input_count(),
-                        program.total_client_input_count()
-                    )));
-                }
-            }
         }
         if let Some(config) = &self.offchain_coordinator {
             config.validate(self.expected_clients)?;
@@ -608,7 +481,6 @@ impl ServerBuilder {
             triples: self.triples,
             random_shares: self.random_shares,
             expected_clients: self.expected_clients,
-            client_input_topology,
             consensus_timeout: self.consensus_timeout,
             backend: self.backend,
             mpc_config: self.mpc_config,
@@ -749,7 +621,6 @@ pub struct StoffelServer {
     triples: usize,
     random_shares: usize,
     expected_clients: usize,
-    client_input_topology: ClientInputTopology,
     consensus_timeout: Duration,
     backend: MpcBackend,
     mpc_config: Option<MpcConfig>,
@@ -776,7 +647,6 @@ pub struct ServerSummary {
     pub bind_addr: String,
     pub peer_count: usize,
     pub expected_clients: usize,
-    pub client_input_topology: ClientInputTopology,
     pub preprocessing_triples: usize,
     pub preprocessing_random_shares: usize,
     pub consensus_timeout_ms: u64,
@@ -877,21 +747,6 @@ impl StoffelServer {
                         .join(","),
                 );
             }
-            let slots = self
-                .client_input_topology
-                .client_slots()
-                .map(|slot| slot.to_string())
-                .collect::<Vec<_>>()
-                .join(",");
-            command
-                .arg("--client-input-count")
-                .arg(self.client_input_topology.inputs_per_client().to_string())
-                .arg("--client-input-total")
-                .arg(self.client_input_topology.total_input_count().to_string())
-                .arg("--client-roster")
-                .arg(&slots)
-                .arg("--client-input-slots")
-                .arg(slots);
         }
         if let Some(bootstrap) = &self.bootstrap_addr {
             command
@@ -974,7 +829,6 @@ impl StoffelServer {
             bind_addr: self.bind_addr.clone(),
             peer_count: self.peers.len(),
             expected_clients: self.expected_clients,
-            client_input_topology: self.client_input_topology.clone(),
             preprocessing_triples,
             preprocessing_random_shares,
             consensus_timeout_ms: self
@@ -1043,10 +897,6 @@ impl StoffelServer {
 
     pub fn expected_clients(&self) -> usize {
         self.expected_clients
-    }
-
-    pub fn client_input_topology(&self) -> &ClientInputTopology {
-        &self.client_input_topology
     }
 
     pub fn consensus_timeout(&self) -> Duration {
