@@ -32,6 +32,9 @@ builtin object Share:
   def get_type(share: Share) -> string {.builtin.}:
   def get_party_id(share: Share) -> int64 {.builtin.}:
   def batch_open(shares: list[Share]) -> list[Object] {.builtin.}:
+  def batch_open_field(shares: list[Share]) -> list[bytes] {.builtin.}:
+  def batch_open_exp(shares: list[Share], curve_name: string) -> list[bytes] {.builtin.}:
+  def batch_open_exp_custom(shares: list[Share], generators: list[bytes], curve_name: string) -> list[bytes] {.builtin.}:
   def batch_open_fixed[T](shares: list[Share]) -> list[T] {.builtin: "Share.batch_open".}:
   def open_exp(share: Share, curve_name: string) -> bytes {.builtin.}:
   def random() -> Share {.builtin.}:

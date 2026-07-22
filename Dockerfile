@@ -6,7 +6,16 @@
 #   ENABLE_NAT - Set to "true" to enable NAT traversal features (requires hole-punching branch)
 #
 # Example:
-#   docker build --build-arg ENABLE_NAT=true -t stoffelvm:nat .
+#   docker build \
+#     --build-context coordinator=../stoffel-mpc-coordinator \
+#     --build-context networking=../stoffel-networking \
+#     --build-arg ENABLE_NAT=true \
+#     -t stoffelvm:nat .
+#
+# The coordinator source context is required so the VM and coordinator images
+# are compiled against the same execution-scoped RPC contract.
+# The networking source context supplies the standing transport's physical
+# frame bound and same-certificate multi-connection support.
 
 # ============================================================================
 # Stage 1: Builder
@@ -25,10 +34,20 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /build
 
 COPY . .
+COPY --from=coordinator . /build/coordinator
+COPY --from=networking . /build/stoffelnet
 
-RUN printf '%s\n' \
+RUN mkdir -p /build/.cargo && \
+    printf '%s\n' \
       '[net]' \
       'git-fetch-with-cli = true' \
+      '' \
+      '[patch."https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git"]' \
+      'stoffel-mpc-coordinator-off-chain = { path = "/build/coordinator/crates/off-chain" }' \
+      'stoffel-mpc-coordinator-shared = { path = "/build/coordinator/crates/coord-shared" }' \
+      '' \
+      '[patch.crates-io]' \
+      'stoffelnet = { path = "/build/stoffelnet" }' \
       '' \
       > /build/.cargo/config.toml
 
@@ -54,6 +73,7 @@ RUN --mount=type=ssh \
 # Compile the AES-128 secret-bit circuit example into VM bytecode for compose runs.
 RUN cargo build --release --package stoffellang && \
     mkdir -p /build/crates/stoffel-lang/examples/mpc_aes128_circuit/target && \
+    mkdir -p /build/docker/standing-concurrency/target && \
     STOFFEL_INLINE_BUDGET=100000000 \
     STOFFEL_UNROLL_BUDGET=100000000 \
     STOFFEL_UNROLL_MAX_EXPANSION=100000000 \
@@ -63,12 +83,63 @@ RUN cargo build --release --package stoffellang && \
       --mpc-backend honeybadger \
       --mpc-curve bls12-381 \
       --output /build/crates/stoffel-lang/examples/mpc_aes128_circuit/target/mpc_aes128_circuit.stflb \
-      /build/crates/stoffel-lang/examples/mpc_aes128_circuit/main.stfl
+      /build/crates/stoffel-lang/examples/mpc_aes128_circuit/main.stfl && \
+    /build/target/release/stoffellang \
+      --binary \
+      --mpc-backend honeybadger \
+      --mpc-curve bls12-381 \
+      --output /build/docker/standing-concurrency/target/single-client-io-honeybadger.stflb \
+      /build/docker/standing-concurrency/programs/single_client_io.stfl && \
+    /build/target/release/stoffellang \
+      --binary \
+      --mpc-backend honeybadger \
+      --mpc-curve bls12-381 \
+      --output /build/docker/standing-concurrency/target/slow-client-io-honeybadger.stflb \
+      /build/docker/standing-concurrency/programs/slow_client_io.stfl && \
+    /build/target/release/stoffellang \
+      --binary \
+      --opt-level 0 \
+      --mpc-backend honeybadger \
+      --mpc-curve bls12-381 \
+      --output /build/docker/standing-concurrency/target/cpu-fairness-honeybadger.stflb \
+      /build/docker/standing-concurrency/programs/cpu_fairness.stfl && \
+    /build/target/release/stoffellang \
+      --disassemble \
+      /build/docker/standing-concurrency/target/cpu-fairness-honeybadger.stflb \
+      > /build/docker/standing-concurrency/target/cpu-fairness-honeybadger.disassembly && \
+    grep -Fqx '.function cpu_long' \
+      /build/docker/standing-concurrency/target/cpu-fairness-honeybadger.disassembly && \
+    grep -Fqx '.function cpu_short' \
+      /build/docker/standing-concurrency/target/cpu-fairness-honeybadger.disassembly && \
+    /build/target/release/stoffellang \
+      --binary \
+      --mpc-backend honeybadger \
+      --mpc-curve bls12-381 \
+      --output /build/docker/standing-concurrency/target/multi-client-io-honeybadger.stflb \
+      /build/docker/standing-concurrency/programs/multi_client_io.stfl && \
+    /build/target/release/stoffellang \
+      --binary \
+      --mpc-backend honeybadger \
+      --mpc-curve bls12-381 \
+      --output /build/docker/standing-concurrency/target/output-only-client-io-honeybadger.stflb \
+      /build/docker/standing-concurrency/programs/output_only_client_io.stfl && \
+    /build/target/release/stoffellang \
+      --binary \
+      --mpc-backend avss \
+      --mpc-curve bls12-381 \
+      --output /build/docker/standing-concurrency/target/single-client-io-avss.stflb \
+      /build/docker/standing-concurrency/programs/single_client_io.stfl && \
+    /build/target/release/stoffellang \
+      --binary \
+      --mpc-backend avss \
+      --mpc-curve bls12-381 \
+      --output /build/docker/standing-concurrency/target/multi-client-io-avss.stflb \
+      /build/docker/standing-concurrency/programs/multi_client_io.stfl
 
 # ============================================================================
-# Stage 2: Runtime
+# Stage 2: Credential-free runtime base
 # ============================================================================
-FROM debian:bookworm-slim AS runtime
+FROM debian:bookworm-slim AS runtime-base
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
@@ -97,9 +168,13 @@ COPY --from=builder /build/crates/stoffel-vm/src/tests/binaries/threshold_bls_bl
 COPY --from=builder /build/crates/stoffel-vm/src/tests/binaries/threshold_ecdsa_secp256k1.stflb /app/programs/threshold_ecdsa_secp256k1.stflb
 COPY --from=builder /build/crates/stoffel-vm/src/tests/binaries/threshold_ecdsa_p256.stflb /app/programs/threshold_ecdsa_p256.stflb
 COPY --from=builder /build/crates/stoffel-lang/examples/mpc_aes128_circuit/target/mpc_aes128_circuit.stflb /app/programs/mpc_aes128_circuit.stflb
-
-# Copy pre-generated certificates for coordinator identity
-COPY ids /app/ids
+COPY --from=builder /build/docker/standing-concurrency/target/single-client-io-honeybadger.stflb /app/standing-fixtures/single-client-io-honeybadger.stflb
+COPY --from=builder /build/docker/standing-concurrency/target/slow-client-io-honeybadger.stflb /app/standing-fixtures/slow-client-io-honeybadger.stflb
+COPY --from=builder /build/docker/standing-concurrency/target/cpu-fairness-honeybadger.stflb /app/standing-fixtures/cpu-fairness-honeybadger.stflb
+COPY --from=builder /build/docker/standing-concurrency/target/multi-client-io-honeybadger.stflb /app/standing-fixtures/multi-client-io-honeybadger.stflb
+COPY --from=builder /build/docker/standing-concurrency/target/output-only-client-io-honeybadger.stflb /app/standing-fixtures/output-only-client-io-honeybadger.stflb
+COPY --from=builder /build/docker/standing-concurrency/target/single-client-io-avss.stflb /app/standing-fixtures/single-client-io-avss.stflb
+COPY --from=builder /build/docker/standing-concurrency/target/multi-client-io-avss.stflb /app/standing-fixtures/multi-client-io-avss.stflb
 
 # Copy the entrypoint script
 COPY docker/entrypoint.sh /app/entrypoint.sh
@@ -132,3 +207,25 @@ ENV STOFFEL_STUN_SERVERS=""
 EXPOSE 9000 10000 16180
 
 ENTRYPOINT ["/app/entrypoint.sh"]
+
+# ============================================================================
+# Stage 3: Standing runtime (public admission rosters only)
+# ============================================================================
+# Private identities are supplied per principal as read-only Compose secrets.
+# Do not COPY the full ids directory into this target: a faulty standing party
+# must not be able to authenticate as another party or client.
+FROM runtime-base AS standing-runtime
+
+RUN mkdir -p /app/ids/nodes /app/ids/clients
+COPY ids/server_cert.crt /app/ids/server_cert.crt
+COPY ids/nodes/*.crt /app/ids/nodes/
+COPY ids/clients/*.crt /app/ids/clients/
+
+# ============================================================================
+# Stage 4: Legacy runtime
+# ============================================================================
+# Preserve the default image contract for existing non-standing Compose stacks.
+# New deployments should mount per-principal private credentials at runtime.
+FROM runtime-base AS runtime
+
+COPY ids /app/ids

@@ -414,6 +414,11 @@ async fn test_leader_bootnode_matrix_average_fixed_point() {
         let open_message_router = open_message_router.clone();
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
+                let Some(raw_msg) =
+                    crate::tests::test_utils::decode_one_shot_party_message(instance_id, &raw_msg)
+                else {
+                    continue;
+                };
                 match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {

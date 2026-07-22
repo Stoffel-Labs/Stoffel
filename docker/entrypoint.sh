@@ -10,6 +10,30 @@ validate_env() {
         echo "Bootnode and parties require authenticated discovery registration."
         exit 2
     fi
+
+    local needs_execution_id=false
+    case "${STOFFEL_ROLE:-}" in
+        leader|party)
+            needs_execution_id=true
+            ;;
+        client)
+            if [ -n "${STOFFEL_COORD_ADDR:-}" ]; then
+                needs_execution_id=true
+            fi
+            ;;
+    esac
+
+    if [ "$needs_execution_id" = true ]; then
+        if [ -z "${STOFFEL_EXECUTION_ID:-}" ]; then
+            echo "ERROR: STOFFEL_EXECUTION_ID is required for ${STOFFEL_ROLE} mode."
+            exit 2
+        fi
+        if ! [[ "${STOFFEL_EXECUTION_ID}" =~ ^[0-9a-fA-F]{64}$ ]] \
+            || [[ "${STOFFEL_EXECUTION_ID}" =~ ^0{64}$ ]]; then
+            echo "ERROR: STOFFEL_EXECUTION_ID must be a nonzero 64-character hexadecimal value."
+            exit 2
+        fi
+    fi
 }
 
 validate_env
@@ -41,10 +65,10 @@ echo "Threshold: ${STOFFEL_THRESHOLD}"
 echo "Program: ${STOFFEL_PROGRAM}"
 echo "Entry: ${STOFFEL_ENTRY}"
 echo "Coordinator: ${STOFFEL_COORD_ADDR:-N/A}"
+echo "Execution ID: ${STOFFEL_EXECUTION_ID:-N/A}"
 echo "Preproc Store: ${STOFFEL_PREPROC_STORE:-none}"
 echo "Local Store: ${STOFFEL_LOCAL_STORE:-none}"
 echo "Profiler: ${STOFFEL_PROFILE:-none}"
-echo "Upload Program Bytes: ${STOFFEL_UPLOAD_PROGRAM_BYTES:-true}"
 echo "Auth Token: $( [ -n "${STOFFEL_AUTH_TOKEN:-}" ] && echo "configured" || echo "not set" )"
 echo "=========================================="
 
@@ -123,6 +147,7 @@ build_command() {
         fi
         if [ -n "${STOFFEL_COORD_ADDR:-}" ]; then
             cmd="${cmd} --off-chain-coord ${STOFFEL_COORD_ADDR}"
+            cmd="${cmd} --execution-id ${STOFFEL_EXECUTION_ID}"
             cmd="${cmd} --cert ${STOFFEL_CERT}"
             cmd="${cmd} --key ${STOFFEL_KEY}"
             cmd="${cmd} --timestamp ${STOFFEL_TIMESTAMP:-0}"
@@ -142,10 +167,6 @@ build_command() {
 
     # Add program path and entry function for non-client modes
     cmd="${cmd} ${STOFFEL_PROGRAM} ${STOFFEL_ENTRY}"
-
-    if [ "${STOFFEL_UPLOAD_PROGRAM_BYTES:-true}" = "false" ]; then
-        cmd="${cmd} --no-program-upload"
-    fi
 
     if [ "${STOFFEL_ROLE}" = "leader" ]; then
         # Leader mode: runs bootnode + party 0
@@ -171,6 +192,10 @@ build_command() {
         cmd="${cmd} --threshold ${STOFFEL_THRESHOLD}"
         BIND_PORT=$(echo "${STOFFEL_BIND_ADDR}" | awk -F: '{print $NF}')
         cmd="${cmd} --advertise ${STOFFEL_ADVERTISE_IP}:${BIND_PORT}"
+    fi
+
+    if [ "${STOFFEL_ROLE}" = "leader" ] || [ "${STOFFEL_ROLE}" = "party" ]; then
+        cmd="${cmd} --execution-id ${STOFFEL_EXECUTION_ID}"
     fi
 
     # Coordinator flags (for leader, party, and bootnode modes)

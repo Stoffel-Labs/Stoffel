@@ -1,14 +1,17 @@
-use super::AvssMpcEngine;
+use super::{AvssExecutionNetwork, AvssMpcEngine};
 use crate::net::curve::SupportedMpcField;
 use crate::storage::preproc::{
-    self, PoolAvailability, PreprocBlob, PreprocKeyScope, PreprocTargets, TopUpReport,
+    self, apply_standing_preproc_plan, standing_preproc_snapshot, OwnedPreprocBundle,
+    PoolAvailability, PreprocBlob, PreprocKeyScope, PreprocTargets,
+};
+pub use crate::storage::preproc::{
+    agree_standing_preproc_plan, StandingPreprocAction, StandingPreprocPlan,
+    StandingPreprocSnapshot,
 };
 use ark_ec::CurveGroup;
 use ark_std::rand::SeedableRng;
-use stoffelmpc_mpc::avss_mpc::triple_gen::BeaverTriple;
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
 use stoffelmpc_mpc::common::PreprocessingMPCProtocol;
-use stoffelnet::transports::quic::QuicNetworkManager;
 use tracing::info;
 
 fn ensure_decoded_count(label: &str, actual: usize, expected: u32) -> Result<(), String> {
@@ -51,8 +54,8 @@ where
             PreprocessingMPCProtocol::<
                 F,
                 FeldmanShamirShare<F, G>,
-                QuicNetworkManager,
-            >::run_preprocessing(&mut *node_clone, self.net.clone(), &mut rng)
+                AvssExecutionNetwork,
+            >::run_preprocessing(&mut *node_clone, self.protocol_net.clone(), &mut rng)
             .await
             .map_err(|e| format!("AVSS preprocessing failed: {:?}", e))?;
         }
@@ -80,6 +83,15 @@ where
                     .to_owned(),
             ),
         };
+        if self.is_standing()
+            && !self
+                .use_program_preproc_reservoir
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(
+                "standing execution preprocessing is owned in memory, not persisted".to_owned(),
+            );
+        }
         let scope = PreprocKeyScope::new(
             hash,
             field_kind,
@@ -90,7 +102,12 @@ where
         Ok((store, hash, scope))
     }
 
-    async fn current_preproc_targets(&self) -> Result<PreprocTargets, String> {
+    /// Exact preprocessing counts configured for this standing engine.
+    ///
+    /// Callers include these targets in the authenticated party proposal so
+    /// mismatched configurations are rejected before an interactive
+    /// preprocessing protocol starts.
+    pub async fn standing_preproc_targets(&self) -> Result<PreprocTargets, String> {
         let node = self.clone_avss_node().await;
         Ok(PreprocTargets {
             beaver: preproc::u32_index(node.params.n_triples as u64, "AVSS beaver target")?,
@@ -100,45 +117,143 @@ where
         })
     }
 
-    async fn preprocess_standing(&self) -> Result<(), String> {
+    /// Install a destructively allocated reservoir bundle into this
+    /// execution's private in-memory preprocessing pool.
+    pub async fn activate_preallocated_standing(
+        &self,
+        bundle: OwnedPreprocBundle,
+    ) -> Result<(), String> {
+        if !self.is_standing() {
+            return Err("preallocated AVSS activation requires standing mode".to_owned());
+        }
+        if self
+            .use_program_preproc_reservoir
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err("an AVSS program reservoir cannot be activated as an execution".to_owned());
+        }
+        let targets = self.standing_preproc_targets().await?;
+        let availability = bundle.availability();
+        if availability != targets {
+            return Err(format!(
+                "preallocated AVSS bundle does not match target: available={availability:?}, target={targets:?}"
+            ));
+        }
+        self.activate_preproc_bundle(bundle).await
+    }
+
+    async fn activate_preproc_bundle(&self, bundle: OwnedPreprocBundle) -> Result<(), String> {
+        let triples = bundle
+            .beaver
+            .map(|item| {
+                let mut decoded =
+                    preproc::deserialize_avss_triples::<F, G>(&item.data, item.item_size, 0)?;
+                ensure_decoded_count("preallocated AVSS triples", decoded.len(), item.count)?;
+                Self::normalize_multiply_triples(&mut decoded);
+                Ok::<_, String>(decoded)
+            })
+            .transpose()?;
+        let random = bundle
+            .random
+            .map(|item| {
+                let decoded =
+                    preproc::deserialize_feldman_shares::<F, G>(&item.data, item.item_size, 0)?;
+                ensure_decoded_count("preallocated AVSS random shares", decoded.len(), item.count)?;
+                Ok::<_, String>(decoded)
+            })
+            .transpose()?;
+        if bundle.prand_bit.is_some() || bundle.prand_int.is_some() {
+            return Err("AVSS bundle contains HoneyBadger-only material".to_owned());
+        }
+        self.clone_avss_node()
+            .await
+            .preprocessing_material
+            .lock()
+            .await
+            .add(triples, random);
+        self.ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub async fn standing_preproc_snapshot(&self) -> Result<StandingPreprocSnapshot, String> {
         let (store, _hash, scope) = self.preproc_scope().await?;
-        let targets = self.current_preproc_targets().await?;
-        let availability = store.scope_availability(&scope).await?;
-        if availability.beaver < targets.beaver || availability.random < targets.random {
-            self.top_up_to(targets).await?;
+        standing_preproc_snapshot(store.as_ref(), scope)
+            .await
+            .map_err(String::from)
+    }
+
+    pub async fn install_standing_preproc_plan(
+        &self,
+        snapshots: Vec<StandingPreprocSnapshot>,
+        fresh_generation_id: [u8; 32],
+    ) -> Result<StandingPreprocPlan, String> {
+        if snapshots.len() != self.topology.n_parties() {
+            return Err(format!(
+                "standing AVSS preprocessing agreement received {} inventories, expected {}",
+                snapshots.len(),
+                self.topology.n_parties()
+            ));
+        }
+        let local = self.standing_preproc_snapshot().await?;
+        if snapshots.get(self.topology.party_id()) != Some(&local) {
+            return Err(format!(
+                "standing AVSS local inventory changed during agreement: local={local:?}, exchanged={:?}",
+                snapshots.get(self.topology.party_id())
+            ));
+        }
+        let targets = self.standing_preproc_targets().await?;
+        let plan = agree_standing_preproc_plan(targets, &snapshots, fresh_generation_id)?;
+        *self.standing_preproc_plan.lock().await = Some(plan);
+        Ok(plan)
+    }
+
+    async fn preprocess_standing(&self) -> Result<(), String> {
+        let targets = self.standing_preproc_targets().await?;
+        let plan = if self.topology.n_parties() == 1 {
+            agree_standing_preproc_plan(
+                targets,
+                &[self.standing_preproc_snapshot().await?],
+                crate::net::session::ExecutionId::new().into_bytes(),
+            )?
+        } else {
+            self.standing_preproc_plan.lock().await.take().ok_or_else(|| {
+                "multi-party standing AVSS preprocessing requires a party-agreed inventory plan before protocol startup"
+                    .to_owned()
+            })?
+        };
+        let (store, _hash, scope) = self.preproc_scope().await?;
+        let final_snapshot = apply_standing_preproc_plan(store.as_ref(), scope, plan, |needed| {
+            self.top_up_exact(needed)
+        })
+        .await?;
+        let availability = final_snapshot.availability();
+        if final_snapshot.generation_id != Some(plan.generation_id) || !availability.covers(targets)
+        {
+            return Err(format!(
+                "standing AVSS preprocessing did not reach agreed plan: plan={plan:?}, final={final_snapshot:?}"
+            ));
         }
         Ok(())
     }
 
-    pub async fn top_up_to(&self, targets: PreprocTargets) -> Result<TopUpReport, String> {
-        let (store, _hash, scope) = self.preproc_scope().await?;
-        let availability = store.scope_availability(&scope).await?;
-        let needed = PoolAvailability {
-            beaver: targets.beaver.saturating_sub(availability.beaver),
-            random: targets.random.saturating_sub(availability.random),
-            prand_bit: 0,
-            prand_int: 0,
-        };
+    async fn top_up_exact(&self, needed: PoolAvailability) -> Result<(), String> {
         if needed == PoolAvailability::default() {
-            return Ok(TopUpReport {
-                generated: PoolAvailability::default(),
-                skipped: true,
-            });
+            return Ok(());
         }
+        let (store, _hash, scope) = self.preproc_scope().await?;
 
         let mut node_clone = self.clone_avss_node().await;
         node_clone.params.n_triples = needed.beaver as usize;
         node_clone.params.n_v_random_shares = needed.random as usize;
         let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-        PreprocessingMPCProtocol::<F, FeldmanShamirShare<F, G>, QuicNetworkManager>::run_preprocessing(
+        PreprocessingMPCProtocol::<F, FeldmanShamirShare<F, G>, AvssExecutionNetwork>::run_preprocessing(
             &mut *node_clone,
-            self.net.clone(),
+            self.protocol_net.clone(),
             &mut rng,
         )
         .await
         .map_err(|e| format!("AVSS top-up preprocessing failed: {:?}", e))?;
 
-        let mut generated = PoolAvailability::default();
         let mut to_append = Vec::new();
         {
             let mut prep = node_clone.preprocessing_material.lock().await;
@@ -146,16 +261,16 @@ where
             if n_bt > 0 {
                 let items = prep.take_triples(n_bt).map_err(|e| format!("{e:?}"))?;
                 let (data, item_size) = preproc::serialize_avss_triples::<F, G>(&items)?;
-                generated.beaver = preproc::u32_index(items.len() as u64, "generated AVSS beaver")?;
-                to_append.push((scope.beaver_triple(), item_size, generated.beaver, data));
+                let added = preproc::u32_index(items.len() as u64, "generated AVSS beaver")?;
+                to_append.push((scope.beaver_triple(), item_size, added, data));
             }
             if n_rs > 0 {
                 let items = prep
                     .take_v_random_shares(n_rs)
                     .map_err(|e| format!("{e:?}"))?;
                 let (data, item_size) = preproc::serialize_feldman_shares::<F, G>(&items)?;
-                generated.random = preproc::u32_index(items.len() as u64, "generated AVSS random")?;
-                to_append.push((scope.random_share(), item_size, generated.random, data));
+                let added = preproc::u32_index(items.len() as u64, "generated AVSS random")?;
+                to_append.push((scope.random_share(), item_size, added, data));
             }
         }
 
@@ -163,10 +278,7 @@ where
             store.append_items(&key, item_size, added, &data).await?;
         }
 
-        Ok(TopUpReport {
-            generated,
-            skipped: false,
-        })
+        Ok(())
     }
 
     /// Try to load AVSS preprocessing material from the persistent store.
@@ -174,10 +286,9 @@ where
         let store = self.preproc_store.read().await.clone();
         let config = *self.preproc_config.read().await;
         let (store, (hash, field_kind)) = match (store, config) {
-            (Some(s), Some(c)) => (s, c),
+            (Some(store), Some(config)) => (store, config),
             _ => return Ok(false),
         };
-
         let scope = PreprocKeyScope::new(
             hash,
             field_kind,
@@ -185,63 +296,13 @@ where
             self.topology.threshold(),
             self.local_identity,
         );
-        let base = scope.beaver_triple();
-        let k_rs = scope.random_share();
-        let (triples, randoms) = tokio::try_join!(store.load(&base), store.load(&k_rs),)?;
-
-        if triples.is_none() && randoms.is_none() {
+        let requested = store.scope_availability(&scope).await?;
+        if requested == PoolAvailability::default() {
             return Ok(false);
         }
 
-        let node = self.clone_avss_node().await;
-        let mut loaded_triples = 0;
-        let mut loaded_randoms = 0;
-
-        if let Some(blob) = triples {
-            let available = blob.meta.available();
-            if available > 0 {
-                let decoded = preproc::deserialize_avss_triples::<F, G>(
-                    blob.unconsumed_data()?,
-                    blob.meta.item_size,
-                    0,
-                )?;
-                ensure_decoded_count("AVSS triples", decoded.len(), available)?;
-                store
-                    .reserve_at(&base, blob.meta.consumed, available)
-                    .await?;
-                store.delete(&base).await?;
-                loaded_triples = available;
-                node.preprocessing_material
-                    .lock()
-                    .await
-                    .add(Some(decoded), None);
-            }
-        }
-        if let Some(blob) = randoms {
-            let available = blob.meta.available();
-            if available > 0 {
-                let decoded = preproc::deserialize_feldman_shares::<F, G>(
-                    blob.unconsumed_data()?,
-                    blob.meta.item_size,
-                    0,
-                )?;
-                ensure_decoded_count("AVSS random shares", decoded.len(), available)?;
-                store
-                    .reserve_at(&k_rs, blob.meta.consumed, available)
-                    .await?;
-                store.delete(&k_rs).await?;
-                loaded_randoms = available;
-                node.preprocessing_material
-                    .lock()
-                    .await
-                    .add(None, Some(decoded));
-            }
-        }
-
-        if loaded_triples == 0 && loaded_randoms == 0 {
-            return Ok(false);
-        }
-
+        let bundle = store.take_bundle_from_reservoir(&scope, requested).await?;
+        self.activate_preproc_bundle(bundle).await?;
         info!(
             "Loaded AVSS preprocessing material from store for program {}",
             hex::encode(hash)
@@ -312,71 +373,24 @@ where
         &self,
         num_shares: usize,
     ) -> Result<Vec<FeldmanShamirShare<F, G>>, String> {
-        let (store, _hash, scope) = self.preproc_scope().await?;
-        let key = scope.random_share();
-        let meta = store
-            .meta(&key)
-            .await?
-            .ok_or_else(|| "no standing AVSS random shares stored".to_owned())?;
-        let count = preproc::u32_index(num_shares as u64, "standing AVSS random share count")?;
-        if meta.available() < count {
-            return Err(format!(
-                "InsufficientPreproc: AVSS random shares need {}, available {}",
-                count,
-                meta.available()
-            ));
-        }
-        let start = meta.consumed;
-        store.reserve_at(&key, start, count).await?;
-        let blob = store
-            .load(&key)
-            .await?
-            .ok_or("no standing AVSS random shares stored")?;
-        let decoded =
-            preproc::deserialize_feldman_shares::<F, G>(&blob.data, blob.meta.item_size, start)?;
-        if decoded.len() < num_shares {
-            return Err(format!(
-                "standing AVSS random decode returned {} items, expected {}",
-                decoded.len(),
-                num_shares
-            ));
-        }
-        Ok(decoded.into_iter().take(num_shares).collect())
+        let node = self.clone_avss_node().await;
+        let result = node
+            .preprocessing_material
+            .lock()
+            .await
+            .take_v_random_shares(num_shares)
+            .map_err(|error| format!("not enough AVSS random shares: {error:?}"));
+        result
     }
 
-    pub(super) async fn reserve_beaver_triples(
+    /// Reserve the correlated masks distributed to one external input client.
+    /// Standing executions remove these shares from LMDB atomically before
+    /// handing them to the input server; one-shot executions consume the
+    /// engine's in-memory preprocessing material.
+    pub async fn reserve_client_input_masks(
         &self,
-        num_triples: usize,
-    ) -> Result<Vec<BeaverTriple<F, G>>, String> {
-        let (store, _hash, scope) = self.preproc_scope().await?;
-        let key = scope.beaver_triple();
-        let meta = store
-            .meta(&key)
-            .await?
-            .ok_or_else(|| "no standing AVSS Beaver triples stored".to_owned())?;
-        let count = preproc::u32_index(num_triples as u64, "standing AVSS Beaver triple count")?;
-        if meta.available() < count {
-            return Err(format!(
-                "InsufficientPreproc: AVSS Beaver triples need {}, available {}",
-                count,
-                meta.available()
-            ));
-        }
-        let start = meta.consumed;
-        store.reserve_at(&key, start, count).await?;
-        let blob = store
-            .load(&key)
-            .await?
-            .ok_or("no standing AVSS Beaver triples stored")?;
-        let decoded =
-            preproc::deserialize_avss_triples::<F, G>(&blob.data, blob.meta.item_size, start)?;
-        if decoded.len() < num_triples {
-            return Err(format!(
-                "standing AVSS Beaver triple decode returned {} items, expected {}",
-                decoded.len(),
-                num_triples
-            ));
-        }
-        Ok(decoded.into_iter().take(num_triples).collect())
+        num_shares: usize,
+    ) -> Result<Vec<FeldmanShamirShare<F, G>>, String> {
+        self.reserve_random_shares(num_shares).await
     }
 }

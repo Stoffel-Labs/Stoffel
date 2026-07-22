@@ -1,4 +1,4 @@
-use super::AvssMpcEngine;
+use super::{AvssExecutionNetwork, AvssMpcEngine};
 use crate::net::curve::{MpcCurveConfig, SupportedMpcField};
 use crate::net::mpc_engine::{
     DurableIdentityDigest, MpcCapabilities, MpcEngine, MpcEngineClientOps, MpcEngineClientOutput,
@@ -17,7 +17,6 @@ use stoffelmpc_mpc::avss_mpc::{AvssMPCNode as AvssMpcNode, AvssSessionId};
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
 use stoffelmpc_mpc::common::MPCProtocol;
-use stoffelnet::transports::quic::QuicNetworkManager;
 use tokio::sync::Mutex;
 use tracing::info;
 
@@ -95,7 +94,7 @@ where
 
     pub(super) async fn run_multiply_round(
         avss_node: Arc<Mutex<AvssMpcNode<F, Avid<AvssSessionId>, G>>>,
-        net: Arc<QuicNetworkManager>,
+        net: Arc<AvssExecutionNetwork>,
         left_share_bytes: Vec<u8>,
         right_share_bytes: Vec<u8>,
     ) -> Result<ShareData, String> {
@@ -121,7 +120,7 @@ where
 
     pub(super) async fn run_batch_multiply_round(
         avss_node: Arc<Mutex<AvssMpcNode<F, Avid<AvssSessionId>, G>>>,
-        net: Arc<QuicNetworkManager>,
+        net: Arc<AvssExecutionNetwork>,
         pairs: Vec<(Vec<u8>, Vec<u8>)>,
     ) -> Result<Vec<ShareData>, String> {
         if pairs.is_empty() {
@@ -158,7 +157,8 @@ where
         if self.is_standing() {
             self.run_standing_batch_multiply_round(pairs).await
         } else {
-            Self::run_batch_multiply_round(self.avss_node.clone(), self.net.clone(), pairs).await
+            Self::run_batch_multiply_round(self.avss_node.clone(), self.protocol_net.clone(), pairs)
+                .await
         }
     }
 
@@ -169,16 +169,17 @@ where
     ) -> Result<ShareData, String> {
         let left_share = Self::decode_feldman_share(&left_share_bytes)?;
         let right_share = Self::decode_feldman_share(&right_share_bytes)?;
-        let mut triples = self.reserve_beaver_triples(1).await?;
-        Self::normalize_multiply_triples(&mut triples);
-
         let mut node = self.clone_avss_node().await;
-        node.preprocessing_material
-            .lock()
-            .await
-            .add(Some(triples), None);
+        let available = node.preprocessing_material.lock().await.len().0;
+        if available < 1 {
+            return Err("not enough AVSS Beaver triples: need 1, available 0".to_owned());
+        }
         let result = node
-            .mul(vec![left_share], vec![right_share], self.net.clone())
+            .mul(
+                vec![left_share],
+                vec![right_share],
+                self.protocol_net.clone(),
+            )
             .await
             .map_err(|e| format!("Multiplication failed: {:?}", e))?;
 
@@ -202,15 +203,15 @@ where
             left_shares.push(Self::decode_feldman_share(&left)?);
             right_shares.push(Self::decode_feldman_share(&right)?);
         }
-        let mut triples = self.reserve_beaver_triples(left_shares.len()).await?;
-        Self::normalize_multiply_triples(&mut triples);
-
         let mut node = self.clone_avss_node().await;
-        node.preprocessing_material
-            .lock()
-            .await
-            .add(Some(triples), None);
-        node.mul(left_shares, right_shares, self.net.clone())
+        let required = left_shares.len();
+        let available = node.preprocessing_material.lock().await.len().0;
+        if available < required {
+            return Err(format!(
+                "not enough AVSS Beaver triples: need {required}, available {available}"
+            ));
+        }
+        node.mul(left_shares, right_shares, self.protocol_net.clone())
             .await
             .map_err(|e| format!("Batch multiplication failed: {:?}", e))?
             .iter()
@@ -220,7 +221,7 @@ where
 
     async fn ensure_multiply_preprocessing_ids(
         node: &mut AvssMpcNode<F, Avid<AvssSessionId>, G>,
-        net: Arc<QuicNetworkManager>,
+        net: Arc<AvssExecutionNetwork>,
     ) -> Result<(), String> {
         let mut triple_count = {
             let store = node.preprocessing_material.lock().await;
@@ -228,7 +229,7 @@ where
         };
 
         if triple_count == 0 {
-            MPCProtocol::<F, FeldmanShamirShare<F, G>, QuicNetworkManager>::rand(node, net)
+            MPCProtocol::<F, FeldmanShamirShare<F, G>, AvssExecutionNetwork>::rand(node, net)
                 .await
                 .map_err(|e| format!("preprocess multiplication material failed: {:?}", e))?;
             triple_count = {
@@ -255,7 +256,7 @@ where
         Ok(())
     }
 
-    fn normalize_multiply_triples(triples: &mut [BeaverTriple<F, G>]) {
+    pub(super) fn normalize_multiply_triples(triples: &mut [BeaverTriple<F, G>]) {
         for triple in triples {
             // mpc-protocols builds the triple c-share with a 0-based party id,
             // while AVSS/Feldman shares are evaluated at 1-based ids.
@@ -269,7 +270,7 @@ where
         payload: Vec<u8>,
     ) -> Result<(), String> {
         crate::net::broadcast::broadcast_to_other_parties(
-            self.net.as_ref(),
+            self.protocol_net.as_ref(),
             self.topology.n_parties(),
             self.topology.party_id(),
             &payload,

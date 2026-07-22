@@ -1,6 +1,6 @@
 use super::HoneyBadgerMpcEngine;
 use crate::net::curve::SupportedMpcField;
-use crate::net::mpc_engine::MpcEngine;
+use crate::net::mpc_engine::{MpcEngine, MpcExponentGroup};
 use crate::net::open_registry::{ExpOpenRegistryKind, ExpOpenRequest};
 use ark_ec::{CurveGroup, PrimeGroup};
 use ark_poly::{EvaluationDomain, GeneralEvaluationDomain};
@@ -126,7 +126,7 @@ where
             }
 
             let result = node
-                .mul_fixed(x, y, self.net.clone())
+                .mul_fixed(x, y, self.protocol_net.clone())
                 .await
                 .map_err(|e| format!("MPC fixed-point multiply failed: {:?}", e))?;
             return Self::encode_share(result.value()).map(|v| ShareData::Opaque(v.into()));
@@ -178,7 +178,11 @@ where
                     );
                 }
                 let result_shares = node
-                    .mul(vec![left_share], vec![right_share], self.net.clone())
+                    .mul(
+                        vec![left_share],
+                        vec![right_share],
+                        self.protocol_net.clone(),
+                    )
                     .await
                     .map_err(|e| format!("MPC multiplication failed: {:?}", e))?;
                 if trace {
@@ -226,7 +230,7 @@ where
             _ => {
                 return Err(
                     "fixed-point division requires a secret fix64 (SecretFixedPoint) share".into(),
-                )
+                );
             }
         };
         if divisor_scaled <= 0 {
@@ -265,7 +269,7 @@ where
             node.params.n_random_shares = node.params.n_random_shares.saturating_add(pool);
         }
         let result = node
-            .div_with_const_fixed(x, y, self.net.clone())
+            .div_with_const_fixed(x, y, self.protocol_net.clone())
             .await
             .map_err(|e| format!("MPC fixed-point division failed: {:?}", e))?;
 
@@ -346,7 +350,7 @@ where
                     }
 
                     let result_shares = node
-                        .mul(left_shares, right_shares, self.net.clone())
+                        .mul(left_shares, right_shares, self.protocol_net.clone())
                         .await
                         .map_err(|e| format!("MPC batch multiplication failed: {:?}", e))?;
                     if trace {
@@ -568,9 +572,174 @@ where
             .await
     }
 
+    pub async fn batch_open_shares_as_fields_async_impl(
+        &self,
+        ty: ShareType,
+        shares: &[Vec<u8>],
+    ) -> Result<Vec<Vec<u8>>, String> {
+        if shares.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let type_key = match ty {
+            ShareType::SecretInt { bit_length } => format!("hb-batch-field-int-{bit_length}"),
+            ShareType::SecretUInt { bit_length } => format!("hb-batch-field-uint-{bit_length}"),
+            ShareType::SecretFixedPoint { precision } => {
+                format!("hb-batch-field-fixed-{}-{}", precision.k(), precision.f())
+            }
+        };
+        let seq = self.open_registry().insert_batch_next(
+            &type_key,
+            self.topology.party_id(),
+            shares.to_vec(),
+        )?;
+        let wire_message = crate::net::open_registry::encode_batch_share_wire_message(
+            self.current_instance_id(),
+            seq,
+            &type_key,
+            self.topology.party_id(),
+            shares,
+        )?;
+        self.broadcast_open_registry_payload(wire_message).await?;
+
+        let required = Self::robust_open_required_contributions(self.topology.threshold());
+        let (_party_ids, collected) = self
+            .open_registry()
+            .batch_collect_at_async(
+                self.topology.party_id(),
+                type_key,
+                seq,
+                shares.to_vec(),
+                required,
+            )
+            .await?;
+        let n = self.topology.n_parties();
+        let t = self.topology.threshold();
+        collected
+            .iter()
+            .enumerate()
+            .map(|(position, contributions)| {
+                let decoded = contributions
+                    .iter()
+                    .map(|bytes| Self::decode_share(bytes))
+                    .collect::<Result<Vec<RobustShare<F>>, _>>()?;
+                let (_degree, secret) =
+                    RobustShare::recover_secret(&decoded, n, t).map_err(|error| {
+                        format!("batch field recover_secret pos {position}: {error:?}")
+                    })?;
+                let mut encoded = Vec::new();
+                secret
+                    .serialize_compressed(&mut encoded)
+                    .map_err(|error| format!("serialize batch field pos {position}: {error}"))?;
+                Ok(encoded)
+            })
+            .collect()
+    }
+
+    pub async fn batch_open_shares_in_exp_group_custom_async_impl(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[Vec<u8>],
+        generators: &[Vec<u8>],
+    ) -> Result<Vec<Vec<u8>>, String> {
+        if shares.len() != generators.len() {
+            return Err(format!(
+                "batch exponent share/generator length mismatch: {} != {}",
+                shares.len(),
+                generators.len()
+            ));
+        }
+        if shares.is_empty() {
+            return Ok(Vec::new());
+        }
+        if group != MpcExponentGroup::native_for_curve(self.curve_config()) {
+            return Err(group.unsupported_error(self.protocol_name()));
+        }
+
+        let mut partial_points = Vec::with_capacity(shares.len());
+        for (position, (share_bytes, generator_bytes)) in shares.iter().zip(generators).enumerate()
+        {
+            let share = Self::decode_share(share_bytes)?;
+            if share.id != self.topology.party_id() {
+                return Err(format!(
+                    "batch exponent share {position} has party id {}, expected {}",
+                    share.id,
+                    self.topology.party_id()
+                ));
+            }
+            let generator =
+                G::deserialize_compressed(generator_bytes.as_slice()).map_err(|error| {
+                    format!("deserialize batch exponent generator {position}: {error}")
+                })?;
+            let mut encoded = Vec::new();
+            (generator * share.share[0])
+                .into_affine()
+                .serialize_compressed(&mut encoded)
+                .map_err(|error| {
+                    format!("serialize batch exponent partial point {position}: {error}")
+                })?;
+            partial_points.push(encoded);
+        }
+
+        let share_type = match ty {
+            ShareType::SecretInt { bit_length } => format!("int-{bit_length}"),
+            ShareType::SecretUInt { bit_length } => format!("uint-{bit_length}"),
+            ShareType::SecretFixedPoint { precision } => {
+                format!("fixed-{}-{}", precision.k(), precision.f())
+            }
+        };
+        let type_key = format!("hb-batch-exp-{}-{share_type}", group.as_str());
+        let seq = self.open_registry().insert_batch_next(
+            &type_key,
+            self.topology.party_id(),
+            partial_points.clone(),
+        )?;
+        let wire_message = crate::net::open_registry::encode_batch_share_wire_message(
+            self.current_instance_id(),
+            seq,
+            &type_key,
+            self.topology.party_id(),
+            &partial_points,
+        )?;
+        self.broadcast_open_registry_payload(wire_message).await?;
+
+        let required = 2 * self.topology.threshold() + 1;
+        let (party_ids, collected) = self
+            .open_registry()
+            .batch_collect_at_async(
+                self.topology.party_id(),
+                type_key,
+                seq,
+                partial_points,
+                required,
+            )
+            .await?;
+        let domain = GeneralEvaluationDomain::<F>::new(self.topology.n_parties())
+            .ok_or_else(|| "No suitable FFT domain".to_string())?;
+        collected
+            .into_iter()
+            .enumerate()
+            .map(|(position, contributions)| {
+                let partials = party_ids
+                    .iter()
+                    .copied()
+                    .zip(contributions)
+                    .collect::<Vec<_>>();
+                crate::net::group_interpolation::interpolate_compressed_group_points::<F, G, _>(
+                    &partials,
+                    |id| Ok(domain.element(id)),
+                    &format!("deserialize batch exponent partial point {position}"),
+                    &format!("zero denominator in batch exponent position {position}"),
+                    &format!("serialize batch exponent result {position}"),
+                )
+            })
+            .collect()
+    }
+
     async fn broadcast_open_exp_payload(&self, payload: Vec<u8>) -> Result<(), String> {
         crate::net::broadcast::broadcast_to_other_parties(
-            self.net.as_ref(),
+            self.protocol_net.as_ref(),
             self.topology.n_parties(),
             self.topology.party_id(),
             &payload,
@@ -588,7 +757,7 @@ where
         payload: Vec<u8>,
     ) -> Result<(), String> {
         crate::net::broadcast::broadcast_to_other_parties(
-            self.net.as_ref(),
+            self.protocol_net.as_ref(),
             self.topology.n_parties(),
             self.topology.party_id(),
             &payload,

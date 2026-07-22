@@ -4,6 +4,7 @@
 
 use crate::net::backend::MpcBackendKind;
 use std::fmt;
+use stoffel_vm_types::compiled_binary::MpcCurve;
 use stoffel_vm_types::core_types::{
     ClearShareValue, FixedPointPrecision, ShareType, Value, BOOLEAN_SECRET_INT_BITS, F64,
 };
@@ -122,6 +123,19 @@ pub enum MpcCurveConfig {
     Secp256k1,
     /// NIST P-256, also known as secp256r1.
     Secp256r1,
+}
+
+impl From<MpcCurve> for MpcCurveConfig {
+    fn from(curve: MpcCurve) -> Self {
+        match curve {
+            MpcCurve::Bls12_381 => Self::Bls12_381,
+            MpcCurve::Bn254 => Self::Bn254,
+            MpcCurve::Curve25519 => Self::Curve25519,
+            MpcCurve::Ed25519 => Self::Ed25519,
+            MpcCurve::Secp256k1 => Self::Secp256k1,
+            MpcCurve::Secp256r1 => Self::Secp256r1,
+        }
+    }
 }
 
 impl std::str::FromStr for MpcCurveConfig {

@@ -8,10 +8,12 @@ pub mod curve;
 pub mod deployment_epoch;
 pub mod deployment_manifest;
 pub mod discovery;
+pub mod execution_transport;
 pub(crate) mod group_interpolation;
 pub mod hb_server;
 pub mod mpc;
 pub mod mpc_runner;
+pub mod node_supervisor;
 pub mod open_registry;
 pub use open_registry::{InstanceRegistry, OpenMessageRouter, UNKNOWN_SENDER_ID};
 pub mod p2p;
@@ -136,6 +138,15 @@ pub use curve::{
     field_from_i64, field_to_i64, MpcCurveConfig, MpcCurveError, MpcCurveResult, MpcFieldKind,
 };
 pub use engine_config::MpcSessionConfig;
+pub use execution_transport::{
+    encode_execution_frame, ExecutionConnectionScanner, ExecutionEnvelopeError,
+    ExecutionEnvelopeV1, ExecutionInboundMessage, ExecutionInbox, ExecutionIngressLimits,
+    ExecutionMessageKind, ExecutionScopedNetwork, ExecutionTransportError, ExecutionTransportMux,
+    ExecutionTransportSource, DEFAULT_EXECUTION_INBOX_BYTE_CAPACITY,
+    DEFAULT_EXECUTION_MUX_BYTE_CAPACITY, EXECUTION_CLIENT_ROUTE_HELLO_V1,
+    EXECUTION_ENVELOPE_HEADER_LEN, EXECUTION_ENVELOPE_MAGIC, EXECUTION_ENVELOPE_VERSION,
+    MAX_EXECUTION_PAYLOAD_LEN,
+};
 pub use mpc_engine::{
     MpcInstanceId, MpcPartyCount, MpcPartyId, MpcSessionTopology, MpcSessionTopologyError,
     MpcThreshold,
@@ -156,6 +167,10 @@ pub use hb_server::{
 pub use mpc_runner::{
     MpcRunner, MpcRunnerBuilder, MpcRunnerConfig, MpcRunnerError, MpcRunnerResult,
 };
+pub use node_supervisor::{
+    wait_for_shutdown_signal, ExecutionSpecV1, NodeEvent, NodeEventKind, NodeExecutionContext,
+    NodeSupervisor, NodeSupervisorError, PreparedNodeExecution,
+};
 // Re-export AVSS QUIC server types
 pub use avss_server::{
     AvssPublicKeyEnvelopeError, AvssQuicConfig, AvssQuicServer, Bls12381AvssServer,
@@ -163,8 +178,8 @@ pub use avss_server::{
 };
 // Re-export discovery helpers
 pub use discovery::{
-    bootstrap_with_bootnode, register_and_wait_for_session, run_bootnode, run_bootnode_with_config,
-    wait_until_min_parties, DiscoveryMessage, SessionRegistrationConfig,
+    register_and_wait_for_session, run_bootnode_with_config, DiscoveryMessage,
+    SessionRegistrationConfig,
 };
 // Re-export program sync + session helpers
 pub use program_sync::{
@@ -172,8 +187,8 @@ pub use program_sync::{
     ProgramSyncResult,
 };
 pub use session::{
-    agree_session_with_bootnode, derive_instance_id, SessionError, SessionInfo, SessionMessage,
-    SessionResult, CONTROL_STREAM_ID, PROGRAM_STREAM_ID,
+    derive_instance_id, derive_instance_id_for_execution, ExecutionId, SessionError, SessionInfo,
+    SessionMessage, SessionResult, CONTROL_STREAM_ID,
 };
 
 #[cfg(test)]

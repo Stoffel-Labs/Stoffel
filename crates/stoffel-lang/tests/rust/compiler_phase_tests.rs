@@ -3682,6 +3682,16 @@ var items: list[int64] = []
 }
 
 #[test]
+fn test_list_constructor_reserves_capacity_with_contextual_element_type() {
+    let source = r#"
+var items: list[uint8] = list(64)
+items[0] = 7
+items[63] = 9
+"#;
+    assert!(compile_source(source).is_ok());
+}
+
+#[test]
 fn test_array_literal_with_elements() {
     let source = r#"
 var items = [1, 2, 3, 4, 5]

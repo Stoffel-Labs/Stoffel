@@ -35,8 +35,8 @@ tracing-opentelemetry = "0.33.0"
 tracing-subscriber = { version = "0.3", features = ["fmt"] }
 
 stoffellang = { version = "0.1.0", path = "../stoffel-lang" }
-stoffel-mpc-coordinator-shared = { git = "https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git", branch = "dev" }
-stoffel-mpc-coordinator-off-chain = { git = "https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git", branch = "dev" }
+stoffel-mpc-coordinator-shared = { git = "https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git", branch = "codex/persistent-execution-coordination" }
+stoffel-mpc-coordinator-off-chain = { git = "https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git", branch = "codex/persistent-execution-coordination" }
 stoffel-vm = { version = "0.1.0", path = "../stoffel-vm" }
 stoffel-vm-runner = { version = "0.1.0", path = "../stoffel-vm-runner" }
 stoffel-vm-types = { version = "0.1.0", path = "../stoffel-vm-types" }
@@ -44,6 +44,9 @@ stoffelmpc-mpc = { package = "stoffelcrypto", version = "0.1.0" }
 
 [dev-dependencies]
 aes = "0.8"
+ark-ec = "0.5.0"
+rand = "0.8"
+sha2 = "0.10"
 stoffel-bindgen = { path = "../stoffel-bindgen" }
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
 trybuild = "1"

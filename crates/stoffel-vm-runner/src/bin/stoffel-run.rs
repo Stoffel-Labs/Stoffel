@@ -1,12 +1,14 @@
 use ark_ec::{CurveGroup, PrimeGroup};
 use ark_ff::{BigInteger, PrimeField};
+use ark_std::rand::{rngs::OsRng, RngCore};
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::env;
 use std::fs;
 use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::process::exit;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -15,17 +17,23 @@ use stoffel_mpc_coordinator_off_chain::node_rpc::{
     NodeRPCClient as OffChainNodeRPCClient, NodeRPCServer as OffChainNodeRPCServer,
 };
 use stoffel_mpc_coordinator_off_chain::OffChainCoordinatorClient;
-use stoffel_mpc_coordinator_shared::{Coordinator, NodeRPCError, Round};
-use stoffel_vm::core_vm::VirtualMachine;
+use stoffel_mpc_coordinator_shared::{
+    Coordinator, ExecutionId as CoordinatorExecutionId, NodeRPCError, Round,
+};
+use stoffel_vm::core_vm::{VirtualMachine, VmCooperativeExecutionMetrics};
 use stoffel_vm::net::curve::{field_from_i64, field_to_i64, SupportedMpcField};
 use stoffel_vm::net::engine_config::DeploymentMode;
-use stoffel_vm::net::hb_engine::HoneyBadgerMpcEngine;
+use stoffel_vm::net::hb_engine::{HoneyBadgerMpcEngine, StandingPreprocAction};
 use stoffel_vm::net::mpc_engine::{
     AsyncMpcEngine, DurableIdentityDigest, MpcEngine, MpcSessionTopology,
 };
+use stoffel_vm::net::session::ExecutionId;
 use stoffel_vm::net::{
     avss_protocol_instance_id, honeybadger_node_opts_with_truncation,
-    honeybadger_protocol_instance_id, honeybadger_protocol_timeout, spawn_receive_loops_split,
+    honeybadger_protocol_instance_id, honeybadger_protocol_timeout, ExecutionConnectionScanner,
+    ExecutionInboundMessage, ExecutionInbox, ExecutionMessageKind, ExecutionScopedNetwork,
+    ExecutionTransportMux, ExecutionTransportSource, NodeExecutionContext, NodeSupervisor,
+    PreparedNodeExecution, EXECUTION_CLIENT_ROUTE_HELLO_V1 as EXECUTION_CLIENT_HELLO_V1,
 };
 use stoffel_vm::net::{
     program_id_from_bytes, register_and_wait_for_session, run_bootnode_with_config,
@@ -33,26 +41,106 @@ use stoffel_vm::net::{
 };
 use stoffel_vm::net::{MpcBackendKind, MpcCurveConfig};
 use stoffel_vm::runtime_hooks::{HookContext, HookEvent};
-use stoffel_vm::storage::preproc::LmdbPreprocStore;
-use stoffel_vm::storage::RedbLocalStorage;
+use stoffel_vm::storage::preproc::{
+    standing_preproc_snapshot, LmdbPreprocStore, OwnedPreprocBundle, PoolAvailability,
+    PreprocKeyScope, PreprocStore, PreprocTargets, StandingPreprocSnapshot,
+};
+use stoffel_vm::storage::{LocalStorage, RedbLocalStorage};
+use stoffel_vm_runner::{
+    validate_standing_program, ResolvedStandingExecutionAdmissionV1, StandingExecutionHandler,
+    StandingNodeControl,
+};
 use stoffel_vm_types::compiled_binary::{
-    BinaryError, ClientIoManifest, CompiledBinary, MpcCurve, MPC_BACKEND_MANIFEST_FORMAT_VERSION,
+    BinaryError, ClientIoManifest, CompiledBinary, MPC_BACKEND_MANIFEST_FORMAT_VERSION,
     MPC_CURVE_MANIFEST_FORMAT_VERSION,
 };
 use stoffel_vm_types::core_types::{ShareType, TableRef, Value};
+use stoffelmpc_mpc::avss_mpc::input::AvssInputError;
 use stoffelmpc_mpc::avss_mpc::{AvssMPCClient, AvssSessionId};
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
 use stoffelmpc_mpc::common::MPCProtocol;
+use stoffelmpc_mpc::honeybadger::input::InputError;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelmpc_mpc::honeybadger::SessionId as HbSessionId;
 use stoffelmpc_mpc::honeybadger::{HoneyBadgerMPCClient, HoneyBadgerMPCNode};
-use stoffelnet::network_utils::ClientId;
 use stoffelnet::network_utils::Network;
+use stoffelnet::network_utils::{CertificateIdentity, ClientId, NetworkError, NodePublicKey};
 use stoffelnet::transports::quic::{NetworkManager, QuicNetworkManager};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
+use tokio_util::task::TaskTracker;
 use x509_parser::prelude::*;
 type HbCoordinatorShare<F> = RobustShare<F>;
+
+/// Owns the detached routing work for one standing execution.
+///
+/// Tasks spawned through this group observe the execution's cancellation token.
+/// Cleanup additionally aborts and joins every task, which makes dropping the
+/// receivers (and any retained ingress leases in their queues/current futures)
+/// deterministic before the execution ID can be reused.
+struct ExecutionTaskGroup {
+    cancellation: CancellationToken,
+    tasks: TaskTracker,
+}
+
+impl ExecutionTaskGroup {
+    fn child_of(parent: &CancellationToken) -> Self {
+        Self {
+            cancellation: parent.child_token(),
+            tasks: TaskTracker::new(),
+        }
+    }
+
+    fn spawn<F>(&self, task: F)
+    where
+        F: std::future::Future<Output = ()> + Send + 'static,
+    {
+        let cancellation = self.cancellation.clone();
+        self.tasks.spawn(async move {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {}
+                _ = task => {}
+            }
+        });
+    }
+
+    fn cancellation_token(&self) -> CancellationToken {
+        self.cancellation.clone()
+    }
+
+    async fn shutdown(&self) {
+        self.cancellation.cancel();
+        self.tasks.close();
+        self.tasks.wait().await;
+    }
+
+    #[cfg(test)]
+    fn task_count(&self) -> usize {
+        self.tasks.len()
+    }
+}
+
+impl Drop for ExecutionTaskGroup {
+    fn drop(&mut self) {
+        self.cancellation.cancel();
+        self.tasks.close();
+    }
+}
+
+fn spawn_execution_task<F>(tasks: Option<&ExecutionTaskGroup>, task: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Some(tasks) = tasks {
+        tasks.spawn(task);
+    } else {
+        // One-shot runners terminate after their sole execution. Standing
+        // executions always provide an owner tied to prepared cleanup.
+        tokio::spawn(task);
+    }
+}
 
 fn manifest_client_input_types(
     manifest: &ClientIoManifest,
@@ -68,7 +156,16 @@ fn manifest_client_input_types(
         .collect()
 }
 
+fn checked_client_input_total(counts: impl IntoIterator<Item = usize>) -> Result<usize, String> {
+    counts.into_iter().try_fold(0usize, |total, count| {
+        total
+            .checked_add(count)
+            .ok_or_else(|| "standing client-input demand overflows usize".to_owned())
+    })
+}
+
 /// Planned preprocessing material counts for one program run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PlannedPreprocessing {
     n_triples: usize,
     n_random: usize,
@@ -76,27 +173,36 @@ struct PlannedPreprocessing {
     n_prandint: usize,
 }
 
-fn read_trimmed_u64(path: &str) -> Option<u64> {
-    fs::read_to_string(path)
-        .ok()
-        .and_then(|value| value.trim().parse::<u64>().ok())
-}
-
-fn current_process_rss_bytes() -> Option<u64> {
-    fs::read_to_string("/proc/self/status")
-        .ok()
-        .and_then(|status| {
-            status.lines().find_map(|line| {
-                let value = line.strip_prefix("VmRSS:")?;
-                let kb = value.split_whitespace().next()?.parse::<u64>().ok()?;
-                Some(kb.saturating_mul(1024))
-            })
+impl PlannedPreprocessing {
+    fn availability(self) -> Result<PoolAvailability, String> {
+        Ok(PoolAvailability {
+            beaver: u32::try_from(self.n_triples)
+                .map_err(|_| "triple target exceeds LMDB metadata domain".to_owned())?,
+            random: u32::try_from(self.n_random)
+                .map_err(|_| "random-share target exceeds LMDB metadata domain".to_owned())?,
+            prand_bit: u32::try_from(self.n_prandbit)
+                .map_err(|_| "random-bit target exceeds LMDB metadata domain".to_owned())?,
+            prand_int: u32::try_from(self.n_prandint)
+                .map_err(|_| "random-integer target exceeds LMDB metadata domain".to_owned())?,
         })
+    }
 }
 
-fn current_cgroup_memory_bytes() -> Option<u64> {
-    read_trimmed_u64("/sys/fs/cgroup/memory.current")
-        .or_else(|| read_trimmed_u64("/sys/fs/cgroup/memory/memory.usage_in_bytes"))
+impl PlannedPreprocessing {
+    fn checked_scale(self, capacity: usize) -> Result<Self, String> {
+        let capacity = capacity.max(1);
+        let scale = |value: usize, label: &str| {
+            value.checked_mul(capacity).ok_or_else(|| {
+                format!("{label} reservoir target overflows usize: {value} * {capacity}")
+            })
+        };
+        Ok(Self {
+            n_triples: scale(self.n_triples, "triple")?,
+            n_random: scale(self.n_random, "random-share")?,
+            n_prandbit: scale(self.n_prandbit, "random-bit")?,
+            n_prandint: scale(self.n_prandint, "random-integer")?,
+        })
+    }
 }
 
 /// Round a demand up to a coarse band for privacy: the observable preprocessing
@@ -198,19 +304,391 @@ type AvssOffChainCoordinator<F, G> = OffChainCoordinatorClient<F, AvssCoordinato
 type AvssOffChainNodeRpcClient<F, G> = OffChainNodeRPCClient<F, AvssCoordinatorShare<F, G>>;
 type AvssOffChainNodeRpcServer<F, G> = OffChainNodeRPCServer<F, AvssCoordinatorShare<F, G>>;
 
-const HB_PREPROCESSING_READY_PREFIX: &[u8] = b"STOFFEL_HB_PREPROCESSING_READY_V1";
-const HB_RUN_COMPLETE_PREFIX: &[u8] = b"STOFFEL_HB_RUN_COMPLETE_V1";
+macro_rules! dispatch_avss_curve {
+    ($curve:expr, $call:ident) => {
+        match $curve {
+            MpcCurveConfig::Bls12_381 => {
+                $call!(ark_bls12_381::Fr, ark_bls12_381::G1Projective)
+            }
+            MpcCurveConfig::Bn254 => $call!(ark_bn254::Fr, ark_bn254::G1Projective),
+            MpcCurveConfig::Curve25519 => {
+                $call!(ark_curve25519::Fr, ark_curve25519::EdwardsProjective)
+            }
+            MpcCurveConfig::Ed25519 => {
+                $call!(ark_ed25519::Fr, ark_ed25519::EdwardsProjective)
+            }
+            MpcCurveConfig::Secp256k1 => {
+                $call!(ark_secp256k1::Fr, ark_secp256k1::Projective)
+            }
+            MpcCurveConfig::Secp256r1 => {
+                $call!(ark_secp256r1::Fr, ark_secp256r1::Projective)
+            }
+        }
+    };
+}
 
-fn parse_u64_marker(prefix: &[u8], raw_msg: &[u8]) -> Option<u64> {
-    let payload = raw_msg.strip_prefix(prefix)?;
-    if payload.len() != std::mem::size_of::<u64>() {
-        return None;
+macro_rules! dispatch_hb_curve {
+    ($curve:expr, $call:ident, $unsupported:expr) => {
+        match $curve {
+            MpcCurveConfig::Bls12_381 => {
+                $call!(ark_bls12_381::Fr, ark_bls12_381::G1Projective)
+            }
+            MpcCurveConfig::Bn254 => $call!(ark_bn254::Fr, ark_bn254::G1Projective),
+            MpcCurveConfig::Curve25519 => {
+                $call!(ark_curve25519::Fr, ark_curve25519::EdwardsProjective)
+            }
+            MpcCurveConfig::Ed25519 => {
+                $call!(ark_ed25519::Fr, ark_ed25519::EdwardsProjective)
+            }
+            MpcCurveConfig::Secp256k1 | MpcCurveConfig::Secp256r1 => $unsupported,
+        }
+    };
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+enum PreprocessingExchangePhase {
+    AvssEcdh,
+    HoneyBadgerInventory,
+    HoneyBadgerReady,
+    AvssInventory,
+    AvssReady,
+    ReservoirAllocationSnapshot,
+    ReservoirAllocationCommit,
+}
+
+impl PreprocessingExchangePhase {
+    fn domain(self) -> &'static [u8] {
+        match self {
+            Self::AvssEcdh => b"stoffel-avss-ecdh-transcript-v2",
+            Self::HoneyBadgerInventory => b"stoffel-hb-preprocessing-inventory-v2",
+            Self::HoneyBadgerReady => b"stoffel-hb-preprocessing-ready-v2",
+            Self::AvssInventory => b"stoffel-avss-preprocessing-inventory-v2",
+            Self::AvssReady => b"stoffel-avss-preprocessing-ready-v2",
+            Self::ReservoirAllocationSnapshot => b"stoffel-reservoir-allocation-snapshot-v3",
+            Self::ReservoirAllocationCommit => b"stoffel-reservoir-allocation-commit-v2",
+        }
     }
-    Some(u64::from_le_bytes(payload.try_into().ok()?))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum PreprocessingExchangeMessage {
+    Value(Vec<u8>),
+    Ack([u8; 32]),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct PreprocessingExchangeFrame {
+    phase: PreprocessingExchangePhase,
+    message: PreprocessingExchangeMessage,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct StandingPreprocessingProposal<T> {
+    snapshot: T,
+    targets: PreprocTargets,
+    nonce: [u8; 32],
+}
+
+fn fresh_preprocessing_nonce() -> [u8; 32] {
+    let mut nonce = [0u8; 32];
+    let mut rng = OsRng;
+    rng.fill_bytes(&mut nonce);
+    nonce
+}
+
+fn validate_preprocessing_proposals<T>(
+    proposals: Vec<StandingPreprocessingProposal<T>>,
+    expected_targets: PreprocTargets,
+    label: &str,
+) -> Result<Vec<T>, String> {
+    proposals
+        .into_iter()
+        .enumerate()
+        .map(|(party_id, proposal)| {
+            if proposal.targets != expected_targets {
+                return Err(format!(
+                    "party {party_id} proposed divergent {label} preprocessing targets: local={expected_targets:?}, remote={:?}",
+                    proposal.targets
+                ));
+            }
+            Ok(proposal.snapshot)
+        })
+        .collect()
+}
+
+fn encode_preprocessing_exchange(frame: &PreprocessingExchangeFrame) -> Result<Vec<u8>, String> {
+    bincode::serialize(frame).map_err(|error| format!("serialize preprocessing exchange: {error}"))
+}
+
+fn decode_preprocessing_exchange(payload: &[u8]) -> Result<PreprocessingExchangeFrame, String> {
+    bincode::deserialize(payload)
+        .map_err(|error| format!("deserialize preprocessing exchange: {error}"))
+}
+
+fn preprocessing_transcript_digest(
+    phase: PreprocessingExchangePhase,
+    execution_id: ExecutionId,
+    values: &[Option<Vec<u8>>],
+) -> Result<[u8; 32], String> {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"stoffel-standing-preprocessing-transcript-v2");
+    hasher.update(&(phase.domain().len() as u64).to_le_bytes());
+    hasher.update(phase.domain());
+    hasher.update(execution_id.as_bytes());
+    hasher.update(&(values.len() as u64).to_le_bytes());
+    for (sender_id, value) in values.iter().enumerate() {
+        let value = value
+            .as_ref()
+            .ok_or_else(|| format!("preprocessing transcript is missing party {sender_id}"))?;
+        hasher.update(&(sender_id as u64).to_le_bytes());
+        hasher.update(&(value.len() as u64).to_le_bytes());
+        hasher.update(value);
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn record_preprocessing_exchange_value<T: PartialEq>(
+    slots: &mut [Option<T>],
+    sender_id: usize,
+    value: T,
+    label: &str,
+) -> Result<(), String> {
+    match slots
+        .get_mut(sender_id)
+        .ok_or_else(|| format!("{label} sender {sender_id} is outside the party set"))?
+    {
+        slot @ None => {
+            *slot = Some(value);
+            Ok(())
+        }
+        Some(existing) if existing == &value => Ok(()),
+        Some(_) => Err(format!(
+            "authenticated party {sender_id} equivocated during {label}"
+        )),
+    }
+}
+
+/// Route preprocessing coordination without creating a second inbox reader.
+async fn preprocessing_transcript_exchange<T>(
+    network: &ExecutionScopedNetwork,
+    receiver: &mut mpsc::Receiver<ExecutionInboundMessage>,
+    execution_id: ExecutionId,
+    party_id: usize,
+    parties: usize,
+    cancellation: &CancellationToken,
+    timeout: Duration,
+    phase: PreprocessingExchangePhase,
+    local_value: &T,
+) -> Result<(Vec<T>, [u8; 32]), String>
+where
+    T: Serialize + serde::de::DeserializeOwned,
+{
+    if parties == 0 || party_id >= parties {
+        return Err(format!(
+            "invalid preprocessing exchange topology: party {} of {}",
+            party_id, parties
+        ));
+    }
+    let local_value = bincode::serialize(local_value)
+        .map_err(|error| format!("serialize local preprocessing value: {error}"))?;
+    let value_frame = encode_preprocessing_exchange(&PreprocessingExchangeFrame {
+        phase,
+        message: PreprocessingExchangeMessage::Value(local_value.clone()),
+    })?;
+    let mut values = vec![None; parties];
+    values[party_id] = Some(local_value);
+    let mut acknowledgements = vec![None; parties];
+    let mut ack_advertised = vec![false; parties];
+    ack_advertised[party_id] = true;
+
+    let exchange = async {
+        let mut retry = tokio::time::interval(STANDING_PREPROC_CONTROL_RETRY_INTERVAL);
+        retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut local_digest = None;
+        while local_digest.is_none()
+            || acknowledgements.iter().any(Option::is_none)
+            || ack_advertised.iter().any(|advertised| !advertised)
+        {
+            if local_digest.is_none() && values.iter().all(Option::is_some) {
+                let digest = preprocessing_transcript_digest(phase, execution_id, &values)?;
+                local_digest = Some(digest);
+                acknowledgements[party_id] = Some(digest);
+            }
+
+            tokio::select! {
+                _ = cancellation.cancelled() => {
+                    return Err("preprocessing transcript exchange cancelled".to_owned());
+                }
+                _ = retry.tick() => {
+                    for peer_id in 0..parties {
+                        if peer_id != party_id {
+                            if let Err(error) = network.send(peer_id, &value_frame).await {
+                                eprintln!("party {} failed to advertise preprocessing value to party {peer_id}: {error}", party_id);
+                            }
+                        }
+                    }
+                    if let Some(digest) = local_digest {
+                        let ack = encode_preprocessing_exchange(&PreprocessingExchangeFrame {
+                            phase,
+                            message: PreprocessingExchangeMessage::Ack(digest),
+                        })?;
+                        for peer_id in 0..parties {
+                            if peer_id != party_id && !ack_advertised[peer_id] {
+                                match network.send(peer_id, &ack).await {
+                                    Ok(_) => ack_advertised[peer_id] = true,
+                                    Err(error) => eprintln!("party {} failed to acknowledge preprocessing transcript to party {peer_id}: {error}", party_id),
+                                }
+                            }
+                        }
+                    }
+                }
+                inbound = receiver.recv() => {
+                    let inbound = inbound.ok_or_else(|| {
+                        "preprocessing exchange channel closed before agreement".to_owned()
+                    })?;
+                    let sender_id = match inbound.source {
+                        ExecutionTransportSource::Party(sender_id) => sender_id,
+                        ExecutionTransportSource::Client(_) => continue,
+                    };
+                    let frame = match decode_preprocessing_exchange(&inbound.payload) {
+                        Ok(frame) => frame,
+                        Err(error) => {
+                            eprintln!("ignoring malformed party exchange: {error}");
+                            continue;
+                        }
+                    };
+                    if frame.phase != phase {
+                        continue;
+                    }
+                    if sender_id >= parties {
+                        return Err(format!(
+                            "preprocessing exchange sender {} is outside party set {}",
+                            sender_id, parties
+                        ));
+                    }
+                    match frame.message {
+                        PreprocessingExchangeMessage::Value(value) => {
+                            record_preprocessing_exchange_value(
+                                &mut values,
+                                sender_id,
+                                value,
+                                "preprocessing transcript value",
+                            )?;
+                        }
+                        PreprocessingExchangeMessage::Ack(digest) => {
+                            record_preprocessing_exchange_value(
+                                &mut acknowledgements,
+                                sender_id,
+                                digest,
+                                "preprocessing transcript acknowledgement",
+                            )?;
+                        }
+                    }
+                }
+            }
+
+            if let Some(expected) = local_digest {
+                for (party_id, received) in acknowledgements.iter().enumerate() {
+                    let Some(received) = received else { continue };
+                    if received != &expected {
+                        return Err(format!(
+                            "party {party_id} acknowledged a divergent preprocessing transcript"
+                        ));
+                    }
+                }
+            }
+        }
+        local_digest.ok_or_else(|| {
+            "preprocessing exchange completed without a transcript digest".to_owned()
+        })
+    };
+
+    let digest = tokio::time::timeout(timeout, exchange)
+        .await
+        .map_err(|_| format!("timed out during {:?} preprocessing exchange", phase))??;
+    let values = values
+        .into_iter()
+        .enumerate()
+        .map(|(sender_id, value)| {
+            let value =
+                value.ok_or_else(|| format!("preprocessing exchange missing party {sender_id}"))?;
+            bincode::deserialize(&value).map_err(|error| {
+                format!("decode preprocessing value from party {sender_id}: {error}")
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok((values, digest))
+}
+
+const STANDING_PREPROC_CONTROL_RETRY_INTERVAL: Duration = Duration::from_millis(250);
+/// Unregisters an execution inbox on every return path. Full execution IDs are
+/// globally non-reusable in standing mode.
+struct ExecutionInboxRegistrationGuard {
+    mux: ExecutionTransportMux,
+    execution_id: ExecutionId,
+}
+
+impl ExecutionInboxRegistrationGuard {
+    fn new(mux: ExecutionTransportMux, execution_id: ExecutionId) -> Self {
+        Self { mux, execution_id }
+    }
+}
+
+impl Drop for ExecutionInboxRegistrationGuard {
+    fn drop(&mut self) {
+        self.mux.unregister(self.execution_id);
+    }
+}
+
+fn start_party_execution_transport(
+    network: &QuicNetworkManager,
+    execution_id: ExecutionId,
+) -> Result<
+    (
+        ExecutionTransportMux,
+        ExecutionInbox,
+        ExecutionInboxRegistrationGuard,
+        ExecutionConnectionScanner,
+    ),
+    String,
+> {
+    let mux = ExecutionTransportMux::new(4096).map_err(|error| error.to_string())?;
+    let inbox = mux
+        .register(execution_id)
+        .map_err(|error| error.to_string())?;
+    let registration = ExecutionInboxRegistrationGuard::new(mux.clone(), execution_id);
+    let scanner = ExecutionConnectionScanner::spawn(network.clone(), mux.clone())
+        .map_err(|error| error.to_string())?;
+    Ok((mux, inbox, registration, scanner))
+}
+
+fn require_network_execution_id(execution_id: Option<ExecutionId>) -> ExecutionId {
+    execution_id.unwrap_or_else(|| {
+        eprintln!("Error: --execution-id <64-hex-chars> is required for MPC party sessions");
+        exit(2);
+    })
+}
+
+fn coordinator_execution_id(execution_id: ExecutionId) -> CoordinatorExecutionId {
+    CoordinatorExecutionId::from_bytes(*execution_id.as_bytes())
 }
 
 fn session_registration_timeout() -> Duration {
     let seconds = env::var("STOFFEL_SESSION_REGISTRATION_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(120);
+    Duration::from_secs(seconds)
+}
+
+/// Bound execution-control exchanges that intentionally require every party
+/// (client-roster agreement, AVSS key agreement, and standing-reservoir
+/// allocation). These are fail-closed barriers rather than threshold opens:
+/// proceeding without an identical transcript can make parties consume
+/// different correlated preprocessing material.
+fn execution_coordination_timeout() -> Duration {
+    let seconds = env::var("STOFFEL_EXECUTION_COORDINATION_TIMEOUT_SECONDS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
         .filter(|value| *value > 0)
@@ -252,6 +730,95 @@ fn required_storage_identity(
         exit(2);
     });
     Some(durable_identity_from_cert(cert))
+}
+
+/// One physical accept loop owns the process-lifetime QUIC listener. Execution
+/// handlers only consume their envelope-demultiplexed inboxes; starting an
+/// accept loop per execution makes concurrent jobs race for new clients.
+fn spawn_connection_accept_loop(
+    mut network: QuicNetworkManager,
+    party_id: usize,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            match network.accept().await {
+                Ok(connection) => {
+                    // `accept` handles both external clients and authenticated
+                    // party reconnects. Recompute the stable certificate-sorted
+                    // party IDs after a peer replaces a dead physical QUIC
+                    // connection so the shared execution scanner sees the
+                    // canonical sender identity.
+                    let assigned = network.assign_party_ids();
+                    eprintln!(
+                        "[party {party_id}] Accepted {:?} connection from {} (assigned_party_connections={assigned})",
+                        connection.get_connection_role(),
+                        connection.remote_address(),
+                    );
+                }
+                Err(error) => {
+                    eprintln!("[party {party_id}] Connection accept error: {error}");
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+            }
+        }
+    })
+}
+
+/// Keep the fixed-membership standing mesh connected for the lifetime of the
+/// process. The higher certificate-derived ID dials each pair, matching the
+/// transport's duplicate-connection tie-breaker while allowing a transient
+/// partition or closed stream to heal without restarting the deployment.
+fn spawn_standing_mesh_reconnect_loop(
+    mut network: QuicNetworkManager,
+    peers: Vec<(NodePublicKey, SocketAddr)>,
+    party_id: usize,
+    cancellation: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    let local_transport_id = network.local_derived_id();
+    tokio::spawn(async move {
+        let mut retry = tokio::time::interval(Duration::from_millis(500));
+        retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                _ = cancellation.cancelled() => return,
+                _ = retry.tick() => {}
+            }
+
+            network.cleanup_dead_connections().await;
+            for (peer_public_key, address) in &peers {
+                let peer_transport_id = peer_public_key.derive_id();
+                if peer_transport_id == local_transport_id
+                    || local_transport_id < peer_transport_id
+                    || network.is_party_connected(peer_transport_id).await
+                {
+                    continue;
+                }
+
+                eprintln!(
+                    "[party {party_id}] standing mesh reconnecting to transport peer {peer_transport_id} at {address}"
+                );
+                match tokio::time::timeout(
+                    Duration::from_secs(3),
+                    network.connect_as_server_with_expected_public_key(*address, peer_public_key),
+                )
+                .await
+                {
+                    Ok(Ok(_)) => {
+                        let assigned = network.assign_party_ids();
+                        eprintln!(
+                            "[party {party_id}] standing mesh reconnected to transport peer {peer_transport_id} (assigned_party_connections={assigned})"
+                        );
+                    }
+                    Ok(Err(error)) => eprintln!(
+                        "[party {party_id}] standing mesh reconnect to transport peer {peer_transport_id} failed: {error}"
+                    ),
+                    Err(_) => eprintln!(
+                        "[party {party_id}] standing mesh reconnect to transport peer {peer_transport_id} timed out"
+                    ),
+                }
+            }
+        }
+    })
 }
 #[derive(Debug, Clone, Copy)]
 enum CoordinatorOutputFormat {
@@ -344,16 +911,6 @@ where
         .collect()
 }
 
-fn curve_config_from_manifest(curve: MpcCurve) -> MpcCurveConfig {
-    match curve {
-        MpcCurve::Bls12_381 => MpcCurveConfig::Bls12_381,
-        MpcCurve::Bn254 => MpcCurveConfig::Bn254,
-        MpcCurve::Curve25519 => MpcCurveConfig::Curve25519,
-        MpcCurve::Ed25519 => MpcCurveConfig::Ed25519,
-        MpcCurve::Secp256k1 => MpcCurveConfig::Secp256k1,
-        MpcCurve::Secp256r1 => MpcCurveConfig::Secp256r1,
-    }
-}
 fn store_reserved_client_inputs<F, I>(
     vm: &mut VirtualMachine,
     client_to_indices: &std::collections::HashMap<I, Vec<u64>>,
@@ -559,25 +1116,17 @@ fn store_reserved_client_inputs_feldman<F, G, I>(
         }
     }
 }
-fn configure_hb_preproc_store<F, G>(
-    engine: &Arc<HoneyBadgerMpcEngine<F, G>>,
+fn configure_preproc_store(
+    engine: &dyn MpcEngine,
     program_hash: [u8; 32],
-    persistent_identity: DurableIdentityDigest,
-    preproc_store_path: Option<&str>,
-) -> Result<(), String>
-where
-    F: SupportedMpcField,
-    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
-{
-    let Some(path) = preproc_store_path else {
+    preproc_store: Option<Arc<dyn PreprocStore>>,
+) -> Result<(), String> {
+    let Some(store) = preproc_store else {
         return Ok(());
     };
-
-    let store = Arc::new(LmdbPreprocStore::open(path)?);
     engine
         .preproc_persistence_ops()?
         .set_preproc_store(store, program_hash)?;
-    engine.set_preproc_store_identity(persistent_identity);
     Ok(())
 }
 async fn load_reserved_mask_share<F, G>(
@@ -639,7 +1188,8 @@ async fn collect_hb_coordinator_inputs_for_bls(
     vm: &mut VirtualMachine,
     engine: &Arc<HoneyBadgerMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projective>>,
     coord: &mut HbOffChainCoordinator<ark_bls12_381::Fr>,
-    node_rpc: &mut HbOffChainNodeRpcServer<ark_bls12_381::Fr>,
+    node_rpc: &HbOffChainNodeRpcServer<ark_bls12_381::Fr>,
+    execution_id: CoordinatorExecutionId,
     input_ids: &[Vec<u8>],
     client_input_total: usize,
     client_input_count: usize,
@@ -668,7 +1218,7 @@ async fn collect_hb_coordinator_inputs_for_bls(
                 program_id,
                 total_input_count as u64,
                 run_id,
-                stoffel_vm::storage::preproc::PoolAvailability::default(),
+                PoolAvailability::default(),
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -693,7 +1243,7 @@ async fn collect_hb_coordinator_inputs_for_bls(
     if let Some(ref mask_shares) = precomputed_mask_shares {
         for (i, share) in mask_shares.iter().enumerate() {
             node_rpc
-                .add_mask_share(i as u64, share)
+                .add_mask_share_for_execution(execution_id, i as u64, share)
                 .await
                 .map_err(|e| format!("add_mask_share: {:?}", e))?;
         }
@@ -720,6 +1270,40 @@ async fn collect_hb_coordinator_inputs_for_bls(
     );
     eprintln!("[party {my_id}] reserved input indices received");
 
+    // Mirror the coordinator's logical allocation in deterministic index order.
+    // Standing engines destructively remove each corresponding mask from LMDB
+    // here and retain it only in process memory until input reconstruction has
+    // completed. This prevents a later program/execution from reusing it.
+    let mut reserved_mask_indices = client_to_indices
+        .values()
+        .flatten()
+        .copied()
+        .collect::<Vec<_>>();
+    reserved_mask_indices.sort_unstable();
+    reserved_mask_indices.dedup();
+    if engine.is_standing() {
+        let reservations = engine.reservation_ops().map_err(|e| e.to_string())?;
+        for (expected, index) in reserved_mask_indices.iter().copied().enumerate() {
+            let expected = u64::try_from(expected)
+                .map_err(|_| "coordinator mask index exceeds u64 range".to_owned())?;
+            if index != expected {
+                return Err(format!(
+                    "coordinator returned non-canonical mask index {index}; expected {expected}"
+                ));
+            }
+            let grant = reservations
+                .reserve_masks(usize::try_from(index).unwrap_or(usize::MAX), 1)
+                .await
+                .map_err(|e| e.to_string())?;
+            if grant.start != index || grant.count != 1 {
+                return Err(format!(
+                    "node reservation diverged from coordinator index {index}: start={}, count={}",
+                    grant.start, grant.count
+                ));
+            }
+        }
+    }
+
     let mask_shares = if let Some(mask_shares) = precomputed_mask_shares {
         mask_shares
     } else {
@@ -737,7 +1321,7 @@ async fn collect_hb_coordinator_inputs_for_bls(
                 .get(slot)
                 .ok_or_else(|| format!("reserved index {idx} exceeds mask share slots"))?;
             node_rpc
-                .add_mask_share(idx, share)
+                .add_mask_share_for_execution(execution_id, idx, share)
                 .await
                 .map_err(|e| format!("add_mask_share: {:?}", e))?;
         }
@@ -748,7 +1332,7 @@ async fn collect_hb_coordinator_inputs_for_bls(
     for (cid, indices) in &client_to_indices {
         for idx in indices {
             node_rpc
-                .add_reserved_index(cid.clone(), *idx)
+                .add_reserved_index_for_execution(execution_id, cid.clone(), *idx)
                 .await
                 .or_else(|e| match e {
                     NodeRPCError::JSONError => {
@@ -777,6 +1361,14 @@ async fn collect_hb_coordinator_inputs_for_bls(
         .await
         .map_err(|e| e.to_string())?;
     eprintln!("[party {my_id}] masked client inputs received");
+    if engine.is_standing() {
+        engine
+            .reservation_ops()
+            .map_err(|e| e.to_string())?
+            .retire_masks(&reserved_mask_indices)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     store_reserved_client_inputs(
         vm,
         &client_to_indices,
@@ -787,104 +1379,6 @@ async fn collect_hb_coordinator_inputs_for_bls(
     );
 
     Ok(())
-}
-
-async fn reset_hb_node_rpcs_as_designated_party(
-    node_rpc_addrs: &[SocketAddr],
-    parties: usize,
-    threshold: usize,
-    cert_der: Vec<u8>,
-    key_der: Vec<u8>,
-) -> Result<(), String> {
-    if node_rpc_addrs.is_empty() {
-        return Err("persistent coordinator reset requires --node-rpc-addrs".to_owned());
-    }
-    let rpc_addrs = node_rpc_addrs
-        .iter()
-        .map(|addr| (addr.ip().to_string(), addr.port()))
-        .collect::<Vec<_>>();
-    let node_rpc: HbOffChainNodeRpcClient<ark_bls12_381::Fr> =
-        HbOffChainNodeRpcClient::<ark_bls12_381::Fr>::start_rpc_client(
-            parties, threshold, rpc_addrs, cert_der, key_der,
-        )
-        .await
-        .map_err(|e| format!("connect node RPC reset client: {e}"))?;
-    node_rpc
-        .reset()
-        .await
-        .map_err(|e| format!("reset node RPC servers: {e}"))
-}
-
-async fn wait_for_hb_run_complete_barrier(
-    net: &Arc<QuicNetworkManager>,
-    run_complete_rx: &mut mpsc::Receiver<(usize, u64)>,
-    my_id: usize,
-    parties: usize,
-    run_id: u64,
-    run_instance_id: u64,
-) -> Result<(), String> {
-    if parties <= 1 {
-        return Ok(());
-    }
-
-    let mut complete_message =
-        Vec::with_capacity(HB_RUN_COMPLETE_PREFIX.len() + std::mem::size_of::<u64>());
-    complete_message.extend_from_slice(HB_RUN_COMPLETE_PREFIX);
-    complete_message.extend_from_slice(&run_instance_id.to_le_bytes());
-
-    for peer_id in 0..parties {
-        if peer_id == my_id {
-            continue;
-        }
-        net.send(peer_id, &complete_message)
-            .await
-            .map_err(|error| {
-                format!(
-                    "Failed to send run-complete marker for run {run_id} to party {peer_id}: {error}"
-                )
-            })?;
-    }
-
-    let mut complete_parties = std::collections::HashSet::with_capacity(parties.saturating_sub(1));
-    let barrier_timeout = honeybadger_protocol_timeout();
-    let barrier_result = tokio::time::timeout(barrier_timeout, async {
-        while complete_parties.len() < parties.saturating_sub(1) {
-            let (sender_id, marker_instance_id) =
-                run_complete_rx.recv().await.ok_or_else(|| {
-                    format!("Run-complete marker channel closed before run {run_id} completed")
-                })?;
-            if sender_id == my_id {
-                continue;
-            }
-            if marker_instance_id == run_instance_id {
-                complete_parties.insert(sender_id);
-            }
-        }
-        Ok::<(), String>(())
-    })
-    .await
-    .map_err(|_| {
-        format!(
-            "Timed out waiting for run-complete markers for run {run_id} ({}/{})",
-            complete_parties.len(),
-            parties.saturating_sub(1)
-        )
-    })?;
-    barrier_result?;
-
-    eprintln!("[party {my_id}] persistent run {run_id}: all parties complete");
-    Ok(())
-}
-
-/// Network adapter for MPC clients.
-///
-/// Client receive paths use authenticated sorted-key IDs and normalize them to
-/// protocol party IDs before messages enter MPC code. Sends use the explicit
-/// server IDs registered from `--servers`, so they are already in protocol
-/// party order.
-struct ClientNetworkAdapter {
-    inner: QuicNetworkManager,
-    local_position: usize,
 }
 
 fn client_transport_recipient(
@@ -898,38 +1392,28 @@ fn client_transport_recipient(
     }
 }
 
-fn client_transport_targets(
-    recipient: stoffelnet::network_utils::PartyId,
+/// Execution-scoped adapter used by MPC clients. Its sends use
+/// the client route, so a persistent party's shared transport mux delivers
+/// them only to the matching execution's client inbox.
+struct ScopedClientNetworkAdapter {
+    inner: ExecutionScopedNetwork,
     local_position: usize,
-) -> Option<[stoffelnet::network_utils::PartyId; 1]> {
-    Some([client_transport_recipient(recipient, local_position)?])
 }
 
 #[async_trait::async_trait]
-impl Network for ClientNetworkAdapter {
-    type NodeType = <QuicNetworkManager as Network>::NodeType;
-    type NetworkConfig = <QuicNetworkManager as Network>::NetworkConfig;
+impl Network for ScopedClientNetworkAdapter {
+    type NodeType = <ExecutionScopedNetwork as Network>::NodeType;
+    type NetworkConfig = <ExecutionScopedNetwork as Network>::NetworkConfig;
 
     async fn send(
         &self,
         recipient: stoffelnet::network_utils::PartyId,
         message: &[u8],
     ) -> Result<usize, stoffelnet::network_utils::NetworkError> {
-        let [mapped] = client_transport_targets(recipient, self.local_position).ok_or(
+        let mapped = client_transport_recipient(recipient, self.local_position).ok_or(
             stoffelnet::network_utils::NetworkError::PartyNotFound(recipient),
         )?;
-        let Some(connection) = self.inner.get_connection_by_party_id(mapped) else {
-            return Err(stoffelnet::network_utils::NetworkError::PartyNotFound(
-                recipient,
-            ));
-        };
-        let bytes = message.to_vec();
-        tokio::spawn(async move {
-            if let Err(error) = connection.send(&bytes).await {
-                eprintln!("[client] Failed to send MPC message to party {recipient}: {error}");
-            }
-        });
-        Ok(message.len())
+        self.inner.send(mapped, message).await
     }
 
     async fn broadcast(
@@ -938,18 +1422,8 @@ impl Network for ClientNetworkAdapter {
     ) -> Result<usize, stoffelnet::network_utils::NetworkError> {
         let n = self.party_count();
         let mut total = 0usize;
-        let results = futures::future::join_all(
-            (0..n).map(|party_id| async move { (party_id, self.send(party_id, message).await) }),
-        )
-        .await;
-
-        for (party_id, result) in results {
-            match result {
-                Ok(bytes) => total += bytes,
-                Err(e) => {
-                    tracing::debug!("client broadcast to party {} failed: {:?}", party_id, e);
-                }
-            }
+        for party_id in 0..n {
+            total = total.saturating_add(self.send(party_id, message).await?);
         }
         Ok(total)
     }
@@ -995,7 +1469,6 @@ impl Network for ClientNetworkAdapter {
     }
 
     fn party_count(&self) -> usize {
-        // Return n (not n+1) — exclude the client from the party count
         self.inner.party_count().saturating_sub(1)
     }
 
@@ -1004,19 +1477,34 @@ impl Network for ClientNetworkAdapter {
     }
 }
 
+async fn send_execution_client_hellos(
+    network: &ScopedClientNetworkAdapter,
+    parties: usize,
+) -> Result<(), String> {
+    for party_id in 0..parties {
+        network
+            .send(party_id, EXECUTION_CLIENT_HELLO_V1)
+            .await
+            .map_err(|error| {
+                format!("failed to send execution hello to party {party_id}: {error}")
+            })?;
+    }
+    Ok(())
+}
+
 /// Network adapter for MPC servers that remaps sequential client indices
 /// (0, 1, ...) back to transport client IDs for send_to_client().
 /// The MPC protocol uses small indices (because session_id only has 8 bits),
 /// and the network layer exposes clients in canonical sorted transport order.
 struct ServerClientAdapter {
-    inner: QuicNetworkManager,
+    inner: ExecutionScopedNetwork,
     /// Maps sequential index to transport client ID.
     client_id_map: Vec<ClientId>,
 }
 #[async_trait::async_trait]
 impl Network for ServerClientAdapter {
-    type NodeType = <QuicNetworkManager as Network>::NodeType;
-    type NetworkConfig = <QuicNetworkManager as Network>::NetworkConfig;
+    type NodeType = <ExecutionScopedNetwork as Network>::NodeType;
+    type NetworkConfig = <ExecutionScopedNetwork as Network>::NetworkConfig;
 
     async fn send(
         &self,
@@ -1089,13 +1577,6 @@ fn is_flag_present(raw_args: &[String], flag: &str) -> bool {
     raw_args
         .iter()
         .any(|arg| arg == flag || arg.starts_with(&format!("{flag}=")))
-}
-
-fn fail_removed_flag(raw_args: &[String], old_flag: &str, replacement_hint: &str) {
-    if is_flag_present(raw_args, old_flag) {
-        eprintln!("Error: `{}` was removed. {}", old_flag, replacement_hint);
-        exit(2);
-    }
 }
 
 fn print_vm_result(vm: &mut VirtualMachine, result: Value) {
@@ -1307,11 +1788,11 @@ fn fixed_width_be_bytes(bytes: &[u8], width: usize) -> Vec<u8> {
     }
 }
 
-/// Connect to all MPC servers with retry logic, spawning a receive loop per connection.
+/// Connect to all MPC servers with retry logic. Inbound ownership is handed
+/// exclusively to the execution connection scanner after this returns.
 async fn connect_to_all_servers(
     network: &Arc<tokio::sync::Mutex<QuicNetworkManager>>,
     server_addrs: &[SocketAddr],
-    msg_tx: mpsc::Sender<(usize, Vec<u8>)>,
 ) {
     let max_retries = 10;
     let retry_delay = Duration::from_millis(500);
@@ -1402,35 +1883,237 @@ async fn connect_to_all_servers(
             exit(24);
         }
 
-        let tx = msg_tx.clone();
-        tokio::spawn(async move {
-            loop {
-                match connection.receive().await {
-                    Ok(data) => {
-                        if let Err(e) = tx.send((peer, data)).await {
-                            eprintln!("[client] Failed to forward message: {:?}", e);
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        eprintln!("[client] Connection to server {} closed: {}", peer, e);
-                        break;
-                    }
-                }
-            }
-        });
+        let _ = connection;
     }
-}
-const CLIENT_SET_SYNC_PREFIX: &[u8; 4] = b"CSS1";
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ClientSetSyncMessage {
-    sender_party_id: usize,
-    client_ids: Vec<ClientId>,
 }
 fn normalize_client_ids(mut ids: Vec<ClientId>) -> Vec<ClientId> {
     ids.sort_unstable();
     ids.dedup();
     ids
+}
+
+/// Binds one authenticated client connection to both its compact protocol
+/// index and the VM-visible slot compiled into the program manifest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClientProtocolBinding {
+    protocol_index: usize,
+    route_id: ClientId,
+    manifest_slot: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ClientInputSetup {
+    protocol_index: usize,
+    input_count: usize,
+}
+
+struct PartyClients {
+    bindings: Vec<ClientProtocolBinding>,
+    input_setup: Vec<ClientInputSetup>,
+    route_ids: Vec<ClientId>,
+    manifest_driven: bool,
+}
+
+fn bind_admitted_client_slots(
+    route_ids: &[ClientId],
+    manifest_slots: &[usize],
+) -> Vec<ClientProtocolBinding> {
+    debug_assert_eq!(route_ids.len(), manifest_slots.len());
+    route_ids
+        .iter()
+        .copied()
+        .zip(manifest_slots.iter().copied())
+        .enumerate()
+        .map(
+            |(protocol_index, (route_id, manifest_slot))| ClientProtocolBinding {
+                protocol_index,
+                route_id,
+                manifest_slot,
+            },
+        )
+        .collect()
+}
+
+fn client_binding_route_ids(bindings: &[ClientProtocolBinding]) -> HashSet<ClientId> {
+    let ids = bindings
+        .iter()
+        .map(|binding| binding.route_id)
+        .collect::<HashSet<_>>();
+    debug_assert_eq!(ids.len(), bindings.len());
+    ids
+}
+
+fn resolve_client_protocol_bindings(
+    expected: Option<&[ClientProtocolBinding]>,
+    observed: HashSet<ClientId>,
+) -> Result<Vec<ClientProtocolBinding>, String> {
+    if let Some(expected) = expected {
+        let expected_ids = client_binding_route_ids(expected);
+        if observed != expected_ids {
+            let mut missing = expected_ids
+                .difference(&observed)
+                .copied()
+                .collect::<Vec<_>>();
+            let mut unexpected = observed
+                .difference(&expected_ids)
+                .copied()
+                .collect::<Vec<_>>();
+            missing.sort_unstable();
+            unexpected.sort_unstable();
+            return Err(format!(
+                "execution client set does not match admission: missing={missing:?}, unexpected={unexpected:?}"
+            ));
+        }
+        return Ok(expected.to_vec());
+    }
+
+    let client_ids = normalize_client_ids(observed.into_iter().collect());
+    if client_ids.len() > usize::from(u8::MAX) + 1 {
+        return Err(format!(
+            "{} clients exceed the one-byte MPC client index domain",
+            client_ids.len()
+        ));
+    }
+    Ok(client_ids
+        .into_iter()
+        .enumerate()
+        .map(|(protocol_index, route_id)| ClientProtocolBinding {
+            protocol_index,
+            route_id,
+            manifest_slot: protocol_index,
+        })
+        .collect())
+}
+
+fn client_input_setup_plan(
+    bindings: &[ClientProtocolBinding],
+    client_input_types: &BTreeMap<usize, Vec<ShareType>>,
+    one_shot_input_count: usize,
+    use_manifest_input_counts: bool,
+) -> Vec<ClientInputSetup> {
+    bindings
+        .iter()
+        .filter_map(|binding| {
+            let input_count = if use_manifest_input_counts {
+                client_input_types
+                    .get(&binding.manifest_slot)
+                    .map(Vec::len)
+                    .unwrap_or(0)
+            } else {
+                one_shot_input_count
+            };
+            (input_count > 0).then_some(ClientInputSetup {
+                protocol_index: binding.protocol_index,
+                input_count,
+            })
+        })
+        .collect()
+}
+
+async fn prepare_party_clients(
+    client_inbox: &mut mpsc::Receiver<ExecutionInboundMessage>,
+    expected_count: Option<usize>,
+    expected_bindings: Option<&[ClientProtocolBinding]>,
+    input_types: &BTreeMap<usize, Vec<ShareType>>,
+    fallback_input_count: usize,
+) -> Result<PartyClients, String> {
+    let bindings = admit_execution_clients(client_inbox, expected_count, expected_bindings).await?;
+    let manifest_driven = expected_bindings.is_some();
+    Ok(PartyClients {
+        input_setup: client_input_setup_plan(
+            &bindings,
+            input_types,
+            fallback_input_count,
+            manifest_driven,
+        ),
+        route_ids: bindings.iter().map(|binding| binding.route_id).collect(),
+        bindings,
+        manifest_driven,
+    })
+}
+
+fn client_preprocessing_count(
+    clients: &PartyClients,
+    deployment_mode: DeploymentMode,
+    input_types: &BTreeMap<usize, Vec<ShareType>>,
+    client_count_hint: usize,
+    fallback_input_count: usize,
+) -> Result<usize, String> {
+    if deployment_mode == DeploymentMode::Standing {
+        checked_client_input_total(input_types.values().map(Vec::len))
+    } else if clients.manifest_driven {
+        checked_client_input_total(clients.input_setup.iter().map(|setup| setup.input_count))
+    } else {
+        clients
+            .route_ids
+            .len()
+            .max(client_count_hint)
+            .checked_mul(fallback_input_count)
+            .ok_or_else(|| "client input preprocessing demand exceeds usize".to_owned())
+    }
+}
+
+async fn send_client_instances(
+    network: &ExecutionScopedNetwork,
+    party_id: usize,
+    instance_id: u64,
+    clients: &[ClientProtocolBinding],
+) -> Result<(), String> {
+    for client in clients {
+        let protocol_index = u8::try_from(client.protocol_index).map_err(|_| {
+            format!(
+                "client protocol index {} exceeds INST domain",
+                client.protocol_index
+            )
+        })?;
+        let mut message = Vec::with_capacity(13);
+        message.extend_from_slice(b"INST");
+        message.extend_from_slice(&instance_id.to_le_bytes());
+        message.push(protocol_index);
+        if let Err(error) = network.send_to_client(client.route_id, &message).await {
+            eprintln!(
+                "[party {party_id}] Failed to send INST to client {}: {error:?}",
+                client.route_id
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Protocol identities installed in the backend `InputServer`.
+///
+/// Admission and output routing intentionally retain every client binding, but
+/// the input barrier must contain only clients that declared at least one
+/// input. An output-only client has no masked-input transcript to complete and
+/// therefore must never be represented by an `Empty` InputServer entry.
+fn mpc_input_protocol_ids(input_setup_plan: &[ClientInputSetup]) -> Vec<ClientId> {
+    input_setup_plan
+        .iter()
+        .map(|setup| setup.protocol_index)
+        .collect()
+}
+
+fn client_output_slot_map(bindings: &[ClientProtocolBinding]) -> BTreeMap<ClientId, ClientId> {
+    bindings
+        .iter()
+        .map(|binding| (binding.manifest_slot, binding.route_id))
+        .collect()
+}
+
+fn client_reservation_identity_map(
+    identities: &[CertificateIdentity],
+) -> BTreeMap<ClientId, DurableIdentityDigest> {
+    identities
+        .iter()
+        .copied()
+        .enumerate()
+        .map(|(ordinal, identity)| {
+            (
+                ordinal,
+                DurableIdentityDigest::from_certificate_identity(identity),
+            )
+        })
+        .collect()
 }
 
 fn input_client_ids_from_output_ids(
@@ -1457,147 +2140,8 @@ fn input_client_ids_from_output_ids(
         .collect()
 }
 
-fn encode_client_set_sync(msg: &ClientSetSyncMessage) -> Result<Vec<u8>, String> {
-    let payload = bincode::serialize(msg)
-        .map_err(|e| format!("Failed to serialize client-set sync payload: {}", e))?;
-    let mut out = Vec::with_capacity(CLIENT_SET_SYNC_PREFIX.len() + payload.len());
-    out.extend_from_slice(CLIENT_SET_SYNC_PREFIX);
-    out.extend_from_slice(&payload);
-    Ok(out)
-}
-fn decode_client_set_sync(bytes: &[u8]) -> Result<ClientSetSyncMessage, String> {
-    if bytes.len() < CLIENT_SET_SYNC_PREFIX.len()
-        || &bytes[..CLIENT_SET_SYNC_PREFIX.len()] != CLIENT_SET_SYNC_PREFIX
-    {
-        return Err("Unexpected message prefix while waiting for client-set sync".to_string());
-    }
-
-    bincode::deserialize(&bytes[CLIENT_SET_SYNC_PREFIX.len()..])
-        .map_err(|e| format!("Failed to deserialize client-set sync payload: {}", e))
-}
-async fn sync_client_set_across_parties(
-    net: Arc<QuicNetworkManager>,
-    my_id: usize,
-    n_parties: usize,
-    local_client_ids: &[ClientId],
-) -> Result<(), String> {
-    if n_parties <= 1 {
-        return Ok(());
-    }
-
-    let normalized_local = normalize_client_ids(local_client_ids.to_vec());
-    let sync_payload = encode_client_set_sync(&ClientSetSyncMessage {
-        sender_party_id: my_id,
-        client_ids: normalized_local.clone(),
-    })?;
-
-    eprintln!(
-        "[party {}] Broadcasting client-set sync payload: {:?}",
-        my_id, normalized_local
-    );
-
-    for peer_id in 0..n_parties {
-        if peer_id == my_id {
-            continue;
-        }
-        net.send(peer_id, &sync_payload)
-            .await
-            .map_err(|e| format!("Failed to send client-set sync to party {}: {}", peer_id, e))?;
-    }
-
-    let mut confirmed_parties: HashSet<usize> = HashSet::new();
-    let expected_confirmations = n_parties - 1;
-    let receive_deadline = std::time::Instant::now() + Duration::from_secs(20);
-
-    // CANCELLATION SAFETY (the InvalidData flake): `connection.receive()` reads
-    // a length-prefixed frame across MULTIPLE awaits. Wrapping it in
-    // `tokio::time::timeout` (the old polling loop here) can cancel it BETWEEN
-    // the length read and the payload read; the next receive on that stream
-    // then parses payload bytes as a length header, permanently desyncing the
-    // frame stream — and these SAME party connections carry all subsequent MPC
-    // traffic, which then fails to deserialize
-    // (`MulError(ArkSerialization(InvalidData))`) and strands the mesh until
-    // the party timeout. Instead, spawn one NEVER-CANCELLED one-shot reader per
-    // peer (the same dedicated-reader idiom as `spawn_receive_loops`) that
-    // forwards its single sync frame through a channel; the deadline applies
-    // to the channel receive, which IS cancellation-safe.
-    let (sync_tx, mut sync_rx) = mpsc::unbounded_channel::<(usize, Result<Vec<u8>, String>)>();
-    let mut spawned_readers: HashSet<usize> = HashSet::new();
-
-    while confirmed_parties.len() < expected_confirmations {
-        if std::time::Instant::now() >= receive_deadline {
-            return Err(format!(
-                "Timed out waiting for client-set sync confirmations ({}/{})",
-                confirmed_parties.len(),
-                expected_confirmations
-            ));
-        }
-
-        // Pick up (possibly late-arriving) peer connections.
-        for (derived_id, connection) in net.get_all_server_connections() {
-            let sender_id = connection.remote_party_id().unwrap_or(derived_id);
-            if sender_id >= n_parties || sender_id == my_id || !spawned_readers.insert(sender_id) {
-                continue;
-            }
-            let tx = sync_tx.clone();
-            tokio::spawn(async move {
-                let result = connection.receive().await;
-                let _ = tx.send((sender_id, result));
-            });
-        }
-
-        // Wait for the next sync frame; short tick so new connections are
-        // still scanned. Cancelling a CHANNEL receive loses nothing.
-        match tokio::time::timeout(Duration::from_millis(100), sync_rx.recv()).await {
-            Ok(Some((sender_id, Ok(data)))) => {
-                let sync = decode_client_set_sync(&data).map_err(|e| {
-                    format!(
-                        "Failed to decode client-set sync from party {}: {}",
-                        sender_id, e
-                    )
-                })?;
-
-                if sync.sender_party_id != sender_id {
-                    return Err(format!(
-                        "Client-set sync sender mismatch: transport sender={} payload sender={}",
-                        sender_id, sync.sender_party_id
-                    ));
-                }
-
-                let normalized_remote = normalize_client_ids(sync.client_ids);
-                if normalized_remote != normalized_local {
-                    return Err(format!(
-                        "Client-set mismatch with party {}: local={:?}, remote={:?}",
-                        sender_id, normalized_local, normalized_remote
-                    ));
-                }
-
-                confirmed_parties.insert(sender_id);
-                eprintln!(
-                    "[party {}] Client-set sync confirmed with party {}",
-                    my_id, sender_id
-                );
-            }
-            Ok(Some((sender_id, Err(e)))) => {
-                return Err(format!(
-                    "Failed to receive client-set sync from party {}: {}",
-                    sender_id, e
-                ));
-            }
-            Ok(None) => {
-                return Err("Client-set sync channel closed unexpectedly".to_string());
-            }
-            Err(_) => {}
-        }
-    }
-
-    eprintln!(
-        "[party {}] Client-set sync complete with {} peers",
-        my_id, expected_confirmations
-    );
-    Ok(())
-}
-struct HbClientProtocolConfig {
+struct ClientProtocolConfig {
+    execution_id: ExecutionId,
     n: usize,
     t: usize,
     /// Number of input values this client contributes (0 for an output-only client).
@@ -1610,48 +2154,108 @@ struct HbClientProtocolConfig {
     local_position: usize,
     curve_config: MpcCurveConfig,
 }
-struct AvssClientProtocolConfig {
-    n: usize,
-    t: usize,
-    output_len: usize,
-    instance_id: u64,
-    client_index: u8,
-    local_position: usize,
-    curve_config: MpcCurveConfig,
+/// Number of distinct, successfully processed mask-share senders that proves
+/// an input client has initiated its masked-input broadcast.
+///
+/// HoneyBadger reconstructs its robust mask after `2t + 1` shares. AVSS can
+/// reconstruct after `t + 1` consistent shares; among `2t + 1` authenticated
+/// senders at most `t` can be Byzantine, so the same quorum guarantees at
+/// least `t + 1` honest shares with the common commitment. Waiting for all
+/// `n` servers is incorrect: a server that receives the masked-input RBC
+/// before it initializes its local input state consumes that input directly
+/// and intentionally never sends its now-unnecessary mask share to the client.
+fn client_input_completion_quorum(n: usize, t: usize) -> Result<usize, String> {
+    let minimum_parties = t
+        .checked_mul(3)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| format!("client input topology overflow for threshold {t}"))?;
+    if n < minimum_parties {
+        return Err(format!(
+            "invalid client input topology: n={n}, t={t}; requires n >= 3t + 1"
+        ));
+    }
+
+    t.checked_mul(2)
+        .and_then(|value| value.checked_add(1))
+        .ok_or_else(|| format!("client input quorum overflow for threshold {t}"))
 }
+
+fn hb_input_only_completion_proven(
+    input_broadcast_started: bool,
+    distinct_successful_senders: usize,
+    quorum: usize,
+) -> bool {
+    // HoneyBadgerMPCClient::process intentionally ignores authenticated
+    // messages for unrelated subprotocols and returns Ok. Therefore sender
+    // count alone is only diagnostic; rbc_done is the exact public protocol
+    // state proving that 2t+1 actual mask shares were reconstructed and the
+    // masked-input AVID broadcast was initiated.
+    input_broadcast_started && distinct_successful_senders >= quorum
+}
+
+/// A direct-client message retains the mux's ingress lease until protocol
+/// processing finishes with it, including while it waits in a downstream
+/// channel or the pre-INST replay buffer.
+struct DirectClientInboundMessage {
+    sender_id: usize,
+    message: ExecutionInboundMessage,
+}
+
+fn direct_client_inbound_message(
+    local_position: usize,
+    message: ExecutionInboundMessage,
+) -> DirectClientInboundMessage {
+    let sender_id = match message.source {
+        ExecutionTransportSource::Party(authenticated_id) => {
+            if authenticated_id > local_position {
+                authenticated_id - 1
+            } else {
+                authenticated_id
+            }
+        }
+        ExecutionTransportSource::Client(client_id) => client_id,
+    };
+    DirectClientInboundMessage { sender_id, message }
+}
+
 async fn run_hb_client_protocol_for_curve<F: PrimeField>(
-    config: HbClientProtocolConfig,
+    config: ClientProtocolConfig,
     inputs_str: &str,
     network_for_process: Arc<tokio::sync::Mutex<QuicNetworkManager>>,
-    mut msg_rx: mpsc::Receiver<(usize, Vec<u8>)>,
+    mut msg_rx: mpsc::Receiver<DirectClientInboundMessage>,
 ) -> Result<(), String> {
     let instance_id = honeybadger_protocol_instance_id(config.instance_id);
     // Use the sequential client_index (0, 1, ...) as the MPC identity,
     // not the transport-derived cid, because the session_id only has
     // 8 bits for the client_id field.
     let mpc_cid = config.client_index as usize;
-    // A client with no inputs is an output-only client: it does not run the
-    // input protocol, it only waits for the servers to deliver its output
-    // shares and reconstructs them. The `OutputClient` is sized by the number
-    // of outputs the client receives; an input client keeps its prior sizing.
-    let is_output_only = config.input_len == 0;
-    let output_client_len = if is_output_only {
-        config.output_len
-    } else {
-        config.input_len
-    };
+    // Input and output cardinalities are independent. In particular, a client
+    // may submit one value and remain connected for several output values.
+    let expects_output = config.output_len > 0;
+    let input_only_quorum = (!expects_output && config.input_len > 0)
+        .then(|| client_input_completion_quorum(config.n, config.t))
+        .transpose()?;
     let mut mpc_client = HoneyBadgerMPCClient::<F, Avid<HbSessionId>>::new(
         mpc_cid,
         config.n,
         config.t,
         instance_id,
         parse_inputs_as_field::<F>(inputs_str),
-        output_client_len,
+        config.output_len,
     )
     .map_err(|e| format!("Failed to create MPC client: {:?}", e))?;
 
+    let scoped_network = {
+        let guard = network_for_process.lock().await;
+        ExecutionScopedNetwork::for_client((*guard).clone(), config.execution_id)
+            .map_err(|error| format!("invalid HoneyBadger client execution transport: {error}"))?
+    };
+
     let mut messages_processed = 0usize;
-    while let Some((sender_id, data)) = msg_rx.recv().await {
+    let mut successful_input_senders = HashSet::new();
+    while let Some(mut inbound) = msg_rx.recv().await {
+        let sender_id = inbound.sender_id;
+        let data = std::mem::take(&mut inbound.message.payload);
         // Skip INST messages from other servers (already consumed the first one)
         if data.len() == 13 && data.starts_with(b"INST") {
             eprintln!(
@@ -1667,27 +2271,38 @@ async fn run_hb_client_protocol_for_curve<F: PrimeField>(
             sender_id
         );
 
-        let adapter = {
-            let guard = network_for_process.lock().await;
-            ClientNetworkAdapter {
-                inner: (*guard).clone(),
-                local_position: config.local_position,
-            }
+        let adapter = ScopedClientNetworkAdapter {
+            inner: scoped_network.clone(),
+            local_position: config.local_position,
         };
 
         match mpc_client.process(sender_id, data, Arc::new(adapter)).await {
             Ok(()) => {
                 messages_processed += 1;
+                if input_only_quorum.is_some() {
+                    if sender_id >= config.n {
+                        return Err(format!(
+                            "HB input response has out-of-range authenticated sender {sender_id} for n={}",
+                            config.n
+                        ));
+                    }
+                    successful_input_senders.insert(sender_id);
+                }
                 eprintln!(
                     "[client {}] Successfully processed message #{} from server {}",
                     mpc_cid, messages_processed, sender_id
                 );
-                // Output-only client: finish as soon as the output shares
-                // reconstruct (>= 2t+1 received).
-                if is_output_only {
+                if expects_output {
                     if let Some(outputs) = mpc_client.output.get_output() {
                         let output_hex = field_outputs_to_hex(&outputs, config.curve_config);
                         println!("Client output: field[{}] 0x{}", outputs.len(), output_hex);
+                        println!(
+                            "outputs: {}",
+                            format_coordinator_outputs(
+                                &outputs,
+                                CoordinatorOutputFormat::FieldInteger,
+                            )
+                        );
                         eprintln!(
                             "[client {}] Reconstructed {} output value(s)",
                             mpc_cid,
@@ -1705,35 +2320,50 @@ async fn run_hb_client_protocol_for_curve<F: PrimeField>(
             }
         }
 
-        if !is_output_only && messages_processed >= config.n {
-            // Input client: keep the connection alive long enough for servers
-            // to drain their preprocessing backlog and process our masked input.
+        let hb_input_broadcast_started = if input_only_quorum.is_some() {
+            mpc_client.input.client_data.lock().await.rbc_done
+        } else {
+            false
+        };
+        if input_only_quorum.is_some_and(|quorum| {
+            hb_input_only_completion_proven(
+                hb_input_broadcast_started,
+                successful_input_senders.len(),
+                quorum,
+            )
+        }) {
             eprintln!(
-                "[client {}] Input protocol complete, holding connection for 300s...",
-                mpc_cid
+                "[client {mpc_cid}] Input-only protocol complete after {} distinct mask-share senders",
+                successful_input_senders.len()
             );
-            tokio::time::sleep(Duration::from_secs(300)).await;
-            break;
+            return Ok(());
         }
     }
 
-    if is_output_only {
+    if expects_output {
         return Err(format!(
-            "HB output client receiver closed before output reconstruction (processed {messages_processed} messages)"
+            "HB client receiver closed before {} output value(s) reconstructed (processed {messages_processed} messages)",
+            config.output_len,
         ));
     }
 
-    eprintln!(
-        "[client {}] Message processing done ({} messages)",
-        mpc_cid, messages_processed
-    );
+    if let Some(quorum) = input_only_quorum {
+        let input_broadcast_started = mpc_client.input.client_data.lock().await.rbc_done;
+        return Err(format!(
+            "HB client receiver closed before input broadcast completion: broadcast_started={input_broadcast_started}, received {}/{} distinct successful protocol senders (processed {messages_processed} messages)",
+            successful_input_senders.len(),
+            quorum
+        ));
+    }
+
+    eprintln!("[client {mpc_cid}] Message processing done ({messages_processed} messages)");
     Ok(())
 }
 async fn run_avss_client_protocol_for_curve<F, G>(
-    config: AvssClientProtocolConfig,
+    config: ClientProtocolConfig,
     inputs_str: &str,
     network_for_process: Arc<tokio::sync::Mutex<QuicNetworkManager>>,
-    mut msg_rx: mpsc::Receiver<(usize, Vec<u8>)>,
+    mut msg_rx: mpsc::Receiver<DirectClientInboundMessage>,
 ) -> Result<(), String>
 where
     F: PrimeField,
@@ -1751,8 +2381,21 @@ where
     )
     .map_err(|e| format!("Failed to create AVSS MPC client: {:?}", e))?;
 
+    let scoped_network = {
+        let guard = network_for_process.lock().await;
+        ExecutionScopedNetwork::for_client((*guard).clone(), config.execution_id)
+            .map_err(|error| format!("invalid AVSS client execution transport: {error}"))?
+    };
+
+    let expects_output = config.output_len > 0;
+    let input_only_quorum = (!expects_output && config.input_len > 0)
+        .then(|| client_input_completion_quorum(config.n, config.t))
+        .transpose()?;
     let mut messages_processed = 0usize;
-    while let Some((sender_id, data)) = msg_rx.recv().await {
+    let mut successful_input_senders = HashSet::new();
+    while let Some(mut inbound) = msg_rx.recv().await {
+        let sender_id = inbound.sender_id;
+        let data = std::mem::take(&mut inbound.message.payload);
         eprintln!(
             "[client {}] Received {} AVSS bytes from sender {}",
             mpc_cid,
@@ -1767,21 +2410,36 @@ where
             continue;
         }
 
-        let adapter = {
-            let guard = network_for_process.lock().await;
-            ClientNetworkAdapter {
-                inner: (*guard).clone(),
-                local_position: config.local_position,
-            }
+        let adapter = ScopedClientNetworkAdapter {
+            inner: scoped_network.clone(),
+            local_position: config.local_position,
         };
 
         match mpc_client.process(sender_id, data, Arc::new(adapter)).await {
             Ok(()) => {
                 messages_processed += 1;
-                if let Some(outputs) = mpc_client.output.get_output() {
-                    let output_hex = field_outputs_to_hex(&outputs, config.curve_config);
-                    println!("Client output: field[{}] 0x{}", outputs.len(), output_hex);
-                    return Ok(());
+                if input_only_quorum.is_some() {
+                    if sender_id >= config.n {
+                        return Err(format!(
+                            "AVSS input response has out-of-range authenticated sender {sender_id} for n={}",
+                            config.n
+                        ));
+                    }
+                    successful_input_senders.insert(sender_id);
+                }
+                if expects_output {
+                    if let Some(outputs) = mpc_client.output.get_output() {
+                        let output_hex = field_outputs_to_hex(&outputs, config.curve_config);
+                        println!("Client output: field[{}] 0x{}", outputs.len(), output_hex);
+                        println!(
+                            "outputs: {}",
+                            format_coordinator_outputs(
+                                &outputs,
+                                CoordinatorOutputFormat::FieldInteger,
+                            )
+                        );
+                        return Ok(());
+                    }
                 }
             }
             Err(e) => {
@@ -1791,126 +2449,75 @@ where
                 );
             }
         }
+        if input_only_quorum.is_some_and(|quorum| successful_input_senders.len() >= quorum) {
+            eprintln!(
+                "[client {mpc_cid}] AVSS input-only protocol complete after {} distinct mask-share senders",
+                successful_input_senders.len()
+            );
+            return Ok(());
+        }
     }
 
-    Err(format!(
-        "AVSS client receiver closed before output reconstruction (processed {} messages)",
-        messages_processed
-    ))
+    if expects_output {
+        Err(format!(
+            "AVSS client receiver closed before {} output value(s) reconstructed (processed {} messages)",
+            config.output_len, messages_processed
+        ))
+    } else if let Some(quorum) = input_only_quorum {
+        Err(format!(
+            "AVSS client receiver closed before input broadcast quorum: received {}/{} distinct successful mask-share senders (processed {messages_processed} messages)",
+            successful_input_senders.len(),
+            quorum
+        ))
+    } else {
+        Ok(())
+    }
 }
 async fn run_avss_client_for_curve(
     curve_config: MpcCurveConfig,
-    config: AvssClientProtocolConfig,
+    config: ClientProtocolConfig,
     inputs_str: &str,
     network_for_process: Arc<tokio::sync::Mutex<QuicNetworkManager>>,
-    msg_rx: mpsc::Receiver<(usize, Vec<u8>)>,
+    msg_rx: mpsc::Receiver<DirectClientInboundMessage>,
 ) -> Result<(), String> {
-    match curve_config {
-        MpcCurveConfig::Bls12_381 => {
-            run_avss_client_protocol_for_curve::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>(
+    macro_rules! run {
+        ($F:ty, $G:ty) => {
+            run_avss_client_protocol_for_curve::<$F, $G>(
                 config,
                 inputs_str,
                 network_for_process,
                 msg_rx,
             )
             .await
-        }
-        MpcCurveConfig::Bn254 => {
-            run_avss_client_protocol_for_curve::<ark_bn254::Fr, ark_bn254::G1Projective>(
-                config,
-                inputs_str,
-                network_for_process,
-                msg_rx,
-            )
-            .await
-        }
-        MpcCurveConfig::Curve25519 => {
-            run_avss_client_protocol_for_curve::<
-                ark_curve25519::Fr,
-                ark_curve25519::EdwardsProjective,
-            >(config, inputs_str, network_for_process, msg_rx)
-            .await
-        }
-        MpcCurveConfig::Ed25519 => {
-            run_avss_client_protocol_for_curve::<ark_ed25519::Fr, ark_ed25519::EdwardsProjective>(
-                config,
-                inputs_str,
-                network_for_process,
-                msg_rx,
-            )
-            .await
-        }
-        MpcCurveConfig::Secp256k1 => {
-            run_avss_client_protocol_for_curve::<ark_secp256k1::Fr, ark_secp256k1::Projective>(
-                config,
-                inputs_str,
-                network_for_process,
-                msg_rx,
-            )
-            .await
-        }
-        MpcCurveConfig::Secp256r1 => {
-            run_avss_client_protocol_for_curve::<ark_secp256r1::Fr, ark_secp256r1::Projective>(
-                config,
-                inputs_str,
-                network_for_process,
-                msg_rx,
-            )
-            .await
-        }
+        };
     }
+    dispatch_avss_curve!(curve_config, run)
 }
 async fn run_hb_client_for_curve(
     curve_config: MpcCurveConfig,
-    config: HbClientProtocolConfig,
+    config: ClientProtocolConfig,
     inputs_str: &str,
     network_for_process: Arc<tokio::sync::Mutex<QuicNetworkManager>>,
-    msg_rx: mpsc::Receiver<(usize, Vec<u8>)>,
+    msg_rx: mpsc::Receiver<DirectClientInboundMessage>,
 ) -> Result<(), String> {
-    match curve_config {
-        MpcCurveConfig::Bls12_381 => {
-            run_hb_client_protocol_for_curve::<ark_bls12_381::Fr>(
-                config,
-                inputs_str,
-                network_for_process,
-                msg_rx,
-            )
-            .await
-        }
-        MpcCurveConfig::Bn254 => {
-            run_hb_client_protocol_for_curve::<ark_bn254::Fr>(
-                config,
-                inputs_str,
-                network_for_process,
-                msg_rx,
-            )
-            .await
-        }
-        MpcCurveConfig::Curve25519 => {
-            run_hb_client_protocol_for_curve::<ark_curve25519::Fr>(
-                config,
-                inputs_str,
-                network_for_process,
-                msg_rx,
-            )
-            .await
-        }
-        MpcCurveConfig::Ed25519 => {
-            run_hb_client_protocol_for_curve::<ark_ed25519::Fr>(
-                config,
-                inputs_str,
-                network_for_process,
-                msg_rx,
-            )
-            .await
-        }
-        MpcCurveConfig::Secp256k1 | MpcCurveConfig::Secp256r1 => Err(format!(
+    macro_rules! run {
+        ($F:ty, $G:ty) => {
+            run_hb_client_protocol_for_curve::<$F>(config, inputs_str, network_for_process, msg_rx)
+                .await
+        };
+    }
+    dispatch_hb_curve!(
+        curve_config,
+        run,
+        Err(format!(
             "client mode with honeybadger backend does not support curve {}",
             curve_config.name()
-        )),
-    }
+        ))
+    )
 }
+
 async fn run_as_client(
+    execution_id: ExecutionId,
     n_parties: Option<usize>,
     threshold: Option<usize>,
     mpc_backend: Option<&str>,
@@ -1918,6 +2525,8 @@ async fn run_as_client(
     client_inputs: Option<String>,
     client_outputs: Option<usize>,
     server_addrs: Vec<SocketAddr>,
+    cert_der: Option<Vec<u8>>,
+    key_der: Option<Vec<u8>>,
 ) {
     let n = n_parties.unwrap_or_else(|| {
         eprintln!("Error: --n-parties is required in client mode");
@@ -1931,8 +2540,12 @@ async fn run_as_client(
             exit(2);
         })
     } else {
-        MpcBackendKind::default_backend()
+        MpcBackendKind::default()
     };
+    if let Err(error) = backend_kind.validate_party_count(n) {
+        eprintln!("Error: {error}");
+        exit(2);
+    }
 
     // A client may be an input client (provides `--inputs`), an output-only
     // client (provides `--outputs` and no inputs, e.g. a result recipient), or
@@ -1954,7 +2567,9 @@ async fn run_as_client(
 
     if server_addrs.is_empty() {
         eprintln!("Error: --servers is required in client mode (comma-separated addresses)");
-        eprintln!("Example: --servers 172.18.0.2:9000,172.18.0.3:9000,172.18.0.4:9000,172.18.0.5:9000,172.18.0.6:9000");
+        eprintln!(
+            "Example: --servers 172.18.0.2:9000,172.18.0.3:9000,172.18.0.4:9000,172.18.0.5:9000,172.18.0.6:9000"
+        );
         exit(2);
     }
 
@@ -1979,7 +2594,6 @@ async fn run_as_client(
         eprintln!("Error: {}", e);
         exit(2);
     }
-
     eprintln!(
         "[client] Client mode (backend={}, curve={}, n={}, t={}, {} inputs, {} outputs, {} servers)",
         backend_kind.name(),
@@ -1995,17 +2609,97 @@ async fn run_as_client(
         .install_default()
         .expect("install rustls crypto");
 
-    let network = Arc::new(tokio::sync::Mutex::new(QuicNetworkManager::new()));
+    let mut client_network = QuicNetworkManager::new();
+    match (cert_der, key_der) {
+        (Some(cert_der), Some(key_der)) => client_network
+            .set_local_certificate_der(cert_der, key_der)
+            .unwrap_or_else(|error| {
+                eprintln!("Error: failed to configure direct-client certificate: {error}");
+                exit(2);
+            }),
+        (None, None) => {}
+        _ => {
+            eprintln!("Error: direct client requires both --cert and --key when either is set");
+            exit(2);
+        }
+    }
+    let network = Arc::new(tokio::sync::Mutex::new(client_network));
 
     for (party_id, &addr) in server_addrs.iter().enumerate() {
         network.lock().await.add_node_with_party_id(party_id, addr);
         eprintln!("[client] Added server party {} at {}", party_id, addr);
     }
 
-    let (msg_tx, mut msg_rx) = mpsc::channel::<(usize, Vec<u8>)>(1000);
+    let (msg_tx, mut msg_rx) = mpsc::channel::<DirectClientInboundMessage>(1000);
 
     eprintln!("[client] Connecting to {} servers...", server_addrs.len());
-    connect_to_all_servers(&network, &server_addrs, msg_tx.clone()).await;
+    connect_to_all_servers(&network, &server_addrs).await;
+
+    // Get the client's position in the (n+1)-key sorted list so inbound and
+    // outbound authenticated IDs can both skip the client's own slot.
+    let local_position = {
+        let net = network.lock().await;
+        net.compute_local_party_id().unwrap_or(0)
+    };
+
+    // MPC backends own no raw connection reader here. The shared scanner is
+    // the sole physical reader and feeds this execution's registered inbox.
+    let (_execution_registration, _execution_scanner) = {
+        let mux = ExecutionTransportMux::new_client(4096)
+            .expect("MPC execution inbox capacity is nonzero");
+        let mut inbox = mux.register(execution_id).unwrap_or_else(|error| {
+            eprintln!("[client] Failed to register execution transport: {error}");
+            exit(24);
+        });
+        let registration = ExecutionInboxRegistrationGuard::new(mux.clone(), execution_id);
+        let scanner_network = {
+            let net = network.lock().await;
+            (*net).clone()
+        };
+        let scanner =
+            ExecutionConnectionScanner::spawn(scanner_network, mux).unwrap_or_else(|error| {
+                eprintln!("[client] Failed to start execution transport: {error}");
+                exit(24);
+            });
+        let routed_tx = msg_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                let message = tokio::select! {
+                    message = inbox.party.recv() => message,
+                    message = inbox.client.recv() => message,
+                };
+                let Some(message) = message else { break };
+                let inbound = direct_client_inbound_message(local_position, message);
+                if routed_tx.send(inbound).await.is_err() {
+                    break;
+                }
+            }
+        });
+        (registration, scanner)
+    };
+
+    let hello_network = {
+        let control_network = {
+            let net = network.lock().await;
+            ExecutionScopedNetwork::for_client((*net).clone(), execution_id)
+                .map(|network| network.with_message_kind(ExecutionMessageKind::Control))
+                .unwrap_or_else(|error| {
+                    eprintln!("[client] Failed to create execution hello transport: {error}");
+                    exit(24);
+                })
+        };
+        let hello_network = ScopedClientNetworkAdapter {
+            inner: control_network,
+            local_position,
+        };
+        send_execution_client_hellos(&hello_network, n)
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("[client] {error}");
+                exit(24);
+            });
+        hello_network
+    };
 
     let cid = {
         let net = network.lock().await;
@@ -2015,30 +2709,53 @@ async fn run_as_client(
 
     // Read INST message from servers: [b"INST" | instance_id:u64 | client_index:u8]
     let (instance_id, client_index, pending_messages) = {
-        let timeout_dur = Duration::from_secs(600);
+        let timeout_dur = honeybadger_protocol_timeout();
         let mut result: Option<(u64, u8)> = None;
         let mut pending_messages = Vec::new();
         let deadline = tokio::time::Instant::now() + timeout_dur;
+        let mut hello_retry = tokio::time::interval(Duration::from_secs(1));
+        hello_retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Consume the immediate first tick; the initial hello was sent above.
+        hello_retry.tick().await;
         while result.is_none() {
-            match tokio::time::timeout_at(deadline, msg_rx.recv()).await {
-                Ok(Some((sender, data))) => {
+            tokio::select! {
+                message = msg_rx.recv() => match message {
+                Some(inbound) => {
+                    let data = &inbound.message.payload;
                     if data.len() == 13 && &data[0..4] == b"INST" {
                         let id_bytes: [u8; 8] = data[4..12].try_into().unwrap();
                         let inst_id = u64::from_le_bytes(id_bytes);
                         let idx = data[12];
                         result = Some((inst_id, idx));
                     } else {
-                        pending_messages.push((sender, data));
+                        pending_messages.push(inbound);
                     }
                 }
-                Ok(None) => {
+                None => {
                     eprintln!("[client {}] Channel closed before receiving INST", cid);
                     exit(25);
                 }
-                Err(_) => {
+                },
+                _ = hello_retry.tick() => {
+                    if let Err(error) = send_execution_client_hellos(&hello_network, n).await {
+                        eprintln!("[client {cid}] execution hello retry failed: {error}");
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
                     eprintln!("[client {}] Timeout waiting for INST from server", cid);
                     exit(25);
                 }
+            }
+        }
+        // The first INST proves only one server admitted this physical route.
+        // Keep advertising briefly so an honest scanner that is still
+        // discovering its connection does not miss the only useful hello. This
+        // is deliberately bounded rather than an all-party acknowledgement
+        // barrier: the client must still progress when a Byzantine party omits.
+        for _ in 0..2 {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            if let Err(error) = send_execution_client_hellos(&hello_network, n).await {
+                eprintln!("[client {cid}] execution hello grace retry failed: {error}");
             }
         }
         let (id, idx) = result.unwrap();
@@ -2054,12 +2771,6 @@ async fn run_as_client(
         cid
     );
 
-    // Get the client's position in the (n+1)-key sorted list so we can
-    // remap party IDs when sending (skip our own slot).
-    let local_position = {
-        let net = network.lock().await;
-        net.compute_local_party_id().unwrap_or(0)
-    };
     eprintln!(
         "[client {}] Local position in sorted key list: {}",
         cid, local_position
@@ -2073,7 +2784,7 @@ async fn run_as_client(
             cid,
             pending_messages.len()
         );
-        let (replay_tx, replay_rx) = mpsc::channel::<(usize, Vec<u8>)>(1000);
+        let (replay_tx, replay_rx) = mpsc::channel::<DirectClientInboundMessage>(1000);
         tokio::spawn(async move {
             for message in pending_messages {
                 if replay_tx.send(message).await.is_err() {
@@ -2093,7 +2804,8 @@ async fn run_as_client(
     let inputs_for_task = inputs_str.clone();
     let process_handle = match backend_kind {
         MpcBackendKind::HoneyBadger => {
-            let protocol_config = HbClientProtocolConfig {
+            let protocol_config = ClientProtocolConfig {
+                execution_id,
                 n,
                 t,
                 input_len,
@@ -2115,9 +2827,11 @@ async fn run_as_client(
             })
         }
         MpcBackendKind::Avss => {
-            let protocol_config = AvssClientProtocolConfig {
+            let protocol_config = ClientProtocolConfig {
+                execution_id,
                 n,
                 t,
+                input_len,
                 output_len,
                 instance_id,
                 client_index,
@@ -2137,13 +2851,10 @@ async fn run_as_client(
         }
     };
 
-    let timeout_duration = Duration::from_secs(600);
+    let timeout_duration = honeybadger_protocol_timeout();
     match tokio::time::timeout(timeout_duration, process_handle).await {
         Ok(Ok(Ok(()))) => {
-            eprintln!(
-                "[client {}] Successfully submitted inputs to MPC network",
-                cid
-            );
+            eprintln!("[client {}] Direct MPC client protocol completed", cid);
         }
         Ok(Ok(Err(e))) => {
             eprintln!("[client {}] Input protocol failed: {}", cid, e);
@@ -2163,6 +2874,7 @@ async fn run_as_client(
     }
 }
 struct AvssOffchainCoordinatorClientArgs {
+    execution_id: ExecutionId,
     curve_config: MpcCurveConfig,
     client_inputs: Option<String>,
     client_outputs: Option<usize>,
@@ -2181,6 +2893,7 @@ async fn run_avss_offchain_coordinator_client_for_curve<F, G>(
     G: CurveGroup<ScalarField = F> + Send + Sync + 'static,
 {
     let AvssOffchainCoordinatorClientArgs {
+        execution_id,
         curve_config,
         client_inputs,
         client_outputs,
@@ -2216,12 +2929,13 @@ async fn run_avss_offchain_coordinator_client_for_curve<F, G>(
     });
 
     let mut coord: AvssOffChainCoordinator<F, G> =
-        AvssOffChainCoordinator::<F, G>::start_rpc_client(
+        AvssOffChainCoordinator::<F, G>::start_rpc_client_for_execution(
             &coord_addr.0,
             coord_addr.1,
             t as u64,
             server_addrs.len() as u64,
             output_len as u64,
+            coordinator_execution_id(execution_id),
             cert_der.clone(),
             key_der.clone(),
         )
@@ -2247,10 +2961,11 @@ async fn run_avss_offchain_coordinator_client_for_curve<F, G>(
         .map(|addr| (addr.ip().to_string(), addr.port()))
         .collect();
     let node_rpc_client: AvssOffChainNodeRpcClient<F, G> =
-        AvssOffChainNodeRpcClient::<F, G>::start_rpc_client(
+        AvssOffChainNodeRpcClient::<F, G>::start_rpc_client_for_execution(
             rpc_addrs.len(),
             t,
             rpc_addrs,
+            coordinator_execution_id(execution_id),
             cert_der,
             key_der,
         )
@@ -2290,51 +3005,16 @@ async fn run_avss_offchain_coordinator_client_for_curve<F, G>(
     println!("Client output: field[{}] 0x{}", outputs.len(), output_hex);
 }
 async fn run_avss_offchain_coordinator_client(args: AvssOffchainCoordinatorClientArgs) {
-    match args.curve_config {
-        MpcCurveConfig::Bls12_381 => {
-            run_avss_offchain_coordinator_client_for_curve::<
-                ark_bls12_381::Fr,
-                ark_bls12_381::G1Projective,
-            >(args)
-            .await
-        }
-        MpcCurveConfig::Bn254 => run_avss_offchain_coordinator_client_for_curve::<
-            ark_bn254::Fr,
-            ark_bn254::G1Projective,
-        >(args)
-        .await,
-        MpcCurveConfig::Curve25519 => {
-            run_avss_offchain_coordinator_client_for_curve::<
-                ark_curve25519::Fr,
-                ark_curve25519::EdwardsProjective,
-            >(args)
-            .await
-        }
-        MpcCurveConfig::Ed25519 => {
-            run_avss_offchain_coordinator_client_for_curve::<
-                ark_ed25519::Fr,
-                ark_ed25519::EdwardsProjective,
-            >(args)
-            .await
-        }
-        MpcCurveConfig::Secp256k1 => {
-            run_avss_offchain_coordinator_client_for_curve::<
-                ark_secp256k1::Fr,
-                ark_secp256k1::Projective,
-            >(args)
-            .await
-        }
-        MpcCurveConfig::Secp256r1 => {
-            run_avss_offchain_coordinator_client_for_curve::<
-                ark_secp256r1::Fr,
-                ark_secp256r1::Projective,
-            >(args)
-            .await
-        }
+    macro_rules! run {
+        ($F:ty, $G:ty) => {
+            run_avss_offchain_coordinator_client_for_curve::<$F, $G>(args).await
+        };
     }
+    dispatch_avss_curve!(args.curve_config, run)
 }
 #[allow(clippy::too_many_arguments)]
 async fn run_hb_coordinator_client_for_field<F>(
+    execution_id: ExecutionId,
     client_inputs: Option<String>,
     client_outputs: Option<usize>,
     output_format: CoordinatorOutputFormat,
@@ -2379,20 +3059,22 @@ async fn run_hb_coordinator_client_for_field<F>(
 
     // Off-chain client mode
     let ca = coord_addr.expect("--off-chain-coord required in off-chain client mode");
-    let mut coord: HbOffChainCoordinator<F> = HbOffChainCoordinator::<F>::start_rpc_client(
-        &ca.0,
-        ca.1,
-        t as u64,
-        server_addrs.len() as u64,
-        output_len as u64,
-        cert_der.clone(),
-        key_der.clone(),
-    )
-    .await
-    .unwrap_or_else(|error| {
-        eprintln!("Failed to connect to off-chain coordinator: {error}");
-        exit(13);
-    });
+    let mut coord: HbOffChainCoordinator<F> =
+        HbOffChainCoordinator::<F>::start_rpc_client_for_execution(
+            &ca.0,
+            ca.1,
+            t as u64,
+            server_addrs.len() as u64,
+            output_len as u64,
+            coordinator_execution_id(execution_id),
+            cert_der.clone(),
+            key_der.clone(),
+        )
+        .await
+        .unwrap_or_else(|error| {
+            eprintln!("Failed to connect to off-chain coordinator: {error}");
+            exit(13);
+        });
 
     coord.wait_for_round(Round::Preprocessing).await.unwrap();
     coord
@@ -2410,10 +3092,11 @@ async fn run_hb_coordinator_client_for_field<F>(
         .map(|a| (a.ip().to_string(), a.port()))
         .collect();
     let node_rpc_client: HbOffChainNodeRpcClient<F> =
-        HbOffChainNodeRpcClient::<F>::start_rpc_client(
+        HbOffChainNodeRpcClient::<F>::start_rpc_client_for_execution(
             rpc_addrs.len(),
             t,
             rpc_addrs,
+            coordinator_execution_id(execution_id),
             cert_der,
             key_der,
         )
@@ -2458,6 +3141,7 @@ async fn run_hb_coordinator_client_for_field<F>(
 #[allow(clippy::too_many_arguments)]
 async fn run_hb_coordinator_client(
     curve_config: MpcCurveConfig,
+    execution_id: ExecutionId,
     client_inputs: Option<String>,
     client_outputs: Option<usize>,
     output_format: CoordinatorOutputFormat,
@@ -2471,9 +3155,10 @@ async fn run_hb_coordinator_client(
     eth_node_addr: Option<String>,
     wallet_sk_str: Option<String>,
 ) {
-    match curve_config {
-        MpcCurveConfig::Bls12_381 => {
-            run_hb_coordinator_client_for_field::<ark_bls12_381::Fr>(
+    macro_rules! run {
+        ($F:ty, $G:ty) => {
+            run_hb_coordinator_client_for_field::<$F>(
+                execution_id,
                 client_inputs,
                 client_outputs,
                 output_format,
@@ -2488,199 +3173,174 @@ async fn run_hb_coordinator_client(
                 wallet_sk_str,
             )
             .await
+        };
+    }
+    dispatch_hb_curve!(curve_config, run, {
+        eprintln!(
+            "Error: curve {} is not supported by honeybadger backend",
+            curve_config.name()
+        );
+        exit(2);
+    })
+}
+async fn admit_execution_clients(
+    client_inbox: &mut mpsc::Receiver<ExecutionInboundMessage>,
+    expected_client_count: Option<usize>,
+    expected_client_bindings: Option<&[ClientProtocolBinding]>,
+) -> Result<Vec<ClientProtocolBinding>, String> {
+    let expected_client_ids = expected_client_bindings.map(client_binding_route_ids);
+    let roster_count = expected_client_bindings.map(<[_]>::len);
+    if let (Some(expected), Some(roster)) = (expected_client_count, roster_count) {
+        if expected != roster {
+            return Err(format!(
+                "wait-for-clients count {expected} does not match the {roster} admitted client bindings"
+            ));
         }
-        MpcCurveConfig::Bn254 => {
-            run_hb_coordinator_client_for_field::<ark_bn254::Fr>(
-                client_inputs,
-                client_outputs,
-                output_format,
-                server_addrs,
-                coord_addr,
-                contract_addr,
-                cert_der,
-                key_der,
-                threshold,
-                coordinator_client_index,
-                eth_node_addr,
-                wallet_sk_str,
-            )
-            .await
+    }
+    let wait_for = roster_count
+        .filter(|count| *count > 0)
+        .or(expected_client_count);
+    if wait_for == Some(0) {
+        return Err("--wait-for-clients count must be greater than 0".to_owned());
+    }
+    let mut bindings = Vec::new();
+    if let Some(expected) = wait_for {
+        let deadline = tokio::time::Instant::now() + honeybadger_protocol_timeout();
+        let mut clients = HashSet::with_capacity(expected);
+        while clients.len() < expected {
+            let inbound = tokio::time::timeout_at(deadline, client_inbox.recv())
+                .await
+                .map_err(|_| {
+                    format!(
+                        "timeout waiting for execution client hellos ({}/{expected})",
+                        clients.len()
+                    )
+                })?
+                .ok_or_else(|| {
+                    "execution client inbox closed while waiting for client hellos".to_owned()
+                })?;
+            match inbound.source {
+                ExecutionTransportSource::Client(client_id)
+                    if inbound.kind == ExecutionMessageKind::Control
+                        && inbound.payload == EXECUTION_CLIENT_HELLO_V1 =>
+                {
+                    if expected_client_ids
+                        .as_ref()
+                        .is_none_or(|allowed| allowed.contains(&client_id))
+                    {
+                        clients.insert(client_id);
+                    }
+                }
+                // Valid clients wait for INST before sending MPC payloads.
+                // Premature or unrelated traffic is not replayed into the
+                // execution after admission.
+                _ => {}
+            }
         }
-        MpcCurveConfig::Curve25519 => {
-            run_hb_coordinator_client_for_field::<ark_curve25519::Fr>(
-                client_inputs,
-                client_outputs,
-                output_format,
-                server_addrs,
-                coord_addr,
-                contract_addr,
-                cert_der,
-                key_der,
-                threshold,
-                coordinator_client_index,
-                eth_node_addr,
-                wallet_sk_str,
-            )
-            .await
-        }
-        MpcCurveConfig::Ed25519 => {
-            run_hb_coordinator_client_for_field::<ark_ed25519::Fr>(
-                client_inputs,
-                client_outputs,
-                output_format,
-                server_addrs,
-                coord_addr,
-                contract_addr,
-                cert_der,
-                key_der,
-                threshold,
-                coordinator_client_index,
-                eth_node_addr,
-                wallet_sk_str,
-            )
-            .await
-        }
-        MpcCurveConfig::Secp256k1 | MpcCurveConfig::Secp256r1 => {
-            eprintln!(
-                "Error: curve {} is not supported by honeybadger backend",
-                curve_config.name()
-            );
-            exit(2);
+        bindings = resolve_client_protocol_bindings(expected_client_bindings, clients)?;
+    } else if expected_client_bindings.is_some() {
+        bindings = resolve_client_protocol_bindings(expected_client_bindings, HashSet::new())?;
+    }
+
+    Ok(bindings)
+}
+
+enum PartyPreprocessing {
+    OneShot,
+    Reservoir { burst_capacity: usize },
+    Execution(OwnedPreprocBundle),
+}
+
+impl PartyPreprocessing {
+    fn into_parts(self) -> (DeploymentMode, usize, bool, Option<OwnedPreprocBundle>) {
+        match self {
+            Self::OneShot => (DeploymentMode::OneShot, 1, false, None),
+            Self::Reservoir { burst_capacity } => {
+                (DeploymentMode::Standing, burst_capacity, true, None)
+            }
+            Self::Execution(bundle) => (DeploymentMode::Standing, 1, false, Some(bundle)),
         }
     }
 }
-struct HbPartySetup<'a> {
+
+struct PartySetup<'a> {
     net: Arc<QuicNetworkManager>,
+    reply_mux: ExecutionTransportMux,
+    execution_id: ExecutionId,
+    execution_inbox: ExecutionInbox,
     my_id: usize,
-    persistent_identity: DurableIdentityDigest,
+    identity: DurableIdentityDigest,
     n: usize,
     t: usize,
     instance_id: u64,
     expected_client_count: Option<usize>,
-    coordinator_client_count_hint: usize,
+    expected_client_bindings: Option<Arc<Vec<ClientProtocolBinding>>>,
+    expected_client_reservation_identities: Option<Arc<BTreeMap<ClientId, DurableIdentityDigest>>>,
+    client_count_hint: usize,
     client_input_count: usize,
     client_input_types: &'a std::collections::BTreeMap<usize, Vec<ShareType>>,
     preprocessing_demand: stoffel_vm_types::compiled_binary::PreprocessingDemand,
     program_hash: [u8; 32],
-    preproc_store_path: Option<&'a str>,
-    deployment_mode: DeploymentMode,
-}
-
-struct HbPartyRuntime<F, G>
-where
-    F: SupportedMpcField,
-    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
-{
-    engine: Arc<HoneyBadgerMpcEngine<F, G>>,
-    run_complete_rx: mpsc::Receiver<(usize, u64)>,
+    preproc_store: Option<Arc<dyn PreprocStore>>,
+    preprocessing: PartyPreprocessing,
+    execution_tasks: Option<&'a ExecutionTaskGroup>,
 }
 
 async fn setup_hb_party_for_curve<F, G>(
     vm: &mut VirtualMachine,
-    setup: HbPartySetup<'_>,
-) -> Result<HbPartyRuntime<F, G>, String>
+    setup: PartySetup<'_>,
+) -> Result<Arc<HoneyBadgerMpcEngine<F, G>>, String>
 where
     F: SupportedMpcField,
     G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
 {
-    let HbPartySetup {
+    let PartySetup {
         net,
+        reply_mux,
+        execution_id,
+        mut execution_inbox,
         my_id,
-        persistent_identity,
+        identity,
         n,
         t,
         instance_id,
         expected_client_count,
-        coordinator_client_count_hint,
+        expected_client_bindings,
+        expected_client_reservation_identities,
+        client_count_hint,
         client_input_count,
         client_input_types,
         preprocessing_demand,
         program_hash,
-        preproc_store_path,
-        deployment_mode,
+        preproc_store,
+        preprocessing,
+        execution_tasks,
     } = setup;
+    let (
+        deployment_mode,
+        preprocessing_burst_capacity,
+        use_program_preproc_reservoir,
+        preallocated_bundle,
+    ) = preprocessing.into_parts();
 
-    // ---- Phase 1: Wait for clients ----
-    let mut input_ids: Vec<ClientId> = Vec::new();
+    let protocol_network = ExecutionScopedNetwork::for_party((*net).clone(), execution_id)
+        .map_err(|error| format!("invalid HoneyBadger execution transport: {error}"))?
+        .with_reply_mux(reply_mux);
+    let control_network = protocol_network
+        .clone()
+        .with_message_kind(ExecutionMessageKind::Control);
 
-    if let Some(expected_count) = expected_client_count {
-        if expected_count == 0 {
-            return Err("--wait-for-clients count must be greater than 0".to_string());
-        }
-        if client_input_count == 0 {
-            return Err("--client-input-count must be greater than 0".to_string());
-        }
-
-        eprintln!(
-            "[party {}] Waiting for {} clients...",
-            my_id, expected_count
-        );
-
-        let mut accept_net = (*net).clone();
-        let accept_party_id = my_id;
-        tokio::spawn(async move {
-            loop {
-                match accept_net.accept().await {
-                    Ok(_) => {
-                        eprintln!("[party {}] Accepted client connection", accept_party_id);
-                    }
-                    Err(e) => {
-                        eprintln!("[party {}] Accept error: {}", accept_party_id, e);
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                }
-            }
-        });
-
-        let connect_timeout = Duration::from_secs(600);
-        let check_interval = Duration::from_millis(250);
-        let start = std::time::Instant::now();
-
-        loop {
-            let mut connected_clients = net.clients();
-            connected_clients.sort_unstable();
-            connected_clients.dedup();
-
-            eprintln!(
-                "[party {}] {} of {} expected clients connected: {:?}",
-                my_id,
-                connected_clients.len(),
-                expected_count,
-                connected_clients
-            );
-
-            if connected_clients.len() > expected_count {
-                return Err(format!(
-                    "Expected exactly {} clients, but {} are connected: {:?}",
-                    expected_count,
-                    connected_clients.len(),
-                    connected_clients
-                ));
-            }
-
-            if connected_clients.len() == expected_count {
-                input_ids = connected_clients;
-                break;
-            }
-
-            if start.elapsed() > connect_timeout {
-                return Err(format!(
-                    "Timeout waiting for {} clients; connected so far: {:?}",
-                    expected_count,
-                    net.clients()
-                ));
-            }
-
-            tokio::time::sleep(check_interval).await;
-        }
-
-        eprintln!(
-            "[party {}] Using canonical client input IDs: {:?}",
-            my_id, input_ids
-        );
-
-        sync_client_set_across_parties(net.clone(), my_id, n, &input_ids).await?;
-    }
+    let clients = prepare_party_clients(
+        &mut execution_inbox.client,
+        expected_client_count,
+        expected_client_bindings.as_deref().map(Vec::as_slice),
+        client_input_types,
+        client_input_count,
+    )
+    .await?;
+    let client_bindings = &clients.bindings;
+    let input_ids = &clients.route_ids;
+    let input_setup_plan = &clients.input_setup;
 
     // ---- Phase 2: Setup MPC node and preprocess ----
     //
@@ -2694,9 +3354,15 @@ where
     // reveals only the program's size octave (privacy), not its exact operation
     // counts. The plan folds in the dependency that prandbit generation consumes
     // a triple + random per bit, and a baseline so light programs still run.
-    let client_random_count = input_ids.len().max(coordinator_client_count_hint);
-    let n_client_random = client_random_count.saturating_mul(client_input_count);
-    let plan = plan_preprocessing(&preprocessing_demand, t, n_client_random);
+    let n_client_random = client_preprocessing_count(
+        &clients,
+        deployment_mode,
+        client_input_types,
+        client_count_hint,
+        client_input_count,
+    )?;
+    let plan = plan_preprocessing(&preprocessing_demand, t, n_client_random)
+        .checked_scale(preprocessing_burst_capacity)?;
     let n_triples = plan.n_triples;
     let n_random = plan.n_random;
     let n_prandbit = plan.n_prandbit;
@@ -2728,7 +3394,11 @@ where
 
     // Use sequential indices (0..n_clients) as client IDs for the MPC protocol
     // because the session_id only has 8 bits for the client_id field.
-    let mpc_input_ids: Vec<ClientId> = (0..input_ids.len()).collect();
+    // The backend's InputServer treats every configured ID as a required
+    // participant in `wait_for_all_inputs`. Keep output-only clients in
+    // `client_bindings` for INST and output routing, but exclude them from the
+    // input protocol instead of requiring a synthetic completion message.
+    let mpc_input_ids = mpc_input_protocol_ids(input_setup_plan);
     let mpc_node = <HoneyBadgerMPCNode<F, Avid<HbSessionId>> as MPCProtocol<
         F,
         RobustShare<F>,
@@ -2737,88 +3407,89 @@ where
     .map_err(|e| format!("Failed to create MPC node: {:?}", e))?;
     eprintln!("[party {}] MPC node setup complete", my_id);
 
-    // The receive loop processes through the engine's resettable node handle.
-    // Earlier code captured a separate cloned node here, which works for a
-    // one-shot process but leaves persistent runs receiving on the old
-    // instance_id after `reset_for_next_run`.
-    // Created via from_existing_node which wraps it in Arc<Mutex>.
+    // Created via from_existing_node which wraps the protocol node in Arc<Mutex>.
     let open_message_router = Arc::new(stoffel_vm::net::OpenMessageRouter::new());
     let topology = MpcSessionTopology::try_new(instance_id, my_id, n, t)
         .map_err(|error| format!("Invalid HoneyBadger MPC topology: {error}"))?;
-    let engine = HoneyBadgerMpcEngine::<F, G>::from_existing_node_with_router_topology_and_mode(
+    let engine = HoneyBadgerMpcEngine::<F, G>::try_from_existing_node_for_execution(
         open_message_router.clone(),
         topology,
-        persistent_identity,
+        identity,
         net.clone(),
+        protocol_network.clone(),
         mpc_node, // moved, not cloned
         deployment_mode,
-    );
-
-    configure_hb_preproc_store(
-        &engine,
-        program_hash,
-        persistent_identity,
-        preproc_store_path,
     )?;
-    if let Some(path) = preproc_store_path {
-        eprintln!("[party {}] Using preprocessing store at {}", my_id, path);
+    if let Some(identities) = expected_client_reservation_identities {
+        engine
+            .install_standing_client_identities(identities.as_ref().clone())
+            .await?;
     }
-    engine.set_client_output_id_map(input_ids.clone()).await;
+
+    let has_preproc_store = preproc_store.is_some();
+    configure_preproc_store(engine.as_ref(), program_hash, preproc_store)?;
+    if has_preproc_store {
+        engine.set_preproc_store_identity(identity);
+    }
+    if use_program_preproc_reservoir {
+        engine.use_program_preproc_reservoir();
+    }
+    if clients.manifest_driven {
+        engine
+            .set_client_output_slot_map(client_output_slot_map(client_bindings))
+            .await;
+    } else {
+        engine.set_client_output_id_map(input_ids.clone()).await;
+    }
     vm.set_mpc_engine(engine.clone());
 
-    eprintln!(
-        "[party {}] Spawning receive loops (split channels)...",
-        my_id
-    );
-    let (mut server_rx, mut client_rx) =
-        spawn_receive_loops_split(net.clone(), my_id, n, open_message_router).await;
+    eprintln!("[party {}] Starting execution inbox pump...", my_id);
+    let mut server_rx = execution_inbox.party;
+    let mut preprocessing_exchange_rx = execution_inbox.control;
+    let mut client_rx = execution_inbox.client;
 
     // Map canonical client transport IDs to MPC protocol indices.
-    let client_id_to_index: std::collections::HashMap<ClientId, usize> = input_ids
+    let client_id_to_index: std::collections::HashMap<ClientId, usize> = client_bindings
         .iter()
-        .enumerate()
-        .map(|(idx, &tid)| (tid, idx))
+        .map(|binding| (binding.route_id, binding.protocol_index))
         .collect();
 
     // Single processing loop using tokio::select! for both server and client messages.
     // Only this task calls process(); fetch the node handle per message so reset swaps are visible.
-    let processing_net = net.clone();
+    let processing_net = Arc::new(protocol_network);
     let processing_engine = engine.clone();
     let process_party_id = my_id;
-    let (preprocessing_ready_tx, mut preprocessing_ready_rx) = mpsc::channel::<usize>(n);
-    let (run_complete_tx, run_complete_rx) = mpsc::channel::<(usize, u64)>(n);
-    tokio::spawn(async move {
-        let mut msg_count = 0u64;
-        let trace_messages = std::env::var("STOFFEL_RUN_TRACE_MESSAGES")
-            .is_ok_and(|value| matches!(value.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"));
+    let processing_router = open_message_router;
+    let preprocessing_cancellation = execution_tasks
+        .map(ExecutionTaskGroup::cancellation_token)
+        .unwrap_or_default();
+    spawn_execution_task(execution_tasks, async move {
         loop {
             tokio::select! {
-                Some((sender_id, raw_msg)) = server_rx.recv() => {
-                    if raw_msg.starts_with(HB_PREPROCESSING_READY_PREFIX) {
-                        if let Err(error) = preprocessing_ready_tx.send(sender_id).await {
-                            eprintln!(
-                                "[party {}] Failed to record preprocessing-ready marker from {}: {}",
-                                process_party_id, sender_id, error
-                            );
+                Some(message) = server_rx.recv() => {
+                    let sender_id = match message.source {
+                        ExecutionTransportSource::Party(sender_id) => sender_id,
+                        ExecutionTransportSource::Client(client_id) => {
+                            eprintln!("[party {}] Ignoring client source {} on party route", process_party_id, client_id);
+                            continue;
                         }
-                        continue;
-                    }
-                    if let Some(run_instance_id) = parse_u64_marker(HB_RUN_COMPLETE_PREFIX, &raw_msg) {
-                        if let Err(error) = run_complete_tx.send((sender_id, run_instance_id)).await {
-                            eprintln!(
-                                "[party {}] Failed to record run-complete marker from {}: {}",
-                                process_party_id, sender_id, error
-                            );
+                    };
+                    let raw_msg = message.payload;
+                    match processing_router.try_handle_wire_message(sender_id, &raw_msg) {
+                        Ok(true) => continue,
+                        Err(error) => {
+                            eprintln!("[party {}] Failed to route open message from {}: {}", process_party_id, sender_id, error);
+                            continue;
                         }
-                        continue;
+                        Ok(false) => {}
                     }
-
-                    msg_count += 1;
-                    if trace_messages && (msg_count <= 5 || msg_count.is_multiple_of(1000)) {
-                        eprintln!(
-                            "[party {}] Processing message #{} from sender {} ({} bytes)",
-                            process_party_id, msg_count, sender_id, raw_msg.len()
-                        );
+                    match processing_router.try_handle_hb_open_exp_wire_message(sender_id, &raw_msg) {
+                        Ok(true) => continue,
+                        Err(error) => {
+                            eprintln!("[party {}] Failed to route open-exp message from {}: {}", process_party_id, sender_id, error);
+                            continue;
+                        }
+                        Ok(false) => {}
                     }
                     let node_handle = processing_engine.node_handle().clone();
                     let process_result = {
@@ -2832,12 +3503,27 @@ where
                         );
                     }
                 }
-                Some((client_id, raw_msg)) = client_rx.recv() => {
+                Some(message) = client_rx.recv() => {
+                    let client_id = match message.source {
+                        ExecutionTransportSource::Client(client_id) => client_id,
+                        ExecutionTransportSource::Party(party_id) => {
+                            eprintln!("[party {}] Ignoring party source {} on client route", process_party_id, party_id);
+                            continue;
+                        }
+                    };
+                    if message.kind != ExecutionMessageKind::Mpc {
+                        eprintln!("[party {}] Ignoring client control message from {}", process_party_id, client_id);
+                        continue;
+                    }
+                    let raw_msg = message.payload;
                     // Remap transport client ID → sequential index
-                    let mpc_sender_id = client_id_to_index
-                        .get(&client_id)
-                        .copied()
-                        .unwrap_or(client_id);
+                    let Some(mpc_sender_id) = client_id_to_index.get(&client_id).copied() else {
+                        eprintln!(
+                            "[party {}] Ignoring MPC payload from unauthorized client {}",
+                            process_party_id, client_id
+                        );
+                        continue;
+                    };
                     let node_handle = processing_engine.node_handle().clone();
                     let process_result = {
                         let mut node = node_handle.lock().await;
@@ -2856,446 +3542,371 @@ where
     });
 
     // Brief delay to let receive loops discover connections
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    if preallocated_bundle.is_none() {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let mut standing_preprocessing_action = None;
+    if engine.is_standing() && n > 1 && preallocated_bundle.is_none() {
+        let local_snapshot = engine.standing_preproc_snapshot().await?;
+        let local_targets = engine.standing_preproc_targets().await?;
+        let local_proposal = StandingPreprocessingProposal {
+            snapshot: local_snapshot,
+            targets: local_targets,
+            nonce: fresh_preprocessing_nonce(),
+        };
+        let (proposals, fresh_generation_id) = preprocessing_transcript_exchange(
+            &control_network,
+            &mut preprocessing_exchange_rx,
+            execution_id,
+            my_id,
+            n,
+            &preprocessing_cancellation,
+            honeybadger_protocol_timeout(),
+            PreprocessingExchangePhase::HoneyBadgerInventory,
+            &local_proposal,
+        )
+        .await?;
+        let snapshots = validate_preprocessing_proposals(proposals, local_targets, "HoneyBadger")?;
+        let agreed_plan = engine
+            .install_standing_preproc_plan(snapshots, fresh_generation_id)
+            .await?;
+        standing_preprocessing_action = Some(agreed_plan.action);
+        eprintln!(
+            "[party {}] HB standing preprocessing agreement: action={:?} generation={} targets={:?}",
+            my_id,
+            agreed_plan.action,
+            hex::encode(&agreed_plan.generation_id[..4]),
+            local_targets,
+        );
+    }
 
-    eprintln!("[party {}] Starting MPC preprocessing...", my_id);
     let preprocessing_started_at = std::time::Instant::now();
-    engine
-        .preprocess()
-        .await
-        .map_err(|e| format!("MPC preprocessing failed: {}", e))?;
-    eprintln!(
-        "[party {}] MPC preprocessing complete! elapsed_ms={}",
-        my_id,
-        preprocessing_started_at.elapsed().as_millis()
-    );
-    match current_cgroup_memory_bytes() {
-        Some(bytes) => eprintln!(
-            "[party {}] POST_PREPROCESSING_CGROUP_MEM_BYTES: {}",
-            my_id, bytes
-        ),
-        None => eprintln!(
-            "[party {}] POST_PREPROCESSING_CGROUP_MEM_BYTES: unavailable",
-            my_id
-        ),
+    if let Some(bundle) = preallocated_bundle {
+        engine.activate_preallocated_standing(bundle).await?;
+        standing_preprocessing_action = Some(StandingPreprocAction::Reuse);
+        eprintln!(
+            "[party {}][execution {}] Activated preallocated HB reservoir bundle; preprocessing_wait_ms=0",
+            my_id, execution_id
+        );
+    } else {
+        eprintln!("[party {}] Starting MPC preprocessing...", my_id);
+        engine
+            .preprocess()
+            .await
+            .map_err(|e| format!("MPC preprocessing failed: {}", e))?;
+        eprintln!(
+            "[party {}] MPC preprocessing complete! elapsed_ms={}",
+            my_id,
+            preprocessing_started_at.elapsed().as_millis()
+        );
     }
-    match current_process_rss_bytes() {
-        Some(bytes) => eprintln!("[party {}] POST_PREPROCESSING_RSS_BYTES: {}", my_id, bytes),
-        None => eprintln!(
-            "[party {}] POST_PREPROCESSING_RSS_BYTES: unavailable",
-            my_id
-        ),
-    }
-
-    if n > 1 {
+    if n > 1 && standing_preprocessing_action != Some(StandingPreprocAction::Reuse) {
         eprintln!(
             "[party {}] Waiting for all parties to finish MPC preprocessing...",
             my_id
         );
-        let mut ready_message =
-            Vec::with_capacity(HB_PREPROCESSING_READY_PREFIX.len() + std::mem::size_of::<u64>());
-        ready_message.extend_from_slice(HB_PREPROCESSING_READY_PREFIX);
-        ready_message.extend_from_slice(&instance_id.to_le_bytes());
-        for peer_id in 0..n {
-            if peer_id == my_id {
-                continue;
-            }
-            net.send(peer_id, &ready_message).await.map_err(|error| {
-                format!(
-                    "Failed to send preprocessing-ready marker to party {}: {}",
-                    peer_id, error
-                )
-            })?;
+        let (ready_instances, _) = preprocessing_transcript_exchange(
+            &control_network,
+            &mut preprocessing_exchange_rx,
+            execution_id,
+            my_id,
+            n,
+            &preprocessing_cancellation,
+            honeybadger_protocol_timeout(),
+            PreprocessingExchangePhase::HoneyBadgerReady,
+            &instance_id,
+        )
+        .await?;
+        if ready_instances.iter().any(|ready| *ready != instance_id) {
+            return Err("parties reported divergent HoneyBadger protocol instances".to_owned());
         }
-
-        let mut ready_parties = std::collections::HashSet::with_capacity(n.saturating_sub(1));
-        let barrier_timeout = honeybadger_protocol_timeout();
-        let barrier_result = tokio::time::timeout(barrier_timeout, async {
-            while ready_parties.len() < n.saturating_sub(1) {
-                let sender_id = preprocessing_ready_rx.recv().await.ok_or_else(|| {
-                    "Preprocessing-ready marker channel closed before all parties were ready"
-                        .to_string()
-                })?;
-                if sender_id != my_id {
-                    ready_parties.insert(sender_id);
-                }
-            }
-            Ok::<(), String>(())
-        })
-        .await
-        .map_err(|_| {
-            format!(
-                "Timed out waiting for preprocessing-ready markers ({}/{})",
-                ready_parties.len(),
-                n.saturating_sub(1)
-            )
-        })?;
-        barrier_result?;
         eprintln!(
             "[party {}] All parties completed MPC preprocessing; continuing",
             my_id
         );
     }
 
-    if !input_ids.is_empty() {
-        let client_index_map: Vec<(usize, ClientId)> = input_ids
-            .iter()
-            .enumerate()
-            .map(|(idx, &tid)| (idx, tid))
-            .collect();
-
+    if !client_bindings.is_empty() {
         // Create a server-side network adapter that remaps sequential client
         // indices to transport client IDs for send_to_client().
         let server_adapter = Arc::new(ServerClientAdapter {
-            inner: (*net).clone(),
-            client_id_map: client_index_map.iter().map(|(_, tid)| *tid).collect(),
+            inner: engine.protocol_network().as_ref().clone(),
+            client_id_map: client_bindings
+                .iter()
+                .map(|binding| binding.route_id)
+                .collect(),
         });
 
-        // Access the engine's node for InputServer init
-        eprintln!(
-            "[party {}] Initializing InputServer for {} clients...",
-            my_id,
-            client_index_map.len()
-        );
-        {
-            let mut node = engine.node_handle().lock().await;
-            for &(idx, _tid) in &client_index_map {
-                let local_shares = node
-                    .preprocessing_material
-                    .lock()
-                    .await
-                    .take_random_shares(client_input_count)
-                    .map_err(|e| format!("Not enough random shares for client {}: {:?}", idx, e))?;
-
-                eprintln!(
-                    "[party {}] Sending random shares to client index {} (server_id={})",
-                    my_id, idx, node.id
-                );
-                node.preprocess
-                    .input
-                    .init(
-                        idx,
-                        local_shares,
-                        client_input_count,
-                        server_adapter.clone(),
-                    )
+        if !input_setup_plan.is_empty() {
+            eprintln!(
+                "[party {}] Initializing InputServer for {} input clients...",
+                my_id,
+                input_setup_plan.len()
+            );
+            let (server_id, mut input_server) = {
+                let node = engine.node_handle().lock().await;
+                (node.id, node.preprocess.input.clone())
+            };
+            for setup in input_setup_plan {
+                let local_shares = engine
+                    .reserve_client_input_masks(setup.input_count)
                     .await
                     .map_err(|e| {
-                        format!("Failed to init InputServer for client {}: {:?}", idx, e)
+                        format!(
+                            "Not enough random shares for client protocol index {}: {e}",
+                            setup.protocol_index
+                        )
                     })?;
+
                 eprintln!(
-                    "[party {}] InputServer initialized for client index {}",
-                    my_id, idx
+                    "[party {}] Sending {} random shares to client protocol index {} (server_id={})",
+                    my_id, setup.input_count, setup.protocol_index, server_id
                 );
+                let init_result = input_server
+                    .init(
+                        setup.protocol_index,
+                        local_shares,
+                        setup.input_count,
+                        server_adapter.clone(),
+                    )
+                    .await;
+                match init_result {
+                    Ok(()) => {}
+                    Err(InputError::NetworkError(
+                        NetworkError::ClientNotFound(_) | NetworkError::SendError,
+                    )) => {
+                        eprintln!(
+                            "[party {my_id}] HB client {} disconnected after admission; continuing with stored input state",
+                            setup.protocol_index
+                        );
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "Failed to init InputServer for client protocol index {}: {error:?}",
+                            setup.protocol_index
+                        ));
+                    }
+                }
             }
         }
 
-        // Signal readiness to clients
+        // Every admitted client receives its compact protocol index, including
+        // output-only clients for which no InputServer state was initialized.
         eprintln!(
-            "[party {}] Sending INST to {} clients...",
-            my_id,
-            client_index_map.len()
+            "[party {my_id}] Sending INST to {} clients...",
+            client_bindings.len()
         );
-        for &(idx, tid) in &client_index_map {
-            let mut inst_msg = Vec::with_capacity(13);
-            inst_msg.extend_from_slice(b"INST");
-            inst_msg.extend_from_slice(&instance_id.to_le_bytes());
-            inst_msg.push(idx as u8);
-            if let Err(e) = net.send_to_client(tid, &inst_msg).await {
-                eprintln!(
-                    "[party {}] Failed to send INST to client {}: {:?}",
-                    my_id, tid, e
-                );
-            }
-        }
+        send_client_instances(&control_network, my_id, instance_id, client_bindings).await?;
 
-        eprintln!(
-            "[party {}] Waiting for all client inputs (timeout=600s)...",
-            my_id
-        );
-        let client_inputs = {
-            let mut node = engine.node_handle().lock().await;
-            node.preprocess
-                .input
-                .wait_for_all_inputs(Duration::from_secs(600))
-                .await
-                .map_err(|e| format!("Failed to receive client inputs: {:?}", e))?
-        };
-
-        for (idx, shares) in client_inputs {
-            let transport_cid = client_index_map
-                .iter()
-                .find(|(i, _)| *i == idx)
-                .map(|(_, tid)| *tid)
-                .unwrap_or(idx);
-            if let Some(share_types) = client_input_types.get(&idx) {
-                vm.try_store_client_input_with_types(idx, shares, share_types)?;
-            } else {
-                vm.try_store_client_input(idx, shares)?;
-            }
+        if !input_setup_plan.is_empty() {
             eprintln!(
-                "[party {}] Stored inputs for client index {} (client {})",
-                my_id, idx, transport_cid
+                "[party {}] Waiting for all client inputs (timeout={}s)...",
+                my_id,
+                honeybadger_protocol_timeout().as_secs()
             );
+            // The inbox processor acquires the node mutex to feed masked-input
+            // frames into InputServer. Clone its shared handle before waiting so
+            // this task does not hold that mutex and deadlock the producer.
+            let mut input_server = {
+                let node = engine.node_handle().lock().await;
+                node.preprocess.input.clone()
+            };
+            let client_inputs = input_server
+                .wait_for_all_inputs(honeybadger_protocol_timeout())
+                .await
+                .map_err(|e| format!("Failed to receive client inputs: {e:?}"))?;
+
+            for (protocol_index, shares) in client_inputs {
+                let binding = client_bindings
+                    .iter()
+                    .find(|binding| binding.protocol_index == protocol_index)
+                    .ok_or_else(|| {
+                        format!(
+                            "InputServer returned unknown client protocol index {protocol_index}"
+                        )
+                    })?;
+                if binding.protocol_index != protocol_index
+                    || !input_setup_plan
+                        .iter()
+                        .any(|setup| setup.protocol_index == protocol_index)
+                {
+                    return Err(format!(
+                        "InputServer returned uninitialized client protocol index {protocol_index}"
+                    ));
+                }
+                if let Some(share_types) = client_input_types.get(&binding.manifest_slot) {
+                    vm.try_store_client_input_with_types(
+                        binding.manifest_slot,
+                        shares,
+                        share_types,
+                    )?;
+                } else {
+                    vm.try_store_client_input(binding.manifest_slot, shares)?;
+                }
+                eprintln!(
+                    "[party {}] Stored inputs for protocol index {} in manifest slot {} (client {})",
+                    my_id, protocol_index, binding.manifest_slot, binding.route_id
+                );
+            }
         }
     }
 
-    Ok(HbPartyRuntime {
-        engine,
-        run_complete_rx,
-    })
-}
-struct AvssPartySetup<'a> {
-    my_id: usize,
-    local_identity: DurableIdentityDigest,
-    n: usize,
-    t: usize,
-    instance_id: u64,
-    expected_client_count: Option<usize>,
-    client_input_count: usize,
-    client_input_types: &'a std::collections::BTreeMap<usize, Vec<ShareType>>,
+    Ok(engine)
 }
 async fn setup_avss_party_for_curve<F, G>(
     vm: &mut VirtualMachine,
-    net: Arc<QuicNetworkManager>,
-    setup: AvssPartySetup<'_>,
+    setup: PartySetup<'_>,
 ) -> Result<Arc<stoffel_vm::net::avss_engine::AvssMpcEngine<F, G>>, String>
 where
     F: SupportedMpcField,
     G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
 {
-    let AvssPartySetup {
+    let PartySetup {
+        net,
+        execution_id,
+        reply_mux,
+        mut execution_inbox,
         my_id,
-        local_identity,
+        identity,
         n,
         t,
         instance_id,
         expected_client_count,
+        expected_client_bindings,
+        expected_client_reservation_identities: _,
+        client_count_hint,
         client_input_count,
         client_input_types,
+        preprocessing_demand,
+        program_hash,
+        preproc_store,
+        preprocessing,
+        execution_tasks,
     } = setup;
+    let (
+        deployment_mode,
+        preprocessing_burst_capacity,
+        use_program_preproc_reservoir,
+        preallocated_bundle,
+    ) = preprocessing.into_parts();
 
-    // ---- Phase 1: Wait for clients ----
-    let mut input_ids: Vec<ClientId> = Vec::new();
+    let protocol_network = ExecutionScopedNetwork::for_party((*net).clone(), execution_id)
+        .map_err(|error| format!("invalid AVSS execution transport: {error}"))?
+        .with_reply_mux(reply_mux);
+    let control_network = protocol_network
+        .clone()
+        .with_message_kind(ExecutionMessageKind::Control);
 
-    if let Some(expected_count) = expected_client_count {
-        if expected_count == 0 {
-            return Err("--wait-for-clients count must be greater than 0".to_string());
-        }
-        if client_input_count == 0 {
-            return Err("--client-input-count must be greater than 0".to_string());
-        }
-
-        eprintln!(
-            "[party {}] Waiting for {} clients (AVSS)...",
-            my_id, expected_count
-        );
-
-        let mut accept_net = (*net).clone();
-        let accept_party_id = my_id;
-        tokio::spawn(async move {
-            loop {
-                match accept_net.accept().await {
-                    Ok(_) => {
-                        eprintln!("[party {}] Accepted client connection", accept_party_id);
-                    }
-                    Err(e) => {
-                        eprintln!("[party {}] Accept error: {}", accept_party_id, e);
-                        tokio::time::sleep(Duration::from_millis(100)).await;
-                    }
-                }
-            }
-        });
-
-        let connect_timeout = Duration::from_secs(600);
-        let check_interval = Duration::from_millis(250);
-        let start = std::time::Instant::now();
-
-        loop {
-            let mut connected_clients = net.clients();
-            connected_clients.sort_unstable();
-            connected_clients.dedup();
-
-            eprintln!(
-                "[party {}] {} of {} expected clients connected: {:?}",
-                my_id,
-                connected_clients.len(),
-                expected_count,
-                connected_clients
-            );
-
-            if connected_clients.len() > expected_count {
-                return Err(format!(
-                    "Expected exactly {} clients, but {} are connected: {:?}",
-                    expected_count,
-                    connected_clients.len(),
-                    connected_clients
-                ));
-            }
-
-            if connected_clients.len() == expected_count {
-                input_ids = connected_clients;
-                break;
-            }
-
-            if start.elapsed() > connect_timeout {
-                return Err(format!(
-                    "Timeout waiting for {} clients; connected so far: {:?}",
-                    expected_count,
-                    net.clients()
-                ));
-            }
-
-            tokio::time::sleep(check_interval).await;
-        }
-
-        eprintln!(
-            "[party {}] Using canonical client input IDs: {:?}",
-            my_id, input_ids
-        );
-
-        sync_client_set_across_parties(net.clone(), my_id, n, &input_ids).await?;
-    }
+    let clients = prepare_party_clients(
+        &mut execution_inbox.client,
+        expected_client_count,
+        expected_client_bindings.as_deref().map(Vec::as_slice),
+        client_input_types,
+        client_input_count,
+    )
+    .await?;
+    let client_bindings = &clients.bindings;
+    let input_ids = &clients.route_ids;
+    let input_setup_plan = &clients.input_setup;
 
     // ---- Phase 2: ECDH key exchange over existing network ----
-    let mpc_input_ids: Vec<ClientId> = (0..input_ids.len()).collect();
+    // AVSS has the same InputServer barrier semantics as HoneyBadger: only
+    // clients with declared inputs belong in the required input set.
+    let mpc_input_ids = mpc_input_protocol_ids(input_setup_plan);
 
     // Generate ECDH key pair for AVSS payload confidentiality
-    use ark_std::rand::SeedableRng as _;
-    let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
+    let mut rng = OsRng;
     let sk_i = F::rand(&mut rng);
     let pk_i: G = G::generator() * sk_i;
 
-    // Serialize our public key into an envelope: [party_id: u32][pk_bytes]
+    // Reuse the same authenticated, retrying transcript exchange used by
+    // preprocessing coordination. The sender position comes from the TLS-bound
+    // party route, so the exchanged value only needs the common instance and
+    // canonical public-key bytes.
     let mut pk_bytes = Vec::new();
     pk_i.serialize_compressed(&mut pk_bytes)
-        .map_err(|e| format!("Failed to serialize ECDH public key: {:?}", e))?;
-    let mut envelope = Vec::with_capacity(4 + pk_bytes.len());
-    envelope.extend_from_slice(&(my_id as u32).to_le_bytes());
-    envelope.extend_from_slice(&pk_bytes);
-
+        .map_err(|error| format!("failed to serialize AVSS ECDH public key: {error:?}"))?;
+    let preprocessing_cancellation = execution_tasks
+        .map(ExecutionTaskGroup::cancellation_token)
+        .unwrap_or_default();
+    let mut party_rx = execution_inbox.party;
+    let mut preprocessing_exchange_rx = execution_inbox.control;
+    eprintln!("[party {my_id}] Exchanging ECDH public keys...");
+    let (public_keys, _) = preprocessing_transcript_exchange(
+        &control_network,
+        &mut preprocessing_exchange_rx,
+        execution_id,
+        my_id,
+        n,
+        &preprocessing_cancellation,
+        execution_coordination_timeout(),
+        PreprocessingExchangePhase::AvssEcdh,
+        &(instance_id, pk_bytes),
+    )
+    .await?;
+    let mut pk_map = Vec::with_capacity(n);
+    for (peer_id, (peer_instance, serialized_key)) in public_keys.into_iter().enumerate() {
+        if peer_instance != instance_id {
+            return Err(format!(
+                "party {peer_id} proposed AVSS ECDH instance {peer_instance}, expected {instance_id}"
+            ));
+        }
+        let key = G::deserialize_compressed(serialized_key.as_slice()).map_err(|error| {
+            format!("failed to deserialize AVSS ECDH public key from party {peer_id}: {error:?}")
+        })?;
+        let mut canonical = Vec::new();
+        key.serialize_compressed(&mut canonical).map_err(|error| {
+            format!("failed to canonicalize AVSS ECDH public key from party {peer_id}: {error:?}")
+        })?;
+        if canonical != serialized_key {
+            return Err(format!(
+                "party {peer_id} sent a non-canonical AVSS ECDH public key"
+            ));
+        }
+        pk_map.push(key);
+    }
     eprintln!(
-        "[party {}] Exchanging ECDH public keys over existing network...",
-        my_id
+        "[party {my_id}] PK exchange complete ({} keys)",
+        pk_map.len()
     );
-
-    // Broadcast our PK to all peers via existing connections
-    let connections = net.get_all_server_connections();
-    for (peer_id, conn) in &connections {
-        let authenticated_peer_id = conn.remote_party_id().unwrap_or(*peer_id);
-        if authenticated_peer_id == my_id {
-            continue;
-        }
-        if let Err(e) = conn.send(&envelope).await {
-            eprintln!(
-                "[party {}] Failed to send PK to peer {}: {}",
-                my_id, authenticated_peer_id, e
-            );
-        }
-    }
-
-    // Collect PKs from all peers
-    let mut pk_map: Vec<G> = vec![G::default(); n];
-    pk_map[my_id] = pk_i;
-    let mut received = 1usize;
-    let mut seen = std::collections::HashSet::new();
-    seen.insert(my_id);
-
-    let (pk_tx, mut pk_rx) = tokio::sync::mpsc::channel::<(usize, Vec<u8>)>(n);
-
-    for (peer_id, conn) in &connections {
-        let authenticated_peer_id = conn.remote_party_id().unwrap_or(*peer_id);
-        if authenticated_peer_id == my_id {
-            continue;
-        }
-        let tx = pk_tx.clone();
-        let conn = conn.clone();
-        tokio::spawn(async move {
-            match conn.receive().await {
-                Ok(data) => {
-                    let _ = tx.send((authenticated_peer_id, data)).await;
-                }
-                Err(e) => {
-                    eprintln!(
-                        "[AVSS] Failed to receive PK from peer {}: {}",
-                        authenticated_peer_id, e
-                    );
-                }
-            }
-        });
-    }
-    drop(pk_tx);
-
-    let pk_deadline = tokio::time::Instant::now() + Duration::from_secs(120);
-    while received < n {
-        let remaining = pk_deadline.saturating_duration_since(tokio::time::Instant::now());
-        match tokio::time::timeout(remaining, pk_rx.recv()).await {
-            Ok(Some((peer_id, data))) => {
-                if data.len() < 4 {
-                    continue;
-                }
-                let claimed_id = u32::from_le_bytes(data[..4].try_into().unwrap()) as usize;
-                // Verify the payload's claimed sender_id against the transport-authenticated
-                // peer_id to prevent a malicious party from registering its key under a
-                // different party's identity.
-                if claimed_id != peer_id {
-                    eprintln!(
-                        "[party {}] AVSS PK exchange: transport sender {} claims to be party {} — ignoring",
-                        my_id, peer_id, claimed_id
-                    );
-                    continue;
-                }
-                let sender_id = claimed_id;
-                if sender_id >= n || !seen.insert(sender_id) {
-                    continue;
-                }
-                match G::deserialize_compressed(&data[4..]) {
-                    Ok(pk) => {
-                        pk_map[sender_id] = pk;
-                        received += 1;
-                        eprintln!(
-                            "[party {}] Received PK from party {} ({}/{})",
-                            my_id, sender_id, received, n
-                        );
-                    }
-                    Err(e) => {
-                        eprintln!(
-                            "[party {}] Failed to deserialize PK from party {}: {:?}",
-                            my_id, sender_id, e
-                        );
-                    }
-                }
-            }
-            Ok(None) => break,
-            Err(_) => {
-                return Err(format!(
-                    "Timeout during PK exchange: received {}/{} keys",
-                    received, n
-                ));
-            }
-        }
-    }
-
-    if received < n {
-        return Err(format!(
-            "PK exchange incomplete: received {}/{} keys",
-            received, n
-        ));
-    }
-    eprintln!("[party {}] PK exchange complete ({} keys)", my_id, n);
-
     let pk_map = Arc::new(pk_map);
 
     // ---- Phase 3: Create engine directly with existing network ----
     use stoffel_vm::net::avss_engine::{AvssEngineConfig, AvssMpcEngine};
     let session = stoffel_vm::net::MpcSessionConfig::try_new(instance_id, my_id, n, t, net.clone())
         .map_err(|error| format!("Invalid AVSS MPC topology: {error}"))?
-        .with_local_identity(local_identity)
+        .try_with_execution_id(execution_id)
+        .map_err(|error| format!("Invalid AVSS execution identity: {error}"))?
+        .with_local_identity(identity)
         .with_input_ids(mpc_input_ids);
-    let engine = AvssMpcEngine::<F, G>::from_config(AvssEngineConfig::new(session, sk_i, pk_map))
-        .await
-        .map_err(|e| format!("Failed to create AVSS engine: {}", e))?;
-    engine.set_client_output_id_map(input_ids.clone()).await;
+    let n_client_random = client_preprocessing_count(
+        &clients,
+        deployment_mode,
+        client_input_types,
+        client_count_hint,
+        client_input_count,
+    )?;
+    let planned = plan_preprocessing(&preprocessing_demand, t, n_client_random)
+        .checked_scale(preprocessing_burst_capacity)?;
+    let engine = AvssMpcEngine::<F, G>::from_config(
+        AvssEngineConfig::new(session, sk_i, pk_map)
+            .with_deployment_mode(deployment_mode)
+            .with_protocol_network(protocol_network.clone())
+            .with_preprocessing_counts(planned.n_random, planned.n_triples),
+    )
+    .await
+    .map_err(|e| format!("Failed to create AVSS engine: {}", e))?;
+    configure_preproc_store(engine.as_ref(), program_hash, preproc_store)?;
+    if use_program_preproc_reservoir {
+        engine.use_program_preproc_reservoir();
+    }
+    if clients.manifest_driven {
+        engine
+            .set_client_output_slot_map(client_output_slot_map(client_bindings))
+            .await;
+    } else {
+        engine.set_client_output_id_map(input_ids.clone()).await;
+    }
 
     engine
         .start_async()
@@ -3303,216 +3914,275 @@ where
         .map_err(|e| format!("Failed to start AVSS engine: {}", e))?;
     vm.set_mpc_engine(engine.clone());
 
-    // ---- Phase 4: Spawn message loops on existing connections ----
-    // Server message loops
-    let (msg_tx, _server_rx) = tokio::sync::mpsc::channel::<(usize, Vec<u8>)>(65536);
-    let (client_tx, mut client_rx) = tokio::sync::mpsc::channel::<(usize, Vec<u8>)>(4096);
+    // ---- Phase 4: Route backend traffic from the mux's MPC inbox.
+    let mut client_rx = execution_inbox.client;
 
-    for (peer_id, conn) in &connections {
-        if *peer_id == my_id {
-            continue;
-        }
-        let peer_id = *peer_id;
-        let engine = engine.clone();
-        let open_message_router = engine.open_message_router();
-        let tx = msg_tx.clone();
-        let conn = conn.clone();
-        let net_clone = net.clone();
-        let authenticated_sender_id = conn.remote_party_id().unwrap_or(peer_id);
-        tokio::spawn(async move {
-            while let Ok(data) = conn.receive().await {
-                if let Ok(true) =
-                    open_message_router.try_handle_wire_message(authenticated_sender_id, &data)
-                {
-                    continue;
-                }
-                if let Ok(true) = open_message_router
-                    .try_handle_avss_open_exp_wire_message(authenticated_sender_id, &data)
-                {
-                    continue;
-                }
-                if let Ok(true) = open_message_router
-                    .try_handle_avss_g2_exp_wire_message(authenticated_sender_id, &data)
-                {
-                    continue;
-                }
-                if let Err(e) = engine
-                    .process_wrapped_message_with_network(
-                        authenticated_sender_id,
-                        &data,
-                        net_clone.clone(),
-                    )
-                    .await
-                {
-                    let _ = tx.send((authenticated_sender_id, data)).await;
-                    if !e.contains("deserialize") && !e.contains("process failed") {
+    let client_id_to_index: std::collections::HashMap<ClientId, usize> = client_bindings
+        .iter()
+        .map(|binding| (binding.route_id, binding.protocol_index))
+        .collect();
+    let processing_engine = engine.clone();
+    let open_message_router = engine.open_message_router();
+    spawn_execution_task(execution_tasks, async move {
+        loop {
+            tokio::select! {
+                Some(message) = party_rx.recv() => {
+                    let sender_id = match message.source {
+                        ExecutionTransportSource::Party(sender_id) => sender_id,
+                        ExecutionTransportSource::Client(client_id) => {
+                            eprintln!("[AVSS] Ignoring client {client_id} on the party route");
+                            continue;
+                        }
+                    };
+                    let data = message.payload;
+                    if open_message_router.try_handle_wire_message(sender_id, &data).unwrap_or(false)
+                        || open_message_router
+                            .try_handle_avss_open_exp_wire_message(sender_id, &data)
+                            .unwrap_or(false)
+                        || open_message_router
+                            .try_handle_avss_g2_exp_wire_message(sender_id, &data)
+                            .unwrap_or(false)
+                    {
+                        continue;
+                    }
+                    if let Err(error) = processing_engine
+                        .process_wrapped_message(sender_id, &data)
+                        .await
+                    {
                         eprintln!(
-                            "[AVSS] Party failed to process message from {}: {}",
-                            authenticated_sender_id, e
+                            "[AVSS] Party failed to process message from {sender_id}: {error}"
                         );
                     }
                 }
-            }
-        });
-    }
-
-    // Client connection monitor
-    let client_net = net.clone();
-    tokio::spawn(async move {
-        let mut spawned = std::collections::HashSet::new();
-        loop {
-            for (cid, conn) in client_net.get_all_client_connections() {
-                if !spawned.insert(cid) {
-                    continue;
-                }
-                let txx = client_tx.clone();
-                tokio::spawn(async move {
-                    while let Ok(data) = conn.receive().await {
-                        if txx.send((cid, data)).await.is_err() {
-                            break;
+                Some(message) = client_rx.recv() => {
+                    let client_id = match message.source {
+                        ExecutionTransportSource::Client(client_id) => client_id,
+                        ExecutionTransportSource::Party(party_id) => {
+                            eprintln!("[AVSS] Ignoring party {party_id} on the client route");
+                            continue;
                         }
+                    };
+                    if message.kind != ExecutionMessageKind::Mpc {
+                        continue;
                     }
-                });
+                    let Some(mpc_sender_id) = client_id_to_index.get(&client_id).copied() else {
+                        eprintln!("[AVSS] Ignoring MPC payload from unauthorized client {client_id}");
+                        continue;
+                    };
+                    if let Err(error) = processing_engine
+                        .process_wrapped_message(mpc_sender_id, &message.payload)
+                        .await
+                    {
+                        eprintln!(
+                            "[party {}] Failed to process client message from {} (idx {}): {}",
+                            processing_engine.party().id(),
+                            client_id,
+                            mpc_sender_id,
+                            error
+                        );
+                    }
+                }
+                else => break,
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
 
-    // Route client messages through the AVSS node's process()
-    if !input_ids.is_empty() {
-        let client_id_to_index: std::collections::HashMap<ClientId, usize> = input_ids
-            .iter()
-            .enumerate()
-            .map(|(idx, &tid)| (tid, idx))
-            .collect();
-
-        let processing_engine = engine.clone();
-        let processing_net = net.clone();
-        tokio::spawn(async move {
-            while let Some((client_id, raw_msg)) = client_rx.recv().await {
-                let mpc_sender_id = client_id_to_index
-                    .get(&client_id)
-                    .copied()
-                    .unwrap_or(client_id);
-                if let Err(e) = processing_engine
-                    .process_wrapped_message_with_network(
-                        mpc_sender_id,
-                        &raw_msg,
-                        processing_net.clone(),
-                    )
-                    .await
-                {
-                    eprintln!(
-                        "[party {}] Failed to process client message from {} (idx {}): {:?}",
-                        processing_engine.party().id(),
-                        client_id,
-                        mpc_sender_id,
-                        e
-                    );
-                }
-            }
-        });
+    // ---- Phase 5: Preprocessing ----
+    if preallocated_bundle.is_none() {
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+    let mut standing_preprocessing_action = None;
+    if engine.is_standing() && n > 1 && preallocated_bundle.is_none() {
+        let local_snapshot = engine.standing_preproc_snapshot().await?;
+        let local_targets = engine.standing_preproc_targets().await?;
+        let local_proposal = StandingPreprocessingProposal {
+            snapshot: local_snapshot,
+            targets: local_targets,
+            nonce: fresh_preprocessing_nonce(),
+        };
+        let (proposals, fresh_generation_id) = preprocessing_transcript_exchange(
+            &control_network,
+            &mut preprocessing_exchange_rx,
+            execution_id,
+            my_id,
+            n,
+            &preprocessing_cancellation,
+            execution_coordination_timeout(),
+            PreprocessingExchangePhase::AvssInventory,
+            &local_proposal,
+        )
+        .await?;
+        let snapshots = validate_preprocessing_proposals(proposals, local_targets, "AVSS")?;
+        let agreed_plan = engine
+            .install_standing_preproc_plan(snapshots, fresh_generation_id)
+            .await?;
+        standing_preprocessing_action = Some(agreed_plan.action);
+        eprintln!(
+            "[party {}] AVSS standing preprocessing agreement: action={:?} generation={} targets={:?}",
+            my_id,
+            agreed_plan.action,
+            hex::encode(&agreed_plan.generation_id[..4]),
+            local_targets,
+        );
+    }
+    if let Some(bundle) = preallocated_bundle {
+        engine.activate_preallocated_standing(bundle).await?;
+        standing_preprocessing_action = Some(StandingPreprocAction::Reuse);
+        eprintln!(
+            "[party {}][execution {}] Activated preallocated AVSS reservoir bundle; preprocessing_wait_ms=0",
+            my_id, execution_id
+        );
+    } else {
+        eprintln!("[party {}] Starting AVSS preprocessing...", my_id);
+        engine.preprocess().await?;
+        eprintln!("[party {}] AVSS preprocessing complete!", my_id);
     }
 
-    // ---- Phase 5: Preprocessing ----
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    eprintln!("[party {}] Starting AVSS preprocessing...", my_id);
-    engine.preprocess().await?;
-    eprintln!("[party {}] AVSS preprocessing complete!", my_id);
-
-    // ---- Phase 6: Client input initialization ----
-    if !input_ids.is_empty() {
-        let client_index_map: Vec<(usize, ClientId)> = input_ids
-            .iter()
-            .enumerate()
-            .map(|(idx, &tid)| (idx, tid))
-            .collect();
-
-        let server_adapter = Arc::new(ServerClientAdapter {
-            inner: (*net).clone(),
-            client_id_map: client_index_map.iter().map(|(_, tid)| *tid).collect(),
-        });
-
+    if n > 1 && standing_preprocessing_action != Some(StandingPreprocAction::Reuse) {
         eprintln!(
-            "[party {}] Initializing AVSS InputServer for {} clients...",
-            my_id,
-            client_index_map.len()
-        );
-        {
-            let mut node = engine.node_handle().lock().await;
-            for &(idx, _tid) in &client_index_map {
-                let local_shares = node
-                    .preprocessing_material
-                    .lock()
-                    .await
-                    .take_v_random_shares(client_input_count)
-                    .map_err(|e| format!("Not enough random shares for client {}: {:?}", idx, e))?;
-
-                node.input_server
-                    .init(
-                        idx,
-                        local_shares,
-                        client_input_count,
-                        server_adapter.clone(),
-                    )
-                    .await
-                    .map_err(|e| {
-                        format!("Failed to init InputServer for client {}: {:?}", idx, e)
-                    })?;
-                eprintln!(
-                    "[party {}] InputServer initialized for client index {}",
-                    my_id, idx
-                );
-            }
-        }
-
-        // Signal readiness to clients
-        eprintln!(
-            "[party {}] Sending INST to {} clients...",
-            my_id,
-            client_index_map.len()
-        );
-        for &(idx, tid) in &client_index_map {
-            let mut inst_msg = Vec::with_capacity(13);
-            inst_msg.extend_from_slice(b"INST");
-            inst_msg.extend_from_slice(&instance_id.to_le_bytes());
-            inst_msg.push(idx as u8);
-            if let Err(e) = net.send_to_client(tid, &inst_msg).await {
-                eprintln!(
-                    "[party {}] Failed to send INST to client {}: {:?}",
-                    my_id, tid, e
-                );
-            }
-        }
-
-        // Wait for all client inputs
-        eprintln!(
-            "[party {}] Waiting for all client inputs (timeout=600s)...",
+            "[party {}] Waiting for all parties to finish AVSS preprocessing...",
             my_id
         );
-        let client_inputs = {
-            let mut node = engine.node_handle().lock().await;
-            node.input_server
-                .wait_for_all_inputs(Duration::from_secs(600))
-                .await
-                .map_err(|e| format!("Failed to receive client inputs: {:?}", e))?
-        };
+        let (ready_instances, _) = preprocessing_transcript_exchange(
+            &control_network,
+            &mut preprocessing_exchange_rx,
+            execution_id,
+            my_id,
+            n,
+            &preprocessing_cancellation,
+            execution_coordination_timeout(),
+            PreprocessingExchangePhase::AvssReady,
+            &instance_id,
+        )
+        .await?;
+        if ready_instances.iter().any(|ready| *ready != instance_id) {
+            return Err("parties reported divergent AVSS protocol instances".to_owned());
+        }
+        eprintln!(
+            "[party {}] All parties completed AVSS preprocessing; continuing",
+            my_id
+        );
+    }
 
-        for (idx, shares) in client_inputs {
-            let transport_cid = client_index_map
+    // ---- Phase 6: Client input initialization ----
+    if !client_bindings.is_empty() {
+        let server_adapter = Arc::new(ServerClientAdapter {
+            inner: protocol_network.clone(),
+            client_id_map: client_bindings
                 .iter()
-                .find(|(i, _)| *i == idx)
-                .map(|(_, tid)| *tid)
-                .unwrap_or(idx);
-            if let Some(share_types) = client_input_types.get(&idx) {
-                vm.try_store_client_input_feldman_with_types(idx, shares, share_types)?;
-            } else {
-                vm.try_store_client_input_feldman(idx, shares)?;
-            }
+                .map(|binding| binding.route_id)
+                .collect(),
+        });
+
+        if !input_setup_plan.is_empty() {
             eprintln!(
-                "[party {}] Stored inputs for client index {} (client {})",
-                my_id, idx, transport_cid
+                "[party {}] Initializing AVSS InputServer for {} input clients...",
+                my_id,
+                input_setup_plan.len()
             );
+            let mut input_server = {
+                let node = engine.node_handle().lock().await;
+                node.input_server.clone()
+            };
+            for setup in input_setup_plan {
+                let local_shares = engine
+                    .reserve_client_input_masks(setup.input_count)
+                    .await
+                    .map_err(|e| {
+                        format!(
+                            "Not enough AVSS random shares for client protocol index {}: {e}",
+                            setup.protocol_index
+                        )
+                    })?;
+                let init_result = input_server
+                    .init(
+                        setup.protocol_index,
+                        local_shares,
+                        setup.input_count,
+                        server_adapter.clone(),
+                    )
+                    .await;
+                match init_result {
+                    Ok(()) => {}
+                    Err(AvssInputError::NetworkError(
+                        NetworkError::ClientNotFound(_) | NetworkError::SendError,
+                    )) => {
+                        // init stores the local masks before attempting this
+                        // send. A threshold-fast client may already have
+                        // broadcast its masked input and disconnected; keep
+                        // waiting for that authenticated broadcast.
+                        eprintln!(
+                            "[party {my_id}] AVSS client {} disconnected after admission; continuing with stored input state",
+                            setup.protocol_index
+                        );
+                    }
+                    Err(error) => {
+                        return Err(format!(
+                            "Failed to init AVSS InputServer for client protocol index {}: {error:?}",
+                            setup.protocol_index
+                        ));
+                    }
+                }
+            }
+        }
+
+        // Every admitted client receives INST, including output-only clients.
+        eprintln!(
+            "[party {my_id}] Sending INST to {} clients...",
+            client_bindings.len()
+        );
+        send_client_instances(&control_network, my_id, instance_id, client_bindings).await?;
+
+        if !input_setup_plan.is_empty() {
+            eprintln!(
+                "[party {}] Waiting for all AVSS client inputs (timeout={}s)...",
+                my_id,
+                honeybadger_protocol_timeout().as_secs()
+            );
+            // Processing masked-input frames also needs the engine node mutex.
+            // AvssInputServer clones share their watch/RBC state, so wait on a
+            // clone after releasing the node guard.
+            let mut input_server = {
+                let node = engine.node_handle().lock().await;
+                node.input_server.clone()
+            };
+            let client_inputs = input_server
+                .wait_for_all_inputs(honeybadger_protocol_timeout())
+                .await
+                .map_err(|e| format!("Failed to receive AVSS client inputs: {e:?}"))?;
+
+            for (protocol_index, shares) in client_inputs {
+                let binding = client_bindings
+                    .iter()
+                    .find(|binding| binding.protocol_index == protocol_index)
+                    .ok_or_else(|| {
+                        format!(
+                            "AVSS InputServer returned unknown client protocol index {protocol_index}"
+                        )
+                    })?;
+                if binding.protocol_index != protocol_index
+                    || !input_setup_plan
+                        .iter()
+                        .any(|setup| setup.protocol_index == protocol_index)
+                {
+                    return Err(format!(
+                        "AVSS InputServer returned uninitialized client protocol index {protocol_index}"
+                    ));
+                }
+                if let Some(share_types) = client_input_types.get(&binding.manifest_slot) {
+                    vm.try_store_client_input_feldman_with_types(
+                        binding.manifest_slot,
+                        shares,
+                        share_types,
+                    )?;
+                } else {
+                    vm.try_store_client_input_feldman(binding.manifest_slot, shares)?;
+                }
+                eprintln!(
+                    "[party {}] Stored AVSS inputs for protocol index {} in manifest slot {} (client {})",
+                    my_id, protocol_index, binding.manifest_slot, binding.route_id
+                );
+            }
         }
     }
 
@@ -3526,11 +4196,19 @@ async fn run_avss_coordinated_party_for_curve<F, G>(
     n: usize,
     t: usize,
     instance_id: u64,
+    execution_id: ExecutionId,
     coord_addr: (String, u16),
     rpc_addr: (String, u16),
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
     expected_clients: &[String],
+    client_input_total: usize,
+    client_input_count: usize,
+    client_input_slots: &[usize],
+    client_input_types: &std::collections::BTreeMap<usize, Vec<ShareType>>,
+    preprocessing_demand: stoffel_vm_types::compiled_binary::PreprocessingDemand,
+    program_hash: [u8; 32],
+    preproc_store: Option<Arc<dyn PreprocStore>>,
     as_leader: bool,
     agreed_entry: &str,
 ) -> Result<(), String>
@@ -3538,87 +4216,109 @@ where
     F: SupportedMpcField,
     G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
 {
+    let coordinator_execution_id = coordinator_execution_id(execution_id);
     let input_ids: Vec<Vec<u8>> = expected_clients
         .iter()
         .map(|path| extract_pubkey_from_cert(&fs::read(path).expect("read client cert")))
         .collect();
+    let (mux, execution_inbox, _execution_registration, _execution_scanner) =
+        start_party_execution_transport(&net, execution_id)
+            .map_err(|error| format!("Failed to start AVSS execution transport: {error}"))?;
+    let coord: AvssOffChainCoordinator<F, G> =
+        AvssOffChainCoordinator::<F, G>::start_rpc_client_for_execution(
+            &coord_addr.0,
+            coord_addr.1,
+            t as u64,
+            n as u64,
+            2,
+            coordinator_execution_id,
+            cert_der.clone(),
+            key_der.clone(),
+        )
+        .await
+        .map_err(|error| format!("Failed to connect to AVSS off-chain coordinator: {error}"))?;
 
-    let coord: AvssOffChainCoordinator<F, G> = AvssOffChainCoordinator::<F, G>::start_rpc_client(
-        &coord_addr.0,
-        coord_addr.1,
-        t as u64,
-        n as u64,
-        2,
-        cert_der.clone(),
-        key_der.clone(),
-    )
-    .await
-    .map_err(|error| format!("Failed to connect to AVSS off-chain coordinator: {error}"))?;
-
-    let mut node_rpc: AvssOffChainNodeRpcServer<F, G> = AvssOffChainNodeRpcServer::<F, G>::start(
-        &rpc_addr.0,
-        rpc_addr.1,
-        cert_der.clone(),
-        key_der.clone(),
-        extract_pubkey_from_cert(&cert_der),
-    )
-    .await
-    .map_err(|error| format!("Failed to start AVSS node RPC server: {error}"))?;
+    let node_rpc: AvssOffChainNodeRpcServer<F, G> =
+        AvssOffChainNodeRpcServer::<F, G>::start_for_execution(
+            &rpc_addr.0,
+            rpc_addr.1,
+            coordinator_execution_id,
+            cert_der.clone(),
+            key_der.clone(),
+        )
+        .await
+        .map_err(|error| format!("Failed to start AVSS node RPC server: {error}"))?;
 
     if as_leader {
-        coord.reset_coord().await.map_err(|e| e.to_string())?;
         coord
             .start_preprocessing()
             .await
             .map_err(|e| e.to_string())?;
     }
 
-    let client_input_types = std::collections::BTreeMap::new();
     let engine = setup_avss_party_for_curve::<F, G>(
         vm,
-        net,
-        AvssPartySetup {
+        PartySetup {
+            net,
+            reply_mux: mux,
+            execution_id,
+            execution_inbox,
             my_id,
-            local_identity: durable_identity_from_cert(&cert_der),
+            identity: durable_identity_from_cert(&cert_der),
             n,
             t,
             instance_id,
             expected_client_count: None,
-            client_input_count: 1,
-            client_input_types: &client_input_types,
+            expected_client_bindings: None,
+            expected_client_reservation_identities: None,
+            client_count_hint: input_ids.len(),
+            client_input_count,
+            client_input_types,
+            preprocessing_demand,
+            program_hash,
+            preproc_store,
+            preprocessing: PartyPreprocessing::OneShot,
+            execution_tasks: None,
         },
     )
     .await?;
     engine.enable_client_output_capture().await;
 
     if input_ids.is_empty() {
+        if client_input_total != 0 {
+            return Err(format!(
+                "AVSS coordinator declared {client_input_total} inputs without any client identities"
+            ));
+        }
         eprintln!(
             "[party {}] AVSS coordinator mode has no client inputs; preprocessing complete, skipping input collection",
             my_id
         );
     } else {
-        let mut mask_shares = Vec::with_capacity(input_ids.len());
-        {
+        if client_input_total == 0 {
+            return Err(
+                "AVSS coordinator has client identities but no declared inputs".to_string(),
+            );
+        }
+        let mask_shares = {
             let node = engine.node_handle().lock().await;
-            for idx in 0..input_ids.len() {
-                let local_shares = node
-                    .preprocessing_material
-                    .lock()
-                    .await
-                    .take_v_random_shares(1)
-                    .map_err(|e| {
-                        format!("Not enough AVSS random shares for client {idx}: {:?}", e)
-                    })?;
-                let share = local_shares
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| format!("AVSS random share batch for client {idx} was empty"))?;
-                node_rpc
-                    .add_mask_share(idx as u64, &share)
-                    .await
-                    .map_err(|e| format!("add_mask_share: {:?}", e))?;
-                mask_shares.push(share);
-            }
+            let local_shares = node
+                .preprocessing_material
+                .lock()
+                .await
+                .take_v_random_shares(client_input_total)
+                .map_err(|e| {
+                    format!(
+                        "Not enough AVSS random shares for {client_input_total} client inputs: {e:?}"
+                    )
+                })?;
+            local_shares
+        };
+        for (idx, share) in mask_shares.iter().enumerate() {
+            node_rpc
+                .add_mask_share_for_execution(coordinator_execution_id, idx as u64, share)
+                .await
+                .map_err(|e| format!("add_mask_share: {:?}", e))?;
         }
 
         if as_leader {
@@ -3634,7 +4334,7 @@ where
 
         let client_to_indices = normalize_client_to_indices(
             coord
-                .wait_for_indices(input_ids.len() as u64)
+                .wait_for_indices(client_input_total as u64)
                 .await
                 .map_err(|e| e.to_string())?,
         );
@@ -3642,7 +4342,7 @@ where
         for (cid, indices) in &client_to_indices {
             for idx in indices {
                 node_rpc
-                    .add_reserved_index(cid.clone(), *idx)
+                    .add_reserved_index_for_execution(coordinator_execution_id, cid.clone(), *idx)
                     .await
                     .or_else(|e| match e {
                         NodeRPCError::JSONError => {
@@ -3666,17 +4366,16 @@ where
             .map_err(|e| e.to_string())?;
 
         let client_inputs = coord
-            .wait_for_inputs(input_ids.len() as u64, mask_shares)
+            .wait_for_inputs(client_input_total as u64, mask_shares)
             .await
             .map_err(|e| e.to_string())?;
-        let client_input_types = std::collections::BTreeMap::new();
         store_reserved_client_inputs_feldman::<F, G, _>(
             vm,
             &client_to_indices,
             client_inputs,
-            1,
-            &[],
-            &client_input_types,
+            client_input_count,
+            client_input_slots,
+            client_input_types,
         );
     }
 
@@ -3689,9 +4388,15 @@ where
         .map_err(|e| e.to_string())?;
 
     eprintln!("Starting VM execution of '{}'...", agreed_entry);
-    let result = vm
-        .execute(agreed_entry)
+    let (result, cooperative_metrics) = vm
+        .execute_async_with_metrics(agreed_entry, engine.as_ref())
+        .await
         .map_err(|err| format!("Execution error in '{}': {}", agreed_entry, err))?;
+    eprintln!(
+        "[party {my_id}] cooperative VM execution: instruction_budget_yields={} online_effect_yields={}",
+        cooperative_metrics.instruction_budget_yields,
+        cooperative_metrics.online_effect_yields,
+    );
 
     let captured_outputs = engine.drain_client_output_records().await;
     if !captured_outputs.is_empty() {
@@ -3733,127 +4438,1186 @@ async fn run_avss_coordinated_party(
     n: usize,
     t: usize,
     instance_id: u64,
+    execution_id: ExecutionId,
     coord_addr: (String, u16),
     rpc_addr: (String, u16),
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
     expected_clients: &[String],
+    client_input_total: usize,
+    client_input_count: usize,
+    client_input_slots: &[usize],
+    client_input_types: &std::collections::BTreeMap<usize, Vec<ShareType>>,
+    preprocessing_demand: stoffel_vm_types::compiled_binary::PreprocessingDemand,
+    program_hash: [u8; 32],
+    preproc_store: Option<Arc<dyn PreprocStore>>,
     as_leader: bool,
     agreed_entry: &str,
 ) -> Result<(), String> {
-    match curve_config {
-        MpcCurveConfig::Bls12_381 => {
-            run_avss_coordinated_party_for_curve::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>(
+    macro_rules! run {
+        ($F:ty, $G:ty) => {
+            run_avss_coordinated_party_for_curve::<$F, $G>(
                 vm,
                 net,
                 my_id,
                 n,
                 t,
                 instance_id,
+                execution_id,
                 coord_addr,
                 rpc_addr,
                 cert_der,
                 key_der,
                 expected_clients,
+                client_input_total,
+                client_input_count,
+                client_input_slots,
+                client_input_types,
+                preprocessing_demand,
+                program_hash,
+                preproc_store,
                 as_leader,
                 agreed_entry,
             )
             .await
+        };
+    }
+    dispatch_avss_curve!(curve_config, run)
+}
+
+struct StandingReservoirProgram {
+    program_id: [u8; 32],
+    bytes: Vec<u8>,
+    backend: MpcBackendKind,
+    curve: MpcCurveConfig,
+    client_io_manifest: ClientIoManifest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct ReservoirAllocationSnapshot {
+    /// Commits the complete frozen standing admission, including the ordered
+    /// certificate identity/manifest-slot roster, before any material moves.
+    admission_config_digest: [u8; 32],
+    requested: PoolAvailability,
+    inventory: StandingPreprocSnapshot,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct ReservoirAllocationCommit {
+    allocation_digest: [u8; 32],
+    allocated: PoolAvailability,
+    remaining: PoolAvailability,
+}
+
+fn validate_reservoir_allocation_admission(
+    local: &ReservoirAllocationSnapshot,
+    snapshots: &[ReservoirAllocationSnapshot],
+) -> Result<(), String> {
+    if let Some((party_id, peer)) = snapshots
+        .iter()
+        .enumerate()
+        .find(|(_, peer)| peer.admission_config_digest != local.admission_config_digest)
+    {
+        return Err(format!(
+            "party {party_id} has divergent frozen standing admission: local config digest={}, remote config digest={}",
+            hex::encode(local.admission_config_digest),
+            hex::encode(peer.admission_config_digest),
+        ));
+    }
+    Ok(())
+}
+
+struct StandingReservoirState {
+    program: StandingReservoirProgram,
+    per_execution: PoolAvailability,
+    material_capacity: usize,
+    lane: Arc<tokio::sync::Mutex<()>>,
+}
+
+fn discover_standing_reservoir_programs(
+    programs_dir: &std::path::Path,
+) -> Result<Vec<StandingReservoirProgram>, String> {
+    let mut paths = fs::read_dir(programs_dir)
+        .map_err(|error| format!("read standing program directory: {error}"))?
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "stflb")
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+
+    let mut programs = Vec::with_capacity(paths.len());
+    for path in paths {
+        let bytes = fs::read(&path)
+            .map_err(|error| format!("read standing artifact {}: {error}", path.display()))?;
+        let program_id = program_id_from_bytes(&bytes);
+        let expected_name = format!("{}.stflb", hex::encode(program_id));
+        if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+            return Err(format!(
+                "standing artifact {} is not stored under its content address {expected_name}",
+                path.display()
+            ));
         }
-        MpcCurveConfig::Bn254 => {
-            run_avss_coordinated_party_for_curve::<ark_bn254::Fr, ark_bn254::G1Projective>(
-                vm,
-                net,
-                my_id,
-                n,
-                t,
-                instance_id,
-                coord_addr,
-                rpc_addr,
-                cert_der,
-                key_der,
-                expected_clients,
-                as_leader,
-                agreed_entry,
+        let (manifest, backend, curve) = validate_standing_program(&bytes, None)
+            .map_err(|error| format!("standing artifact {}: {error}", path.display()))?;
+        programs.push(StandingReservoirProgram {
+            program_id,
+            bytes,
+            backend,
+            curve,
+            client_io_manifest: manifest,
+        });
+    }
+    Ok(programs)
+}
+
+fn standing_execution_id(
+    domain: &[u8],
+    pool_id: ExecutionId,
+    program_id: [u8; 32],
+    trigger: &[u8],
+) -> ExecutionId {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(domain);
+    hasher.update(pool_id.as_bytes());
+    hasher.update(&program_id);
+    hasher.update(trigger);
+    let mut bytes = *hasher.finalize().as_bytes();
+    if bytes.iter().all(|byte| *byte == 0) {
+        bytes[0] = 1;
+    }
+    ExecutionId::from_bytes(bytes)
+}
+
+fn standing_reservoir_warm_execution_id(pool_id: ExecutionId, program_id: [u8; 32]) -> ExecutionId {
+    standing_execution_id(
+        b"stoffel-standing-reservoir-warm-v2",
+        pool_id,
+        program_id,
+        &[],
+    )
+}
+
+/// LMDB reservoir namespace. Pool IDs must be globally unique among live
+/// deployments; a preprocessing volume must never be cloned into another live
+/// pool because both would otherwise own copies of the same correlated data.
+fn standing_preproc_pool_program_id(pool_id: ExecutionId, real_program_id: [u8; 32]) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"stoffel-standing-preproc-pool-v1");
+    hasher.update(pool_id.as_bytes());
+    hasher.update(&real_program_id);
+    *hasher.finalize().as_bytes()
+}
+
+fn standing_reservoir_refill_execution_id(
+    pool_id: ExecutionId,
+    program_id: [u8; 32],
+    trigger_execution_id: ExecutionId,
+) -> ExecutionId {
+    standing_execution_id(
+        b"stoffel-standing-reservoir-refill-v3",
+        pool_id,
+        program_id,
+        trigger_execution_id.as_bytes(),
+    )
+}
+
+fn standing_reservoir_plan(
+    program: &StandingReservoirProgram,
+    threshold: usize,
+    burst_capacity: usize,
+) -> Result<(PlannedPreprocessing, PlannedPreprocessing, usize), String> {
+    let client_input_total = checked_client_input_total(
+        program
+            .client_io_manifest
+            .clients
+            .iter()
+            .map(|client| client.inputs.len()),
+    )?;
+    let per_execution = plan_preprocessing(
+        &program.client_io_manifest.preprocessing_demand,
+        threshold,
+        client_input_total,
+    );
+    let material_capacity = burst_capacity
+        .checked_add(1)
+        .ok_or_else(|| "standing reservoir burst capacity overflows usize".to_owned())?;
+    let high = per_execution.checked_scale(material_capacity)?;
+    Ok((per_execution, high, material_capacity))
+}
+
+fn availability_reached_refill_threshold(
+    actual: PoolAvailability,
+    per_execution: PoolAvailability,
+) -> bool {
+    (per_execution.beaver > 0 && actual.beaver <= per_execution.beaver)
+        || (per_execution.random > 0 && actual.random <= per_execution.random)
+        || (per_execution.prand_bit > 0 && actual.prand_bit <= per_execution.prand_bit)
+        || (per_execution.prand_int > 0 && actual.prand_int <= per_execution.prand_int)
+}
+
+struct StandingRunnerExecutionHandler {
+    network: Arc<QuicNetworkManager>,
+    mux: ExecutionTransportMux,
+    local_store: Option<RedbLocalStorage>,
+    preproc_store: Arc<dyn PreprocStore>,
+    persistent_identity: DurableIdentityDigest,
+    party_id: usize,
+    parties: usize,
+    threshold: usize,
+    pool_id: ExecutionId,
+    reservoirs: BTreeMap<[u8; 32], Arc<StandingReservoirState>>,
+    reservoir_cancellation: CancellationToken,
+}
+
+struct StandingPreparedExecution {
+    handler: Arc<StandingRunnerExecutionHandler>,
+    admission: Arc<ResolvedStandingExecutionAdmissionV1>,
+    reservoir: Arc<StandingReservoirState>,
+    context: NodeExecutionContext,
+    execution_inbox: Option<ExecutionInbox>,
+    execution_registration: Option<ExecutionInboxRegistrationGuard>,
+    execution_tasks: ExecutionTaskGroup,
+    preprocessing_bundle: Option<OwnedPreprocBundle>,
+}
+
+#[async_trait::async_trait]
+impl PreparedNodeExecution for StandingPreparedExecution {
+    async fn execute(&mut self) -> Result<VmCooperativeExecutionMetrics, String> {
+        eprintln!(
+            "[party {}][execution {}] starting online execution",
+            self.handler.party_id, self.context.spec.execution_id,
+        );
+        let execution_inbox = self.execution_inbox.take().ok_or_else(|| {
+            format!(
+                "online execution inbox for {} was already consumed",
+                self.context.spec.execution_id
             )
-            .await
-        }
-        MpcCurveConfig::Curve25519 => {
-            run_avss_coordinated_party_for_curve::<
-                ark_curve25519::Fr,
-                ark_curve25519::EdwardsProjective,
-            >(
-                vm,
-                net,
-                my_id,
-                n,
-                t,
-                instance_id,
-                coord_addr,
-                rpc_addr,
-                cert_der,
-                key_der,
-                expected_clients,
-                as_leader,
-                agreed_entry,
+        })?;
+        let preprocessing_bundle = self.preprocessing_bundle.take().ok_or_else(|| {
+            format!(
+                "owned preprocessing bundle for {} was already consumed",
+                self.context.spec.execution_id
             )
-            .await
-        }
-        MpcCurveConfig::Ed25519 => {
-            run_avss_coordinated_party_for_curve::<ark_ed25519::Fr, ark_ed25519::EdwardsProjective>(
-                vm,
-                net,
-                my_id,
-                n,
-                t,
-                instance_id,
-                coord_addr,
-                rpc_addr,
-                cert_der,
-                key_der,
-                expected_clients,
-                as_leader,
-                agreed_entry,
-            )
-            .await
-        }
-        MpcCurveConfig::Secp256k1 => {
-            run_avss_coordinated_party_for_curve::<ark_secp256k1::Fr, ark_secp256k1::Projective>(
-                vm,
-                net,
-                my_id,
-                n,
-                t,
-                instance_id,
-                coord_addr,
-                rpc_addr,
-                cert_der,
-                key_der,
-                expected_clients,
-                as_leader,
-                agreed_entry,
-            )
-            .await
-        }
-        MpcCurveConfig::Secp256r1 => {
-            run_avss_coordinated_party_for_curve::<ark_secp256r1::Fr, ark_secp256r1::Projective>(
-                vm,
-                net,
-                my_id,
-                n,
-                t,
-                instance_id,
-                coord_addr,
-                rpc_addr,
-                cert_der,
-                key_der,
-                expected_clients,
-                as_leader,
-                agreed_entry,
-            )
-            .await
+        })?;
+        tokio::select! {
+            biased;
+            _ = self.context.cancellation.cancelled() => Err("execution cancelled".to_owned()),
+            result = self.handler.execute_inner(
+                &self.admission,
+                &self.reservoir.program,
+                &self.context,
+                execution_inbox,
+                &self.execution_tasks,
+                preprocessing_bundle,
+            ) => result,
         }
     }
+
+    async fn cleanup(&mut self) -> Result<(), String> {
+        // Close ingress before retiring the execution's persistent scopes.
+        self.execution_inbox.take();
+        self.execution_registration.take();
+        // Dropping this single-owner value burns already-destructively-allocated
+        // correlated material if execution was cancelled before activation.
+        self.preprocessing_bundle.take();
+        self.execution_tasks.shutdown().await;
+        self.handler
+            .cleanup_execution_resources(&self.context)
+            .await
+    }
+}
+
+impl StandingRunnerExecutionHandler {
+    fn expected_client_bindings(
+        &self,
+        admission: &ResolvedStandingExecutionAdmissionV1,
+    ) -> Arc<Vec<ClientProtocolBinding>> {
+        let clients = &admission.clients;
+        let route_ids = (0..clients.len()).collect::<Vec<_>>();
+        let manifest_slots = clients
+            .iter()
+            .map(|client| client.manifest_slot)
+            .collect::<Vec<_>>();
+        Arc::new(bind_admitted_client_slots(&route_ids, &manifest_slots))
+    }
+
+    async fn warm_reservoirs(
+        &mut self,
+        programs: Vec<StandingReservoirProgram>,
+        burst_capacity: usize,
+    ) -> Result<(), String> {
+        if programs.is_empty() {
+            return Err(
+                "standing node program catalog is empty; no preprocessing reservoirs can be warmed"
+                    .to_owned(),
+            );
+        }
+        for program in programs {
+            let preproc_program_id =
+                standing_preproc_pool_program_id(self.pool_id, program.program_id);
+            let (per_execution_plan, high_plan, material_capacity) =
+                standing_reservoir_plan(&program, self.threshold, burst_capacity)?;
+            let warm_execution_id =
+                standing_reservoir_warm_execution_id(self.pool_id, program.program_id);
+            let generation_id = self
+                .warm_reservoir_program(&program, warm_execution_id, material_capacity)
+                .await?;
+            let source_scope = PreprocKeyScope::new(
+                preproc_program_id,
+                program.curve.field_kind(),
+                self.parties,
+                self.threshold,
+                self.persistent_identity,
+            );
+            let availability = self
+                .preproc_store
+                .scope_availability(&source_scope)
+                .await
+                .map_err(String::from)?;
+            let high_watermark = high_plan.availability()?;
+            let per_execution = per_execution_plan.availability()?;
+            if !availability.covers(high_watermark) {
+                return Err(format!(
+                    "standing reservoir {} did not reach high watermark: actual={availability:?}, required={high_watermark:?}",
+                    hex::encode(program.program_id)
+                ));
+            }
+            eprintln!(
+                "[party {}] standing reservoir ready: program={} backend={} curve={} generation={} availability={:?} low={:?} high={:?}",
+                self.party_id,
+                hex::encode(program.program_id),
+                program.backend.name(),
+                program.curve.name(),
+                hex::encode(generation_id),
+                availability,
+                per_execution,
+                high_watermark,
+            );
+            self.reservoirs.insert(
+                program.program_id,
+                Arc::new(StandingReservoirState {
+                    program,
+                    per_execution,
+                    material_capacity,
+                    lane: Arc::new(tokio::sync::Mutex::new(())),
+                }),
+            );
+        }
+        Ok(())
+    }
+
+    fn spawn_synchronized_reservoir_refill(
+        self: &Arc<Self>,
+        state: Arc<StandingReservoirState>,
+        lane: tokio::sync::OwnedMutexGuard<()>,
+        trigger_execution_id: ExecutionId,
+    ) {
+        let refill_execution_id = standing_reservoir_refill_execution_id(
+            self.pool_id,
+            state.program.program_id,
+            trigger_execution_id,
+        );
+        // Keep the program lane locked while the existing preprocessing engine
+        // performs its all-party inventory agreement and top-up/rebuild. This
+        // is the only refill protocol: there is no staging lane, promotion
+        // transaction, retry journal, or second commit barrier. A failed refill
+        // remains fail-closed; the next allocation observes the divergent
+        // inventory and asks the engine to rebuild it.
+        let handler = Arc::clone(self);
+        tokio::spawn(async move {
+            eprintln!(
+                "[party {}] RESERVOIR_REFILL_STARTED program={}",
+                handler.party_id,
+                hex::encode(state.program.program_id),
+            );
+            let result = tokio::select! {
+                _ = handler.reservoir_cancellation.cancelled() => {
+                    Err("standing reservoir refill cancelled".to_owned())
+                }
+                result = handler.warm_reservoir_program(
+                    &state.program,
+                    refill_execution_id,
+                    state.material_capacity,
+                ) => result,
+            };
+            match result {
+                Ok(generation_id) => {
+                    eprintln!(
+                        "[party {}] RESERVOIR_REFILL_COMPLETED program={} generation={}",
+                        handler.party_id,
+                        hex::encode(state.program.program_id),
+                        hex::encode(&generation_id[..4]),
+                    );
+                }
+                Err(error) => {
+                    eprintln!(
+                        "[party {}] RESERVOIR_REFILL_FAILED program={}: {error}",
+                        handler.party_id,
+                        hex::encode(state.program.program_id),
+                    );
+                }
+            }
+            drop(lane);
+        });
+    }
+    async fn reserve_reservoir_bundle(
+        self: &Arc<Self>,
+        admission: &ResolvedStandingExecutionAdmissionV1,
+        state: Arc<StandingReservoirState>,
+        cancellation: &CancellationToken,
+        exchange_rx: &mut mpsc::Receiver<ExecutionInboundMessage>,
+    ) -> Result<OwnedPreprocBundle, String> {
+        // Serializes allocation and refill decisions for this program. Every
+        // party processes the immutable Prepare stream in the same order and
+        // confirms the exact source snapshot before moving bytes.
+        let lane = tokio::select! {
+            _ = cancellation.cancelled() => {
+                return Err("reservoir allocation cancelled before entering the program lane".to_owned());
+            }
+            lane = Arc::clone(&state.lane).lock_owned() => lane,
+        };
+        let preproc_program_id =
+            standing_preproc_pool_program_id(self.pool_id, admission.program_id);
+        let source = PreprocKeyScope::new(
+            preproc_program_id,
+            state.program.curve.field_kind(),
+            self.parties,
+            self.threshold,
+            self.persistent_identity,
+        );
+        let snapshot = ReservoirAllocationSnapshot {
+            admission_config_digest: admission.config_digest,
+            requested: state.per_execution,
+            inventory: standing_preproc_snapshot(self.preproc_store.as_ref(), source)
+                .await
+                .map_err(String::from)?,
+        };
+        let control_network =
+            ExecutionScopedNetwork::for_party((*self.network).clone(), admission.execution_id)
+                .map_err(|error| format!("create reservoir allocation transport: {error}"))?
+                .with_reply_mux(self.mux.clone())
+                .with_message_kind(ExecutionMessageKind::Control);
+        // This marker is also the synchronization point used by the
+        // production-shaped fault-injection harness. Emit it only after this
+        // program's allocation lane and transport inbox are live, but before
+        // waiting for any peer's snapshot.
+        eprintln!(
+            "[party {}] RESERVOIR_ALLOCATION_STARTED execution={}",
+            self.party_id, admission.execution_id,
+        );
+        let (snapshots, allocation_digest) = preprocessing_transcript_exchange(
+            &control_network,
+            exchange_rx,
+            admission.execution_id,
+            self.party_id,
+            self.parties,
+            cancellation,
+            execution_coordination_timeout(),
+            PreprocessingExchangePhase::ReservoirAllocationSnapshot,
+            &snapshot,
+        )
+        .await?;
+        if let Err(error) = validate_reservoir_allocation_admission(&snapshot, &snapshots) {
+            // A divergent admission is not an inventory failure. Fail closed
+            // before allocate_from_reservoir and do not start the refill path,
+            // which would otherwise mutate valid material in response to a
+            // certificate-roster/configuration disagreement.
+            return Err(format!(
+                "standing admission diverged before reservoir allocation for program {} execution {}: {error}",
+                hex::encode(admission.program_id),
+                admission.execution_id,
+            ));
+        }
+        if snapshots.iter().any(|peer| peer != &snapshot) {
+            let error = format!(
+                "standing reservoir diverged before allocation for program {} execution {}: local={snapshot:?}, parties={snapshots:?}",
+                hex::encode(admission.program_id),
+                admission.execution_id
+            );
+            self.spawn_synchronized_reservoir_refill(
+                Arc::clone(&state),
+                lane,
+                admission.execution_id,
+            );
+            return Err(error);
+        }
+        let local_allocation = match self
+            .preproc_store
+            .take_bundle_from_reservoir(&source, state.per_execution)
+            .await
+        {
+            Ok(bundle) if bundle.availability() == state.per_execution => Ok(bundle),
+            Ok(bundle) => Err(format!(
+                "reservoir allocation returned {:?}, expected {:?}",
+                bundle.availability(),
+                state.per_execution
+            )),
+            Err(error) => Err(error.to_string()),
+        };
+        if let Err(error) = &local_allocation {
+            eprintln!(
+                "[party {}][execution {}] local reservoir allocation failed before commit: {error}",
+                self.party_id, admission.execution_id,
+            );
+        }
+        // The remaining inventory is returned by the same LMDB transaction
+        // that removed the bundle, so the commit needs no second store read.
+        let remaining = local_allocation
+            .as_ref()
+            .map(|bundle| bundle.remaining)
+            .unwrap_or_default();
+        let commit = ReservoirAllocationCommit {
+            allocation_digest,
+            allocated: local_allocation
+                .as_ref()
+                .map(|bundle| bundle.availability())
+                .unwrap_or_default(),
+            remaining,
+        };
+        let commits = preprocessing_transcript_exchange(
+            &control_network,
+            exchange_rx,
+            admission.execution_id,
+            self.party_id,
+            self.parties,
+            cancellation,
+            execution_coordination_timeout(),
+            PreprocessingExchangePhase::ReservoirAllocationCommit,
+            &commit,
+        )
+        .await
+        .map(|(commits, _)| commits);
+        let commit_failure = match &commits {
+            Ok(commits) => commits.iter().any(|peer| {
+                peer.allocation_digest != allocation_digest
+                    || peer.allocated != state.per_execution
+                    || peer.remaining != remaining
+            }),
+            Err(_) => true,
+        };
+        if commit_failure {
+            let exchange_error = commits.err();
+            self.spawn_synchronized_reservoir_refill(
+                Arc::clone(&state),
+                lane,
+                admission.execution_id,
+            );
+            let error = exchange_error.unwrap_or_else(|| {
+                format!(
+                    "standing reservoir allocation commit failed on at least one party for execution {}",
+                    admission.execution_id
+                )
+            });
+            return Err(error);
+        }
+        let allocated = commit.allocated;
+        let generation_id = snapshot
+            .inventory
+            .generation_id
+            .expect("warmed reservoir has a generation marker");
+        eprintln!(
+            "[party {}][execution {}] reservoir allocation ready: program={} generation={} digest={} allocated={:?} remaining={:?} low={:?}",
+            self.party_id,
+            admission.execution_id,
+            hex::encode(admission.program_id),
+            hex::encode(&generation_id[..4]),
+            hex::encode(allocation_digest),
+            allocated,
+            remaining,
+            state.per_execution,
+        );
+        if availability_reached_refill_threshold(remaining, state.per_execution) {
+            self.spawn_synchronized_reservoir_refill(
+                Arc::clone(&state),
+                lane,
+                admission.execution_id,
+            );
+        }
+        local_allocation
+    }
+
+    async fn warm_reservoir_program(
+        &self,
+        program: &StandingReservoirProgram,
+        execution_id: ExecutionId,
+        burst_capacity: usize,
+    ) -> Result<[u8; 32], String> {
+        let preproc_program_id = standing_preproc_pool_program_id(self.pool_id, program.program_id);
+        let instance_id = stoffel_vm::net::session::derive_instance_id_for_execution(&execution_id);
+        let execution_inbox = self
+            .mux
+            .register_with_client_identities(execution_id, Vec::new())
+            .map_err(|error| format!("register reservoir transport: {error}"))?;
+        let registration = ExecutionInboxRegistrationGuard::new(self.mux.clone(), execution_id);
+        let mut vm = VirtualMachine::builder().build();
+        let client_input_types = manifest_client_input_types(&program.client_io_manifest);
+        let execution_tasks = ExecutionTaskGroup::child_of(&self.reservoir_cancellation);
+        let mut setup = Some(PartySetup {
+            net: Arc::clone(&self.network),
+            reply_mux: self.mux.clone(),
+            execution_id,
+            execution_inbox,
+            my_id: self.party_id,
+            identity: self.persistent_identity,
+            n: self.parties,
+            t: self.threshold,
+            instance_id,
+            expected_client_count: None,
+            expected_client_bindings: None,
+            expected_client_reservation_identities: None,
+            client_count_hint: 0,
+            client_input_count: 0,
+            client_input_types: &client_input_types,
+            preprocessing_demand: program.client_io_manifest.preprocessing_demand,
+            program_hash: preproc_program_id,
+            preproc_store: Some(Arc::clone(&self.preproc_store)),
+            preprocessing: PartyPreprocessing::Reservoir { burst_capacity },
+            execution_tasks: Some(&execution_tasks),
+        });
+
+        let result = async {
+            match program.backend {
+                MpcBackendKind::HoneyBadger => {
+                    macro_rules! warm_hb {
+                        ($F:ty, $G:ty) => {{
+                            let engine = setup_hb_party_for_curve::<$F, $G>(
+                                &mut vm,
+                                setup.take().expect("reservoir setup is consumed once"),
+                            )
+                            .await?;
+                            let snapshot = engine.standing_preproc_snapshot().await?;
+                            let generation = snapshot.generation_id.ok_or_else(|| {
+                                "HB reservoir completed without a generation marker".to_owned()
+                            })?;
+                            Ok::<[u8; 32], String>(generation)
+                        }};
+                    }
+                    dispatch_hb_curve!(
+                        program.curve,
+                        warm_hb,
+                        Err(format!(
+                            "curve {} is not supported by HoneyBadger reservoir",
+                            program.curve.name()
+                        ))
+                    )
+                }
+                MpcBackendKind::Avss => {
+                    macro_rules! warm_avss {
+                        ($F:ty, $G:ty) => {{
+                            let engine = setup_avss_party_for_curve::<$F, $G>(
+                                &mut vm,
+                                setup.take().expect("reservoir setup is consumed once"),
+                            )
+                            .await?;
+                            let snapshot = engine.standing_preproc_snapshot().await?;
+                            let generation = snapshot.generation_id.ok_or_else(|| {
+                                "AVSS reservoir completed without a generation marker".to_owned()
+                            })?;
+                            Ok::<[u8; 32], String>(generation)
+                        }};
+                    }
+                    dispatch_avss_curve!(program.curve, warm_avss)
+                }
+            }
+        }
+        .await;
+        drop(registration);
+        execution_tasks.shutdown().await;
+        result
+    }
+
+    async fn cleanup_execution_resources(
+        &self,
+        context: &NodeExecutionContext,
+    ) -> Result<(), String> {
+        // Preprocessing was already removed from LMDB into the execution's
+        // owned in-memory bundle. Cleanup only retires local VM state; dropping
+        // the bundle burns any unused correlated material.
+        let Some(storage) = self.local_store.as_ref() else {
+            return Ok(());
+        };
+        let storage = storage.clone();
+        let execution_id = context.spec.execution_id;
+        tokio::task::spawn_blocking(move || {
+            let mut namespace = storage.with_namespace(*execution_id.as_bytes());
+            namespace.clear().map_err(String::from)
+        })
+        .await
+        .map_err(|error| format!("Redb cleanup worker failed: {error}"))?
+    }
+
+    async fn execute_inner(
+        &self,
+        admission: &ResolvedStandingExecutionAdmissionV1,
+        program: &StandingReservoirProgram,
+        context: &NodeExecutionContext,
+        execution_inbox: ExecutionInbox,
+        execution_tasks: &ExecutionTaskGroup,
+        preprocessing_bundle: OwnedPreprocBundle,
+    ) -> Result<VmCooperativeExecutionMetrics, String> {
+        let mut vm = load_standing_vm(
+            &program.bytes,
+            self.local_store
+                .as_ref()
+                .map(|storage| storage.with_namespace(*context.spec.execution_id.as_bytes())),
+        )?;
+        if !admission.clients.is_empty() {
+            vm.set_client_roster(admission.clients.iter().map(|client| client.manifest_slot));
+        }
+        let client_input_types = manifest_client_input_types(&program.client_io_manifest);
+        let manifest_client_input_count =
+            client_input_types.values().map(Vec::len).max().unwrap_or(0);
+        let expected_client_bindings = self.expected_client_bindings(admission);
+        let expected_client_reservation_identities = Arc::new(client_reservation_identity_map(
+            &admission.expected_client_identities,
+        ));
+        let expected_client_count =
+            (!expected_client_bindings.is_empty()).then_some(expected_client_bindings.len());
+        let execution_id = context.spec.execution_id;
+        let instance_id =
+            stoffel_vm::net::derive_instance_id_for_execution(&context.spec.execution_id);
+        let preproc_program_id =
+            standing_preproc_pool_program_id(self.pool_id, admission.program_id);
+        let mut setup = Some(PartySetup {
+            net: Arc::clone(&self.network),
+            reply_mux: self.mux.clone(),
+            execution_id,
+            execution_inbox,
+            my_id: self.party_id,
+            identity: self.persistent_identity,
+            n: self.parties,
+            t: self.threshold,
+            instance_id,
+            expected_client_count,
+            expected_client_bindings: Some(Arc::clone(&expected_client_bindings)),
+            expected_client_reservation_identities: (program.backend
+                == MpcBackendKind::HoneyBadger)
+                .then_some(expected_client_reservation_identities),
+            client_count_hint: if program.backend == MpcBackendKind::Avss {
+                admission.clients.len()
+            } else {
+                0
+            },
+            client_input_count: manifest_client_input_count,
+            client_input_types: &client_input_types,
+            preprocessing_demand: program.client_io_manifest.preprocessing_demand,
+            program_hash: preproc_program_id,
+            preproc_store: Some(Arc::clone(&self.preproc_store)),
+            preprocessing: PartyPreprocessing::Execution(preprocessing_bundle),
+            execution_tasks: Some(execution_tasks),
+        });
+        let cooperative_engine: Arc<dyn AsyncMpcEngine> = match program.backend {
+            MpcBackendKind::HoneyBadger => {
+                macro_rules! setup_hb_standing {
+                    ($F:ty, $G:ty) => {{
+                        let engine = setup_hb_party_for_curve::<$F, $G>(
+                            &mut vm,
+                            setup.take().expect("execution setup is consumed once"),
+                        )
+                        .await?;
+                        engine as Arc<dyn AsyncMpcEngine>
+                    }};
+                }
+                dispatch_hb_curve!(program.curve, setup_hb_standing, {
+                    return Err(format!(
+                        "curve {} is not supported by HoneyBadger",
+                        program.curve.name()
+                    ));
+                })
+            }
+            MpcBackendKind::Avss => {
+                macro_rules! setup_avss_standing {
+                    ($F:ty, $G:ty) => {{
+                        let engine = setup_avss_party_for_curve::<$F, $G>(
+                            &mut vm,
+                            setup.take().expect("execution setup is consumed once"),
+                        )
+                        .await?;
+                        engine as Arc<dyn AsyncMpcEngine>
+                    }};
+                }
+                dispatch_avss_curve!(program.curve, setup_avss_standing)
+            }
+        };
+
+        let (_, metrics) = vm
+            .execute_async_with_metrics(&admission.entry, cooperative_engine.as_ref())
+            .await
+            .map_err(|error| format!("VM execution failed: {error}"))?;
+        eprintln!(
+            "[party {}][execution {}] cooperative VM execution: instruction_budget_yields={} online_effect_yields={}",
+            self.party_id,
+            execution_id,
+            metrics.instruction_budget_yields,
+            metrics.online_effect_yields,
+        );
+
+        Ok(metrics)
+    }
+}
+
+#[async_trait::async_trait]
+impl StandingExecutionHandler for StandingRunnerExecutionHandler {
+    async fn prepare(
+        self: Arc<Self>,
+        admission: ResolvedStandingExecutionAdmissionV1,
+        context: NodeExecutionContext,
+    ) -> Result<Box<dyn PreparedNodeExecution>, String> {
+        let admission = Arc::new(admission);
+        let reservoir = self
+            .reservoirs
+            .get(&admission.program_id)
+            .cloned()
+            .ok_or_else(|| {
+                format!(
+                    "program {} has no ready standing preprocessing reservoir",
+                    hex::encode(admission.program_id)
+                )
+            })?;
+        // Establish every fallible online resource before destructively moving
+        // preprocessing material into the execution scope.
+        let execution_inbox = self
+            .mux
+            .register_with_client_identities(
+                context.spec.execution_id,
+                admission.expected_client_identities.clone(),
+            )
+            .map_err(|error| format!("register prepared execution transport: {error}"))?;
+        let execution_registration =
+            ExecutionInboxRegistrationGuard::new(self.mux.clone(), context.spec.execution_id);
+        let execution_tasks = ExecutionTaskGroup::child_of(&context.cancellation);
+        let mut execution_inbox = execution_inbox;
+        let preprocessing_bundle = self
+            .reserve_reservoir_bundle(
+                &admission,
+                Arc::clone(&reservoir),
+                &context.cancellation,
+                &mut execution_inbox.control,
+            )
+            .await?;
+        // Once allocation succeeds, always return an owned prepared value.
+        // If cancellation raced with allocation, the supervisor takes its
+        // cleanup path and burns the execution scope instead of leaking it.
+        Ok(Box::new(StandingPreparedExecution {
+            handler: self,
+            admission,
+            reservoir,
+            context,
+            execution_inbox: Some(execution_inbox),
+            execution_registration: Some(execution_registration),
+            execution_tasks,
+            preprocessing_bundle: Some(preprocessing_bundle),
+        }))
+    }
+}
+
+fn load_standing_vm(
+    program: &[u8],
+    local_storage: Option<RedbLocalStorage>,
+) -> Result<VirtualMachine, String> {
+    let mut builder = VirtualMachine::builder();
+    if let Some(storage) = local_storage {
+        builder = builder.with_local_storage(storage);
+    }
+    let mut vm = builder.build();
+    let (function_count, _, _) = CompiledBinary::try_for_each_resolved_vm_function_from_reader(
+        &mut BufReader::new(program),
+        |header, stream| {
+            let mut stream_error = None;
+            let result = vm.try_register_resolved_function_without_source(header, || match stream
+                .next_instruction()
+            {
+                Ok(instruction) => instruction,
+                Err(error) => {
+                    stream_error = Some(error);
+                    None
+                }
+            });
+            if let Some(error) = stream_error {
+                return Err(error);
+            }
+            result.map_err(|error| {
+                BinaryError::InvalidData(format!("invalid VM function: {error}"))
+            })?;
+            Ok(())
+        },
+    )
+    .map_err(|error| format!("invalid compiled program: {error:?}"))?;
+    if function_count == 0 {
+        return Err("compiled program contains no functions".to_owned());
+    }
+    vm.discard_vm_source_instructions();
+    Ok(vm)
+}
+
+fn standing_flag_value(args: &[String], name: &str) -> Option<String> {
+    args.iter()
+        .position(|arg| arg == name)
+        .and_then(|index| args.get(index + 1))
+        .cloned()
+}
+
+fn standing_required_flag(args: &[String], name: &str) -> Result<String, String> {
+    standing_flag_value(args, name).ok_or_else(|| format!("{name} is required in standing mode"))
+}
+
+fn load_standing_party_public_keys(
+    directory: &PathBuf,
+    parties: usize,
+) -> Result<Vec<(usize, NodePublicKey)>, String> {
+    (0..parties)
+        .map(|party_id| {
+            let path = directory.join(format!("cert{party_id}.crt"));
+            let cert_der = fs::read(&path).map_err(|error| {
+                format!(
+                    "read standing party certificate {}: {error}",
+                    path.display()
+                )
+            })?;
+            let public_key = QuicNetworkManager::public_key_from_certificate_der(&cert_der)
+                .map_err(|error| {
+                    format!(
+                        "parse standing party certificate {}: {error}",
+                        path.display()
+                    )
+                })?;
+            Ok((party_id, public_key))
+        })
+        .collect()
+}
+
+async fn run_standing_node(raw_args: &[String]) -> Result<(), String> {
+    let party_id = standing_required_flag(raw_args, "--party-id")?
+        .parse::<usize>()
+        .map_err(|error| format!("invalid --party-id: {error}"))?;
+    let parties = standing_required_flag(raw_args, "--n-parties")?
+        .parse::<usize>()
+        .map_err(|error| format!("invalid --n-parties: {error}"))?;
+    let threshold = standing_flag_value(raw_args, "--threshold")
+        .unwrap_or_else(|| "1".to_owned())
+        .parse::<usize>()
+        .map_err(|error| format!("invalid --threshold: {error}"))?;
+    let pool_id = standing_required_flag(raw_args, "--pool-id")?
+        .parse::<ExecutionId>()
+        .map_err(|error| format!("invalid --pool-id: {error}"))?;
+    if pool_id.is_zero() {
+        return Err("--pool-id must be nonzero".to_owned());
+    }
+    MpcSessionTopology::try_new(
+        stoffel_vm::net::derive_instance_id_for_execution(&pool_id),
+        party_id,
+        parties,
+        threshold,
+    )
+    .map_err(|error| format!("invalid standing MPC topology: {error}"))?;
+    let control_dir = PathBuf::from(standing_required_flag(raw_args, "--control-dir")?);
+    let programs_dir = PathBuf::from(standing_required_flag(raw_args, "--program-dir")?);
+    let client_cert_dir = PathBuf::from(standing_required_flag(raw_args, "--client-cert-dir")?);
+    let party_cert_dir = PathBuf::from(standing_required_flag(raw_args, "--party-cert-dir")?);
+    let bind = standing_required_flag(raw_args, "--bind")?
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("invalid --bind: {error}"))?;
+    let advertise = standing_flag_value(raw_args, "--advertise")
+        .map(|value| value.parse::<SocketAddr>())
+        .transpose()
+        .map_err(|error| format!("invalid --advertise: {error}"))?;
+    let cert_path = standing_required_flag(raw_args, "--cert")?;
+    let key_path = standing_required_flag(raw_args, "--key")?;
+    let cert_der = fs::read(&cert_path).map_err(|error| format!("read --cert: {error}"))?;
+    let key_der = fs::read(&key_path).map_err(|error| format!("read --key: {error}"))?;
+    let party_public_keys = load_standing_party_public_keys(&party_cert_dir, parties)?;
+    let local_public_key = QuicNetworkManager::public_key_from_certificate_der(&cert_der)
+        .map_err(|error| format!("parse --cert: {error}"))?;
+    if party_public_keys.get(party_id).map(|(_, key)| key) != Some(&local_public_key) {
+        return Err(format!(
+            "--cert does not match {}/cert{}.crt for logical party {}",
+            party_cert_dir.display(),
+            party_id,
+            party_id
+        ));
+    }
+    let persistent_identity = durable_identity_from_cert(&cert_der);
+    let preproc_store: Arc<dyn PreprocStore> = Arc::new(
+        LmdbPreprocStore::open(standing_required_flag(raw_args, "--preproc-store")?)
+            .map_err(String::from)?,
+    );
+    let local_store = standing_flag_value(raw_args, "--local-store")
+        .map(|path| {
+            match fs::remove_file(&path) {
+                Ok(()) => {
+                    eprintln!("[party {party_id}] standing startup removed orphaned local VM state")
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(format!("remove stale --local-store: {error}")),
+            }
+            RedbLocalStorage::new(path).map_err(|error| format!("open --local-store: {error}"))
+        })
+        .transpose()?;
+    let reservoir_burst_capacity = standing_flag_value(raw_args, "--reservoir-burst-capacity")
+        .unwrap_or_else(|| "9".to_owned())
+        .parse::<usize>()
+        .map_err(|error| format!("invalid --reservoir-burst-capacity: {error}"))?;
+    if reservoir_burst_capacity == 0 {
+        return Err("--reservoir-burst-capacity must be greater than zero".to_owned());
+    }
+    let as_leader = is_flag_present(raw_args, "--leader");
+
+    let _ = rustls::crypto::ring::default_provider().install_default();
+    let (bootnode, party_bind) = if as_leader {
+        let bootnode = bind;
+        tokio::spawn(async move {
+            if let Err(error) = run_bootnode_with_config(bootnode, parties).await {
+                eprintln!("standing bootnode failed: {error}");
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let party_bind = SocketAddr::new(bind.ip(), bind.port().saturating_add(1000));
+        let connect = if bind.ip().is_unspecified() {
+            SocketAddr::new("127.0.0.1".parse().unwrap(), bind.port())
+        } else {
+            bind
+        };
+        (connect, party_bind)
+    } else {
+        let bootnode = standing_required_flag(raw_args, "--bootstrap")?
+            .parse::<SocketAddr>()
+            .map_err(|error| format!("invalid --bootstrap: {error}"))?;
+        (bootnode, bind)
+    };
+
+    let mut network = QuicNetworkManager::with_node_id(party_id);
+    network
+        .set_local_certificate_der(cert_der, key_der)
+        .map_err(|error| format!("configure node certificate: {error}"))?;
+    network
+        .install_expected_server_public_keys(
+            party_public_keys
+                .iter()
+                .map(|(_, public_key)| public_key.clone()),
+        )
+        .map_err(|error| format!("configure standing party certificate roster: {error}"))?;
+    network
+        .listen(party_bind)
+        .await
+        .map_err(|error| format!("listen on {party_bind}: {error}"))?;
+    let pool_program_id = program_id_from_bytes(b"stoffel-standing-physical-mesh-v1");
+    let standing_session = register_and_wait_for_session(
+        &mut network,
+        SessionRegistrationConfig {
+            execution_id: pool_id,
+            bootnode,
+            my_party_id: party_id,
+            my_listen: advertise.unwrap_or(party_bind),
+            program_id: pool_program_id,
+            entry: "__standing_node_pool_v1".to_owned(),
+            n_parties: parties,
+            threshold,
+            timeout: session_registration_timeout(),
+            expected_party_public_keys: Some(party_public_keys.clone()),
+        },
+    )
+    .await
+    .map_err(|error| format!("standing mesh registration failed: {error}"))?;
+
+    let party_public_key_map = party_public_keys.into_iter().collect::<BTreeMap<_, _>>();
+    let reconnect_peers = standing_session
+        .parties
+        .iter()
+        .filter(|(registered_party_id, _)| *registered_party_id != party_id)
+        .map(|(registered_party_id, address)| {
+            party_public_key_map
+                .get(registered_party_id)
+                .cloned()
+                .map(|public_key| (public_key, *address))
+                .ok_or_else(|| {
+                    format!(
+                        "configured standing roster omitted TLS identity for party {registered_party_id}"
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let protocol_party_id = network.local_party_id();
+    let mux = ExecutionTransportMux::new(4096)
+        .map_err(|error| format!("create standing execution mux: {error}"))?;
+    let scanner = ExecutionConnectionScanner::spawn(network.clone(), mux.clone())
+        .map_err(|error| format!("start standing execution scanner: {error}"))?;
+    let reservoir_cancellation = CancellationToken::new();
+    let _connection_accept_loop = spawn_connection_accept_loop(network.clone(), protocol_party_id);
+    let _mesh_reconnect_loop = spawn_standing_mesh_reconnect_loop(
+        network.clone(),
+        reconnect_peers,
+        protocol_party_id,
+        reservoir_cancellation.clone(),
+    );
+    let mut handler = StandingRunnerExecutionHandler {
+        network: Arc::new(network),
+        mux,
+        local_store,
+        preproc_store,
+        persistent_identity,
+        party_id: protocol_party_id,
+        parties,
+        threshold,
+        pool_id,
+        reservoirs: BTreeMap::new(),
+        reservoir_cancellation: reservoir_cancellation.clone(),
+    };
+    let reservoir_programs = discover_standing_reservoir_programs(&programs_dir)?;
+    handler
+        .warm_reservoirs(reservoir_programs, reservoir_burst_capacity)
+        .await?;
+    let handler = Arc::new(handler);
+    let supervisor = NodeSupervisor::new();
+    let control = Arc::new(
+        StandingNodeControl::new(
+            party_id,
+            control_dir,
+            programs_dir,
+            client_cert_dir,
+            Arc::clone(&supervisor),
+            handler,
+        )
+        .map_err(|error| error.to_string())?,
+    );
+    let cancellation = CancellationToken::new();
+    eprintln!(
+        "[party {protocol_party_id}] standing node ready: reservoir_burst_capacity={reservoir_burst_capacity}"
+    );
+    let mut control_task = {
+        let control = Arc::clone(&control);
+        let cancellation = cancellation.clone();
+        tokio::spawn(async move { control.run(cancellation).await })
+    };
+    let result = tokio::select! {
+        result = &mut control_task => {
+            reservoir_cancellation.cancel();
+            cancellation.cancel();
+            supervisor.shutdown();
+            result
+                .map_err(|error| format!("standing control task failed: {error}"))?
+                .map_err(|error| error.to_string())
+        }
+        signal = stoffel_vm::net::wait_for_shutdown_signal() => {
+            signal.map_err(|error| error.to_string())?;
+            reservoir_cancellation.cancel();
+            supervisor.shutdown();
+            // Keep the durable event writer alive while terminal cancellation
+            // events drain from the supervisor broadcast channel.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            cancellation.cancel();
+            control_task
+                .await
+                .map_err(|error| format!("standing control task failed: {error}"))?
+                .map_err(|error| error.to_string())?;
+            Ok(())
+        }
+    };
+    scanner.shutdown().await;
+    result
 }
 
 // Use a Tokio runtime for async operations
@@ -3884,6 +5648,27 @@ async fn main() {
 
     let raw_args = env::args().skip(1).collect::<Vec<_>>();
 
+    if let Some(index) = raw_args.iter().position(|arg| arg == "--print-program-id") {
+        let path = raw_args.get(index + 1).unwrap_or_else(|| {
+            eprintln!("Error: --print-program-id requires an artifact path");
+            exit(2);
+        });
+        let bytes = fs::read(path).unwrap_or_else(|error| {
+            eprintln!("Error: failed to read program artifact '{path}': {error}");
+            exit(2);
+        });
+        println!("{}", hex::encode(program_id_from_bytes(&bytes)));
+        return;
+    }
+
+    if is_flag_present(&raw_args, "--standing-node") {
+        if let Err(error) = run_standing_node(&raw_args).await {
+            eprintln!("Standing node failed: {error}");
+            exit(13);
+        }
+        return;
+    }
+
     if raw_args.is_empty() {
         // Allow bootnode-only mode without program path
         print_usage_and_exit();
@@ -3897,7 +5682,6 @@ async fn main() {
     let mut as_bootnode = false;
     let mut as_leader = false;
     let mut as_client = false;
-    let mut upload_program_bytes = true;
     let mut bind_addr: Option<SocketAddr> = None;
     let mut party_id: Option<usize> = None;
     let mut bootstrap_addr: Option<SocketAddr> = None;
@@ -3931,9 +5715,7 @@ async fn main() {
     let mut preproc_store_path: Option<String> = None;
     let mut local_store_path: Option<String> = None;
     let mut advertise_addr: Option<SocketAddr> = None;
-    let mut persistent_runs: usize = 1;
-    let mut node_rpc_addrs: Vec<SocketAddr> = Vec::new();
-    let mut node_rpc_designated_party_cert: Option<Vec<u8>> = None;
+    let mut execution_id: Option<ExecutionId> = None;
 
     for arg in &raw_args {
         if arg == "-h" || arg == "--help" {
@@ -3950,8 +5732,6 @@ async fn main() {
             as_leader = true;
         } else if arg == "--client" {
             as_client = true;
-        } else if arg == "--no-program-upload" {
-            upload_program_bytes = false;
         } else if arg == "--nat" {
             _enable_nat = true;
         } else if let Some(_rest) = arg.strip_prefix("--bind") {
@@ -3985,33 +5765,9 @@ async fn main() {
         } else if let Some(_rest) = arg.strip_prefix("--preproc-store") {
         } else if let Some(_rest) = arg.strip_prefix("--local-store") {
         } else if let Some(_rest) = arg.strip_prefix("--advertise") {
-        } else if let Some(_rest) = arg.strip_prefix("--persistent-runs") {
-        } else if let Some(_rest) = arg.strip_prefix("--node-rpc-addrs") {
-        } else if let Some(_rest) = arg.strip_prefix("--node-rpc-designated-party-cert") {
-        } else if let Some(_rest) = arg.strip_prefix("--no-program-upload") {
+        } else if let Some(_rest) = arg.strip_prefix("--execution-id") {
         }
     }
-
-    fail_removed_flag(
-        &raw_args,
-        "--client-id",
-        "Client IDs are now transport-derived. Remove `--client-id`.",
-    );
-    fail_removed_flag(
-        &raw_args,
-        "--expected-client-count",
-        "Use `--expected-clients <cert-paths-or-addrs>` instead.",
-    );
-    fail_removed_flag(
-        &raw_args,
-        "--node-ids",
-        "On-chain coordinator mode is temporarily unavailable in the crates.io-ready build.",
-    );
-    fail_removed_flag(
-        &raw_args,
-        "--adkg-curve",
-        "Use `--mpc-curve <name>` instead.",
-    );
 
     // collect positional args (non-flags)
     let mut positional = raw_args
@@ -4210,40 +5966,21 @@ async fn main() {
                     advertise_addr = Some(v.parse().expect("Invalid --advertise addr"));
                 }
             }
-            "--persistent-runs" => {
+            "--execution-id" => {
                 if let Some(v) = args_iter.next() {
-                    persistent_runs = v.parse().expect("Invalid --persistent-runs");
+                    let parsed = v.parse::<ExecutionId>().unwrap_or_else(|error| {
+                        eprintln!("Error: invalid --execution-id: {error}");
+                        exit(2);
+                    });
+                    if parsed.is_zero() {
+                        eprintln!("Error: --execution-id must be nonzero");
+                        exit(2);
+                    }
+                    execution_id = Some(parsed);
                 }
             }
-            "--node-rpc-addrs" => {
-                if let Some(v) = args_iter.next() {
-                    node_rpc_addrs = v
-                        .split(',')
-                        .filter(|s| !s.trim().is_empty())
-                        .map(|s| s.trim().parse().expect("Invalid --node-rpc-addrs entry"))
-                        .collect();
-                }
-            }
-            "--node-rpc-designated-party-cert" => {
-                if let Some(v) = args_iter.next() {
-                    node_rpc_designated_party_cert = Some(
-                        std::fs::read(&v)
-                            .expect("Failed to read --node-rpc-designated-party-cert file"),
-                    );
-                }
-            }
-            "--no-program-upload" => {}
             _ => {}
         }
-    }
-
-    if persistent_runs == 0 {
-        eprintln!("Error: --persistent-runs must be greater than zero");
-        exit(2);
-    }
-    if persistent_runs > 1 && preproc_store_path.is_none() {
-        eprintln!("Error: --persistent-runs requires --preproc-store");
-        exit(2);
     }
 
     let coordinator_output_format = match output_fixed_point_fractional_bits {
@@ -4263,6 +6000,15 @@ async fn main() {
         &key_der,
         local_store_path.is_some() || preproc_store_path.is_some(),
     );
+    let preproc_store: Option<Arc<dyn PreprocStore>> = preproc_store_path
+        .as_deref()
+        .map(LmdbPreprocStore::open)
+        .transpose()
+        .unwrap_or_else(|error| {
+            eprintln!("Error: failed to open preprocessing store: {error}");
+            exit(2);
+        })
+        .map(|store| Arc::new(store) as Arc<dyn PreprocStore>);
     if contract_addr.is_some() {
         let _ = (eth_node_addr.as_ref(), wallet_sk_str.as_ref());
         eprintln!(
@@ -4273,14 +6019,30 @@ async fn main() {
 
     // Bootnode-only mode (no program execution)
     if as_bootnode && !as_leader {
+        let n = n_parties.unwrap_or_else(|| {
+            eprintln!("Error: --n-parties is required for bootnode mode");
+            exit(2);
+        });
+        let backend = mpc_backend
+            .as_deref()
+            .map(MpcBackendKind::from_str)
+            .transpose()
+            .unwrap_or_else(|error| {
+                eprintln!("Error: {error}");
+                exit(2);
+            })
+            .unwrap_or_default();
+        if let Err(error) = backend.validate_party_count(n) {
+            eprintln!("Error: {error}");
+            exit(2);
+        }
         let bind = bind_addr.unwrap_or_else(|| "127.0.0.1:9000".parse().unwrap());
         eprintln!("Starting bootnode on {}", bind);
         // Install crypto provider for quinn/rustls
         rustls::crypto::ring::default_provider()
             .install_default()
             .expect("install rustls crypto");
-        // Pass expected parties if specified, so bootnode waits for all before announcing session
-        if let Err(e) = run_bootnode_with_config(bind, n_parties).await {
+        if let Err(e) = run_bootnode_with_config(bind, n).await {
             eprintln!("Bootnode error: {}", e);
             exit(10);
         }
@@ -4295,6 +6057,11 @@ async fn main() {
                 backend.eq_ignore_ascii_case("avss") || backend.eq_ignore_ascii_case("adkg")
             })
         {
+            let party_count = n_parties.unwrap_or(server_addrs.len());
+            if let Err(error) = MpcBackendKind::Avss.validate_party_count(party_count) {
+                eprintln!("Error: {error}");
+                exit(2);
+            }
             let curve_config = if let Some(ref name) = mpc_curve {
                 match MpcCurveConfig::from_str(name) {
                     Ok(c) => c,
@@ -4311,6 +6078,7 @@ async fn main() {
                 exit(2);
             }
             run_avss_offchain_coordinator_client(AvssOffchainCoordinatorClientArgs {
+                execution_id: require_network_execution_id(execution_id),
                 curve_config,
                 client_inputs,
                 client_outputs,
@@ -4329,6 +6097,11 @@ async fn main() {
         // Coordinator-based client mode
         if contract_addr.is_some() || coord_addr.is_some() {
             {
+                let party_count = n_parties.unwrap_or(server_addrs.len());
+                if let Err(error) = MpcBackendKind::HoneyBadger.validate_party_count(party_count) {
+                    eprintln!("Error: {error}");
+                    exit(2);
+                }
                 let curve_config = if let Some(ref name) = mpc_curve {
                     match MpcCurveConfig::from_str(name) {
                         Ok(c) => c,
@@ -4346,6 +6119,7 @@ async fn main() {
                 }
                 run_hb_coordinator_client(
                     curve_config,
+                    require_network_execution_id(execution_id),
                     client_inputs,
                     client_outputs,
                     coordinator_output_format,
@@ -4367,6 +6141,7 @@ async fn main() {
         // Direct client mode (no coordinator)
         {
             run_as_client(
+                require_network_execution_id(execution_id),
                 n_parties,
                 threshold,
                 mpc_backend.as_deref(),
@@ -4374,6 +6149,8 @@ async fn main() {
                 client_inputs,
                 client_outputs,
                 server_addrs,
+                cert_der,
+                key_der,
             )
             .await;
             return;
@@ -4413,7 +6190,7 @@ async fn main() {
         let backend = (bytecode_version >= MPC_BACKEND_MANIFEST_FORMAT_VERSION)
             .then_some(MpcBackendKind::from(client_io_manifest.mpc_backend));
         let curve = (bytecode_version >= MPC_CURVE_MANIFEST_FORMAT_VERSION)
-            .then_some(curve_config_from_manifest(client_io_manifest.mpc_curve));
+            .then_some(MpcCurveConfig::from(client_io_manifest.mpc_curve));
         (backend, curve)
     });
     let manifest_backend = manifest_config.and_then(|(backend, _)| backend);
@@ -4443,7 +6220,7 @@ async fn main() {
     } else if let Some(manifest_backend) = manifest_backend {
         manifest_backend
     } else {
-        MpcBackendKind::default_backend()
+        MpcBackendKind::default()
     };
 
     let curve_config = if let Some(ref name) = mpc_curve {
@@ -4473,22 +6250,11 @@ async fn main() {
         eprintln!("Error: {}", e);
         exit(2);
     }
-
-    // Validate incompatible flag combinations
-    if !backend_kind.supports_client_input() && as_client {
-        eprintln!(
-            "Error: {} backend does not support client mode",
-            backend_kind.name()
-        );
-        exit(2);
-    }
-
-    if expected_client_count.is_some() && !backend_kind.supports_client_input() {
-        eprintln!(
-            "Error: {} backend does not support --wait-for-clients",
-            backend_kind.name()
-        );
-        exit(2);
+    if let Some(n) = n_parties {
+        if let Err(error) = backend_kind.validate_party_count(n) {
+            eprintln!("Error: {error}");
+            exit(2);
+        }
     }
 
     // Optional: bring up networking in party mode if bootstrap provided or if leader
@@ -4534,7 +6300,7 @@ async fn main() {
         let bootnode_bind = bind;
         let bootnode_n = n;
         tokio::spawn(async move {
-            if let Err(e) = run_bootnode_with_config(bootnode_bind, Some(bootnode_n)).await {
+            if let Err(e) = run_bootnode_with_config(bootnode_bind, bootnode_n).await {
                 eprintln!("Bootnode error: {}", e);
             }
         });
@@ -4573,18 +6339,12 @@ async fn main() {
             my_id, party_bind, bind, bootnode_connect
         );
 
-        // Register with our own bootnode and wait for session. By default the
-        // leader uploads program bytes so parties without a local copy can fetch
-        // them; mounted-program deployments can opt out to avoid a large
-        // discovery message.
-        let program_bytes = if upload_program_bytes {
-            Some(bytes)
-        } else {
-            None
-        };
+        // Register with our own bootnode and wait for the physical party mesh.
+        // Every party already validated its local content-addressed artifact.
         let session_info = match register_and_wait_for_session(
             &mut mgr,
             SessionRegistrationConfig {
+                execution_id: require_network_execution_id(execution_id),
                 bootnode: bootnode_connect,
                 my_party_id: my_id,
                 my_listen: advertise_addr.unwrap_or(party_bind),
@@ -4593,7 +6353,7 @@ async fn main() {
                 n_parties: n,
                 threshold: t,
                 timeout: session_registration_timeout(),
-                program_bytes,
+                expected_party_public_keys: None,
             },
         )
         .await
@@ -4668,18 +6428,11 @@ async fn main() {
             my_id, actual_listen, bootnode
         );
 
-        // Register with bootnode and wait for session to be announced. This
-        // blocks until all n parties have registered. By default parties upload
-        // program bytes so the bootnode can distribute to parties that don't
-        // have a local copy; mounted-program deployments can opt out.
-        let program_bytes = if upload_program_bytes {
-            Some(bytes)
-        } else {
-            None
-        };
+        // Register with bootnode and wait until the physical party mesh is complete.
         let session_info = match register_and_wait_for_session(
             &mut mgr,
             SessionRegistrationConfig {
+                execution_id: require_network_execution_id(execution_id),
                 bootnode,
                 my_party_id: my_id,
                 my_listen: advertise_addr.unwrap_or(actual_listen),
@@ -4688,7 +6441,7 @@ async fn main() {
                 n_parties: n,
                 threshold: t,
                 timeout: session_registration_timeout(),
-                program_bytes,
+                expected_party_public_keys: None,
             },
         )
         .await
@@ -4724,6 +6477,13 @@ async fn main() {
             program_id = program_id_from_bytes(&bytes);
         } else {
             eprintln!("Error: local run requires a program path unless --bootnode or --leader");
+            exit(2);
+        }
+    }
+
+    if let Some(n) = session_n_parties {
+        if let Err(error) = backend_kind.validate_party_count(n) {
+            eprintln!("Error: {error}");
             exit(2);
         }
     }
@@ -4987,16 +6747,21 @@ async fn main() {
     let mut hb_bls12381_coord_engine: Option<
         Arc<HoneyBadgerMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projective>>,
     > = None;
-    let mut hb_bls12381_run_complete_rx: Option<mpsc::Receiver<(usize, u64)>> = None;
+    // Retain every concrete backend/curve engine behind the async trait. VM
+    // online execution must always use the cooperative scheduler; limiting this
+    // to the BLS12-381 coordinator path makes concurrent jobs block one another.
+    let mut cooperative_engine: Option<Arc<dyn AsyncMpcEngine>> = None;
 
     if matches!(backend_kind, MpcBackendKind::HoneyBadger) {
         if let Some(ref ca) = coord_addr {
-            let coord = HbOffChainCoordinator::<ark_bls12_381::Fr>::start_rpc_client(
+            let execution_id = require_network_execution_id(execution_id);
+            let coord = HbOffChainCoordinator::<ark_bls12_381::Fr>::start_rpc_client_for_execution(
                 &ca.0,
                 ca.1,
                 session_threshold.unwrap_or(1) as u64,
                 session_n_parties.unwrap_or_else(|| n_parties.unwrap_or(5)) as u64,
                 1,
+                coordinator_execution_id(execution_id),
                 cert_der.clone().expect("--cert required"),
                 key_der.clone().expect("--key required"),
             )
@@ -5021,15 +6786,12 @@ async fn main() {
 
             if let Some(ref rpc) = rpc_addr {
                 let node_cert_der = cert_der.clone().unwrap();
-                let node_rpc = HbOffChainNodeRpcServer::<ark_bls12_381::Fr>::start(
+                let node_rpc = HbOffChainNodeRpcServer::<ark_bls12_381::Fr>::start_for_execution(
                     &rpc.0,
                     rpc.1,
-                    node_cert_der.clone(),
+                    coordinator_execution_id(execution_id),
+                    node_cert_der,
                     key_der.clone().unwrap(),
-                    node_rpc_designated_party_cert
-                        .as_deref()
-                        .map(extract_pubkey_from_cert)
-                        .unwrap_or_else(|| extract_pubkey_from_cert(&node_cert_der)),
                 )
                 .await
                 .unwrap_or_else(|error| {
@@ -5040,6 +6802,11 @@ async fn main() {
             }
         }
     }
+
+    // Keep the scanner guard alive through VM execution. Dropping it cancels
+    // the sole physical receive owner and would strand the execution inbox.
+    let mut _execution_scanner: Option<ExecutionConnectionScanner> = None;
+    let mut _execution_registration: Option<ExecutionInboxRegistrationGuard> = None;
 
     // If in party mode, configure MPC engine based on selected backend
     if let Some(net) = net_opt.clone() {
@@ -5052,6 +6819,7 @@ async fn main() {
         // Use the session instance_id (agreed with all parties via bootnode)
         let instance_id =
             session_instance_id.expect("session instance_id should be set in party mode");
+        let _client_accept_loop = spawn_connection_accept_loop((*net).clone(), my_id);
 
         eprintln!(
             "[party {}] Creating MPC engine (backend={}): instance_id={}, n={}, t={}",
@@ -5062,22 +6830,20 @@ async fn main() {
             t
         );
 
-        // Debug: print established connections (server connections are to other MPC parties)
-        let connections = net.get_all_server_connections();
-        let conn_ids: Vec<_> = connections.iter().map(|(id, _)| *id).collect();
-        eprintln!(
-            "[party {}] Connections before MPC: {:?} ({} total)",
-            my_id,
-            conn_ids,
-            connections.len()
-        );
-
         match backend_kind {
             MpcBackendKind::HoneyBadger => {
+                let execution_id = require_network_execution_id(execution_id);
+                let (mux, inbox, registration, scanner) =
+                    start_party_execution_transport(&net, execution_id).unwrap_or_else(|error| {
+                        eprintln!("[party {my_id}] Failed to start execution transport: {error}");
+                        exit(13);
+                    });
+                let mut execution_inbox = Some(inbox);
+                _execution_registration = Some(registration);
+                _execution_scanner = Some(scanner);
                 // Phase 1: Coordinator preprocessing trigger
                 if let Some(ref mut coord) = coord_opt {
                     if as_leader {
-                        coord.reset_coord().await.unwrap();
                         coord.start_preprocessing().await.unwrap();
                     }
                 }
@@ -5086,28 +6852,36 @@ async fn main() {
                     ($F:ty, $G:ty) => {{
                         match setup_hb_party_for_curve::<$F, $G>(
                             &mut vm,
-                            HbPartySetup {
+                            PartySetup {
                                 net: net.clone(),
+                                reply_mux: mux.clone(),
+                                execution_id,
+                                execution_inbox: execution_inbox
+                                    .take()
+                                    .expect("HoneyBadger execution inbox is consumed once"),
                                 my_id,
-                                persistent_identity: storage_identity.unwrap_or_else(|| {
+                                identity: storage_identity.unwrap_or_else(|| {
                                     DurableIdentityDigest::from_legacy_party_id(my_id)
                                 }),
                                 n,
                                 t,
                                 instance_id,
                                 expected_client_count,
-                                coordinator_client_count_hint: 0,
+                                expected_client_bindings: None,
+                                expected_client_reservation_identities: None,
+                                client_count_hint: 0,
                                 client_input_count,
                                 client_input_types: &client_input_types,
                                 preprocessing_demand,
                                 program_hash: program_id,
-                                preproc_store_path: preproc_store_path.as_deref(),
-                                deployment_mode: DeploymentMode::OneShot,
+                                preproc_store: preproc_store.clone(),
+                                preprocessing: PartyPreprocessing::OneShot,
+                                execution_tasks: None,
                             },
                         )
                         .await
                         {
-                            Ok(_) => {}
+                            Ok(engine) => cooperative_engine = Some(engine),
                             Err(e) => {
                                 eprintln!("[party {}] HoneyBadger setup failed: {}", my_id, e);
                                 exit(13);
@@ -5123,102 +6897,88 @@ async fn main() {
                         ark_bls12_381::G1Projective,
                     >(
                         &mut vm,
-                        HbPartySetup {
+                        PartySetup {
                             net: net.clone(),
+                            reply_mux: mux.clone(),
+                            execution_id,
+                            execution_inbox: execution_inbox
+                                .take()
+                                .expect("HoneyBadger execution inbox is consumed once"),
                             my_id,
-                            persistent_identity: storage_identity.unwrap_or_else(|| {
+                            identity: storage_identity.unwrap_or_else(|| {
                                 DurableIdentityDigest::from_legacy_party_id(my_id)
                             }),
                             n,
                             t,
                             instance_id,
                             expected_client_count: None, // coordinator handles clients
-                            coordinator_client_count_hint: output_ids.len(),
+                            expected_client_bindings: None,
+                            expected_client_reservation_identities: None,
+                            client_count_hint: output_ids.len(),
                             client_input_count,
                             client_input_types: &client_input_types,
                             preprocessing_demand,
                             program_hash: program_id,
-                            preproc_store_path: preproc_store_path.as_deref(),
-                            deployment_mode: if persistent_runs > 1 {
-                                DeploymentMode::Standing
-                            } else {
-                                DeploymentMode::OneShot
-                            },
+                            preproc_store: preproc_store.clone(),
+                            preprocessing: PartyPreprocessing::OneShot,
+                            execution_tasks: None,
                         },
                     )
                     .await
                     {
-                        Ok(e) => e,
+                        Ok(engine) => engine,
                         Err(e) => {
                             eprintln!("[party {}] HoneyBadger setup failed: {}", my_id, e);
                             exit(13);
                         }
                     };
-                    let HbPartyRuntime {
-                        engine,
-                        run_complete_rx,
-                    } = runtime;
+                    let engine = runtime;
+                    cooperative_engine = Some(engine.clone());
                     if coord_opt.is_some() {
                         engine.enable_client_output_capture().await;
                         hb_bls12381_coord_engine = Some(engine.clone());
-                        hb_bls12381_run_complete_rx = Some(run_complete_rx);
                     }
 
                     // Coordinator mask distribution + input collection
-                    if persistent_runs == 1 {
-                        if let Some(ref mut coord) = coord_opt {
-                            let node_rpc = node_rpc_opt
-                                .as_mut()
-                                .expect("--rpc-bind required with coordinator");
+                    if let Some(ref mut coord) = coord_opt {
+                        let node_rpc = node_rpc_opt
+                            .as_ref()
+                            .expect("--rpc-bind required with coordinator");
 
-                            if let Err(e) = collect_hb_coordinator_inputs_for_bls(
-                                &mut vm,
-                                &engine,
-                                coord,
-                                node_rpc,
-                                &input_ids,
-                                client_input_total,
-                                client_input_count,
-                                &client_input_slots,
-                                &client_input_types,
-                                program_id,
-                                0,
-                                my_id,
-                                as_leader,
-                            )
-                            .await
-                            {
-                                eprintln!(
-                                    "[party {}] coordinator input collection failed: {}",
-                                    my_id, e
-                                );
-                                exit(13);
-                            }
+                        if let Err(e) = collect_hb_coordinator_inputs_for_bls(
+                            &mut vm,
+                            &engine,
+                            coord,
+                            node_rpc,
+                            coordinator_execution_id(execution_id),
+                            &input_ids,
+                            client_input_total,
+                            client_input_count,
+                            &client_input_slots,
+                            &client_input_types,
+                            program_id,
+                            0,
+                            my_id,
+                            as_leader,
+                        )
+                        .await
+                        {
+                            eprintln!(
+                                "[party {}] coordinator input collection failed: {}",
+                                my_id, e
+                            );
+                            exit(13);
                         }
                     }
                 } else {
                     // No coordinator or non-Bls12_381 curves
-                    match curve_config {
-                        MpcCurveConfig::Bls12_381 => {
-                            setup_hb!(ark_bls12_381::Fr, ark_bls12_381::G1Projective)
-                        }
-                        MpcCurveConfig::Bn254 => {
-                            setup_hb!(ark_bn254::Fr, ark_bn254::G1Projective)
-                        }
-                        MpcCurveConfig::Curve25519 => {
-                            setup_hb!(ark_curve25519::Fr, ark_curve25519::EdwardsProjective)
-                        }
-                        MpcCurveConfig::Ed25519 => {
-                            setup_hb!(ark_ed25519::Fr, ark_ed25519::EdwardsProjective)
-                        }
-                        MpcCurveConfig::Secp256k1 | MpcCurveConfig::Secp256r1 => {
-                            eprintln!(
-                                "Error: curve {} is not supported by honeybadger backend",
-                                curve_config.name()
-                            );
-                            exit(2);
-                        }
-                    }
+                    dispatch_hb_curve!(curve_config, setup_hb, {
+                        eprintln!(
+                            "Error: curve {} is not supported by honeybadger backend",
+                            curve_config.name()
+                        );
+                        exit(2);
+                    })
                 }
 
                 eprintln!(
@@ -5227,6 +6987,7 @@ async fn main() {
                 );
             }
             MpcBackendKind::Avss => {
+                let execution_id = require_network_execution_id(execution_id);
                 eprintln!(
                     "[party {}] Setting up AVSS backend (curve: {})...",
                     my_id,
@@ -5254,11 +7015,19 @@ async fn main() {
                         n,
                         t,
                         instance_id,
+                        execution_id,
                         coord,
                         rpc,
                         cert,
                         key,
                         &expected_clients,
+                        client_input_total,
+                        client_input_count,
+                        &client_input_slots,
+                        &client_input_types,
+                        preprocessing_demand,
+                        program_id,
+                        preproc_store.clone(),
                         as_leader,
                         &agreed_entry,
                     )
@@ -5270,52 +7039,60 @@ async fn main() {
                     return;
                 }
 
+                let (mux, inbox, registration, scanner) =
+                    start_party_execution_transport(&net, execution_id).unwrap_or_else(|error| {
+                        eprintln!(
+                            "[party {my_id}] Failed to start AVSS execution transport: {error}"
+                        );
+                        exit(13);
+                    });
+                let mut execution_inbox = Some(inbox);
+                _execution_registration = Some(registration);
+                _execution_scanner = Some(scanner);
+
                 macro_rules! setup_avss {
                     ($F:ty, $G:ty) => {{
-                        if let Err(e) = setup_avss_party_for_curve::<$F, $G>(
+                        match setup_avss_party_for_curve::<$F, $G>(
                             &mut vm,
-                            net.clone(),
-                            AvssPartySetup {
+                            PartySetup {
+                                net: net.clone(),
+                                reply_mux: mux.clone(),
+                                execution_id,
+                                execution_inbox: execution_inbox
+                                    .take()
+                                    .expect("AVSS execution inbox is consumed once"),
                                 my_id,
-                                local_identity: storage_identity.unwrap_or_else(|| {
+                                identity: storage_identity.unwrap_or_else(|| {
                                     DurableIdentityDigest::from_legacy_party_id(my_id)
                                 }),
                                 n,
                                 t,
                                 instance_id,
                                 expected_client_count,
+                                expected_client_bindings: None,
+                                expected_client_reservation_identities: None,
+                                client_count_hint: expected_client_count.unwrap_or(0),
                                 client_input_count,
                                 client_input_types: &client_input_types,
+                                preprocessing_demand,
+                                program_hash: program_id,
+                                preproc_store: preproc_store.clone(),
+                                preprocessing: PartyPreprocessing::OneShot,
+                                execution_tasks: None,
                             },
                         )
                         .await
                         {
-                            eprintln!("[party {}] AVSS setup failed: {}", my_id, e);
-                            exit(13);
+                            Ok(engine) => cooperative_engine = Some(engine),
+                            Err(e) => {
+                                eprintln!("[party {}] AVSS setup failed: {}", my_id, e);
+                                exit(13);
+                            }
                         }
                     }};
                 }
 
-                match curve_config {
-                    MpcCurveConfig::Bls12_381 => {
-                        setup_avss!(ark_bls12_381::Fr, ark_bls12_381::G1Projective)
-                    }
-                    MpcCurveConfig::Bn254 => {
-                        setup_avss!(ark_bn254::Fr, ark_bn254::G1Projective)
-                    }
-                    MpcCurveConfig::Curve25519 => {
-                        setup_avss!(ark_curve25519::Fr, ark_curve25519::EdwardsProjective)
-                    }
-                    MpcCurveConfig::Ed25519 => {
-                        setup_avss!(ark_ed25519::Fr, ark_ed25519::EdwardsProjective)
-                    }
-                    MpcCurveConfig::Secp256k1 => {
-                        setup_avss!(ark_secp256k1::Fr, ark_secp256k1::Projective)
-                    }
-                    MpcCurveConfig::Secp256r1 => {
-                        setup_avss!(ark_secp256r1::Fr, ark_secp256r1::Projective)
-                    }
-                }
+                dispatch_avss_curve!(curve_config, setup_avss);
 
                 eprintln!(
                     "[party {}] AVSS engine set, starting VM execution...",
@@ -5323,246 +7100,6 @@ async fn main() {
                 );
             }
         }
-    }
-
-    if persistent_runs > 1 {
-        if !matches!(backend_kind, MpcBackendKind::HoneyBadger)
-            || !matches!(curve_config, MpcCurveConfig::Bls12_381)
-            || coord_opt.is_none()
-            || hb_bls12381_coord_engine.is_none()
-            || hb_bls12381_run_complete_rx.is_none()
-        {
-            eprintln!(
-                "Error: --persistent-runs currently supports HoneyBadger bls12-381 off-chain coordinator party mode"
-            );
-            exit(2);
-        }
-        let mut coord = coord_opt.take().expect("coordinator checked above");
-        let engine = hb_bls12381_coord_engine
-            .as_ref()
-            .expect("engine checked above")
-            .clone();
-        let node_rpc = node_rpc_opt
-            .as_mut()
-            .expect("--rpc-bind required with persistent coordinator mode");
-        let mut run_complete_rx = hb_bls12381_run_complete_rx
-            .take()
-            .expect("run-complete receiver checked above");
-        let instance_id =
-            session_instance_id.expect("session instance_id should be set in party mode");
-        let n = session_n_parties.unwrap_or_else(|| {
-            net_opt
-                .as_ref()
-                .map(|net| net.parties().len())
-                .unwrap_or_else(|| n_parties.unwrap_or(0))
-        });
-        let t = session_threshold.unwrap_or(1);
-        let my_id = net_opt
-            .as_ref()
-            .map(|net| net.local_party_id())
-            .unwrap_or_else(|| party_id.unwrap_or(0));
-        let persistent_net = net_opt
-            .as_ref()
-            .expect("persistent coordinator mode requires a party network")
-            .clone();
-
-        if !client_roster.is_empty() {
-            vm.set_client_roster(client_roster.clone());
-        }
-
-        for run_index in 0..persistent_runs {
-            let run_id = u64::try_from(run_index)
-                .ok()
-                .and_then(|idx| idx.checked_add(1))
-                .unwrap_or(u64::MAX);
-            let run_instance_id = instance_id.saturating_add(run_index as u64);
-
-            if run_index > 0 {
-                eprintln!(
-                    "[party {my_id}] persistent run {run_id}: resetting engine to instance_id={run_instance_id}"
-                );
-                engine
-                    .reset_for_next_run(run_instance_id)
-                    .await
-                    .unwrap_or_else(|error| {
-                        eprintln!(
-                            "[party {my_id}] reset_for_next_run failed for run {run_id}: {error}"
-                        );
-                        exit(13);
-                    });
-                if let Err(error) = vm.clear_local_storage() {
-                    eprintln!("[party {my_id}] failed to clear local storage: {error}");
-                    exit(13);
-                }
-                engine.preprocess().await.unwrap_or_else(|error| {
-                    eprintln!("[party {my_id}] persistent top-up failed: {error}");
-                    exit(13);
-                });
-            }
-
-            if as_leader {
-                eprintln!("[party {my_id}] persistent run {run_id}: coordinator reset");
-                coord.reset_coord().await.unwrap_or_else(|error| {
-                    eprintln!("[party {my_id}] coordinator reset failed: {error}");
-                    exit(13);
-                });
-                reset_hb_node_rpcs_as_designated_party(
-                    &node_rpc_addrs,
-                    n,
-                    t,
-                    cert_der.clone().expect("--cert required"),
-                    key_der.clone().expect("--key required"),
-                )
-                .await
-                .unwrap_or_else(|error| {
-                    eprintln!("[party {my_id}] node RPC reset failed: {error}");
-                    exit(13);
-                });
-                eprintln!("[party {my_id}] persistent run {run_id}: node RPC reset complete");
-                coord.start_preprocessing().await.unwrap_or_else(|error| {
-                    eprintln!("[party {my_id}] coordinator preprocessing start failed: {error}");
-                    exit(13);
-                });
-            }
-
-            if let Err(e) = collect_hb_coordinator_inputs_for_bls(
-                &mut vm,
-                &engine,
-                &mut coord,
-                node_rpc,
-                &input_ids,
-                client_input_total,
-                client_input_count,
-                &client_input_slots,
-                &client_input_types,
-                program_id,
-                run_id,
-                my_id,
-                as_leader,
-            )
-            .await
-            {
-                eprintln!("[party {my_id}] persistent input collection failed: {e}");
-                exit(13);
-            }
-
-            if as_leader {
-                eprintln!("[party {my_id}] persistent run {run_id}: coordinator -> MPCExecution");
-                coord.start_mpc().await.unwrap_or_else(|error| {
-                    eprintln!("[party {my_id}] coordinator MPC start failed: {error}");
-                    exit(13);
-                });
-            }
-            coord
-                .wait_for_round(Round::MPCExecution)
-                .await
-                .unwrap_or_else(|error| {
-                    eprintln!("[party {my_id}] wait for MPCExecution failed: {error}");
-                    exit(13);
-                });
-
-            eprintln!(
-                "Starting persistent VM run {run_id} of '{}'...",
-                agreed_entry
-            );
-            let online_started_at = std::time::Instant::now();
-            let execution_result = vm.execute_async(&agreed_entry, engine.as_ref()).await;
-            eprintln!(
-                "persistent VM run {run_id} complete! elapsed_ms={}",
-                online_started_at.elapsed().as_millis()
-            );
-
-            let result = execution_result.unwrap_or_else(|err| {
-                eprintln!("Execution error in '{}': {}", agreed_entry, err);
-                exit(4);
-            });
-
-            let output_share = if output_ids.is_empty() {
-                None
-            } else {
-                coordinator_output_share_bytes(&mut vm, &result)
-            };
-            let captured_outputs = engine.drain_client_output_records().await;
-
-            if output_share.is_some() || !captured_outputs.is_empty() {
-                let mut output_shares_by_client: Vec<Vec<HbCoordinatorShare<ark_bls12_381::Fr>>> =
-                    vec![Vec::new(); output_ids.len()];
-
-                if let Some(output_share) = output_share {
-                    let share: HbCoordinatorShare<ark_bls12_381::Fr> =
-                        ark_serialize::CanonicalDeserialize::deserialize_compressed(
-                            output_share.as_slice(),
-                        )
-                        .expect("deserialize output share");
-                    for shares in output_shares_by_client.iter_mut() {
-                        shares.push(share.clone());
-                    }
-                }
-
-                for record in captured_outputs {
-                    let Some(shares) = output_shares_by_client.get_mut(record.client_id) else {
-                        eprintln!(
-                            "Execution error in '{}': HoneyBadger output client index {} has no matching coordinator client identity",
-                            agreed_entry, record.client_id
-                        );
-                        exit(4);
-                    };
-                    shares.extend(record.shares);
-                }
-
-                if as_leader {
-                    coord.send_output().await.unwrap_or_else(|error| {
-                        eprintln!("[party {my_id}] coordinator output start failed: {error}");
-                        exit(13);
-                    });
-                }
-                coord
-                    .wait_for_round(Round::OutputDistribution)
-                    .await
-                    .unwrap_or_else(|error| {
-                        eprintln!("[party {my_id}] wait for OutputDistribution failed: {error}");
-                        exit(13);
-                    });
-
-                for (cid, output_shares) in output_ids.iter().zip(output_shares_by_client) {
-                    if output_shares.is_empty() {
-                        continue;
-                    }
-                    if let Err(e) = coord
-                        .send_output_shares(cid.clone(), cid.clone(), output_shares)
-                        .await
-                    {
-                        eprintln!(
-                            "Warning: failed to submit output shares for client {:?}: {}",
-                            cid, e
-                        );
-                    }
-                }
-                if as_leader {
-                    coord.finalize().await.unwrap_or_else(|error| {
-                        eprintln!("[party {my_id}] coordinator finalize failed: {error}");
-                        exit(13);
-                    });
-                }
-            }
-
-            print_vm_result(&mut vm, result);
-            wait_for_hb_run_complete_barrier(
-                &persistent_net,
-                &mut run_complete_rx,
-                my_id,
-                n,
-                run_id,
-                run_instance_id,
-            )
-            .await
-            .unwrap_or_else(|error| {
-                eprintln!("[party {my_id}] persistent run-complete barrier failed: {error}");
-                exit(13);
-            });
-        }
-
-        return;
     }
 
     // Coordinator: signal MPC execution phase
@@ -5586,11 +7123,24 @@ async fn main() {
     // This call is the online phase (preprocessing is already done), so timing it
     // isolates online MPC cost from preprocessing for benchmarking.
     let online_started_at = std::time::Instant::now();
-    let execution_result = if let Some(engine) = hb_bls12381_coord_engine.as_ref() {
-        vm.execute_async(&agreed_entry, engine.as_ref()).await
+    let (execution_result, cooperative_metrics) = if let Some(engine) = cooperative_engine.as_ref()
+    {
+        match vm
+            .execute_async_with_metrics(&agreed_entry, engine.as_ref())
+            .await
+        {
+            Ok((value, metrics)) => (Ok(value), Some(metrics)),
+            Err(error) => (Err(error), None),
+        }
     } else {
-        vm.execute(&agreed_entry)
+        (vm.execute(&agreed_entry), None)
     };
+    if let Some(metrics) = cooperative_metrics {
+        eprintln!(
+            "cooperative VM execution: instruction_budget_yields={} online_effect_yields={}",
+            metrics.instruction_budget_yields, metrics.online_effect_yields,
+        );
+    }
     eprintln!(
         "online VM execution complete! elapsed_ms={}",
         online_started_at.elapsed().as_millis()
@@ -5636,8 +7186,7 @@ async fn main() {
                             else {
                                 eprintln!(
                                     "Execution error in '{}': HoneyBadger output client index {} has no matching coordinator client identity",
-                                    agreed_entry,
-                                    record.client_id
+                                    agreed_entry, record.client_id
                                 );
                                 exit(4);
                             };
@@ -5700,13 +7249,23 @@ Usage:
   stoffel-run <path-to-compiled-binary> [entry_function] [flags]
 
 Flags:
+  --standing-node         Run a long-lived concurrent execution host
+  --control-dir <path>    Mounted standing-node command/event directory
+  --program-dir <path>    Content-addressed standing-node program artifacts
+  --client-cert-dir <path>
+                          Trusted client certificate artifacts named by standing admissions
+  --pool-id <64-hex>      Nonzero identity for the process-lifetime party mesh
+  --reservoir-burst-capacity <n>
+                          Per-program preprocessing burst capacity warmed before
+                          standing readiness (default: 9)
+  --print-program-id <path>
+                          Print the domain-separated content ID and exit
   --trace-instr           Trace instructions before/after execution
   --trace-regs            Trace register reads/writes
   --trace-stack           Trace function calls and stack push/pop
   --bootnode              Run as bootnode only (coordinates party discovery)
   --leader                Run as leader: bootnode + party 0 in one process
   --client                Run as client (provide inputs to MPC network)
-  --no-program-upload     Do not upload program bytes during session registration
   --bind <addr:port>      Bind address for bootnode or party listen
   --party-id <usize>      Party id (party mode, 0-indexed)
   --bootstrap <addr:port> Bootnode address (party mode or client mode)
@@ -5737,8 +7296,9 @@ Flags:
   --cert <path>           Path to DER-encoded X.509 certificate
   --key <path>            Path to DER-encoded private key
   --client-index <u64>    Reserved coordinator input index (coordinator client mode)
-  --preproc-store <path>  Persistent HoneyBadger preprocessing store directory
+  --preproc-store <path>  Persistent MPC preprocessing store directory
   --local-store <path>    Persistent VM local storage database
+  --execution-id <hex>    Nonzero 256-bit execution ID shared by all MPC parties
   --expected-clients <cert-paths>
                           Comma-separated client cert paths for off-chain coordinator mode
   -h, --help              Show this help
@@ -5814,12 +7374,120 @@ Examples:
 #[cfg(test)]
 mod tests {
     use super::{
-        band_pow2, client_transport_recipient, client_transport_targets, field_outputs_to_hex,
-        format_coordinator_outputs, input_client_ids_from_output_ids, plan_preprocessing,
-        render_fixed_point_i64, CoordinatorOutputFormat,
+        band_pow2, bind_admitted_client_slots, checked_client_input_total,
+        client_input_completion_quorum, client_input_setup_plan, client_output_slot_map,
+        client_transport_recipient, decode_preprocessing_exchange, direct_client_inbound_message,
+        encode_preprocessing_exchange, field_outputs_to_hex, format_coordinator_outputs,
+        hb_input_only_completion_proven, input_client_ids_from_output_ids, mpc_input_protocol_ids,
+        plan_preprocessing, preprocessing_transcript_digest, record_preprocessing_exchange_value,
+        render_fixed_point_i64, resolve_client_protocol_bindings, standing_preproc_pool_program_id,
+        standing_reservoir_plan, standing_reservoir_refill_execution_id,
+        validate_preprocessing_proposals, validate_reservoir_allocation_admission,
+        CoordinatorOutputFormat, ExecutionTaskGroup, PreprocessingExchangeFrame,
+        PreprocessingExchangeMessage, PreprocessingExchangePhase, ReservoirAllocationSnapshot,
+        StandingPreprocessingProposal, StandingReservoirProgram,
     };
+    use std::collections::{BTreeMap, HashSet};
+    use stoffel_vm::net::session::ExecutionId;
     use stoffel_vm::net::MpcCurveConfig;
-    use stoffel_vm_types::compiled_binary::PreprocessingDemand;
+    use stoffel_vm::storage::preproc::PreprocMeta;
+    use stoffel_vm::storage::preproc::{PoolAvailability, PreprocTargets, StandingPreprocSnapshot};
+    use stoffel_vm_types::compiled_binary::{
+        ClientIoManifest, ClientIoSchema, PreprocessingDemand,
+    };
+    use stoffel_vm_types::core_types::ShareType;
+
+    #[tokio::test]
+    async fn execution_task_group_cancels_drops_and_joins_every_child() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+        use tokio_util::sync::CancellationToken;
+
+        struct ActiveTask {
+            active: Arc<AtomicUsize>,
+            dropped: Arc<AtomicUsize>,
+        }
+
+        impl Drop for ActiveTask {
+            fn drop(&mut self) {
+                self.active.fetch_sub(1, Ordering::SeqCst);
+                self.dropped.fetch_add(1, Ordering::SeqCst);
+            }
+        }
+
+        let parent = CancellationToken::new();
+        let tasks = ExecutionTaskGroup::child_of(&parent);
+        let active = Arc::new(AtomicUsize::new(0));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(tokio::sync::Notify::new());
+
+        for _ in 0..3 {
+            let active = Arc::clone(&active);
+            let dropped = Arc::clone(&dropped);
+            let started = Arc::clone(&started);
+            tasks.spawn(async move {
+                active.fetch_add(1, Ordering::SeqCst);
+                let _active = ActiveTask { active, dropped };
+                started.notify_one();
+                std::future::pending::<()>().await;
+            });
+        }
+
+        while active.load(Ordering::SeqCst) != 3 {
+            started.notified().await;
+        }
+        assert_eq!(tasks.task_count(), 3);
+
+        // A prepared execution's token cancellation stops each child even
+        // before cleanup gets its deterministic abort-and-join pass.
+        parent.cancel();
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while active.load(Ordering::SeqCst) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("execution children must observe parent cancellation");
+
+        tasks.shutdown().await;
+        assert_eq!(tasks.task_count(), 0);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert_eq!(dropped.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn direct_client_downstream_queue_retains_ingress_capacity_lease() {
+        use stoffel_vm::net::session::ExecutionId;
+        use stoffel_vm::net::{
+            encode_execution_frame, ExecutionIngressLimits, ExecutionMessageKind,
+            ExecutionTransportMux,
+        };
+
+        let execution_id = ExecutionId::from_bytes([0x73; 32]);
+        let mux = ExecutionTransportMux::new_client_with_limits(ExecutionIngressLimits {
+            inbox_capacity: 2,
+            execution_byte_capacity: 3,
+            global_byte_capacity: 3,
+        })
+        .expect("valid client mux");
+        let mut inbox = mux.register(execution_id).unwrap();
+        let frame =
+            encode_execution_frame(execution_id, ExecutionMessageKind::Mpc, &[1, 2, 3]).unwrap();
+
+        mux.route_party_frame(5, &frame).unwrap();
+        let routed = direct_client_inbound_message(3, inbox.client.recv().await.unwrap());
+        assert_eq!(routed.sender_id, 4);
+        let (downstream_tx, mut downstream_rx) = tokio::sync::mpsc::channel(1);
+        downstream_tx.send(routed).await.unwrap();
+
+        assert!(
+            mux.route_party_frame(5, &frame).is_err(),
+            "moving into the protocol queue must not release ingress capacity"
+        );
+        drop(downstream_rx.recv().await.unwrap());
+        mux.route_party_frame(5, &frame)
+            .expect("dropping the queued direct-client message releases its lease");
+    }
 
     fn demand(triples: u64, prandbits: u64, prandints: u64, dynamic: bool) -> PreprocessingDemand {
         PreprocessingDemand {
@@ -5855,6 +7523,330 @@ mod tests {
     }
 
     #[test]
+    fn standing_preprocessing_storage_is_scoped_by_pool_and_program() {
+        let first_pool = ExecutionId::from_bytes([0x11; 32]);
+        let second_pool = ExecutionId::from_bytes([0x22; 32]);
+        let first_program = [0x33; 32];
+        let second_program = [0x44; 32];
+        let derived = standing_preproc_pool_program_id(first_pool, first_program);
+
+        assert_eq!(
+            derived,
+            standing_preproc_pool_program_id(first_pool, first_program)
+        );
+        assert_ne!(derived, first_program);
+        assert_ne!(
+            derived,
+            standing_preproc_pool_program_id(second_pool, first_program)
+        );
+        assert_ne!(
+            derived,
+            standing_preproc_pool_program_id(first_pool, second_program)
+        );
+    }
+
+    #[test]
+    fn standing_reservoir_plan_keeps_one_spare_and_refills_at_one_bundle() {
+        let input = ShareType::secret_int(64);
+        let program = StandingReservoirProgram {
+            program_id: [0x51; 32],
+            bytes: Vec::new(),
+            backend: stoffel_vm::net::MpcBackendKind::HoneyBadger,
+            curve: MpcCurveConfig::Bls12_381,
+            client_io_manifest: ClientIoManifest {
+                clients: vec![
+                    ClientIoSchema {
+                        client_slot: 0,
+                        inputs: vec![input.clone()],
+                        outputs: Vec::new(),
+                    },
+                    ClientIoSchema {
+                        client_slot: 1,
+                        inputs: vec![input.clone(), input.clone(), input],
+                        outputs: Vec::new(),
+                    },
+                    ClientIoSchema {
+                        client_slot: 2,
+                        inputs: Vec::new(),
+                        outputs: Vec::new(),
+                    },
+                ],
+                ..ClientIoManifest::default()
+            },
+        };
+
+        let (per_execution, high, material_capacity) =
+            standing_reservoir_plan(&program, 1, 9).unwrap();
+        assert_eq!(material_capacity, 10);
+        assert_eq!(
+            per_execution.n_random, 6,
+            "one baseline pair plus four inputs"
+        );
+        assert_eq!(high, per_execution.checked_scale(10).unwrap());
+
+        let per_execution = per_execution.availability().unwrap();
+        assert!(super::availability_reached_refill_threshold(
+            per_execution,
+            per_execution,
+        ));
+        assert!(!super::availability_reached_refill_threshold(
+            PoolAvailability {
+                beaver: per_execution.beaver.saturating_mul(2),
+                random: per_execution.random.saturating_mul(2),
+                prand_bit: per_execution.prand_bit.saturating_mul(2),
+                prand_int: per_execution.prand_int.saturating_mul(2),
+            },
+            per_execution,
+        ));
+    }
+
+    #[test]
+    fn standing_client_input_total_is_checked() {
+        assert_eq!(checked_client_input_total([1, 3, 0]).unwrap(), 4);
+        assert!(checked_client_input_total([usize::MAX, 1])
+            .unwrap_err()
+            .contains("overflows usize"));
+    }
+
+    #[test]
+    fn reservoir_admission_mismatch_is_separate_from_inventory_repair() {
+        use stoffel_vm::storage::preproc::PoolAvailability;
+
+        let local = ReservoirAllocationSnapshot {
+            admission_config_digest: [0x93; 32],
+            requested: PoolAvailability {
+                beaver: 2,
+                random: 1,
+                prand_bit: 0,
+                prand_int: 0,
+            },
+            inventory: StandingPreprocSnapshot {
+                generation_id: Some([0x94; 32]),
+                beaver: PreprocMeta {
+                    count: 8,
+                    consumed: 0,
+                    item_size: 96,
+                },
+                random: PreprocMeta {
+                    count: 4,
+                    consumed: 0,
+                    item_size: 32,
+                },
+                prand_bit: PreprocMeta::default(),
+                prand_int: PreprocMeta::default(),
+            },
+        };
+
+        let mut divergent_admission = local.clone();
+        divergent_admission.admission_config_digest = [0x95; 32];
+        let error =
+            validate_reservoir_allocation_admission(&local, &[local.clone(), divergent_admission])
+                .unwrap_err();
+        assert!(error.contains("divergent frozen standing admission"));
+
+        let mut divergent_inventory = local.clone();
+        divergent_inventory.inventory.beaver.count -= 1;
+        validate_reservoir_allocation_admission(
+            &local,
+            &[local.clone(), divergent_inventory.clone()],
+        )
+        .expect("matching admissions leave actual inventory divergence to the refill path");
+        assert_ne!(local, divergent_inventory);
+    }
+
+    #[test]
+    fn preprocessing_inventory_generation_binds_order_backend_and_execution() {
+        let execution_id = ExecutionId::from_bytes([0x71; 32]);
+        let encode = |value| Some(bincode::serialize(&value).unwrap());
+        let inventory = vec![encode(3u64), encode(5u64), encode(8u64)];
+        let hb = preprocessing_transcript_digest(
+            PreprocessingExchangePhase::HoneyBadgerInventory,
+            execution_id,
+            &inventory,
+        )
+        .unwrap();
+        assert_eq!(
+            hb,
+            preprocessing_transcript_digest(
+                PreprocessingExchangePhase::HoneyBadgerInventory,
+                execution_id,
+                &inventory,
+            )
+            .unwrap()
+        );
+
+        let reordered = vec![encode(5u64), encode(3u64), encode(8u64)];
+        assert_ne!(
+            hb,
+            preprocessing_transcript_digest(
+                PreprocessingExchangePhase::HoneyBadgerInventory,
+                execution_id,
+                &reordered,
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            hb,
+            preprocessing_transcript_digest(
+                PreprocessingExchangePhase::AvssInventory,
+                execution_id,
+                &inventory,
+            )
+            .unwrap()
+        );
+        assert_ne!(
+            hb,
+            preprocessing_transcript_digest(
+                PreprocessingExchangePhase::HoneyBadgerInventory,
+                ExecutionId::from_bytes([0x72; 32]),
+                &inventory,
+            )
+            .unwrap()
+        );
+        assert!(preprocessing_transcript_digest(
+            PreprocessingExchangePhase::HoneyBadgerInventory,
+            execution_id,
+            &[encode(3u64), None, encode(8u64)],
+        )
+        .unwrap_err()
+        .contains("missing party 1"));
+    }
+
+    #[test]
+    fn preprocessing_exchange_retries_are_idempotent_and_equivocation_fails() {
+        let mut values = vec![None, None];
+        record_preprocessing_exchange_value(&mut values, 1, vec![7], "preprocessing value")
+            .unwrap();
+        record_preprocessing_exchange_value(&mut values, 1, vec![7], "preprocessing value")
+            .unwrap();
+        let error =
+            record_preprocessing_exchange_value(&mut values, 1, vec![8], "preprocessing value")
+                .unwrap_err();
+        assert!(error.contains("equivocated"));
+        assert_eq!(values[1], Some(vec![7]));
+    }
+
+    #[test]
+    fn fresh_preprocessing_generation_binds_every_party_nonce() {
+        let execution_id = ExecutionId::from_bytes([0x91; 32]);
+        let targets = PreprocTargets {
+            beaver: 3,
+            random: 5,
+            prand_bit: 7,
+            prand_int: 11,
+        };
+        let proposal = |nonce| StandingPreprocessingProposal {
+            snapshot: 13u64,
+            targets,
+            nonce,
+        };
+        let encode = |value| Some(bincode::serialize(&value).unwrap());
+        let first = vec![encode(proposal([0x21; 32])), encode(proposal([0x22; 32]))];
+        let second = vec![encode(proposal([0x21; 32])), encode(proposal([0x23; 32]))];
+
+        assert_ne!(
+            preprocessing_transcript_digest(
+                PreprocessingExchangePhase::HoneyBadgerInventory,
+                execution_id,
+                &first,
+            )
+            .unwrap(),
+            preprocessing_transcript_digest(
+                PreprocessingExchangePhase::HoneyBadgerInventory,
+                execution_id,
+                &second,
+            )
+            .unwrap(),
+        );
+    }
+
+    #[test]
+    fn preprocessing_target_mismatch_is_rejected_before_protocol_start() {
+        let expected = PreprocTargets {
+            beaver: 2,
+            random: 4,
+            prand_bit: 6,
+            prand_int: 8,
+        };
+        let mut divergent = expected;
+        divergent.random += 1;
+        let error = validate_preprocessing_proposals(
+            vec![
+                StandingPreprocessingProposal {
+                    snapshot: 1u64,
+                    targets: expected,
+                    nonce: [0x31; 32],
+                },
+                StandingPreprocessingProposal {
+                    snapshot: 2u64,
+                    targets: divergent,
+                    nonce: [0x32; 32],
+                },
+            ],
+            expected,
+            "test",
+        )
+        .unwrap_err();
+        assert!(error.contains("party 1 proposed divergent"));
+    }
+
+    #[test]
+    fn identical_preprocessing_proposal_retry_is_idempotent() {
+        let proposal = StandingPreprocessingProposal {
+            snapshot: 17u64,
+            targets: PreprocTargets {
+                beaver: 1,
+                random: 2,
+                prand_bit: 3,
+                prand_int: 4,
+            },
+            nonce: [0x41; 32],
+        };
+        let mut proposals = vec![None, None];
+        record_preprocessing_exchange_value(&mut proposals, 1, proposal, "proposal").unwrap();
+        record_preprocessing_exchange_value(&mut proposals, 1, proposal, "proposal").unwrap();
+
+        let mut equivocation = proposal;
+        equivocation.nonce[0] ^= 1;
+        assert!(
+            record_preprocessing_exchange_value(&mut proposals, 1, equivocation, "proposal",)
+                .unwrap_err()
+                .contains("equivocated")
+        );
+        assert_eq!(proposals[1], Some(proposal));
+    }
+
+    #[test]
+    fn preprocessing_exchange_wire_carries_phase() {
+        let frame = PreprocessingExchangeFrame {
+            phase: PreprocessingExchangePhase::AvssReady,
+            message: PreprocessingExchangeMessage::Ack([0x5a; 32]),
+        };
+        let encoded = encode_preprocessing_exchange(&frame).unwrap();
+        assert_eq!(decode_preprocessing_exchange(&encoded).unwrap(), frame);
+    }
+
+    #[test]
+    fn refill_route_is_bound_to_the_common_trigger() {
+        let pool_id = ExecutionId::from_bytes([0x81; 32]);
+        let program_id = [0x82; 32];
+        let trigger = ExecutionId::from_bytes([0x83; 32]);
+        let route = standing_reservoir_refill_execution_id(pool_id, program_id, trigger);
+        assert_eq!(
+            route,
+            standing_reservoir_refill_execution_id(pool_id, program_id, trigger)
+        );
+        assert_ne!(
+            route,
+            standing_reservoir_refill_execution_id(
+                pool_id,
+                program_id,
+                ExecutionId::from_bytes([0x84; 32]),
+            )
+        );
+    }
+
+    #[test]
     fn client_transport_routing_keeps_lower_recipient_unchanged() {
         assert_eq!(client_transport_recipient(1, 3), Some(1));
     }
@@ -5863,8 +7855,6 @@ mod tests {
     fn client_transport_routing_shifts_past_local_position_without_leaking() {
         assert_eq!(client_transport_recipient(3, 3), Some(4));
         assert_eq!(client_transport_recipient(4, 3), Some(5));
-        assert_eq!(client_transport_targets(3, 3), Some([4]));
-        assert!(!client_transport_targets(3, 3).unwrap().contains(&3));
     }
 
     #[test]
@@ -5938,6 +7928,156 @@ mod tests {
     }
 
     #[test]
+    fn input_only_client_completion_uses_protocol_quorum_not_all_parties() {
+        // Regression for split client I/O with n=5,t=1: after parties 0, 2,
+        // and 3 supplied mask shares, the client broadcast its masked input.
+        // Parties 1 and 4 consumed that RBC before initializing their local
+        // InputServer and therefore correctly never sent redundant shares.
+        assert_eq!(client_input_completion_quorum(5, 1).unwrap(), 3);
+        assert_eq!(client_input_completion_quorum(4, 1).unwrap(), 3);
+        assert_eq!(client_input_completion_quorum(1, 0).unwrap(), 1);
+    }
+
+    #[test]
+    fn input_only_client_completion_rejects_invalid_or_overflowing_topology() {
+        let too_few = client_input_completion_quorum(3, 1).unwrap_err();
+        assert!(too_few.contains("requires n >= 3t + 1"));
+
+        let empty = client_input_completion_quorum(0, 0).unwrap_err();
+        assert!(empty.contains("requires n >= 3t + 1"));
+
+        let overflow = client_input_completion_quorum(usize::MAX, usize::MAX).unwrap_err();
+        assert!(overflow.contains("topology overflow"));
+    }
+
+    #[test]
+    fn honeybadger_input_only_completion_rejects_ok_noop_sender_quorum() {
+        // HoneyBadgerMPCClient::process returns Ok for authenticated wrapped
+        // messages belonging to another subprotocol. Even a full diagnostic
+        // sender quorum must not complete an input-only client until the
+        // InputClient's public rbc_done state proves its masked-input
+        // broadcast actually started.
+        assert!(!hb_input_only_completion_proven(false, 3, 3));
+        assert!(!hb_input_only_completion_proven(true, 2, 3));
+        assert!(hb_input_only_completion_proven(true, 3, 3));
+    }
+
+    #[test]
+    fn admitted_client_order_binds_permuted_sparse_manifest_slots() {
+        let bindings = bind_admitted_client_slots(&[900, 100, 700], &[9, 2, 41]);
+        assert_eq!(bindings[0].protocol_index, 0);
+        assert_eq!(bindings[0].route_id, 900);
+        assert_eq!(bindings[0].manifest_slot, 9);
+        assert_eq!(bindings[1].protocol_index, 1);
+        assert_eq!(bindings[1].route_id, 100);
+        assert_eq!(bindings[1].manifest_slot, 2);
+
+        // Arrival order cannot change protocol indices; the immutable
+        // admission order is retained after observing exactly the admitted set.
+        let observed = HashSet::from([700, 900, 100]);
+        let resolved = resolve_client_protocol_bindings(Some(&bindings), observed).unwrap();
+        assert_eq!(resolved, bindings);
+        assert_eq!(
+            client_output_slot_map(&resolved),
+            BTreeMap::from([(2, 100), (9, 900), (41, 700)])
+        );
+
+        let input_types = BTreeMap::from([
+            (2, vec![ShareType::default_secret_int(); 2]),
+            (9, Vec::new()),
+            (41, vec![ShareType::default_secret_int()]),
+        ]);
+        let plan = client_input_setup_plan(&resolved, &input_types, 99, true);
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0].protocol_index, 1);
+        assert_eq!(plan[0].input_count, 2);
+        assert_eq!(plan[1].protocol_index, 2);
+        assert_eq!(plan[1].input_count, 1);
+    }
+
+    #[test]
+    fn admitted_client_resolution_rejects_unknown_or_missing_cert_identity() {
+        let bindings = bind_admitted_client_slots(&[10, 20], &[7, 3]);
+        let error = resolve_client_protocol_bindings(Some(&bindings), HashSet::from([10, 999]))
+            .unwrap_err();
+
+        assert!(error.contains("missing=[20]"));
+        assert!(error.contains("unexpected=[999]"));
+    }
+
+    #[test]
+    fn output_only_setup_skips_input_server_plan_but_retains_inst_and_output_targets() {
+        let bindings = bind_admitted_client_slots(&[51, 52], &[8, 27]);
+        let input_types = BTreeMap::from([(8, Vec::new()), (27, Vec::new())]);
+
+        let plan = client_input_setup_plan(&bindings, &input_types, 0, true);
+        assert!(
+            plan.is_empty(),
+            "no InputServer state should be initialized"
+        );
+        assert_eq!(bindings.len(), 2, "both clients still receive INST");
+        assert_eq!(
+            client_output_slot_map(&bindings),
+            BTreeMap::from([(8, 51), (27, 52)])
+        );
+    }
+
+    #[test]
+    fn split_authenticated_input_and_output_clients_gate_only_on_the_input_client() {
+        // These route IDs represent two distinct authenticated certificate
+        // principals. Slot 4 submits one input and receives no output; slot 9
+        // submits no input and remains connected to receive one output.
+        let admitted = bind_admitted_client_slots(&[0x51, 0xa2], &[4, 9]);
+        let bindings =
+            resolve_client_protocol_bindings(Some(&admitted), HashSet::from([0xa2, 0x51])).unwrap();
+        let input_types =
+            BTreeMap::from([(4, vec![ShareType::default_secret_int()]), (9, Vec::new())]);
+
+        let input_plan = client_input_setup_plan(&bindings, &input_types, 0, true);
+        assert_eq!(input_plan.len(), 1);
+        assert_eq!(
+            mpc_input_protocol_ids(&input_plan),
+            vec![0],
+            "the output-only authenticated client must not hold the InputServer barrier open"
+        );
+
+        // Admission, INST delivery, and output routing still retain both exact
+        // authenticated routes; excluding a route from InputServer does not
+        // weaken or merge execution-scoped client admission.
+        assert_eq!(bindings.len(), 2);
+        assert_eq!(
+            client_output_slot_map(&bindings),
+            BTreeMap::from([(4, 0x51), (9, 0xa2)])
+        );
+    }
+
+    #[test]
+    fn output_only_client_before_input_client_preserves_sparse_protocol_identity() {
+        // Protocol indices are admission-order identities. Filtering the input
+        // set must not renumber an input client across parties or collide it
+        // with the output-only client's authenticated route.
+        let admitted = bind_admitted_client_slots(&[0xa2, 0x51], &[9, 4]);
+        let bindings =
+            resolve_client_protocol_bindings(Some(&admitted), HashSet::from([0x51, 0xa2])).unwrap();
+        let input_types =
+            BTreeMap::from([(4, vec![ShareType::default_secret_int()]), (9, Vec::new())]);
+        let input_plan = client_input_setup_plan(&bindings, &input_types, 0, true);
+
+        assert_eq!(mpc_input_protocol_ids(&input_plan), vec![1]);
+        assert_eq!(client_output_slot_map(&bindings).get(&9), Some(&0xa2));
+    }
+
+    #[test]
+    fn one_shot_client_binding_remains_sorted_ordinal_and_allows_zero_inputs() {
+        let bindings = resolve_client_protocol_bindings(None, HashSet::from([91, 17])).unwrap();
+        assert_eq!(bindings[0].route_id, 17);
+        assert_eq!(bindings[0].manifest_slot, 0);
+        assert_eq!(bindings[1].route_id, 91);
+        assert_eq!(bindings[1].manifest_slot, 1);
+        assert!(client_input_setup_plan(&bindings, &BTreeMap::new(), 0, false).is_empty());
+    }
+
+    #[test]
     fn client_input_slots_select_sparse_input_clients_from_output_roster() {
         let output_ids = vec![vec![20], vec![21], vec![22]];
 
@@ -5947,7 +8087,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_client_input_slots_preserves_legacy_all_clients_are_inputs() {
+    fn missing_client_input_slots_treats_all_one_shot_clients_as_inputs() {
         let output_ids = vec![vec![30], vec![31]];
 
         let input_ids = input_client_ids_from_output_ids(&output_ids, &[], &[], 1);

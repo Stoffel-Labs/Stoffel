@@ -1,9 +1,12 @@
 use crate::net::curve::SupportedMpcField;
+use crate::net::execution_transport::ExecutionScopedNetwork;
 use crate::net::mpc::{honeybadger_node_opts, honeybadger_node_opts_with_truncation};
 use crate::net::mpc_engine::{DurableIdentityDigest, MpcPartyId, MpcSessionTopology};
 use crate::net::reservation::ReservationRegistry;
+use crate::net::session::ExecutionId;
 use crate::storage::preproc::PreprocStore;
 use ark_ec::{CurveGroup, PrimeGroup};
+use std::collections::BTreeMap;
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -27,6 +30,10 @@ mod reservation;
 #[cfg(test)]
 mod tests;
 pub use config::{HoneyBadgerEngineConfig, HoneyBadgerPreprocessingConfig};
+pub use preprocessing::{
+    agree_standing_preproc_plan, StandingPreprocAction, StandingPreprocPlan,
+    StandingPreprocSnapshot,
+};
 
 // RBC/SSS type aliases used by HB implementation
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
@@ -47,7 +54,11 @@ where
     topology: MpcSessionTopology,
     current_instance_id: AtomicU64,
     local_identity: DurableIdentityDigest,
+    /// Physical manager retained for topology and connection inspection.
+    /// MPC protocol sends use `protocol_net`.
     net: Arc<QuicNetworkManager>,
+    /// Outbound adapter that envelopes every message with the execution ID.
+    protocol_net: Arc<ExecutionScopedNetwork>,
     input_ids: Vec<ClientId>,
     node: Arc<Mutex<HoneyBadgerMPCNode<F, RBCImpl>>>,
     in_flight: Arc<AtomicUsize>,
@@ -55,21 +66,38 @@ where
     group_marker: PhantomData<G>,
     /// Persistent preprocessing store.
     preproc_store: tokio::sync::RwLock<Option<Arc<dyn PreprocStore>>>,
+    /// Background reservoir engines persist into the stable program lane while
+    /// keeping protocol traffic isolated by their full execution envelope.
+    use_program_preproc_reservoir: AtomicBool,
+    /// One-shot, party-agreed gate for correlated standing top-up.
+    standing_preproc_plan: Mutex<Option<StandingPreprocPlan>>,
     /// Program hash for keying stored material.
     program_hash: tokio::sync::RwLock<Option<[u8; 32]>>,
     /// Durable node identity used for persistent store keys.
     persistent_identity: StdRwLock<DurableIdentityDigest>,
     /// Reservation registry for masked-input protocol.
     reservation: tokio::sync::RwLock<Option<ReservationRegistry>>,
+    /// Destructively allocated standing mask shares keyed by the logical
+    /// reservation index. Material is removed from LMDB before insertion here
+    /// and erased after the masked-input exchange completes.
+    reserved_mask_shares: Mutex<BTreeMap<u64, Vec<u8>>>,
     /// Optional in-process capture used by coordinator-backed output delivery.
     client_output_capture: Mutex<Option<Vec<HoneyBadgerClientOutputRecord<F>>>>,
-    /// Maps VM/client protocol indices to transport-derived client IDs.
-    client_output_id_map: RwLock<Vec<ClientId>>,
+    /// Maps VM-visible manifest slots to transport-derived client IDs.
+    /// One-shot sessions install the equivalent ordinal map (0, 1, ...).
+    client_output_id_map: RwLock<BTreeMap<ClientId, ClientId>>,
+    /// Manifest-driven maps reject unknown slots; direct one-shot sessions use
+    /// transport IDs.
+    strict_client_output_id_map: AtomicBool,
+    /// Frozen execution ordinal to certificate-exact durable client identity.
+    /// `None` means no standing admission roster was installed; an empty map
+    /// is a valid deny-all roster.
+    client_reservation_identities: RwLock<Option<BTreeMap<ClientId, DurableIdentityDigest>>>,
     /// Session-local router for open-share/open-exp payloads.
     open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
     /// Per-instance open share accumulation registry.
     open_registry: StdRwLock<Arc<crate::net::open_registry::InstanceRegistry>>,
-    /// Deployment lifetime semantics. OneShot preserves legacy load/delete/RAM behavior.
+    /// Deployment lifetime semantics for one-shot and standing execution.
     deployment_mode: DeploymentMode,
 }
 
@@ -153,6 +181,14 @@ where
 
     pub fn net(&self) -> Arc<QuicNetworkManager> {
         self.net.clone()
+    }
+
+    pub fn execution_id(&self) -> ExecutionId {
+        self.protocol_net.execution_id()
+    }
+
+    pub fn protocol_network(&self) -> Arc<ExecutionScopedNetwork> {
+        Arc::clone(&self.protocol_net)
     }
 
     pub fn topology(&self) -> MpcSessionTopology {
@@ -263,7 +299,10 @@ where
         self.current_instance_id
             .store(new_instance_id, Ordering::SeqCst);
         *self.reservation.write().await = None;
+        self.reserved_mask_shares.lock().await.clear();
         self.client_output_id_map.write().await.clear();
+        self.strict_client_output_id_map
+            .store(false, Ordering::SeqCst);
         {
             let mut capture = self.client_output_capture.lock().await;
             if capture.is_some() {
@@ -300,14 +339,24 @@ where
             .expect("persistent identity lock poisoned") = identity;
     }
 
+    /// Route persistent preprocessing storage to this program's stable
+    /// reservoir lane. Configure this before snapshot agreement/preprocessing.
+    pub fn use_program_preproc_reservoir(&self) {
+        self.use_program_preproc_reservoir
+            .store(true, Ordering::SeqCst);
+    }
+
     pub fn from_config(config: HoneyBadgerEngineConfig) -> Result<Arc<Self>, String> {
         let HoneyBadgerEngineConfig {
             session,
             preprocessing,
             deployment_mode,
         } = config;
+        let execution_id = session.execution_id();
         let (topology, local_identity, network, input_ids, open_message_router) =
             session.into_parts();
+        let protocol_net = ExecutionScopedNetwork::for_party((*network).clone(), execution_id)
+            .map_err(|error| format!("invalid HoneyBadger execution transport: {error}"))?;
         let instance_id = topology.instance_id();
         let party_id = topology.party_id();
         let n_parties = topology.n_parties();
@@ -335,17 +384,23 @@ where
             current_instance_id: AtomicU64::new(instance_id),
             local_identity,
             net: network,
+            protocol_net: Arc::new(protocol_net),
             input_ids: input_ids.clone(),
             node: Arc::new(Mutex::new(node)),
             in_flight: Arc::new(AtomicUsize::new(0)),
             ready: AtomicBool::new(false),
             group_marker: PhantomData,
             preproc_store: tokio::sync::RwLock::new(None),
+            use_program_preproc_reservoir: AtomicBool::new(false),
+            standing_preproc_plan: Mutex::new(None),
             program_hash: tokio::sync::RwLock::new(None),
             persistent_identity: StdRwLock::new(local_identity),
             reservation: tokio::sync::RwLock::new(None),
+            reserved_mask_shares: Mutex::new(BTreeMap::new()),
             client_output_capture: Mutex::new(None),
-            client_output_id_map: RwLock::new(Vec::new()),
+            client_output_id_map: RwLock::new(BTreeMap::new()),
+            strict_client_output_id_map: AtomicBool::new(false),
+            client_reservation_identities: RwLock::new(None),
             open_registry: StdRwLock::new(open_message_router.register_instance(instance_id)),
             open_message_router,
             deployment_mode,
@@ -469,6 +524,56 @@ where
         node: HoneyBadgerMPCNode<F, RBCImpl>,
         deployment_mode: DeploymentMode,
     ) -> Arc<Self> {
+        let execution_id =
+            crate::net::session::derive_execution_id_for_instance(topology.instance_id());
+        let protocol_net = Arc::new(
+            ExecutionScopedNetwork::for_party((*net).clone(), execution_id)
+                .expect("derived one-shot execution IDs are nonzero"),
+        );
+        Self::from_existing_node_with_transport(
+            open_message_router,
+            topology,
+            local_identity,
+            net,
+            protocol_net,
+            node,
+            deployment_mode,
+        )
+    }
+
+    /// Wrap an already network-driven node with an execution-scoped transport.
+    /// This is the runner/supervisor constructor for concurrent executions.
+    #[allow(clippy::too_many_arguments)]
+    pub fn try_from_existing_node_for_execution(
+        open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
+        topology: MpcSessionTopology,
+        local_identity: DurableIdentityDigest,
+        net: Arc<QuicNetworkManager>,
+        protocol_net: ExecutionScopedNetwork,
+        node: HoneyBadgerMPCNode<F, RBCImpl>,
+        deployment_mode: DeploymentMode,
+    ) -> Result<Arc<Self>, String> {
+        Ok(Self::from_existing_node_with_transport(
+            open_message_router,
+            topology,
+            local_identity,
+            net,
+            Arc::new(protocol_net),
+            node,
+            deployment_mode,
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn from_existing_node_with_transport(
+        open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
+        topology: MpcSessionTopology,
+        local_identity: DurableIdentityDigest,
+        net: Arc<QuicNetworkManager>,
+        protocol_net: Arc<ExecutionScopedNetwork>,
+        node: HoneyBadgerMPCNode<F, RBCImpl>,
+        deployment_mode: DeploymentMode,
+    ) -> Arc<Self> {
         let instance_id = topology.instance_id();
         let node = Arc::new(Mutex::new(node));
         Arc::new(Self {
@@ -476,17 +581,23 @@ where
             current_instance_id: AtomicU64::new(instance_id),
             local_identity,
             net,
+            protocol_net,
             input_ids: Vec::new(),
             node,
             in_flight: Arc::new(AtomicUsize::new(0)),
             ready: AtomicBool::new(true),
             group_marker: PhantomData,
             preproc_store: tokio::sync::RwLock::new(None),
+            use_program_preproc_reservoir: AtomicBool::new(false),
+            standing_preproc_plan: Mutex::new(None),
             program_hash: tokio::sync::RwLock::new(None),
             persistent_identity: StdRwLock::new(local_identity),
             reservation: tokio::sync::RwLock::new(None),
+            reserved_mask_shares: Mutex::new(BTreeMap::new()),
             client_output_capture: Mutex::new(None),
-            client_output_id_map: RwLock::new(Vec::new()),
+            client_output_id_map: RwLock::new(BTreeMap::new()),
+            strict_client_output_id_map: AtomicBool::new(false),
+            client_reservation_identities: RwLock::new(None),
             open_registry: StdRwLock::new(open_message_router.register_instance(instance_id)),
             open_message_router,
             deployment_mode,
@@ -494,24 +605,89 @@ where
     }
 
     pub async fn set_client_output_id_map(&self, client_ids: Vec<ClientId>) {
-        *self.client_output_id_map.write().await = client_ids;
+        *self.client_output_id_map.write().await = client_ids.into_iter().enumerate().collect();
+        self.strict_client_output_id_map
+            .store(false, Ordering::SeqCst);
     }
 
-    pub(crate) async fn client_output_transport_id(&self, client_id: ClientId) -> ClientId {
-        self.client_output_id_map
+    /// Install an explicit VM manifest-slot to authenticated transport mapping.
+    /// Standing admissions use this when roster slots are sparse or permuted.
+    pub async fn set_client_output_slot_map(&self, client_ids: BTreeMap<ClientId, ClientId>) {
+        *self.client_output_id_map.write().await = client_ids;
+        self.strict_client_output_id_map
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) async fn client_output_transport_id(
+        &self,
+        client_id: ClientId,
+    ) -> Result<ClientId, String> {
+        if let Some(transport_id) = self
+            .client_output_id_map
             .read()
             .await
-            .get(client_id)
+            .get(&client_id)
             .copied()
-            .unwrap_or(client_id)
+        {
+            return Ok(transport_id);
+        }
+        if self.strict_client_output_id_map.load(Ordering::SeqCst) {
+            return Err(format!(
+                "VM output references client slot {client_id}, which is not present in the standing admission"
+            ));
+        }
+        Ok(client_id)
     }
 
-    pub(crate) fn client_identity(&self, client_id: ClientId) -> DurableIdentityDigest {
-        self.net
-            .get_sorted_client_keys()
-            .get(client_id)
-            .map(|key| DurableIdentityDigest::from_public_key_bytes(&key.0))
-            .unwrap_or_else(|| DurableIdentityDigest::from_legacy_party_id(client_id))
+    /// Install the immutable client principal roster for a standing execution.
+    /// Identical retries are harmless; changing an installed ordinal is not.
+    pub async fn install_standing_client_identities(
+        &self,
+        identities: BTreeMap<ClientId, DurableIdentityDigest>,
+    ) -> Result<(), String> {
+        if !self.is_standing() {
+            return Err("standing client identities require a standing engine".to_owned());
+        }
+        let mut installed = self.client_reservation_identities.write().await;
+        match installed.as_ref() {
+            Some(existing) if existing == &identities => Ok(()),
+            Some(_) => Err("standing client identity roster is immutable".to_owned()),
+            None => {
+                *installed = Some(identities);
+                Ok(())
+            }
+        }
+    }
+
+    pub(crate) async fn client_identity(
+        &self,
+        client_id: ClientId,
+    ) -> Result<DurableIdentityDigest, String> {
+        if self.is_standing() {
+            return self
+                .client_reservation_identities
+                .read()
+                .await
+                .as_ref()
+                .ok_or_else(|| {
+                    "standing client identity roster was not installed for this execution"
+                        .to_owned()
+                })?
+                .get(&client_id)
+                .copied()
+                .ok_or_else(|| {
+                    format!(
+                        "client protocol ordinal {client_id} is not admitted for this execution"
+                    )
+                });
+        }
+
+        Ok(self
+            .net
+            .client_public_key_bytes_by_transport_id(client_id)
+            .or_else(|| self.net.client_public_key_bytes(client_id))
+            .map(|key| DurableIdentityDigest::from_public_key_bytes(&key))
+            .unwrap_or_else(|| DurableIdentityDigest::from_legacy_party_id(client_id)))
     }
 
     pub async fn enable_client_output_capture(&self) {

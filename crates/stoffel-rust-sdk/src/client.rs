@@ -18,7 +18,7 @@ use serde::{Deserialize, Serialize};
 use stoffel_mpc_coordinator_off_chain::{
     node_rpc::NodeRPCClient as OffChainNodeRPCClient, OffChainCoordinatorClient,
 };
-use stoffel_mpc_coordinator_shared::Coordinator as _;
+use stoffel_mpc_coordinator_shared::{Coordinator as _, ExecutionId};
 use stoffel_vm_types::core_types::ShareType;
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
@@ -322,6 +322,8 @@ impl ClientBuilder {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OffChainClientConfig {
+    /// Execution namespace shared by the coordinator, MPC nodes, and clients.
+    pub execution_id: ExecutionId,
     pub coordinator_host: String,
     pub coordinator_port: u16,
     pub timestamp: u64,
@@ -348,6 +350,11 @@ impl OffChainClientConfig {
     }
 
     pub fn validate(&self) -> Result<()> {
+        if self.execution_id.is_zero() {
+            return Err(Error::Configuration(
+                "off-chain execution ID must be nonzero".to_owned(),
+            ));
+        }
         if self.coordinator_host.trim().is_empty() {
             return Err(Error::Configuration(
                 "off-chain coordinator host must not be empty".to_owned(),
@@ -428,6 +435,7 @@ impl OffChainClientConfig {
 
 #[derive(Debug, Clone)]
 pub struct OffChainClientConfigBuilder {
+    execution_id: Option<ExecutionId>,
     coordinator_host: String,
     coordinator_port: Option<u16>,
     timestamp: Option<u64>,
@@ -447,6 +455,12 @@ pub struct OffChainClientConfigBuilder {
 }
 
 impl OffChainClientConfigBuilder {
+    /// Select the execution namespace used by every coordinator and node RPC.
+    pub fn execution_id(mut self, execution_id: ExecutionId) -> Self {
+        self.execution_id = Some(execution_id);
+        self
+    }
+
     pub fn coordinator(mut self, host: impl Into<String>, port: u16) -> Self {
         self.coordinator_host = host.into();
         self.coordinator_port = Some(port);
@@ -568,6 +582,9 @@ impl OffChainClientConfigBuilder {
             return Err(Error::Io(std::io::Error::other(error)));
         }
         let config = OffChainClientConfig {
+            execution_id: self.execution_id.ok_or_else(|| {
+                Error::Configuration("off-chain execution ID is required".to_owned())
+            })?,
             coordinator_host: self.coordinator_host,
             coordinator_port: self.coordinator_port.ok_or_else(|| {
                 Error::Configuration("off-chain coordinator port is required".to_owned())
@@ -600,6 +617,7 @@ impl OffChainClientConfigBuilder {
 impl Default for OffChainClientConfigBuilder {
     fn default() -> Self {
         Self {
+            execution_id: None,
             coordinator_host: "127.0.0.1".to_owned(),
             coordinator_port: None,
             timestamp: None,
@@ -1155,12 +1173,13 @@ where
     S: stoffel_mpc_coordinator_shared::ShareBound<Fr, ValueType = Fr>,
 {
     tokio::time::timeout(config.timeout, async {
-        let coord = OffChainCoordinatorClient::<Fr, S>::start_rpc_client(
+        let coord = OffChainCoordinatorClient::<Fr, S>::start_rpc_client_for_execution(
             &config.coordinator_host,
             config.coordinator_port,
             config.threshold as u64,
             config.parties as u64,
             config.output_count,
+            config.execution_id,
             config.cert_der.clone(),
             config.key_der.clone(),
         )
@@ -1178,10 +1197,11 @@ where
             let reserved_index = config.input_start_index + ordinal as u64;
             coord.reserve_mask_index(reserved_index).await?;
         }
-        let node_rpc = OffChainNodeRPCClient::<Fr, S>::start_rpc_client(
+        let node_rpc = OffChainNodeRPCClient::<Fr, S>::start_rpc_client_for_execution(
             config.parties,
             config.threshold,
             config.node_rpc_endpoints()?,
+            config.execution_id,
             config.cert_der.clone(),
             config.key_der.clone(),
         )
@@ -1228,6 +1248,15 @@ fn value_to_field(value: &Value, share_type: ShareType) -> Result<Fr> {
             })?;
             Ok(i64_to_field(value))
         }
+        // `Value::Bytes` is the full-width field input path used by protocols
+        // such as blinded OPRFs. Integer SDK values remain intentionally
+        // bounded, while canonical field scalars can use the entire Fr domain.
+        (ShareType::SecretInt { bit_length }, Value::Bytes(value)) if bit_length > 1 => {
+            canonical_bls12381_field_from_be_bytes(value)
+        }
+        (ShareType::SecretUInt { .. }, Value::Bytes(value)) => {
+            canonical_bls12381_field_from_be_bytes(value)
+        }
         (ShareType::SecretUInt { bit_length }, Value::U64(value)) => {
             validate_secret_uint_range(*value, bit_length)?;
             Ok(Fr::from(*value))
@@ -1258,6 +1287,32 @@ fn value_to_field(value: &Value, share_type: ShareType) -> Result<Fr> {
             value.kind()
         ))),
     }
+}
+
+fn canonical_bls12381_field_from_be_bytes(bytes: &[u8]) -> Result<Fr> {
+    use ark_ff::{BigInteger, PrimeField};
+
+    const FIELD_BYTES: usize = 32;
+    if bytes.len() != FIELD_BYTES {
+        return Err(Error::InvalidInput(format!(
+            "BLS12-381 field input must be exactly {FIELD_BYTES} canonical big-endian bytes, got {}",
+            bytes.len()
+        )));
+    }
+
+    let value = Fr::from_be_bytes_mod_order(bytes);
+    let encoded = value.into_bigint().to_bytes_be();
+    let mut canonical = [0u8; FIELD_BYTES];
+    let start = FIELD_BYTES
+        .checked_sub(encoded.len())
+        .ok_or_else(|| Error::InvalidInput("BLS12-381 field input is not canonical".to_owned()))?;
+    canonical[start..].copy_from_slice(&encoded);
+    if canonical.as_slice() != bytes {
+        return Err(Error::InvalidInput(
+            "BLS12-381 field input must be less than the scalar-field modulus".to_owned(),
+        ));
+    }
+    Ok(value)
 }
 
 fn validate_secret_uint_range(value: u64, bit_length: usize) -> Result<()> {
@@ -1582,6 +1637,14 @@ mod tests {
     use super::*;
 
     #[test]
+    fn offchain_client_builder_carries_the_execution_namespace() {
+        let execution_id = ExecutionId::from_bytes([0x5a; 32]);
+        let builder = OffChainClientConfigBuilder::default().execution_id(execution_id);
+
+        assert_eq!(builder.execution_id, Some(execution_id));
+    }
+
+    #[test]
     fn secret_uint_values_encode_and_decode_as_unsigned() -> Result<()> {
         let share_type = ShareType::secret_uint(8);
         let field = value_to_field(&Value::U64(255), share_type)?;
@@ -1595,5 +1658,32 @@ mod tests {
 
         assert!(value_to_field(&Value::I64(-1), share_type).is_err());
         assert!(value_to_field(&Value::U64(256), share_type).is_err());
+    }
+
+    #[test]
+    fn full_width_field_bytes_are_accepted_for_integer_shares() -> Result<()> {
+        use ark_ff::{BigInteger, PrimeField};
+
+        let expected = Fr::from(42u64);
+        let encoded = expected.into_bigint().to_bytes_be();
+        let mut canonical = vec![0u8; 32];
+        canonical[32 - encoded.len()..].copy_from_slice(&encoded);
+
+        assert_eq!(
+            value_to_field(&Value::Bytes(canonical), ShareType::default_secret_int())?,
+            expected
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn full_width_field_bytes_must_be_canonical() {
+        use ark_ff::{BigInteger, PrimeField};
+
+        let modulus = Fr::MODULUS.to_bytes_be();
+        let mut encoded = vec![0u8; 32];
+        encoded[32 - modulus.len()..].copy_from_slice(&modulus);
+
+        assert!(value_to_field(&Value::Bytes(encoded), ShareType::default_secret_int()).is_err());
     }
 }

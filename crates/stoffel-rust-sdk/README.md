@@ -107,7 +107,7 @@ assert_eq!(result, vec![Value::I64(100)]);
   `stoffel-networking`. For programs with `ClientStore` metadata,
   `runtime.offchain_client_config(slot)` derives the typed client IO settings
   from the compiled program and MPC runtime; callers then provide coordinator
-  address, node RPC addresses, timestamp, and client identity material before
+  address, node RPC addresses, a nonzero execution ID, timestamp, and client identity material before
   calling `client.run_typed(...)`, `client.submit_typed(...)`, `client.run(...)`,
   or `client.submit(...)`. Server launch for those programs uses
   `ServerBuilder::offchain_coordinator(...)` to pass the

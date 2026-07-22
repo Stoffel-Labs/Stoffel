@@ -2,6 +2,7 @@
 //! Minimal public API kept to avoid cross-crate trait bound conflicts.
 //! Use the MpcEngine abstraction (net::mpc_engine) to attach an engine to VMState for VM usage.
 
+use super::backend::MpcBackendKind;
 use super::protocol_ids::derive_protocol_instance_id_u32;
 use serde::{Deserialize, Serialize};
 use stoffel_vm_types::core_types::DEFAULT_FIXED_POINT_FRACTIONAL_BITS;
@@ -110,6 +111,9 @@ pub fn honeybadger_node_opts_with_truncation(
 }
 
 fn validate_honeybadger_topology(n_parties: usize, threshold: usize) -> Result<(), String> {
+    MpcBackendKind::HoneyBadger
+        .validate_party_count(n_parties)
+        .map_err(|error| error.to_string())?;
     let required = threshold
         .checked_mul(3)
         .and_then(|value| value.checked_add(1))
@@ -157,15 +161,15 @@ mod tests {
 
     #[test]
     fn honeybadger_node_opts_requires_bft_topology() {
-        let err =
-            honeybadger_node_opts(3, 1, 0, 0, 1).expect_err("HoneyBadger must reject n < 3t + 1");
+        let err = honeybadger_node_opts(4, 1, 0, 0, 1)
+            .expect_err("HoneyBadger must reject fewer than five parties");
         assert!(
-            err.contains("HoneyBadger requires n_parties (3) >= 3 * threshold (1) + 1 (4)"),
+            err.contains("HoneyBadger requires at least 5 parties (got 4)"),
             "unexpected error: {err}"
         );
 
-        honeybadger_node_opts(4, 1, 0, 0, 1)
-            .expect("n = 3t + 1 should be accepted for HoneyBadger");
+        honeybadger_node_opts(5, 1, 0, 0, 1)
+            .expect("five parties should be accepted for HoneyBadger at threshold one");
     }
 
     #[test]

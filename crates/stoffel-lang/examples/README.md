@@ -241,7 +241,7 @@ Docker examples default to git build contexts for the coordinator and
 networking repos:
 
 ```sh
-STOFFEL_COORDINATOR_CONTEXT='https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#feature/no-feature-gates-and-multi-type-awareness'
+STOFFEL_COORDINATOR_CONTEXT='https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#dev'
 STOFFEL_NETWORK_CONTEXT='https://github.com/Stoffel-Labs/stoffel-networking.git#feature/robust-identity-based-on-cert'
 ```
 

@@ -17,8 +17,8 @@ pub use crate::config::{
 };
 pub use crate::consensus::{ConsensusGate, NodePublicKey, VerifiedOrdering};
 pub use crate::coordinator::{
-    Coordinator, OffChainCoordinator, OffChainCoordinatorClient, OffChainCoordinatorServer,
-    ShareBound,
+    Coordinator, ExecutionId, OffChainCoordinator, OffChainCoordinatorClient,
+    OffChainCoordinatorServer, ShareBound,
 };
 pub use crate::error::{
     ConsensusError, CoordinatorError, Error, ErrorCategory, NetworkError, Result,

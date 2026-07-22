@@ -72,15 +72,17 @@ fn allocate_local_avss_session(
 }
 
 fn next_u16_domain_counter(counter: &AtomicU64, context: &'static str) -> Result<u64, String> {
-    counter
-        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |current| {
-            if current <= u64::from(u16::MAX) {
-                current.checked_add(1)
-            } else {
-                None
-            }
-        })
-        .map_err(|_| format!("{context} exhausted u16 session slot domain"))
+    let mut current = counter.load(Ordering::SeqCst);
+    loop {
+        let next = current
+            .checked_add(1)
+            .filter(|_| current <= u64::from(u16::MAX))
+            .ok_or_else(|| format!("{context} exhausted u16 session slot domain"))?;
+        match counter.compare_exchange_weak(current, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(previous) => return Ok(previous),
+            Err(observed) => current = observed,
+        }
+    }
 }
 
 fn u8_domain_value(value: usize, field: &'static str) -> Result<u8, String> {

@@ -1,7 +1,12 @@
 use super::HoneyBadgerMpcEngine;
 use crate::net::curve::SupportedMpcField;
 use crate::storage::preproc::{
-    self, PoolAvailability, PreprocBlob, PreprocKeyScope, PreprocTargets, TopUpReport,
+    self, apply_standing_preproc_plan, standing_preproc_snapshot, OwnedPreprocBundle,
+    PoolAvailability, PreprocBlob, PreprocKeyScope, PreprocTargets, TakenPreproc,
+};
+pub use crate::storage::preproc::{
+    agree_standing_preproc_plan, StandingPreprocAction, StandingPreprocPlan,
+    StandingPreprocSnapshot,
 };
 use ark_ec::{CurveGroup, PrimeGroup};
 use ark_std::rand::SeedableRng;
@@ -79,7 +84,9 @@ where
                 })
             });
 
-            let result = node.run_preprocessing(self.net.clone(), &mut rng).await;
+            let result = node
+                .run_preprocessing(self.protocol_net.clone(), &mut rng)
+                .await;
             progress_done.store(true, Ordering::SeqCst);
             if let Some(handle) = progress_handle {
                 handle.abort();
@@ -93,7 +100,7 @@ where
         Ok(())
     }
 
-    async fn preproc_scope(
+    pub(super) async fn preproc_scope(
         &self,
     ) -> Result<
         (
@@ -111,9 +118,18 @@ where
                 return Err(
                     "standing preprocessing requires configured preproc store and program hash"
                         .to_owned(),
-                )
+                );
             }
         };
+        if self.is_standing()
+            && !self
+                .use_program_preproc_reservoir
+                .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(
+                "standing execution preprocessing is owned in memory, not persisted".to_owned(),
+            );
+        }
         let scope = PreprocKeyScope::new(
             hash,
             F::field_kind(),
@@ -124,7 +140,12 @@ where
         Ok((store, hash, scope))
     }
 
-    async fn current_preproc_targets(&self) -> Result<PreprocTargets, String> {
+    /// Exact preprocessing counts configured for this standing engine.
+    ///
+    /// Callers include these targets in the authenticated party proposal so
+    /// mismatched configurations are rejected before an interactive
+    /// preprocessing protocol starts.
+    pub async fn standing_preproc_targets(&self) -> Result<PreprocTargets, String> {
         let node = self.clone_node().await;
         Ok(PreprocTargets {
             beaver: preproc::u32_index(node.params.n_triples as u64, "HB beaver target")?,
@@ -134,37 +155,167 @@ where
         })
     }
 
-    async fn preprocess_standing(&self) -> Result<(), String> {
-        let (store, _hash, scope) = self.preproc_scope().await?;
-        let targets = self.current_preproc_targets().await?;
-        let availability = store.scope_availability(&scope).await?;
-        if availability.beaver < targets.beaver
-            || availability.random < targets.random
-            || availability.prand_bit < targets.prand_bit
-            || availability.prand_int < targets.prand_int
-        {
-            self.top_up_to(targets).await?;
+    /// Install a destructively allocated reservoir bundle into this execution's
+    /// private in-memory preprocessing pool. The bundle has no persistent
+    /// execution lane: dropping it before this call securely burns it.
+    pub async fn activate_preallocated_standing(
+        &self,
+        bundle: OwnedPreprocBundle,
+    ) -> Result<(), String> {
+        if !self.is_standing() {
+            return Err("preallocated activation requires standing deployment mode".to_owned());
         }
+        if self
+            .use_program_preproc_reservoir
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(
+                "a program reservoir engine cannot be activated as an execution".to_owned(),
+            );
+        }
+        let targets = self.standing_preproc_targets().await?;
+        let availability = bundle.availability();
+        if availability != targets {
+            return Err(format!(
+                "preallocated HB bundle does not match target: available={availability:?}, target={targets:?}"
+            ));
+        }
+        self.activate_preproc_bundle(bundle).await
+    }
+
+    async fn activate_preproc_bundle(&self, bundle: OwnedPreprocBundle) -> Result<(), String> {
+        fn decode<T>(
+            item: Option<TakenPreproc>,
+            label: &str,
+            decode: impl FnOnce(&[u8], u32) -> Result<Vec<T>, String>,
+        ) -> Result<Option<Vec<T>>, String> {
+            item.map(|item| {
+                let expected = item.count;
+                let decoded = decode(&item.data, item.item_size)?;
+                ensure_decoded_count(label, decoded.len(), expected)?;
+                Ok(decoded)
+            })
+            .transpose()
+        }
+
+        let beaver = decode(
+            bundle.beaver,
+            "preallocated Beaver triples",
+            |data, item_size| {
+                preproc::deserialize_beaver_triples::<F>(data, item_size, 0)
+                    .map_err(|error| error.to_string())
+            },
+        )?;
+        let random = decode(
+            bundle.random,
+            "preallocated random shares",
+            |data, item_size| {
+                preproc::deserialize_robust_shares::<F>(data, item_size, 0)
+                    .map_err(|error| error.to_string())
+            },
+        )?;
+        let prand_bit = decode(
+            bundle.prand_bit,
+            "preallocated PRandBit shares",
+            |data, item_size| {
+                preproc::deserialize_prandbit_shares::<F>(data, item_size, 0)
+                    .map_err(|error| error.to_string())
+            },
+        )?;
+        let prand_int = decode(
+            bundle.prand_int,
+            "preallocated PRandInt shares",
+            |data, item_size| {
+                preproc::deserialize_robust_shares::<F>(data, item_size, 0)
+                    .map_err(|error| error.to_string())
+            },
+        )?;
+        self.clone_node()
+            .await
+            .preprocessing_material
+            .lock()
+            .await
+            .add(beaver, None, random, None, prand_bit, prand_int);
+        self.ready.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    pub async fn standing_preproc_snapshot(&self) -> Result<StandingPreprocSnapshot, String> {
+        let (store, _hash, scope) = self.preproc_scope().await?;
+        standing_preproc_snapshot(store.as_ref(), scope)
+            .await
+            .map_err(String::from)
+    }
+
+    /// Validate party-indexed snapshots and install the only plan that a
+    /// multi-party standing execution may use. Callers exchange snapshots over
+    /// the execution-scoped control route before calling [`Self::preprocess`].
+    pub async fn install_standing_preproc_plan(
+        &self,
+        snapshots: Vec<StandingPreprocSnapshot>,
+        fresh_generation_id: [u8; 32],
+    ) -> Result<StandingPreprocPlan, String> {
+        if snapshots.len() != self.topology.n_parties() {
+            return Err(format!(
+                "standing preprocessing agreement received {} inventories, expected {}",
+                snapshots.len(),
+                self.topology.n_parties()
+            ));
+        }
+        let local = self.standing_preproc_snapshot().await?;
+        let local_index = self.topology.party_id();
+        if snapshots.get(local_index) != Some(&local) {
+            return Err(format!(
+                "standing preprocessing local inventory changed during agreement: local={local:?}, exchanged={:?}",
+                snapshots.get(local_index)
+            ));
+        }
+        let plan = agree_standing_preproc_plan(
+            self.standing_preproc_targets().await?,
+            &snapshots,
+            fresh_generation_id,
+        )?;
+        *self.standing_preproc_plan.lock().await = Some(plan);
+        Ok(plan)
+    }
+
+    async fn preprocess_standing(&self) -> Result<(), String> {
+        let targets = self.standing_preproc_targets().await?;
+        let plan = if self.topology.n_parties() == 1 {
+            agree_standing_preproc_plan(
+                targets,
+                &[self.standing_preproc_snapshot().await?],
+                crate::net::session::ExecutionId::new().into_bytes(),
+            )?
+        } else {
+            self.standing_preproc_plan.lock().await.take().ok_or_else(|| {
+                "multi-party standing preprocessing requires a party-agreed inventory plan before protocol startup"
+                    .to_owned()
+            })?
+        };
+        let (store, _hash, scope) = self.preproc_scope().await?;
+        let final_snapshot = apply_standing_preproc_plan(store.as_ref(), scope, plan, |needed| {
+            self.top_up_exact(needed)
+        })
+        .await?;
+        let final_available = final_snapshot.availability();
+        if final_snapshot.generation_id != Some(plan.generation_id)
+            || !final_available.covers(targets)
+        {
+            return Err(format!(
+                "standing preprocessing top-up did not reach agreed plan: plan={plan:?}, final={final_snapshot:?}"
+            ));
+        }
+
         self.ready.store(true, Ordering::SeqCst);
         Ok(())
     }
 
-    pub async fn top_up_to(&self, targets: PreprocTargets) -> Result<TopUpReport, String> {
-        let (store, _hash, scope) = self.preproc_scope().await?;
-        let availability = store.scope_availability(&scope).await?;
-        let needed = PoolAvailability {
-            beaver: targets.beaver.saturating_sub(availability.beaver),
-            random: targets.random.saturating_sub(availability.random),
-            prand_bit: targets.prand_bit.saturating_sub(availability.prand_bit),
-            prand_int: targets.prand_int.saturating_sub(availability.prand_int),
-        };
+    async fn top_up_exact(&self, needed: PoolAvailability) -> Result<(), String> {
         if needed == PoolAvailability::default() {
-            return Ok(TopUpReport {
-                generated: PoolAvailability::default(),
-                skipped: true,
-            });
+            return Ok(());
         }
-
+        let (store, _hash, scope) = self.preproc_scope().await?;
         let mut node = self.clone_node().await;
         node.params.n_triples = needed.beaver as usize;
         node.params.n_random_shares = needed.random as usize;
@@ -172,11 +323,10 @@ where
         node.params.n_prandint = needed.prand_int as usize;
 
         let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-        node.run_preprocessing(self.net.clone(), &mut rng)
+        node.run_preprocessing(self.protocol_net.clone(), &mut rng)
             .await
             .map_err(|e| format!("Failed to top up preprocessing material: {:?}", e))?;
 
-        let mut generated = PoolAvailability::default();
         let mut to_append = Vec::new();
         {
             let mut prep = node.preprocessing_material.lock().await;
@@ -186,32 +336,32 @@ where
                     .take_beaver_triples(lengths.beaver_triples)
                     .map_err(|e| format!("{e:?}"))?;
                 let (data, item_size) = preproc::serialize_beaver_triples::<F>(&items)?;
-                generated.beaver = preproc::u32_index(items.len() as u64, "generated beaver")?;
-                to_append.push((scope.beaver_triple(), item_size, generated.beaver, data));
+                let added = preproc::u32_index(items.len() as u64, "generated beaver")?;
+                to_append.push((scope.beaver_triple(), item_size, added, data));
             }
             if lengths.random_shr > 0 {
                 let items = prep
                     .take_random_shares(lengths.random_shr)
                     .map_err(|e| format!("{e:?}"))?;
                 let (data, item_size) = preproc::serialize_robust_shares::<F>(&items)?;
-                generated.random = preproc::u32_index(items.len() as u64, "generated random")?;
-                to_append.push((scope.random_share(), item_size, generated.random, data));
+                let added = preproc::u32_index(items.len() as u64, "generated random")?;
+                to_append.push((scope.random_share(), item_size, added, data));
             }
             if lengths.prandbit > 0 {
                 let items = prep
                     .take_prandbit_shares(lengths.prandbit)
                     .map_err(|e| format!("{e:?}"))?;
                 let (data, item_size) = preproc::serialize_prandbit_shares::<F>(&items)?;
-                generated.prand_bit = preproc::u32_index(items.len() as u64, "generated prandbit")?;
-                to_append.push((scope.prand_bit(), item_size, generated.prand_bit, data));
+                let added = preproc::u32_index(items.len() as u64, "generated prandbit")?;
+                to_append.push((scope.prand_bit(), item_size, added, data));
             }
             if lengths.prandint > 0 {
                 let items = prep
                     .take_prandint_shares(lengths.prandint)
                     .map_err(|e| format!("{e:?}"))?;
                 let (data, item_size) = preproc::serialize_robust_shares::<F>(&items)?;
-                generated.prand_int = preproc::u32_index(items.len() as u64, "generated prandint")?;
-                to_append.push((scope.prand_int(), item_size, generated.prand_int, data));
+                let added = preproc::u32_index(items.len() as u64, "generated prandint")?;
+                to_append.push((scope.prand_int(), item_size, added, data));
             }
         }
 
@@ -219,10 +369,7 @@ where
             store.append_items(&key, item_size, added, &data).await?;
         }
 
-        Ok(TopUpReport {
-            generated,
-            skipped: false,
-        })
+        Ok(())
     }
 
     /// Try to load preprocessing material from the persistent store.
@@ -231,172 +378,38 @@ where
         let store = self.preproc_store.read().await.clone();
         let hash = *self.program_hash.read().await;
         let (store, hash) = match (store, hash) {
-            (Some(s), Some(h)) => (s, h),
+            (Some(store), Some(hash)) => (store, hash),
             _ => return Ok(false),
         };
-        let persistent_identity = self.persistent_identity();
-
+        let identity = self.persistent_identity();
         let scope = PreprocKeyScope::new(
             hash,
             F::field_kind(),
             self.topology.n_parties(),
             self.topology.threshold(),
-            persistent_identity,
+            identity,
         );
-        let base = scope.beaver_triple();
-        let k_rs = scope.random_share();
-        let k_pb = scope.prand_bit();
-        let k_pi = scope.prand_int();
-        let (triples, randoms, prandbits, prandints) = tokio::try_join!(
-            store.load(&base),
-            store.load(&k_rs),
-            store.load(&k_pb),
-            store.load(&k_pi),
-        )?;
-
-        if triples.is_none() && randoms.is_none() && prandbits.is_none() && prandints.is_none() {
-            let msg = format!(
-                "No preprocessing material found in store for program {} (identity={}, n={}, t={})",
-                hex::encode(hash),
-                persistent_identity,
-                self.topology.n_parties(),
-                self.topology.threshold()
-            );
-            eprintln!("{msg}");
-            tracing::info!("{msg}");
+        let requested = store.scope_availability(&scope).await?;
+        if requested == PoolAvailability::default() {
             return Ok(false);
         }
 
-        let node = self.clone_node().await;
-        let mut loaded_triples = 0;
-        let mut loaded_randoms = 0;
-        let mut loaded_prandbits = 0;
-        let mut loaded_prandints = 0;
-
-        if let Some(ref blob) = triples {
-            let available = blob.meta.available();
-            if available > 0 {
-                let decoded = preproc::deserialize_beaver_triples::<F>(
-                    blob.unconsumed_data()?,
-                    blob.meta.item_size,
-                    0,
-                )?;
-                ensure_decoded_count("beaver triples", decoded.len(), available)?;
-                store
-                    .reserve_at(&base, blob.meta.consumed, available)
-                    .await?;
-                store.delete(&base).await?;
-                loaded_triples = available;
-                node.preprocessing_material.lock().await.add(
-                    Some(decoded),
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                );
-            }
-        }
-        if let Some(ref blob) = randoms {
-            let available = blob.meta.available();
-            if available > 0 {
-                let decoded = preproc::deserialize_robust_shares::<F>(
-                    blob.unconsumed_data()?,
-                    blob.meta.item_size,
-                    0,
-                )?;
-                ensure_decoded_count("random shares", decoded.len(), available)?;
-                store
-                    .reserve_at(&k_rs, blob.meta.consumed, available)
-                    .await?;
-                store.delete(&k_rs).await?;
-                loaded_randoms = available;
-                node.preprocessing_material.lock().await.add(
-                    None,
-                    None,
-                    Some(decoded),
-                    None,
-                    None,
-                    None,
-                );
-            }
-        }
-        if let Some(ref blob) = prandbits {
-            let available = blob.meta.available();
-            if available > 0 {
-                let decoded = preproc::deserialize_prandbit_shares::<F>(
-                    blob.unconsumed_data()?,
-                    blob.meta.item_size,
-                    0,
-                )?;
-                ensure_decoded_count("PRandBit shares", decoded.len(), available)?;
-                store
-                    .reserve_at(&k_pb, blob.meta.consumed, available)
-                    .await?;
-                store.delete(&k_pb).await?;
-                loaded_prandbits = available;
-                node.preprocessing_material.lock().await.add(
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(decoded),
-                    None,
-                );
-            }
-        }
-        if let Some(ref blob) = prandints {
-            let available = blob.meta.available();
-            if available > 0 {
-                let decoded = preproc::deserialize_robust_shares::<F>(
-                    blob.unconsumed_data()?,
-                    blob.meta.item_size,
-                    0,
-                )?;
-                ensure_decoded_count("PRandInt shares", decoded.len(), available)?;
-                store
-                    .reserve_at(&k_pi, blob.meta.consumed, available)
-                    .await?;
-                store.delete(&k_pi).await?;
-                loaded_prandints = available;
-                node.preprocessing_material.lock().await.add(
-                    None,
-                    None,
-                    None,
-                    None,
-                    None,
-                    Some(decoded),
-                );
-            }
-        }
-
-        if loaded_triples == 0
-            && loaded_randoms == 0
-            && loaded_prandbits == 0
-            && loaded_prandints == 0
-        {
-            let msg = format!(
-                "No unconsumed preprocessing material found in store for program {} (identity={}, n={}, t={})",
-                hex::encode(hash),
-                persistent_identity,
-                self.topology.n_parties(),
-                self.topology.threshold()
-            );
-            eprintln!("{msg}");
-            tracing::info!("{msg}");
-            return Ok(false);
-        }
-
+        // One transaction removes the complete bundle before it reaches RAM.
+        // Concurrent engines therefore cannot observe or consume the same
+        // correlated material.
+        let bundle = store.take_bundle_from_reservoir(&scope, requested).await?;
+        let loaded = bundle.availability();
+        self.activate_preproc_bundle(bundle).await?;
         let msg = format!(
             "Loaded preprocessing material from store for program {} (identity={}, n={}, t={}, triples={}, randoms={}, prandbits={}, prandints={})",
             hex::encode(hash),
-            persistent_identity,
+            identity,
             self.topology.n_parties(),
             self.topology.threshold(),
-            loaded_triples,
-            loaded_randoms,
-            loaded_prandbits,
-            loaded_prandints
+            loaded.beaver,
+            loaded.random,
+            loaded.prand_bit,
+            loaded.prand_int,
         );
         eprintln!("{msg}");
         tracing::info!("{msg}");
@@ -507,32 +520,6 @@ where
         &self,
         num_shares: usize,
     ) -> Result<Vec<RobustShare<F>>, String> {
-        if self.is_standing() {
-            let (store, _hash, scope) = self.preproc_scope().await?;
-            let key = scope.random_share();
-            let meta = store
-                .meta(&key)
-                .await?
-                .ok_or_else(|| "no standing random shares stored".to_owned())?;
-            let count = preproc::u32_index(num_shares as u64, "standing random share count")?;
-            if meta.available() < count {
-                return Err(format!(
-                    "InsufficientPreproc: random shares need {}, available {}",
-                    count,
-                    meta.available()
-                ));
-            }
-            let start = meta.consumed;
-            store.reserve_at(&key, start, count).await?;
-            let blob = store
-                .load(&key)
-                .await?
-                .ok_or("no standing random shares stored")?;
-            let decoded =
-                preproc::deserialize_robust_shares::<F>(&blob.data, blob.meta.item_size, start)?;
-            return Ok(decoded.into_iter().take(num_shares).collect());
-        }
-
         loop {
             let attempt = {
                 let node = self.clone_node().await;
@@ -542,6 +529,11 @@ where
 
             match attempt {
                 Ok(shares) => return Ok(shares),
+                Err(HoneyBadgerError::NotEnoughPreprocessing) if self.is_standing() => {
+                    return Err(format!(
+                        "standing execution exhausted its owned random-share bundle (need {num_shares})"
+                    ));
+                }
                 Err(HoneyBadgerError::NotEnoughPreprocessing) => {
                     self.regenerate_random_shares(num_shares).await?;
                     continue;
@@ -558,33 +550,6 @@ where
         num_shares: usize,
         ty: ShareType,
     ) -> Result<Vec<RobustShare<F>>, String> {
-        if self.is_standing() {
-            let _ = ty;
-            let (store, _hash, scope) = self.preproc_scope().await?;
-            let key = scope.prand_int();
-            let meta = store
-                .meta(&key)
-                .await?
-                .ok_or_else(|| "no standing PRandInt shares stored".to_owned())?;
-            let count = preproc::u32_index(num_shares as u64, "standing PRandInt share count")?;
-            if meta.available() < count {
-                return Err(format!(
-                    "InsufficientPreproc: PRandInt shares need {}, available {}",
-                    count,
-                    meta.available()
-                ));
-            }
-            let start = meta.consumed;
-            store.reserve_at(&key, start, count).await?;
-            let blob = store
-                .load(&key)
-                .await?
-                .ok_or("no standing PRandInt shares stored")?;
-            let decoded =
-                preproc::deserialize_robust_shares::<F>(&blob.data, blob.meta.item_size, start)?;
-            return Ok(decoded.into_iter().take(num_shares).collect());
-        }
-
         loop {
             let attempt = {
                 let node = self.clone_node().await;
@@ -594,6 +559,11 @@ where
 
             match attempt {
                 Ok(shares) => return Ok(shares),
+                Err(HoneyBadgerError::NotEnoughPreprocessing) if self.is_standing() => {
+                    return Err(format!(
+                        "standing execution exhausted its owned PRandInt bundle (need {num_shares})"
+                    ));
+                }
                 Err(HoneyBadgerError::NotEnoughPreprocessing) => {
                     self.regenerate_prandint_shares(num_shares, ty).await?;
                     continue;
@@ -609,92 +579,28 @@ where
         &self,
         num_triples: usize,
     ) -> Result<Vec<ShamirBeaverTriple<F>>, String> {
-        if !self.is_standing() {
-            let node = self.clone_node().await;
-            return node
-                .preprocessing_material
-                .lock()
-                .await
-                .take_beaver_triples(num_triples)
-                .map_err(|e| format!("Failed to take Beaver triples: {:?}", e));
-        }
-
-        let (store, _hash, scope) = self.preproc_scope().await?;
-        let key = scope.beaver_triple();
-        let meta = store
-            .meta(&key)
-            .await?
-            .ok_or_else(|| "no standing Beaver triples stored".to_owned())?;
-        let count = preproc::u32_index(num_triples as u64, "standing Beaver triple count")?;
-        if meta.available() < count {
-            return Err(format!(
-                "InsufficientPreproc: Beaver triples need {}, available {}",
-                count,
-                meta.available()
-            ));
-        }
-        let start = meta.consumed;
-        store.reserve_at(&key, start, count).await?;
-        let blob = store
-            .load(&key)
-            .await?
-            .ok_or("no standing Beaver triples stored")?;
-        let decoded =
-            preproc::deserialize_beaver_triples::<F>(&blob.data, blob.meta.item_size, start)?;
-        if decoded.len() < num_triples {
-            return Err(format!(
-                "standing Beaver triple decode returned {} items, expected {}",
-                decoded.len(),
-                num_triples
-            ));
-        }
-        Ok(decoded.into_iter().take(num_triples).collect())
+        let node = self.clone_node().await;
+        let result = node
+            .preprocessing_material
+            .lock()
+            .await
+            .take_beaver_triples(num_triples)
+            .map_err(|e| format!("Failed to take Beaver triples: {:?}", e));
+        result
     }
 
     pub(super) async fn reserve_prandbit_shares(
         &self,
         num_shares: usize,
     ) -> Result<Vec<(RobustShare<F>, Gf256)>, String> {
-        if !self.is_standing() {
-            let node = self.clone_node().await;
-            return node
-                .preprocessing_material
-                .lock()
-                .await
-                .take_prandbit_shares(num_shares)
-                .map_err(|e| format!("Failed to take PRandBit shares: {:?}", e));
-        }
-
-        let (store, _hash, scope) = self.preproc_scope().await?;
-        let key = scope.prand_bit();
-        let meta = store
-            .meta(&key)
-            .await?
-            .ok_or_else(|| "no standing PRandBit shares stored".to_owned())?;
-        let count = preproc::u32_index(num_shares as u64, "standing PRandBit share count")?;
-        if meta.available() < count {
-            return Err(format!(
-                "InsufficientPreproc: PRandBit shares need {}, available {}",
-                count,
-                meta.available()
-            ));
-        }
-        let start = meta.consumed;
-        store.reserve_at(&key, start, count).await?;
-        let blob = store
-            .load(&key)
-            .await?
-            .ok_or("no standing PRandBit shares stored")?;
-        let decoded =
-            preproc::deserialize_prandbit_shares::<F>(&blob.data, blob.meta.item_size, start)?;
-        if decoded.len() < num_shares {
-            return Err(format!(
-                "standing PRandBit decode returned {} items, expected {}",
-                decoded.len(),
-                num_shares
-            ));
-        }
-        Ok(decoded.into_iter().take(num_shares).collect())
+        let node = self.clone_node().await;
+        let result = node
+            .preprocessing_material
+            .lock()
+            .await
+            .take_prandbit_shares(num_shares)
+            .map_err(|e| format!("Failed to take PRandBit shares: {:?}", e));
+        result
     }
 
     async fn regenerate_random_shares(&self, needed: usize) -> Result<(), String> {
@@ -708,7 +614,7 @@ where
         }
 
         let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-        node.run_preprocessing(self.net.clone(), &mut rng)
+        node.run_preprocessing(self.protocol_net.clone(), &mut rng)
             .await
             .map_err(|e| format!("Failed to regenerate preprocessing material: {:?}", e))
     }
@@ -728,7 +634,7 @@ where
         }
 
         let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-        node.run_preprocessing(self.net.clone(), &mut rng)
+        node.run_preprocessing(self.protocol_net.clone(), &mut rng)
             .await
             .map_err(|e| {
                 format!(
@@ -756,5 +662,148 @@ where
     ) -> Result<ShareData, String> {
         let shares = self.reserve_prandint_shares(1, ty).await?;
         Self::encode_share(&shares[0]).map(|v| ShareData::Opaque(v.into()))
+    }
+}
+
+#[cfg(test)]
+mod standing_agreement_tests {
+    use super::*;
+
+    fn retained_snapshot() -> StandingPreprocSnapshot {
+        StandingPreprocSnapshot {
+            generation_id: Some([4; 32]),
+            beaver: preproc::PreprocMeta {
+                count: 16,
+                consumed: 3,
+                item_size: 96,
+            },
+            random: preproc::PreprocMeta {
+                count: 20,
+                consumed: 4,
+                item_size: 48,
+            },
+            prand_bit: preproc::PreprocMeta {
+                count: 8,
+                consumed: 1,
+                item_size: 49,
+            },
+            prand_int: preproc::PreprocMeta {
+                count: 6,
+                consumed: 2,
+                item_size: 48,
+            },
+        }
+    }
+
+    #[test]
+    fn party_agreement_rebuilds_empty_store_against_retained_peers() {
+        let retained = retained_snapshot();
+        let empty = StandingPreprocSnapshot::default();
+        let plan = agree_standing_preproc_plan(
+            PoolAvailability {
+                beaver: 16,
+                random: 16,
+                prand_bit: 8,
+                prand_int: 4,
+            },
+            &[retained, retained, empty, retained],
+            [9; 32],
+        )
+        .unwrap();
+        assert_eq!(plan.action, StandingPreprocAction::Rebuild);
+        assert_eq!(
+            plan.needed,
+            PoolAvailability {
+                beaver: 16,
+                random: 16,
+                prand_bit: 8,
+                prand_int: 4,
+            }
+        );
+        assert_eq!(plan.generation_id, [9; 32]);
+    }
+
+    #[test]
+    fn party_agreement_rebuilds_stale_cursor_before_top_up() {
+        let retained = retained_snapshot();
+        let mut stale = retained;
+        stale.random.consumed += 1;
+        let plan = agree_standing_preproc_plan(
+            PoolAvailability::default(),
+            &[retained, stale, retained],
+            [7; 32],
+        )
+        .unwrap();
+        assert_eq!(plan.action, StandingPreprocAction::Rebuild);
+        assert_eq!(plan.generation_id, [7; 32]);
+    }
+
+    #[test]
+    fn same_shape_from_different_generations_rebuilds() {
+        let first = retained_snapshot();
+        let mut second = first;
+        second.generation_id = Some([99; 32]);
+        let plan =
+            agree_standing_preproc_plan(first.availability(), &[first, second], [8; 32]).unwrap();
+        assert_eq!(plan.action, StandingPreprocAction::Rebuild);
+        assert_eq!(plan.generation_id, [8; 32]);
+    }
+
+    #[test]
+    fn retained_matching_generation_is_reused_without_changing_nonce() {
+        let retained = retained_snapshot();
+        let plan = agree_standing_preproc_plan(
+            PoolAvailability {
+                beaver: 13,
+                random: 16,
+                prand_bit: 7,
+                prand_int: 4,
+            },
+            &[retained, retained],
+            [88; 32],
+        )
+        .unwrap();
+        assert_eq!(plan.action, StandingPreprocAction::Reuse);
+        assert_eq!(plan.needed, PoolAvailability::default());
+        assert_eq!(plan.generation_id, [4; 32]);
+    }
+
+    #[test]
+    fn matching_inventories_choose_one_identical_deficit_and_generation() {
+        let retained = retained_snapshot();
+        let plan = agree_standing_preproc_plan(
+            PoolAvailability {
+                beaver: 20,
+                random: 20,
+                prand_bit: 10,
+                prand_int: 8,
+            },
+            &[retained, retained, retained],
+            [5; 32],
+        )
+        .unwrap();
+        assert_eq!(plan.action, StandingPreprocAction::TopUp);
+        assert_eq!(
+            plan.needed,
+            PoolAvailability {
+                beaver: 7,
+                random: 4,
+                prand_bit: 3,
+                prand_int: 4,
+            }
+        );
+        assert_eq!(plan.generation_id, [5; 32]);
+        let peer_plan = agree_standing_preproc_plan(
+            PoolAvailability {
+                beaver: 20,
+                random: 20,
+                prand_bit: 10,
+                prand_int: 8,
+            },
+            &[retained, retained, retained],
+            [5; 32],
+        )
+        .unwrap();
+        assert_eq!(peer_plan, plan, "all parties must install the same plan");
     }
 }

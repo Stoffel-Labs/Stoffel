@@ -135,6 +135,79 @@ where
 
         result.map_mpc_engine_operation("open_share_in_exp_group")
     }
+
+    fn batch_open_shares_in_exp_group(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[Vec<u8>],
+        generator_bytes: &[u8],
+    ) -> MpcEngineResult<Vec<Vec<u8>>> {
+        if !self.supports_exponent_group(group) {
+            return Err(MpcEngineError::operation_failed(
+                "batch_open_shares_in_exp_group",
+                group.unsupported_error(self.protocol_name()),
+            ));
+        }
+
+        if group == self.native_exponent_group() {
+            let generators = vec![generator_bytes.to_vec(); shares.len()];
+            return crate::net::try_block_on_current(
+                self.batch_open_shares_in_exp_group_custom_async_impl(
+                    group,
+                    ty,
+                    shares,
+                    &generators,
+                ),
+            )
+            .map_mpc_engine_operation("batch_open_shares_in_exp_group");
+        }
+
+        shares
+            .iter()
+            .map(|share| self.open_share_in_exp_group(group, ty, share, generator_bytes))
+            .collect()
+    }
+
+    fn batch_open_shares_in_exp_group_custom(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[Vec<u8>],
+        generators: &[Vec<u8>],
+    ) -> MpcEngineResult<Vec<Vec<u8>>> {
+        if shares.len() != generators.len() {
+            return Err(MpcEngineError::operation_failed(
+                "batch_open_shares_in_exp_group_custom",
+                format!(
+                    "share/generator length mismatch: {} != {}",
+                    shares.len(),
+                    generators.len()
+                ),
+            ));
+        }
+        if !self.supports_exponent_group(group) {
+            return Err(MpcEngineError::operation_failed(
+                "batch_open_shares_in_exp_group_custom",
+                group.unsupported_error(self.protocol_name()),
+            ));
+        }
+
+        if group == self.native_exponent_group() {
+            return crate::net::try_block_on_current(
+                self.batch_open_shares_in_exp_group_custom_async_impl(
+                    group, ty, shares, generators,
+                ),
+            )
+            .map_mpc_engine_operation("batch_open_shares_in_exp_group_custom");
+        }
+
+        shares
+            .iter()
+            .zip(generators)
+            .map(|(share, generator)| self.open_share_in_exp_group(group, ty, share, generator))
+            .collect()
+    }
 }
 
 impl<F, G> MpcEngineFieldOpen for HoneyBadgerMpcEngine<F, G>
@@ -145,6 +218,15 @@ where
     fn open_share_as_field(&self, ty: ShareType, share_bytes: &[u8]) -> MpcEngineResult<Vec<u8>> {
         crate::net::try_block_on_current(self.open_share_as_field_async_impl(ty, share_bytes))
             .map_mpc_engine_operation("open_share_as_field")
+    }
+
+    fn batch_open_shares_as_fields(
+        &self,
+        ty: ShareType,
+        shares: &[Vec<u8>],
+    ) -> MpcEngineResult<Vec<Vec<u8>>> {
+        crate::net::try_block_on_current(self.batch_open_shares_as_fields_async_impl(ty, shares))
+            .map_mpc_engine_operation("batch_open_shares_as_fields")
     }
 }
 

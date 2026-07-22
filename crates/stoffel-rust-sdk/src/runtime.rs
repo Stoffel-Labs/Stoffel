@@ -127,7 +127,8 @@ impl StoffelRuntime {
     ///
     /// The runtime supplies the MPC backend, topology, and output count for
     /// `client_slot`. Callers still provide coordinator/node endpoints,
-    /// timestamp, and client identity explicitly.
+    /// execution ID, timestamp, and client identity explicitly. The execution
+    /// ID must match the coordinator and every MPC node for that invocation.
     pub fn offchain_client_config(&self, client_slot: u64) -> Result<OffChainClientConfigBuilder> {
         let client = self.program.client(client_slot).ok_or_else(|| {
             Error::Configuration(format!(

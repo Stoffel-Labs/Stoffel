@@ -52,7 +52,9 @@ use tracing::{error, info, warn};
 use crate::core_vm::VirtualMachine;
 use crate::net::avss_engine::{AvssEngineConfig, AvssMpcEngine};
 use crate::net::curve::SupportedMpcField;
-use crate::net::MpcSessionConfig;
+use crate::net::{
+    ExecutionEnvelopeV1, ExecutionMessageKind, ExecutionScopedNetwork, MpcSessionConfig,
+};
 use crate::runtime_hooks::HookEvent;
 use crate::tests::avss_certificate_programs::{
     build_threshold_ecdsa_program, THRESHOLD_ECDSA_DEMO_MESSAGE_INPUT,
@@ -80,6 +82,7 @@ impl EcdsaThirdPartyVerifier {
 // SimplePartyNetwork - party-id-based Network adapter (same as avss_e2e)
 // ---------------------------------------------------------------------------
 
+#[derive(Clone)]
 struct SimplePartyNetwork {
     node_id: usize,
     n: usize,
@@ -572,13 +575,31 @@ fn spawn_message_processors<F, G>(
         let engine = engines[i].clone();
         let open_message_router = engine.open_message_router();
         let simple_net = node.simple_net.clone().unwrap();
+        let protocol_net = Arc::new(
+            ExecutionScopedNetwork::for_party((*simple_net).clone(), engine.execution_id())
+                .expect("test execution ID is nonzero"),
+        );
         let node_id = node.node_id;
 
         tokio::spawn(async move {
             let mut rx = rx;
             while let Some((sender_id, data)) = rx.recv().await {
+                let envelope = match ExecutionEnvelopeV1::decode(&data) {
+                    Ok(envelope)
+                        if envelope.execution_id() == engine.execution_id()
+                            && envelope.kind() == ExecutionMessageKind::Mpc =>
+                    {
+                        envelope
+                    }
+                    Ok(_) => continue,
+                    Err(error) => {
+                        error!("[TSIG] Node {node_id} rejected execution frame: {error}");
+                        continue;
+                    }
+                };
+                let payload = envelope.payload();
                 // 1. Check open registry (Share.open, Share.open_field, Share.batch_open)
-                match open_message_router.try_handle_wire_message(sender_id, &data) {
+                match open_message_router.try_handle_wire_message(sender_id, payload) {
                     Ok(true) => continue,
                     Err(e) => {
                         error!(
@@ -591,14 +612,15 @@ fn spawn_message_processors<F, G>(
                 }
 
                 // 2. Check AVSS open-in-exp (G1) wire messages
-                match open_message_router.try_handle_avss_open_exp_wire_message(sender_id, &data) {
+                match open_message_router.try_handle_avss_open_exp_wire_message(sender_id, payload)
+                {
                     Ok(true) => continue,
                     Err(_) => {} // Not an open-exp message, continue
                     Ok(false) => {}
                 }
 
                 // 3. Check AVSS G2 open-in-exp wire messages
-                match open_message_router.try_handle_avss_g2_exp_wire_message(sender_id, &data) {
+                match open_message_router.try_handle_avss_g2_exp_wire_message(sender_id, payload) {
                     Ok(true) => continue,
                     Err(_) => {}
                     Ok(false) => {}
@@ -606,7 +628,7 @@ fn spawn_message_processors<F, G>(
 
                 // 4. AVSS protocol messages (RBC, share delivery)
                 match engine
-                    .process_wrapped_message_with_network(sender_id, &data, simple_net.clone())
+                    .process_wrapped_message_with_network(sender_id, payload, protocol_net.clone())
                     .await
                 {
                     Ok(()) => {}

@@ -9,20 +9,31 @@ use clap::Parser;
 use jsonrpsee::{core::RpcResult, server::RpcModule};
 use stoffel_mpc_coordinator_off_chain::{
     ClientIdentity, CoordinatorRPCBaseServer, CoordinatorRPCServerConnectionBase,
-    CoordinatorRPCServerSharedBase, OffChainCoordinatorServer, StoffelCoordinatorRPCServer,
+    CoordinatorRPCServerSharedBase, InputAssignment, OffChainCoordinatorServer,
+    StoffelCoordinatorRPCServer,
 };
 use stoffel_mpc_coordinator_shared::rpc::RPCServerConnection;
-use stoffel_mpc_coordinator_shared::{Round, ShareBound};
+use stoffel_mpc_coordinator_shared::{ExecutionId, Round, ShareBound};
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use tokio::sync::Mutex;
 use x509_parser::prelude::*;
 
 #[derive(Parser, Debug)]
-#[command(author, version, about, long_about = None)]
+#[command(
+    author,
+    version,
+    about,
+    long_about = "Run the off-chain coordinator until SIGINT or SIGTERM is received. \
+SIGKILL cannot be caught; the operating system terminates the process immediately."
+)]
 struct Args {
     #[arg(long)]
     hash: String,
+
+    /// Nonzero identity shared by the coordinator, nodes, and clients for this invocation.
+    #[arg(long, value_parser = parse_nonzero_execution_id)]
+    execution_id: ExecutionId,
 
     #[arg(long, value_delimiter = ',', num_args = 1..)]
     initial_mpc_nodes: Vec<String>,
@@ -56,6 +67,16 @@ struct Args {
 
     #[arg(long, default_value_t = 31415)]
     port: u16,
+}
+
+fn parse_nonzero_execution_id(value: &str) -> Result<ExecutionId, String> {
+    let execution_id = value
+        .parse::<ExecutionId>()
+        .map_err(|error| error.to_string())?;
+    if execution_id.is_zero() {
+        return Err("execution ID must be nonzero".to_string());
+    }
+    Ok(execution_id)
 }
 
 #[derive(Clone)]
@@ -96,28 +117,40 @@ where
     F: FftField,
     S: ShareBound<F>,
 {
-    async fn start_preprocessing(&self) -> RpcResult<()> {
-        self.base.transition(Round::Preprocessing).await
+    async fn start_preprocessing(&self, execution_id: ExecutionId) -> RpcResult<()> {
+        self.base
+            .transition(execution_id, Round::Preprocessing)
+            .await
     }
 
-    async fn reserve_input_masks(&self) -> RpcResult<()> {
-        self.base.transition(Round::InputMaskReservation).await
+    async fn reserve_input_masks(&self, execution_id: ExecutionId) -> RpcResult<()> {
+        self.base
+            .transition(execution_id, Round::InputMaskReservation)
+            .await
     }
 
-    async fn collect_inputs(&self) -> RpcResult<()> {
-        self.base.transition(Round::InputCollection).await
+    async fn collect_inputs(&self, execution_id: ExecutionId) -> RpcResult<()> {
+        self.base
+            .transition(execution_id, Round::InputCollection)
+            .await
     }
 
-    async fn start_mpc(&self) -> RpcResult<()> {
-        self.base.transition(Round::MPCExecution).await
+    async fn start_mpc(&self, execution_id: ExecutionId) -> RpcResult<()> {
+        self.base
+            .transition(execution_id, Round::MPCExecution)
+            .await
     }
 
-    async fn send_output(&self) -> RpcResult<()> {
-        self.base.transition(Round::OutputDistribution).await
+    async fn send_output(&self, execution_id: ExecutionId) -> RpcResult<()> {
+        self.base
+            .transition(execution_id, Round::OutputDistribution)
+            .await
     }
 
-    async fn finalize(&self) -> RpcResult<()> {
-        self.base.transition(Round::ProgramFinished).await
+    async fn finalize(&self, execution_id: ExecutionId) -> RpcResult<()> {
+        self.base
+            .transition(execution_id, Round::ProgramFinished)
+            .await
     }
 }
 
@@ -180,16 +213,19 @@ where
     let server_cert_der = fs::read(&args.server_cert).expect("could not read server cert");
     let server_key_der = fs::read(&args.server_key).expect("could not read server key");
 
-    let server_state = CoordinatorRPCServerSharedBase::new(
+    let server_state = CoordinatorRPCServerSharedBase::new_for_execution(
+        args.execution_id,
         hash,
         args.n,
         args.t,
         public_keys,
         args.n_inputs,
         output_client_keys,
-    );
+        InputAssignment::default(),
+    )
+    .expect("invalid coordinator configuration");
 
-    let _coord = OffChainCoordinatorServer::<CoordinatorConnection<F, S>>::start_coord(
+    let coord = OffChainCoordinatorServer::<CoordinatorConnection<F, S>>::start_coord(
         server_state,
         &args.bind_addr,
         args.port,
@@ -202,7 +238,30 @@ where
 
     println!("Listening on {}:{}", args.bind_addr, args.port);
 
-    tokio::time::sleep(tokio::time::Duration::MAX).await;
+    wait_for_shutdown_signal().await;
+    println!("Shutdown signal received; stopping coordinator listener");
+    coord.shutdown().await;
+}
+
+/// Wait for catchable termination requests. SIGKILL cannot be intercepted by a process.
+async fn wait_for_shutdown_signal() {
+    #[cfg(unix)]
+    {
+        let mut terminate =
+            tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+                .expect("failed to install SIGTERM handler");
+        tokio::select! {
+            result = tokio::signal::ctrl_c() => {
+                result.expect("failed to install SIGINT handler");
+            }
+            _ = terminate.recv() => {}
+        }
+    }
+
+    #[cfg(not(unix))]
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to install interrupt handler");
 }
 
 fn parse_public_keys(cert_files: &[String]) -> Vec<Vec<u8>> {
@@ -221,4 +280,20 @@ fn parse_public_keys(cert_files: &[String]) -> Vec<Vec<u8>> {
                 .to_vec()
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn execution_id_parser_requires_nonzero_strict_hex() {
+        assert!(parse_nonzero_execution_id(&"00".repeat(32)).is_err());
+        assert!(parse_nonzero_execution_id("01").is_err());
+        let expected = ExecutionId::from_bytes([7; 32]);
+        assert_eq!(
+            parse_nonzero_execution_id(&expected.to_string()).unwrap(),
+            expected
+        );
+    }
 }

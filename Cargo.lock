@@ -5706,7 +5706,7 @@ dependencies = [
 [[package]]
 name = "stoffel-mpc-coordinator-off-chain"
 version = "0.1.0"
-source = "git+https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git?branch=dev#abac1fb778730d42ecd775d993123f05482685db"
+source = "git+https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git?branch=codex%2Fpersistent-execution-coordination#2661aa59b512e889a669c01472e5192d9e2bec7f"
 dependencies = [
  "ark-bls12-381",
  "ark-ff 0.5.0",
@@ -5727,7 +5727,7 @@ dependencies = [
 [[package]]
 name = "stoffel-mpc-coordinator-shared"
 version = "0.1.0"
-source = "git+https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git?branch=dev#abac1fb778730d42ecd775d993123f05482685db"
+source = "git+https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git?branch=codex%2Fpersistent-execution-coordination#2661aa59b512e889a669c01472e5192d9e2bec7f"
 dependencies = [
  "ark-bls12-381",
  "ark-ec",
@@ -5735,6 +5735,7 @@ dependencies = [
  "ark-serialize 0.5.0",
  "async-trait",
  "futures-util",
+ "hex",
  "hpke",
  "hyper",
  "hyper-util",
@@ -5762,6 +5763,7 @@ version = "0.1.0"
 dependencies = [
  "aes",
  "ark-bls12-381",
+ "ark-ec",
  "ark-ff 0.5.0",
  "ark-serialize 0.5.0",
  "csv",
@@ -5769,9 +5771,11 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-stdout",
  "opentelemetry_sdk",
+ "rand 0.8.6",
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "stoffel-bindgen",
  "stoffel-mpc-coordinator-off-chain",
  "stoffel-mpc-coordinator-shared",
@@ -5867,11 +5871,14 @@ dependencies = [
  "ark-std 0.5.0",
  "async-trait",
  "bincode",
+ "blake3",
  "futures",
  "hex",
  "libc",
+ "rcgen",
  "rustls",
  "serde",
+ "serde_json",
  "stoffel-mpc-coordinator-off-chain",
  "stoffel-mpc-coordinator-shared",
  "stoffel-vm",
@@ -5879,8 +5886,10 @@ dependencies = [
  "stoffelcrypto",
  "stoffellang",
  "stoffelnet",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
  "x509-parser 0.18.1",
@@ -5973,8 +5982,7 @@ dependencies = [
 [[package]]
 name = "stoffelnet"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3dedfe14784d0d5d9fa4a3c5c9c36b49581c43789ac44449be3ade72fa025223"
+source = "git+https://github.com/Stoffel-Labs/stoffel-networking.git?branch=codex%2Fconcurrent-execution-transport#6a099b21f11150c9d7cd89ed24f275807f01aacf"
 dependencies = [
  "ark-ff 0.5.0",
  "async-trait",
