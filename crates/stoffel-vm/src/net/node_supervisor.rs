@@ -15,10 +15,8 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use tokio::sync::broadcast;
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-
-const EVENT_BUFFER_CAPACITY: usize = 256;
 
 /// Immutable version-one description of a single program execution.
 ///
@@ -78,7 +76,7 @@ enum ExecutionPhase {
 }
 
 impl ExecutionPhase {
-    pub const fn is_terminal(self) -> bool {
+    const fn is_terminal(self) -> bool {
         matches!(self, Self::Terminal)
     }
 }
@@ -186,7 +184,7 @@ impl ExecutionEntry {
 /// block another admitted, runnable execution.
 pub struct NodeSupervisor {
     state: Mutex<SupervisorState>,
-    events: broadcast::Sender<NodeEvent>,
+    events: mpsc::UnboundedSender<NodeEvent>,
 }
 
 struct SupervisorState {
@@ -196,28 +194,21 @@ struct SupervisorState {
 }
 
 impl NodeSupervisor {
-    pub fn new() -> Arc<Self> {
-        let (events, _) = broadcast::channel(EVENT_BUFFER_CAPACITY);
-        Arc::new(Self {
+    pub fn new() -> (Arc<Self>, mpsc::UnboundedReceiver<NodeEvent>) {
+        let (events, receiver) = mpsc::unbounded_channel();
+        let supervisor = Arc::new(Self {
             state: Mutex::new(SupervisorState {
                 accepting: true,
                 executions: HashMap::new(),
                 prepare_tails: HashMap::new(),
             }),
             events,
-        })
-    }
-
-    pub fn subscribe(&self) -> broadcast::Receiver<NodeEvent> {
-        self.events.subscribe()
-    }
-
-    pub fn active_execution_count(&self) -> usize {
-        self.state.lock().executions.len()
+        });
+        (supervisor, receiver)
     }
 
     /// Admit one execution and return its immediate acknowledgement. Later
-    /// lifecycle transitions are published to subscribers.
+    /// lifecycle transitions are published to the control-plane event sink.
     pub fn prepare<F, Fut>(
         self: &Arc<Self>,
         spec: ExecutionSpecV1,
@@ -578,7 +569,7 @@ mod tests {
     }
 
     async fn wait_for(
-        events: &mut broadcast::Receiver<NodeEvent>,
+        events: &mut mpsc::UnboundedReceiver<NodeEvent>,
         execution_id: ExecutionId,
         expected: impl Fn(&NodeEventKind) -> bool,
     ) {
@@ -611,8 +602,7 @@ mod tests {
     #[tokio::test]
     async fn prepare_launch_and_cleanup_are_isolated() {
         let handler = Arc::new(GateHandler::default());
-        let supervisor = NodeSupervisor::new();
-        let mut events = supervisor.subscribe();
+        let (supervisor, mut events) = NodeSupervisor::new();
         let first = spec(1);
         let execution_id = first.execution_id;
 
@@ -662,8 +652,7 @@ mod tests {
     #[tokio::test]
     async fn cancellation_cleans_preparing_work() {
         let handler = Arc::new(GateHandler::default());
-        let supervisor = NodeSupervisor::new();
-        let mut events = supervisor.subscribe();
+        let (supervisor, mut events) = NodeSupervisor::new();
         let execution_id = spec(9).execution_id;
         supervisor.prepare(spec(9), preparation!(handler)).unwrap();
         supervisor.cancel(execution_id).unwrap();
@@ -688,8 +677,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_preparation_emits_event_and_releases_active_state() {
         let handler = Arc::new(FailingHandler);
-        let supervisor = NodeSupervisor::new();
-        let mut events = supervisor.subscribe();
+        let (supervisor, mut events) = NodeSupervisor::new();
         let first = spec(10);
         let preparing = supervisor
             .prepare(first.clone(), preparation!(handler))
@@ -705,8 +693,6 @@ mod tests {
             matches!(kind, NodeEventKind::Failed { .. })
         })
         .await;
-        assert_eq!(supervisor.active_execution_count(), 0);
-
         supervisor
             .prepare(spec(11), preparation!(handler))
             .expect("terminal execution does not retain active state");
@@ -715,7 +701,7 @@ mod tests {
     #[tokio::test]
     async fn same_program_preparation_is_fifo_while_different_programs_overlap() {
         let handler = Arc::new(OrderingHandler::default());
-        let supervisor = NodeSupervisor::new();
+        let (supervisor, _events) = NodeSupervisor::new();
         let first = spec(1);
         let second = ExecutionSpecV1::new(ExecutionId::from([2; 32]), [1; 32]);
         let other = ExecutionSpecV1::new(ExecutionId::from([3; 32]), [3; 32]);
@@ -748,8 +734,7 @@ mod tests {
     #[tokio::test]
     async fn cancelled_middle_prepare_does_not_release_later_same_program_work() {
         let handler = Arc::new(OrderingHandler::default());
-        let supervisor = NodeSupervisor::new();
-        let mut events = supervisor.subscribe();
+        let (supervisor, mut events) = NodeSupervisor::new();
         let same_program = |byte: u8| ExecutionSpecV1::new(ExecutionId::from([byte; 32]), [1; 32]);
         let first = same_program(1);
         let middle = same_program(2);
