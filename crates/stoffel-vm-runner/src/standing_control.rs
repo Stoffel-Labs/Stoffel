@@ -7,7 +7,7 @@
 //! unauthenticated network listener.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::fs;
 use std::io::{BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -93,6 +93,137 @@ pub struct ResolvedStandingExecutionAdmissionV1 {
     pub config_digest: [u8; 32],
 }
 
+/// One immutable, content-addressed program loaded when the standing node starts.
+#[derive(Debug)]
+pub struct StandingProgram {
+    pub program_id: [u8; 32],
+    pub bytes: Arc<[u8]>,
+    pub backend: MpcBackendKind,
+    pub curve: MpcCurveConfig,
+    pub client_io_manifest: ClientIoManifest,
+    entries: HashSet<String>,
+}
+
+impl StandingProgram {
+    fn contains_entry(&self, entry: &str) -> bool {
+        self.entries.contains(entry)
+    }
+}
+
+/// Programs frozen at startup and shared by admission, preprocessing, and execution.
+#[derive(Debug)]
+pub struct StandingProgramCatalog(BTreeMap<[u8; 32], Arc<StandingProgram>>);
+
+impl StandingProgramCatalog {
+    pub fn load(directory: &Path) -> Result<Self, StandingControlError> {
+        fs::create_dir_all(directory).map_err(|source| io_error(directory, source))?;
+        let mut paths = fs::read_dir(directory)
+            .map_err(|source| io_error(directory, source))?
+            .filter_map(Result::ok)
+            .map(|entry| entry.path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "stflb")
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+
+        let mut programs = BTreeMap::new();
+        for path in paths {
+            let bytes = fs::read(&path).map_err(|source| io_error(&path, source))?;
+            let program_id = program_id_from_bytes(&bytes);
+            let expected_name = format!("{}.stflb", hex::encode(program_id));
+            if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
+                return Err(StandingControlError::InvalidCommand(format!(
+                    "standing artifact {} is not stored under its content address {expected_name}",
+                    path.display()
+                )));
+            }
+            let (client_io_manifest, backend, curve, entries) = inspect_standing_program(&bytes)?;
+            programs.insert(
+                program_id,
+                Arc::new(StandingProgram {
+                    program_id,
+                    bytes: Arc::from(bytes),
+                    backend,
+                    curve,
+                    client_io_manifest,
+                    entries,
+                }),
+            );
+        }
+        Ok(Self(programs))
+    }
+
+    pub fn get(&self, program_id: &[u8; 32]) -> Option<Arc<StandingProgram>> {
+        self.0.get(program_id).cloned()
+    }
+
+    pub fn programs(&self) -> impl Iterator<Item = Arc<StandingProgram>> + '_ {
+        self.0.values().cloned()
+    }
+}
+
+/// Client certificate identities frozen alongside the program catalog at startup.
+#[derive(Debug)]
+pub struct StandingClientCatalog(BTreeMap<String, NodePublicKey>);
+
+impl StandingClientCatalog {
+    pub fn load(directory: &Path) -> Result<Self, StandingControlError> {
+        fs::create_dir_all(directory).map_err(|source| io_error(directory, source))?;
+        let mut identities = BTreeMap::new();
+        for entry in fs::read_dir(directory).map_err(|source| io_error(directory, source))? {
+            let entry = entry.map_err(|source| io_error(directory, source))?;
+            let path = entry.path();
+            if !entry
+                .file_type()
+                .map_err(|source| io_error(&path, source))?
+                .is_file()
+            {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                continue;
+            };
+            let cert_der = fs::read(&path).map_err(|source| io_error(&path, source))?;
+            if cert_der.len() > MAX_STANDING_CONTROL_FILE_BYTES {
+                return Err(StandingControlError::InvalidCommand(format!(
+                    "client certificate {} exceeds {} bytes",
+                    path.display(),
+                    MAX_STANDING_CONTROL_FILE_BYTES
+                )));
+            }
+            let (remainder, parsed) = X509Certificate::from_der(&cert_der).map_err(|error| {
+                StandingControlError::InvalidCommand(format!(
+                    "parse expected client certificate {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if !remainder.is_empty() {
+                return Err(StandingControlError::InvalidCommand(format!(
+                    "expected client certificate {} has trailing bytes",
+                    path.display()
+                )));
+            }
+            identities.insert(
+                name.to_owned(),
+                NodePublicKey(parsed.public_key().raw.to_vec()),
+            );
+        }
+        Ok(Self(identities))
+    }
+
+    fn get(&self, filename: &str) -> Option<CertificateIdentity> {
+        self.0
+            .get(filename)
+            .map(NodePublicKey::certificate_identity)
+    }
+
+    pub fn public_keys(&self) -> impl Iterator<Item = NodePublicKey> + '_ {
+        self.0.values().cloned()
+    }
+}
+
 #[async_trait::async_trait]
 pub trait StandingExecutionHandler: Send + Sync + 'static {
     async fn prepare(
@@ -160,9 +291,10 @@ fn retire_execution(
 pub struct StandingNodeControl {
     commands_dir: PathBuf,
     events_dir: PathBuf,
-    programs_dir: PathBuf,
-    client_cert_dir: PathBuf,
+    programs: Arc<StandingProgramCatalog>,
+    clients: Arc<StandingClientCatalog>,
     supervisor: Arc<NodeSupervisor>,
+    events: tokio::sync::mpsc::UnboundedReceiver<NodeEvent>,
     handler: Arc<dyn StandingExecutionHandler>,
     retired_executions: PathBuf,
 }
@@ -171,9 +303,10 @@ impl StandingNodeControl {
     pub fn new<H>(
         party_id: usize,
         control_root: impl Into<PathBuf>,
-        programs_dir: impl Into<PathBuf>,
-        client_cert_dir: impl Into<PathBuf>,
+        programs: Arc<StandingProgramCatalog>,
+        clients: Arc<StandingClientCatalog>,
         supervisor: Arc<NodeSupervisor>,
+        events: tokio::sync::mpsc::UnboundedReceiver<NodeEvent>,
         handler: Arc<H>,
     ) -> Result<Self, StandingControlError>
     where
@@ -182,9 +315,7 @@ impl StandingNodeControl {
         let control_root = control_root.into();
         let commands_dir = control_root.join("commands");
         let events_dir = control_root.join("events").join(format!("party{party_id}"));
-        let programs_dir = programs_dir.into();
-        let client_cert_dir = client_cert_dir.into();
-        for path in [&commands_dir, &events_dir, &programs_dir] {
+        for path in [&commands_dir, &events_dir] {
             fs::create_dir_all(path).map_err(|source| io_error(path, source))?;
         }
         let retired_executions =
@@ -194,30 +325,30 @@ impl StandingNodeControl {
         Ok(Self {
             commands_dir,
             events_dir,
-            programs_dir,
-            client_cert_dir,
+            programs,
+            clients,
             supervisor,
+            events,
             handler,
             retired_executions,
         })
     }
 
-    pub async fn run(&self, cancellation: CancellationToken) -> Result<(), StandingControlError> {
+    pub async fn run(
+        &mut self,
+        cancellation: CancellationToken,
+    ) -> Result<(), StandingControlError> {
         let mut cursor = load_cursor(&self.events_dir)?;
         let mut interval = tokio::time::interval(CONTROL_POLL_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut events = self.supervisor.subscribe();
         loop {
             tokio::select! {
                 _ = cancellation.cancelled() => return Ok(()),
                 _ = interval.tick() => { self.poll_one(&mut cursor)?; },
-                event = events.recv() => match event {
-                    Ok(event) if is_async_lifecycle_event(&event) => self.write_async_event(event)?,
-                    Ok(_) => {},
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        return Err(StandingControlError::InvalidCommand("lost lifecycle event".to_owned()));
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => return Ok(()),
+                event = self.events.recv() => match event {
+                    Some(event) if is_async_lifecycle_event(&event) => self.write_async_event(event)?,
+                    Some(_) => {},
+                    None => return Ok(()),
                 }
             }
         }
@@ -310,45 +441,29 @@ impl StandingNodeControl {
                 )));
             }
         }
-        let program_path = self
-            .programs_dir
-            .join(format!("{}.stflb", admission.program_id));
-        let bytes = fs::read(&program_path).map_err(|source| io_error(&program_path, source))?;
-        if program_id_from_bytes(&bytes) != program_id {
-            return Err(StandingControlError::InvalidCommand(format!(
-                "program artifact {} does not match content address {}",
-                program_path.display(),
+        let program = self.programs.get(&program_id).ok_or_else(|| {
+            StandingControlError::InvalidCommand(format!(
+                "program {} is not in the standing startup catalog",
                 admission.program_id
+            ))
+        })?;
+        if !program.contains_entry(&admission.entry) {
+            return Err(StandingControlError::InvalidCommand(format!(
+                "admitted entry function {:?} is absent from compiled program",
+                admission.entry
             )));
         }
-        let (client_io_manifest, _, _) = validate_standing_program(&bytes, Some(&admission.entry))?;
-        validate_client_io_admission(&admission.clients, &client_io_manifest)?;
+        validate_client_io_admission(&admission.clients, &program.client_io_manifest)?;
 
         let mut expected_client_identities = Vec::with_capacity(admission.clients.len());
         let mut unique_client_identities = HashSet::with_capacity(admission.clients.len());
         for client in &admission.clients {
-            let path = self.client_cert_dir.join(&client.certificate);
-            let cert_der = fs::read(&path).map_err(|source| io_error(&path, source))?;
-            if cert_der.len() > MAX_STANDING_CONTROL_FILE_BYTES {
-                return Err(StandingControlError::InvalidCommand(format!(
-                    "client certificate {} exceeds {} bytes",
-                    path.display(),
-                    MAX_STANDING_CONTROL_FILE_BYTES
-                )));
-            }
-            let (remainder, parsed) = X509Certificate::from_der(&cert_der).map_err(|error| {
+            let identity = self.clients.get(&client.certificate).ok_or_else(|| {
                 StandingControlError::InvalidCommand(format!(
-                    "parse expected client certificate {}: {error}",
-                    path.display()
+                    "client certificate {:?} is not in the standing startup catalog",
+                    client.certificate
                 ))
             })?;
-            if !remainder.is_empty() {
-                return Err(StandingControlError::InvalidCommand(format!(
-                    "expected client certificate {} has trailing bytes",
-                    path.display()
-                )));
-            }
-            let identity = NodePublicKey(parsed.public_key().raw.to_vec()).certificate_identity();
             if !unique_client_identities.insert(identity) {
                 return Err(StandingControlError::InvalidCommand(format!(
                     "standing client roster contains duplicate SPKI identity at {:?}",
@@ -404,17 +519,22 @@ impl StandingNodeControl {
     }
 }
 
-/// Parse and validate an artifact accepted by a standing node. When an entry
-/// is supplied, also require that function to exist.
-pub fn validate_standing_program(
+fn inspect_standing_program(
     bytes: &[u8],
-    entry: Option<&str>,
-) -> Result<(ClientIoManifest, MpcBackendKind, MpcCurveConfig), StandingControlError> {
+) -> Result<
+    (
+        ClientIoManifest,
+        MpcBackendKind,
+        MpcCurveConfig,
+        HashSet<String>,
+    ),
+    StandingControlError,
+> {
     let mut reader = BufReader::new(bytes);
-    let mut entry_found = entry.is_none();
+    let mut entries = HashSet::new();
     let (functions, version, manifest) =
         CompiledBinary::try_for_each_vm_function_from_reader(&mut reader, |function| {
-            entry_found |= entry == Some(function.name());
+            entries.insert(function.name().to_owned());
             Ok(())
         })
         .map_err(|error| {
@@ -425,12 +545,6 @@ pub fn validate_standing_program(
             "compiled program contains no functions".to_owned(),
         ));
     }
-    if !entry_found {
-        return Err(StandingControlError::InvalidCommand(format!(
-            "admitted entry function {:?} is absent from compiled program",
-            entry.unwrap()
-        )));
-    }
     validate_standing_preprocessing_manifest(version, &manifest.preprocessing_demand)
         .map_err(StandingControlError::InvalidCommand)?;
     let backend = MpcBackendKind::from(manifest.mpc_backend);
@@ -438,7 +552,7 @@ pub fn validate_standing_program(
     curve
         .validate_for_backend(backend)
         .map_err(|error| StandingControlError::InvalidCommand(error.to_string()))?;
-    Ok((manifest, backend, curve))
+    Ok((manifest, backend, curve, entries))
 }
 
 fn validate_standing_preprocessing_manifest(

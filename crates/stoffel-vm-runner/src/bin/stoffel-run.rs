@@ -43,12 +43,12 @@ use stoffel_vm::net::{MpcBackendKind, MpcCurveConfig};
 use stoffel_vm::runtime_hooks::{HookContext, HookEvent};
 use stoffel_vm::storage::preproc::{
     standing_preproc_snapshot, LmdbPreprocStore, OwnedPreprocBundle, PoolAvailability,
-    PreprocKeyScope, PreprocStore, PreprocTargets, StandingPreprocSnapshot,
+    PreprocKeyScope, PreprocStore, StandingPreprocSnapshot,
 };
 use stoffel_vm::storage::{LocalStorage, RedbLocalStorage};
 use stoffel_vm_runner::{
-    validate_standing_program, ResolvedStandingExecutionAdmissionV1, StandingExecutionHandler,
-    StandingNodeControl,
+    ResolvedStandingExecutionAdmissionV1, StandingClientCatalog, StandingExecutionHandler,
+    StandingNodeControl, StandingProgram, StandingProgramCatalog,
 };
 use stoffel_vm_types::compiled_binary::{
     BinaryError, ClientIoManifest, CompiledBinary, MPC_BACKEND_MANIFEST_FORMAT_VERSION,
@@ -385,7 +385,7 @@ struct PreprocessingExchangeFrame {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct StandingPreprocessingProposal<T> {
     snapshot: T,
-    targets: PreprocTargets,
+    targets: PoolAvailability,
     nonce: [u8; 32],
 }
 
@@ -398,7 +398,7 @@ fn fresh_preprocessing_nonce() -> [u8; 32] {
 
 fn validate_preprocessing_proposals<T>(
     proposals: Vec<StandingPreprocessingProposal<T>>,
-    expected_targets: PreprocTargets,
+    expected_targets: PoolAvailability,
     label: &str,
 ) -> Result<Vec<T>, String> {
     proposals
@@ -4485,14 +4485,6 @@ async fn run_avss_coordinated_party(
     dispatch_avss_curve!(curve_config, run)
 }
 
-struct StandingReservoirProgram {
-    program_id: [u8; 32],
-    bytes: Vec<u8>,
-    backend: MpcBackendKind,
-    curve: MpcCurveConfig,
-    client_io_manifest: ClientIoManifest,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct ReservoirAllocationSnapshot {
     /// Commits the complete frozen standing admission, including the ordered
@@ -4528,49 +4520,10 @@ fn validate_reservoir_allocation_admission(
 }
 
 struct StandingReservoirState {
-    program: StandingReservoirProgram,
+    program: Arc<StandingProgram>,
     per_execution: PoolAvailability,
     material_capacity: usize,
     lane: Arc<tokio::sync::Mutex<()>>,
-}
-
-fn discover_standing_reservoir_programs(
-    programs_dir: &std::path::Path,
-) -> Result<Vec<StandingReservoirProgram>, String> {
-    let mut paths = fs::read_dir(programs_dir)
-        .map_err(|error| format!("read standing program directory: {error}"))?
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .filter(|path| {
-            path.extension()
-                .is_some_and(|extension| extension == "stflb")
-        })
-        .collect::<Vec<_>>();
-    paths.sort();
-
-    let mut programs = Vec::with_capacity(paths.len());
-    for path in paths {
-        let bytes = fs::read(&path)
-            .map_err(|error| format!("read standing artifact {}: {error}", path.display()))?;
-        let program_id = program_id_from_bytes(&bytes);
-        let expected_name = format!("{}.stflb", hex::encode(program_id));
-        if path.file_name().and_then(|name| name.to_str()) != Some(expected_name.as_str()) {
-            return Err(format!(
-                "standing artifact {} is not stored under its content address {expected_name}",
-                path.display()
-            ));
-        }
-        let (manifest, backend, curve) = validate_standing_program(&bytes, None)
-            .map_err(|error| format!("standing artifact {}: {error}", path.display()))?;
-        programs.push(StandingReservoirProgram {
-            program_id,
-            bytes,
-            backend,
-            curve,
-            client_io_manifest: manifest,
-        });
-    }
-    Ok(programs)
 }
 
 fn standing_execution_id(
@@ -4625,19 +4578,14 @@ fn standing_reservoir_refill_execution_id(
 }
 
 fn standing_reservoir_plan(
-    program: &StandingReservoirProgram,
+    manifest: &ClientIoManifest,
     threshold: usize,
     burst_capacity: usize,
 ) -> Result<(PlannedPreprocessing, PlannedPreprocessing, usize), String> {
-    let client_input_total = checked_client_input_total(
-        program
-            .client_io_manifest
-            .clients
-            .iter()
-            .map(|client| client.inputs.len()),
-    )?;
+    let client_input_total =
+        checked_client_input_total(manifest.clients.iter().map(|client| client.inputs.len()))?;
     let per_execution = plan_preprocessing(
-        &program.client_io_manifest.preprocessing_demand,
+        &manifest.preprocessing_demand,
         threshold,
         client_input_total,
     );
@@ -4746,10 +4694,11 @@ impl StandingRunnerExecutionHandler {
 
     async fn warm_reservoirs(
         &mut self,
-        programs: Vec<StandingReservoirProgram>,
+        programs: impl IntoIterator<Item = Arc<StandingProgram>>,
         burst_capacity: usize,
     ) -> Result<(), String> {
-        if programs.is_empty() {
+        let mut programs = programs.into_iter().peekable();
+        if programs.peek().is_none() {
             return Err(
                 "standing node program catalog is empty; no preprocessing reservoirs can be warmed"
                     .to_owned(),
@@ -4758,8 +4707,11 @@ impl StandingRunnerExecutionHandler {
         for program in programs {
             let preproc_program_id =
                 standing_preproc_pool_program_id(self.pool_id, program.program_id);
-            let (per_execution_plan, high_plan, material_capacity) =
-                standing_reservoir_plan(&program, self.threshold, burst_capacity)?;
+            let (per_execution_plan, high_plan, material_capacity) = standing_reservoir_plan(
+                &program.client_io_manifest,
+                self.threshold,
+                burst_capacity,
+            )?;
             let warm_execution_id =
                 standing_reservoir_warm_execution_id(self.pool_id, program.program_id);
             let generation_id = self
@@ -5041,7 +4993,7 @@ impl StandingRunnerExecutionHandler {
 
     async fn warm_reservoir_program(
         &self,
-        program: &StandingReservoirProgram,
+        program: &StandingProgram,
         execution_id: ExecutionId,
         burst_capacity: usize,
     ) -> Result<[u8; 32], String> {
@@ -5152,7 +5104,7 @@ impl StandingRunnerExecutionHandler {
     async fn execute_inner(
         &self,
         admission: &ResolvedStandingExecutionAdmissionV1,
-        program: &StandingReservoirProgram,
+        program: &StandingProgram,
         context: &NodeExecutionContext,
         execution_inbox: ExecutionInbox,
         execution_tasks: &ExecutionTaskGroup,
@@ -5417,6 +5369,10 @@ async fn run_standing_node(raw_args: &[String]) -> Result<(), String> {
     let programs_dir = PathBuf::from(standing_required_flag(raw_args, "--program-dir")?);
     let client_cert_dir = PathBuf::from(standing_required_flag(raw_args, "--client-cert-dir")?);
     let party_cert_dir = PathBuf::from(standing_required_flag(raw_args, "--party-cert-dir")?);
+    let program_catalog =
+        Arc::new(StandingProgramCatalog::load(&programs_dir).map_err(|error| error.to_string())?);
+    let client_catalog =
+        Arc::new(StandingClientCatalog::load(&client_cert_dir).map_err(|error| error.to_string())?);
     let bind = standing_required_flag(raw_args, "--bind")?
         .parse::<SocketAddr>()
         .map_err(|error| format!("invalid --bind: {error}"))?;
@@ -5521,6 +5477,12 @@ async fn run_standing_node(raw_args: &[String]) -> Result<(), String> {
     )
     .await
     .map_err(|error| format!("standing mesh registration failed: {error}"))?;
+    // The transport's TLS allowlist is connection-wide. Admit deployment
+    // client certificates at TLS, then let the execution envelope mux enforce
+    // the exact per-execution certificate roster.
+    for public_key in client_catalog.public_keys() {
+        network.add_allowed_certificate_public_key(public_key);
+    }
 
     let party_public_key_map = party_public_keys.into_iter().collect::<BTreeMap<_, _>>();
     let reconnect_peers = standing_session
@@ -5566,29 +5528,26 @@ async fn run_standing_node(raw_args: &[String]) -> Result<(), String> {
         reservoirs: BTreeMap::new(),
         reservoir_cancellation: reservoir_cancellation.clone(),
     };
-    let reservoir_programs = discover_standing_reservoir_programs(&programs_dir)?;
     handler
-        .warm_reservoirs(reservoir_programs, reservoir_burst_capacity)
+        .warm_reservoirs(program_catalog.programs(), reservoir_burst_capacity)
         .await?;
     let handler = Arc::new(handler);
-    let supervisor = NodeSupervisor::new();
-    let control = Arc::new(
-        StandingNodeControl::new(
-            party_id,
-            control_dir,
-            programs_dir,
-            client_cert_dir,
-            Arc::clone(&supervisor),
-            handler,
-        )
-        .map_err(|error| error.to_string())?,
-    );
+    let (supervisor, events) = NodeSupervisor::new();
+    let mut control = StandingNodeControl::new(
+        party_id,
+        control_dir,
+        program_catalog,
+        client_catalog,
+        Arc::clone(&supervisor),
+        events,
+        handler,
+    )
+    .map_err(|error| error.to_string())?;
     let cancellation = CancellationToken::new();
     eprintln!(
         "[party {protocol_party_id}] standing node ready: reservoir_burst_capacity={reservoir_burst_capacity}"
     );
     let mut control_task = {
-        let control = Arc::clone(&control);
         let cancellation = cancellation.clone();
         tokio::spawn(async move { control.run(cancellation).await })
     };
@@ -5605,9 +5564,6 @@ async fn run_standing_node(raw_args: &[String]) -> Result<(), String> {
             signal.map_err(|error| error.to_string())?;
             reservoir_cancellation.cancel();
             supervisor.shutdown();
-            // Keep the durable event writer alive while terminal cancellation
-            // events drain from the supervisor broadcast channel.
-            tokio::time::sleep(Duration::from_millis(100)).await;
             cancellation.cancel();
             control_task
                 .await
@@ -7385,13 +7341,13 @@ mod tests {
         validate_preprocessing_proposals, validate_reservoir_allocation_admission,
         CoordinatorOutputFormat, ExecutionTaskGroup, PreprocessingExchangeFrame,
         PreprocessingExchangeMessage, PreprocessingExchangePhase, ReservoirAllocationSnapshot,
-        StandingPreprocessingProposal, StandingReservoirProgram,
+        StandingPreprocessingProposal,
     };
     use std::collections::{BTreeMap, HashSet};
     use stoffel_vm::net::session::ExecutionId;
     use stoffel_vm::net::MpcCurveConfig;
     use stoffel_vm::storage::preproc::PreprocMeta;
-    use stoffel_vm::storage::preproc::{PoolAvailability, PreprocTargets, StandingPreprocSnapshot};
+    use stoffel_vm::storage::preproc::{PoolAvailability, StandingPreprocSnapshot};
     use stoffel_vm_types::compiled_binary::{
         ClientIoManifest, ClientIoSchema, PreprocessingDemand,
     };
@@ -7548,35 +7504,29 @@ mod tests {
     #[test]
     fn standing_reservoir_plan_keeps_one_spare_and_refills_at_one_bundle() {
         let input = ShareType::secret_int(64);
-        let program = StandingReservoirProgram {
-            program_id: [0x51; 32],
-            bytes: Vec::new(),
-            backend: stoffel_vm::net::MpcBackendKind::HoneyBadger,
-            curve: MpcCurveConfig::Bls12_381,
-            client_io_manifest: ClientIoManifest {
-                clients: vec![
-                    ClientIoSchema {
-                        client_slot: 0,
-                        inputs: vec![input.clone()],
-                        outputs: Vec::new(),
-                    },
-                    ClientIoSchema {
-                        client_slot: 1,
-                        inputs: vec![input.clone(), input.clone(), input],
-                        outputs: Vec::new(),
-                    },
-                    ClientIoSchema {
-                        client_slot: 2,
-                        inputs: Vec::new(),
-                        outputs: Vec::new(),
-                    },
-                ],
-                ..ClientIoManifest::default()
-            },
+        let manifest = ClientIoManifest {
+            clients: vec![
+                ClientIoSchema {
+                    client_slot: 0,
+                    inputs: vec![input.clone()],
+                    outputs: Vec::new(),
+                },
+                ClientIoSchema {
+                    client_slot: 1,
+                    inputs: vec![input.clone(), input.clone(), input],
+                    outputs: Vec::new(),
+                },
+                ClientIoSchema {
+                    client_slot: 2,
+                    inputs: Vec::new(),
+                    outputs: Vec::new(),
+                },
+            ],
+            ..ClientIoManifest::default()
         };
 
         let (per_execution, high, material_capacity) =
-            standing_reservoir_plan(&program, 1, 9).unwrap();
+            standing_reservoir_plan(&manifest, 1, 9).unwrap();
         assert_eq!(material_capacity, 10);
         assert_eq!(
             per_execution.n_random, 6,
@@ -7729,7 +7679,7 @@ mod tests {
     #[test]
     fn fresh_preprocessing_generation_binds_every_party_nonce() {
         let execution_id = ExecutionId::from_bytes([0x91; 32]);
-        let targets = PreprocTargets {
+        let targets = PoolAvailability {
             beaver: 3,
             random: 5,
             prand_bit: 7,
@@ -7762,7 +7712,7 @@ mod tests {
 
     #[test]
     fn preprocessing_target_mismatch_is_rejected_before_protocol_start() {
-        let expected = PreprocTargets {
+        let expected = PoolAvailability {
             beaver: 2,
             random: 4,
             prand_bit: 6,
@@ -7794,7 +7744,7 @@ mod tests {
     fn identical_preprocessing_proposal_retry_is_idempotent() {
         let proposal = StandingPreprocessingProposal {
             snapshot: 17u64,
-            targets: PreprocTargets {
+            targets: PoolAvailability {
                 beaver: 1,
                 random: 2,
                 prand_bit: 3,

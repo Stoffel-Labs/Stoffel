@@ -7,7 +7,8 @@ pub use local_runner::{
     LocalPartyOutput,
 };
 pub use standing_control::{
-    validate_standing_program, ResolvedStandingExecutionAdmissionV1, StandingClientAdmissionV1,
+    ResolvedStandingExecutionAdmissionV1, StandingClientAdmissionV1, StandingClientCatalog,
     StandingControlCommandV1, StandingControlError, StandingControlOutcomeV1,
-    StandingExecutionAdmissionV1, StandingExecutionHandler, StandingNodeControl,
+    StandingExecutionAdmissionV1, StandingExecutionHandler, StandingNodeControl, StandingProgram,
+    StandingProgramCatalog,
 };

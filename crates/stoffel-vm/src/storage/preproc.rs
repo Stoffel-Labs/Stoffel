@@ -275,7 +275,7 @@ pub struct StandingPreprocPlan {
 
 /// Agree on reuse, top-up, or rebuild from party-indexed inventories.
 pub fn agree_standing_preproc_plan(
-    targets: PreprocTargets,
+    targets: PoolAvailability,
     snapshots: &[StandingPreprocSnapshot],
     fresh_generation_id: [u8; 32],
 ) -> Result<StandingPreprocPlan, String> {
@@ -372,8 +372,6 @@ impl PoolAvailability {
     }
 }
 
-pub type PreprocTargets = PoolAvailability;
-
 /// Preprocessing material removed atomically from a stable reservoir.
 ///
 /// This value deliberately is not `Clone`: one successful take creates one
@@ -438,20 +436,6 @@ impl PreprocBlob {
                 self.data.len()
             ))
         })
-    }
-
-    /// Slice a single item at the given index.
-    pub fn item_data(&self, index: u32) -> Option<&[u8]> {
-        let is = u32_to_usize(self.meta.item_size, "preprocessing item size").ok()?;
-        let start = u32_to_usize(index, "preprocessing item index")
-            .ok()?
-            .checked_mul(is)?;
-        let end = start.checked_add(is)?;
-        if end <= self.data.len() {
-            Some(&self.data[start..end])
-        } else {
-            None
-        }
     }
 }
 
@@ -614,12 +598,40 @@ pub async fn store_standing_preproc_generation(
         .await
 }
 
+/// Verify that every party agreed over one stable, party-indexed inventory,
+/// then derive the shared reservoir action.
+pub async fn agree_standing_preproc_plan_for_party(
+    store: &dyn PreprocStore,
+    scope: PreprocKeyScope,
+    targets: PoolAvailability,
+    snapshots: &[StandingPreprocSnapshot],
+    party_id: usize,
+    parties: usize,
+    fresh_generation_id: [u8; 32],
+) -> Result<StandingPreprocPlan, String> {
+    if snapshots.len() != parties {
+        return Err(format!(
+            "standing preprocessing agreement received {} inventories, expected {parties}",
+            snapshots.len()
+        ));
+    }
+    let local = standing_preproc_snapshot(store, scope).await?;
+    if snapshots.get(party_id) != Some(&local) {
+        return Err(format!(
+            "standing preprocessing local inventory changed during agreement: local={local:?}, exchanged={:?}",
+            snapshots.get(party_id)
+        ));
+    }
+    agree_standing_preproc_plan(targets, snapshots, fresh_generation_id)
+}
+
 /// Apply one party-agreed reservoir plan and return the resulting inventory.
 /// Backend code supplies only its material generator; clearing, generation
 /// ownership, and the final store read stay identical across MPC backends.
 pub async fn apply_standing_preproc_plan<F, Fut>(
     store: &dyn PreprocStore,
     scope: PreprocKeyScope,
+    targets: PoolAvailability,
     plan: StandingPreprocPlan,
     top_up: F,
 ) -> Result<StandingPreprocSnapshot, String>
@@ -638,9 +650,17 @@ where
     if plan.action != StandingPreprocAction::Reuse {
         store_standing_preproc_generation(store, scope, plan.generation_id).await?;
     }
-    standing_preproc_snapshot(store, scope)
+    let final_snapshot = standing_preproc_snapshot(store, scope)
         .await
-        .map_err(String::from)
+        .map_err(String::from)?;
+    if final_snapshot.generation_id != Some(plan.generation_id)
+        || !final_snapshot.availability().covers(targets)
+    {
+        return Err(format!(
+            "standing preprocessing did not reach agreed plan: plan={plan:?}, final={final_snapshot:?}"
+        ));
+    }
+    Ok(final_snapshot)
 }
 
 pub async fn clear_standing_preproc_scope(

@@ -1,8 +1,9 @@
 use super::HoneyBadgerMpcEngine;
 use crate::net::curve::SupportedMpcField;
 use crate::storage::preproc::{
-    self, apply_standing_preproc_plan, standing_preproc_snapshot, OwnedPreprocBundle,
-    PoolAvailability, PreprocBlob, PreprocKeyScope, PreprocTargets, TakenPreproc,
+    self, agree_standing_preproc_plan_for_party, apply_standing_preproc_plan,
+    standing_preproc_snapshot, OwnedPreprocBundle, PoolAvailability, PreprocBlob, PreprocKeyScope,
+    TakenPreproc,
 };
 pub use crate::storage::preproc::{
     agree_standing_preproc_plan, StandingPreprocAction, StandingPreprocPlan,
@@ -145,9 +146,9 @@ where
     /// Callers include these targets in the authenticated party proposal so
     /// mismatched configurations are rejected before an interactive
     /// preprocessing protocol starts.
-    pub async fn standing_preproc_targets(&self) -> Result<PreprocTargets, String> {
+    pub async fn standing_preproc_targets(&self) -> Result<PoolAvailability, String> {
         let node = self.clone_node().await;
-        Ok(PreprocTargets {
+        Ok(PoolAvailability {
             beaver: preproc::u32_index(node.params.n_triples as u64, "HB beaver target")?,
             random: preproc::u32_index(node.params.n_random_shares as u64, "HB random target")?,
             prand_bit: preproc::u32_index(node.params.n_prandbit as u64, "HB prandbit target")?,
@@ -255,26 +256,17 @@ where
         snapshots: Vec<StandingPreprocSnapshot>,
         fresh_generation_id: [u8; 32],
     ) -> Result<StandingPreprocPlan, String> {
-        if snapshots.len() != self.topology.n_parties() {
-            return Err(format!(
-                "standing preprocessing agreement received {} inventories, expected {}",
-                snapshots.len(),
-                self.topology.n_parties()
-            ));
-        }
-        let local = self.standing_preproc_snapshot().await?;
-        let local_index = self.topology.party_id();
-        if snapshots.get(local_index) != Some(&local) {
-            return Err(format!(
-                "standing preprocessing local inventory changed during agreement: local={local:?}, exchanged={:?}",
-                snapshots.get(local_index)
-            ));
-        }
-        let plan = agree_standing_preproc_plan(
+        let (store, _hash, scope) = self.preproc_scope().await?;
+        let plan = agree_standing_preproc_plan_for_party(
+            store.as_ref(),
+            scope,
             self.standing_preproc_targets().await?,
             &snapshots,
+            self.topology.party_id(),
+            self.topology.n_parties(),
             fresh_generation_id,
-        )?;
+        )
+        .await?;
         *self.standing_preproc_plan.lock().await = Some(plan);
         Ok(plan)
     }
@@ -294,18 +286,10 @@ where
             })?
         };
         let (store, _hash, scope) = self.preproc_scope().await?;
-        let final_snapshot = apply_standing_preproc_plan(store.as_ref(), scope, plan, |needed| {
+        apply_standing_preproc_plan(store.as_ref(), scope, targets, plan, |needed| {
             self.top_up_exact(needed)
         })
         .await?;
-        let final_available = final_snapshot.availability();
-        if final_snapshot.generation_id != Some(plan.generation_id)
-            || !final_available.covers(targets)
-        {
-            return Err(format!(
-                "standing preprocessing top-up did not reach agreed plan: plan={plan:?}, final={final_snapshot:?}"
-            ));
-        }
 
         self.ready.store(true, Ordering::SeqCst);
         Ok(())

@@ -1,8 +1,8 @@
 use super::{AvssExecutionNetwork, AvssMpcEngine};
 use crate::net::curve::SupportedMpcField;
 use crate::storage::preproc::{
-    self, apply_standing_preproc_plan, standing_preproc_snapshot, OwnedPreprocBundle,
-    PoolAvailability, PreprocBlob, PreprocKeyScope, PreprocTargets,
+    self, agree_standing_preproc_plan_for_party, apply_standing_preproc_plan,
+    standing_preproc_snapshot, OwnedPreprocBundle, PoolAvailability, PreprocBlob, PreprocKeyScope,
 };
 pub use crate::storage::preproc::{
     agree_standing_preproc_plan, StandingPreprocAction, StandingPreprocPlan,
@@ -107,9 +107,9 @@ where
     /// Callers include these targets in the authenticated party proposal so
     /// mismatched configurations are rejected before an interactive
     /// preprocessing protocol starts.
-    pub async fn standing_preproc_targets(&self) -> Result<PreprocTargets, String> {
+    pub async fn standing_preproc_targets(&self) -> Result<PoolAvailability, String> {
         let node = self.clone_avss_node().await;
-        Ok(PreprocTargets {
+        Ok(PoolAvailability {
             beaver: preproc::u32_index(node.params.n_triples as u64, "AVSS beaver target")?,
             random: preproc::u32_index(node.params.n_v_random_shares as u64, "AVSS random target")?,
             prand_bit: 0,
@@ -187,22 +187,18 @@ where
         snapshots: Vec<StandingPreprocSnapshot>,
         fresh_generation_id: [u8; 32],
     ) -> Result<StandingPreprocPlan, String> {
-        if snapshots.len() != self.topology.n_parties() {
-            return Err(format!(
-                "standing AVSS preprocessing agreement received {} inventories, expected {}",
-                snapshots.len(),
-                self.topology.n_parties()
-            ));
-        }
-        let local = self.standing_preproc_snapshot().await?;
-        if snapshots.get(self.topology.party_id()) != Some(&local) {
-            return Err(format!(
-                "standing AVSS local inventory changed during agreement: local={local:?}, exchanged={:?}",
-                snapshots.get(self.topology.party_id())
-            ));
-        }
+        let (store, _hash, scope) = self.preproc_scope().await?;
         let targets = self.standing_preproc_targets().await?;
-        let plan = agree_standing_preproc_plan(targets, &snapshots, fresh_generation_id)?;
+        let plan = agree_standing_preproc_plan_for_party(
+            store.as_ref(),
+            scope,
+            targets,
+            &snapshots,
+            self.topology.party_id(),
+            self.topology.n_parties(),
+            fresh_generation_id,
+        )
+        .await?;
         *self.standing_preproc_plan.lock().await = Some(plan);
         Ok(plan)
     }
@@ -222,17 +218,10 @@ where
             })?
         };
         let (store, _hash, scope) = self.preproc_scope().await?;
-        let final_snapshot = apply_standing_preproc_plan(store.as_ref(), scope, plan, |needed| {
+        apply_standing_preproc_plan(store.as_ref(), scope, targets, plan, |needed| {
             self.top_up_exact(needed)
         })
         .await?;
-        let availability = final_snapshot.availability();
-        if final_snapshot.generation_id != Some(plan.generation_id) || !availability.covers(targets)
-        {
-            return Err(format!(
-                "standing AVSS preprocessing did not reach agreed plan: plan={plan:?}, final={final_snapshot:?}"
-            ));
-        }
         Ok(())
     }
 

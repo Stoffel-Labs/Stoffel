@@ -5174,7 +5174,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs 0.26.11",
- "windows-sys 0.59.0",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -5982,7 +5982,7 @@ dependencies = [
 [[package]]
 name = "stoffelnet"
 version = "0.1.0"
-source = "git+https://github.com/Stoffel-Labs/stoffel-networking.git?branch=codex%2Fconcurrent-execution-transport#6a099b21f11150c9d7cd89ed24f275807f01aacf"
+source = "git+https://github.com/Stoffel-Labs/stoffel-networking.git?branch=codex%2Fconcurrent-execution-transport#257743809206fdd0db4ea3b63a548efe4e9c68d7"
 dependencies = [
  "ark-ff 0.5.0",
  "async-trait",
@@ -6113,7 +6113,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.61.2",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

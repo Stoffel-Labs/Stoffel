@@ -746,7 +746,7 @@ async fn standing_avss_activation_requires_complete_owned_bundle_without_top_up(
 
 #[test]
 fn standing_avss_inventory_agreement_rebuilds_every_party_on_divergence() {
-    let targets = preproc::PreprocTargets {
+    let targets = preproc::PoolAvailability {
         beaver: 8,
         random: 16,
         prand_bit: 0,
