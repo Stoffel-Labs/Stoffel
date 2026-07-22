@@ -3,6 +3,10 @@ name = "stoffel-coordinator-docker"
 version = "0.1.0"
 edition = "2021"
 
+[[bin]]
+name = "stoffel-coordinator-docker"
+path = "src/main.rs"
+
 [workspace]
 
 [dependencies]
@@ -22,5 +26,5 @@ rustls = "=0.23.41"
 stoffel-mpc-coordinator-off-chain = "=0.1.0"
 stoffel-mpc-coordinator-shared = "=0.1.0"
 stoffelmpc-mpc = { package = "stoffelcrypto", version = "=0.1.0" }
-tokio = { version = "=1.52.3", features = ["macros", "rt-multi-thread", "time"] }
+tokio = { version = "=1.52.3", features = ["macros", "rt-multi-thread", "signal", "time"] }
 x509-parser = "=0.18.1"

@@ -422,6 +422,145 @@ struct BarrierInputEngine {
     sync_input_calls: AtomicUsize,
 }
 
+struct ScheduledInputEngine {
+    input_calls: AtomicUsize,
+}
+
+struct WorkConservingInputEngine {
+    blocked_input: Option<i64>,
+    blocked_started: AtomicUsize,
+    blocked_release: tokio::sync::Notify,
+    runnable_calls: AtomicUsize,
+    schedule: Mutex<Vec<u8>>,
+}
+
+impl WorkConservingInputEngine {
+    fn new(blocked_input: Option<i64>) -> Self {
+        Self {
+            blocked_input,
+            blocked_started: AtomicUsize::new(0),
+            blocked_release: tokio::sync::Notify::new(),
+            runnable_calls: AtomicUsize::new(0),
+            schedule: Mutex::new(Vec::new()),
+        }
+    }
+}
+
+impl MpcEngine for WorkConservingInputEngine {
+    fn protocol_name(&self) -> &'static str {
+        "work-conserving-input"
+    }
+
+    fn topology(&self) -> MpcSessionTopology {
+        MpcSessionTopology::try_new(14, 1, 3, 1).expect("test topology should be valid")
+    }
+
+    fn is_ready(&self) -> bool {
+        true
+    }
+
+    fn start(&self) -> MpcEngineResult<()> {
+        Ok(())
+    }
+
+    fn input_share(&self, _clear: ClearShareInput) -> MpcEngineResult<ShareData> {
+        Err(crate::net::mpc_engine::MpcEngineError::operation_failed(
+            "input_share",
+            "sync input_share should not be used by async builtin calls",
+        ))
+    }
+
+    fn open_share(&self, _ty: ShareType, _share_bytes: &[u8]) -> MpcEngineResult<ClearShareValue> {
+        Err(crate::net::mpc_engine::MpcEngineError::operation_failed(
+            "open_share",
+            "not used",
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncMpcEngine for WorkConservingInputEngine {
+    async fn input_share_async(&self, clear: ClearShareInput) -> MpcEngineResult<ShareData> {
+        let ClearShareValue::Integer(value) = clear.value() else {
+            return Err(crate::net::mpc_engine::MpcEngineError::operation_failed(
+                "input_share_async",
+                "work-conserving scheduler probe expects an integer",
+            ));
+        };
+        let lane = u8::from(value >= 10_000);
+        self.schedule.lock().push(lane);
+        if self.blocked_input == Some(value) {
+            self.blocked_started.fetch_add(1, Ordering::SeqCst);
+            self.blocked_release.notified().await;
+        } else if lane == 1 {
+            self.runnable_calls.fetch_add(1, Ordering::SeqCst);
+        }
+        Ok(ShareData::Opaque(vec![value.to_le_bytes()[0]].into()))
+    }
+
+    async fn open_share_async(
+        &self,
+        _ty: ShareType,
+        _share_bytes: &[u8],
+    ) -> MpcEngineResult<ClearShareValue> {
+        Err(crate::net::mpc_engine::MpcEngineError::operation_failed(
+            "open_share_async",
+            "not used",
+        ))
+    }
+}
+
+impl MpcEngine for ScheduledInputEngine {
+    fn protocol_name(&self) -> &'static str {
+        "scheduled-input"
+    }
+
+    fn topology(&self) -> MpcSessionTopology {
+        MpcSessionTopology::try_new(13, 1, 3, 1).expect("test topology should be valid")
+    }
+
+    fn is_ready(&self) -> bool {
+        true
+    }
+
+    fn start(&self) -> MpcEngineResult<()> {
+        Ok(())
+    }
+
+    fn input_share(&self, _clear: ClearShareInput) -> MpcEngineResult<ShareData> {
+        Err(crate::net::mpc_engine::MpcEngineError::operation_failed(
+            "input_share",
+            "sync input_share should not be used by async builtin calls",
+        ))
+    }
+
+    fn open_share(&self, _ty: ShareType, _share_bytes: &[u8]) -> MpcEngineResult<ClearShareValue> {
+        Err(crate::net::mpc_engine::MpcEngineError::operation_failed(
+            "open_share",
+            "not used",
+        ))
+    }
+}
+
+#[async_trait::async_trait]
+impl AsyncMpcEngine for ScheduledInputEngine {
+    async fn input_share_async(&self, _clear: ClearShareInput) -> MpcEngineResult<ShareData> {
+        self.input_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(ShareData::Opaque(vec![1].into()))
+    }
+
+    async fn open_share_async(
+        &self,
+        _ty: ShareType,
+        _share_bytes: &[u8],
+    ) -> MpcEngineResult<ClearShareValue> {
+        Err(crate::net::mpc_engine::MpcEngineError::operation_failed(
+            "open_share_async",
+            "not used",
+        ))
+    }
+}
+
 impl BarrierInputEngine {
     fn new(expected_concurrent_inputs: usize) -> Self {
         Self {
@@ -2969,6 +3108,37 @@ fn async_share_from_clear_open_call_function(name: &str, clear_value: i64) -> VM
     )
 }
 
+fn repeated_async_inputs_function(name: &str, input_count: usize) -> VMFunction {
+    repeated_async_inputs_function_with_offset(name, input_count, 0)
+}
+
+fn repeated_async_inputs_function_with_offset(
+    name: &str,
+    input_count: usize,
+    offset: i64,
+) -> VMFunction {
+    let mut instructions = Vec::with_capacity(input_count.saturating_mul(3).saturating_add(1));
+    for input in 0..input_count {
+        instructions.push(Instruction::LDI(
+            1,
+            Value::I64(offset.saturating_add(input as i64)),
+        ));
+        instructions.push(Instruction::PUSHARG(1));
+        instructions.push(Instruction::CALL("Share.from_clear".to_string()));
+    }
+    instructions.push(Instruction::RET(0));
+
+    VMFunction::new(
+        name.to_string(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        2,
+        instructions,
+        HashMap::new(),
+    )
+}
+
 fn async_rbc_receive_call_function(name: &str, from_party: usize) -> VMFunction {
     async_rbc_receive_call_function_with_timeout(name, from_party, 1_000)
 }
@@ -3067,6 +3237,61 @@ async fn execute_many_async_single_invocation_uses_async_entry_path() {
 }
 
 #[tokio::test]
+async fn execute_async_with_metrics_distinguishes_online_effect_from_explicit_yield() {
+    let engine = Arc::new(BarrierOpenEngine::new(1));
+    let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+    let mut vm = VirtualMachine::builder()
+        .with_standard_library(false)
+        .with_mpc_builtins(false)
+        .with_register_layout(RegisterLayout::new(1))
+        .with_mpc_engine(runtime_engine)
+        .build();
+    vm.register_function(async_open_function("open_with_metrics", 41));
+
+    let (value, metrics) = vm
+        .execute_async_with_metrics("open_with_metrics", engine.as_ref())
+        .await
+        .expect("async execution with metrics should succeed");
+
+    assert_eq!(value, Value::I64(41));
+    assert_eq!(metrics.instruction_budget_yields, 0);
+    assert_eq!(metrics.online_effect_yields, 1);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn execute_async_with_metrics_reports_local_instruction_budget_yields() {
+    const LOCAL_INSTRUCTIONS: usize = 2048;
+
+    let mut instructions = (0..LOCAL_INSTRUCTIONS)
+        .map(|value| Instruction::LDI(0, Value::I64(value as i64)))
+        .collect::<Vec<_>>();
+    instructions.push(Instruction::RET(0));
+
+    let mut vm = VirtualMachine::builder()
+        .with_standard_library(false)
+        .with_mpc_builtins(false)
+        .build();
+    vm.register_function(VMFunction::new(
+        "many_local_instructions".to_string(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        1,
+        instructions,
+        HashMap::new(),
+    ));
+
+    let (value, metrics) = vm
+        .execute_async_with_metrics("many_local_instructions", &ClonePreservedEngine)
+        .await
+        .expect("budgeted local execution should complete");
+
+    assert_eq!(value, Value::I64((LOCAL_INSTRUCTIONS - 1) as i64));
+    assert_eq!(metrics.instruction_budget_yields, 2);
+    assert_eq!(metrics.online_effect_yields, 0);
+}
+
+#[tokio::test]
 async fn execute_many_async_yields_on_share_from_clear_builtin_call() {
     let engine = Arc::new(BarrierInputEngine::new(2));
     let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
@@ -3098,7 +3323,7 @@ async fn execute_many_async_yields_on_share_from_clear_builtin_call() {
 }
 
 #[tokio::test]
-async fn execute_many_async_runs_independent_programs_across_online_effects() {
+async fn execute_many_async_runs_independent_vm_states_across_online_effects() {
     let engine = Arc::new(BarrierOpenEngine::new(2));
     let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
     let mut vm = VirtualMachine::builder()
@@ -3121,6 +3346,148 @@ async fn execute_many_async_runs_independent_programs_across_online_effects() {
     assert_eq!(result, vec![Value::I64(11), Value::I64(29)]);
     assert_eq!(engine.open_started.load(Ordering::SeqCst), 2);
     assert_eq!(engine.open_finished.load(Ordering::SeqCst), 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn async_scheduler_yields_during_long_runs_of_immediately_ready_effects() {
+    const INPUT_COUNT: usize = 256;
+
+    let engine = Arc::new(ScheduledInputEngine {
+        input_calls: AtomicUsize::new(0),
+    });
+    let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+    let mut vm = VirtualMachine::builder()
+        .with_standard_library(false)
+        .with_mpc_engine(runtime_engine)
+        .build();
+    vm.register_function(repeated_async_inputs_function(
+        "many_immediate_inputs",
+        INPUT_COUNT,
+    ));
+
+    let heartbeat = Arc::new(AtomicUsize::new(0));
+    let heartbeat_task = {
+        let heartbeat = heartbeat.clone();
+        tokio::spawn(async move {
+            tokio::task::yield_now().await;
+            heartbeat.fetch_add(1, Ordering::SeqCst);
+        })
+    };
+
+    let (_, metrics) = vm
+        .execute_async_with_metrics("many_immediate_inputs", engine.as_ref())
+        .await
+        .expect("immediately ready input effects should complete");
+
+    assert_eq!(engine.input_calls.load(Ordering::SeqCst), INPUT_COUNT);
+    assert_eq!(metrics.instruction_budget_yields, 0);
+    assert_eq!(metrics.online_effect_yields, INPUT_COUNT as u64);
+    assert_eq!(
+        heartbeat.load(Ordering::SeqCst),
+        1,
+        "the async VM must yield even when every MPC effect is immediately ready"
+    );
+    heartbeat_task
+        .await
+        .expect("heartbeat task should complete");
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn blocked_online_effect_does_not_stall_a_runnable_sibling_execution() {
+    const RUNNABLE_INPUT_COUNT: usize = 192;
+
+    let engine = Arc::new(WorkConservingInputEngine::new(Some(0)));
+    let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+    let mut vm = VirtualMachine::builder()
+        .with_standard_library(false)
+        .with_mpc_engine(runtime_engine)
+        .build();
+    vm.register_function(repeated_async_inputs_function_with_offset(
+        "blocked_execution",
+        1,
+        0,
+    ));
+    vm.register_function(repeated_async_inputs_function_with_offset(
+        "runnable_execution",
+        RUNNABLE_INPUT_COUNT,
+        10_000,
+    ));
+
+    let executions =
+        vm.execute_many_async(["blocked_execution", "runnable_execution"], engine.as_ref());
+    tokio::pin!(executions);
+
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if engine.runnable_calls.load(Ordering::SeqCst) == RUNNABLE_INPUT_COUNT {
+                break;
+            }
+            tokio::select! {
+                result = &mut executions => {
+                    panic!("blocked execution unexpectedly completed first: {result:?}")
+                }
+                _ = tokio::task::yield_now() => {}
+            }
+        }
+    })
+    .await
+    .expect("the runnable sibling should make progress while its peer waits forever");
+    assert_eq!(engine.blocked_started.load(Ordering::SeqCst), 1);
+
+    engine.blocked_release.notify_one();
+    let values = executions
+        .await
+        .expect("both executions should complete after releasing the blocked effect");
+    assert_eq!(values.len(), 2);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn repeated_immediately_ready_effects_are_fair_between_runnable_executions() {
+    const INPUTS_PER_EXECUTION: usize = 256;
+
+    let engine = Arc::new(WorkConservingInputEngine::new(None));
+    let runtime_engine: Arc<dyn MpcEngine> = engine.clone();
+    let mut vm = VirtualMachine::builder()
+        .with_standard_library(false)
+        .with_mpc_engine(runtime_engine)
+        .build();
+    vm.register_function(repeated_async_inputs_function_with_offset(
+        "first_ready_execution",
+        INPUTS_PER_EXECUTION,
+        0,
+    ));
+    vm.register_function(repeated_async_inputs_function_with_offset(
+        "second_ready_execution",
+        INPUTS_PER_EXECUTION,
+        10_000,
+    ));
+
+    vm.execute_many_async(
+        ["first_ready_execution", "second_ready_execution"],
+        engine.as_ref(),
+    )
+    .await
+    .expect("both immediately-ready executions should complete");
+
+    let schedule = engine.schedule.lock();
+    assert_eq!(
+        schedule.iter().filter(|lane| **lane == 0).count(),
+        INPUTS_PER_EXECUTION
+    );
+    assert_eq!(
+        schedule.iter().filter(|lane| **lane == 1).count(),
+        INPUTS_PER_EXECUTION
+    );
+    let longest_single_lane_run = schedule
+        .chunk_by(|left, right| left == right)
+        .map(<[u8]>::len)
+        .max()
+        .unwrap_or_default();
+    assert!(
+        longest_single_lane_run <= super::effect_scheduler::DEFAULT_COMPLETED_EFFECT_BUDGET,
+        "one runnable execution monopolized {longest_single_lane_run} consecutive effects; budget is {}",
+        super::effect_scheduler::DEFAULT_COMPLETED_EFFECT_BUDGET,
+    );
 }
 
 #[tokio::test]

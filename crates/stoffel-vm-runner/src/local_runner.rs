@@ -12,11 +12,11 @@ use stoffel_mpc_coordinator_off_chain::tests::fake_coord::{
     HoneyBadgerCoordinatorConnection, HoneyBadgerCoordinatorRPCServerSharedBase,
 };
 use stoffel_mpc_coordinator_off_chain::{
-    node_rpc::NodeRPCClient as OffChainNodeRPCClient, OffChainCoordinatorClient,
+    node_rpc::NodeRPCClient as OffChainNodeRPCClient, InputAssignment, OffChainCoordinatorClient,
     OffChainCoordinatorServer,
 };
 use stoffel_mpc_coordinator_shared::self_signed_certs;
-use stoffel_mpc_coordinator_shared::Coordinator;
+use stoffel_mpc_coordinator_shared::{Coordinator, ExecutionId as CoordinatorExecutionId};
 use stoffel_vm_types::compiled_binary::{utils::save_to_file, CompiledBinary};
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
@@ -25,6 +25,7 @@ use tokio::process::{Child, Command};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
 use stoffel_vm::net::program_id_from_bytes;
+use stoffel_vm::net::session::ExecutionId;
 use stoffel_vm::net::{MpcBackendKind, MpcCurveConfig};
 
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
@@ -75,7 +76,6 @@ pub struct LocalCoordinatorRunner {
     expected_clients: Option<usize>,
     /// Per-client number of output values to receive via `send_to_client`.
     client_output_counts: std::collections::HashMap<u64, u64>,
-    persistent_runs: usize,
 }
 
 impl LocalCoordinatorRunner {
@@ -83,7 +83,7 @@ impl LocalCoordinatorRunner {
         runner_path: impl Into<PathBuf>,
         binary: CompiledBinary,
     ) -> LocalCoordinatorRunnerBuilder {
-        let curve_config = local_runner_curve_from_manifest(binary.client_io_manifest.mpc_curve);
+        let curve_config = MpcCurveConfig::from(binary.client_io_manifest.mpc_curve);
         LocalCoordinatorRunnerBuilder {
             runner: Self {
                 runner_path: runner_path.into(),
@@ -98,7 +98,6 @@ impl LocalCoordinatorRunner {
                 client_inputs: Vec::new(),
                 expected_clients: None,
                 client_output_counts: std::collections::HashMap::new(),
-                persistent_runs: 1,
             },
         }
     }
@@ -113,6 +112,7 @@ impl LocalCoordinatorRunner {
         save_to_file(&self.binary, &program_path).map_err(LocalCoordinatorRunnerError::Bytecode)?;
         let program_bytes = self.binary_bytes()?;
         let program_id = program_id_from_bytes(&program_bytes);
+        let execution_id = ExecutionId::new();
 
         let node_identities = write_node_identities(temp.path(), self.parties)?;
         let node_public_keys = node_identities
@@ -132,14 +132,16 @@ impl LocalCoordinatorRunner {
         let coord_port = reserve_port()?;
         let coord_cert = self_signed_certs::server_cert();
         let (n_inputs, output_clients) = self.coordinator_client_io_binding(&client_bindings)?;
-        let coord_state = HoneyBadgerCoordinatorRPCServerSharedBase::new(
+        let coord_state = HoneyBadgerCoordinatorRPCServerSharedBase::new_for_execution(
+            CoordinatorExecutionId::from_bytes(*execution_id.as_bytes()),
             program_id,
             self.parties as u64,
             self.threshold as u64,
             node_public_keys,
             n_inputs,
             output_clients,
-        );
+            InputAssignment::default(),
+        )?;
         let _coord = OffChainCoordinatorServer::<HoneyBadgerCoordinatorConnection>::start_coord(
             coord_state,
             "127.0.0.1",
@@ -166,9 +168,8 @@ impl LocalCoordinatorRunner {
                 program_path: &program_path,
                 identity: &node_identities[0],
                 rpc_addr: node_rpc_addrs[0],
-                all_node_rpc_addrs: &node_rpc_addrs,
-                reset_designated_cert: &node_identities[0].cert_path,
-                preproc_store_dir: temp.path().join("preproc-node0"),
+                local_store_path: temp.path().join("local-node0.redb"),
+                execution_id,
                 role: PartyRole::Leader { bootnode },
                 clients: &local_clients,
                 coord_port,
@@ -185,9 +186,8 @@ impl LocalCoordinatorRunner {
                     program_path: &program_path,
                     identity,
                     rpc_addr: node_rpc_addrs[party_id],
-                    all_node_rpc_addrs: &node_rpc_addrs,
-                    reset_designated_cert: &node_identities[0].cert_path,
-                    preproc_store_dir: temp.path().join(format!("preproc-node{party_id}")),
+                    local_store_path: temp.path().join(format!("local-node{party_id}.redb")),
+                    execution_id,
                     role: PartyRole::Follower {
                         party_id,
                         bootnode,
@@ -203,51 +203,48 @@ impl LocalCoordinatorRunner {
         let timeout = self.timeout;
         let threshold = self.threshold;
         let client_results_future = async {
-            let mut all_results = Vec::new();
-            for _run in 0..self.persistent_runs {
-                let mut run_results = match self.backend {
-                    MpcBackendKind::HoneyBadger => {
-                        futures::future::join_all(
-                            local_clients
-                                .iter()
-                                .filter(|client| client.input.has_input())
-                                .cloned()
-                                .map(|client| {
-                                    run_honeybadger_offchain_client(
-                                        client,
-                                        node_rpc_addrs.clone(),
-                                        coord_port,
-                                        self.parties,
-                                        threshold,
-                                        timeout,
-                                    )
-                                }),
-                        )
-                        .await
-                    }
-                    MpcBackendKind::Avss => {
-                        futures::future::join_all(
-                            local_clients
-                                .iter()
-                                .filter(|client| client.input.has_input())
-                                .cloned()
-                                .map(|client| {
-                                    run_avss_offchain_client(
-                                        client,
-                                        node_rpc_addrs.clone(),
-                                        coord_port,
-                                        self.parties,
-                                        threshold,
-                                        timeout,
-                                    )
-                                }),
-                        )
-                        .await
-                    }
-                };
-                all_results.append(&mut run_results);
+            match self.backend {
+                MpcBackendKind::HoneyBadger => {
+                    futures::future::join_all(
+                        local_clients
+                            .iter()
+                            .filter(|client| client.input.has_input())
+                            .cloned()
+                            .map(|client| {
+                                run_honeybadger_offchain_client(
+                                    client,
+                                    execution_id,
+                                    node_rpc_addrs.clone(),
+                                    coord_port,
+                                    self.parties,
+                                    threshold,
+                                    timeout,
+                                )
+                            }),
+                    )
+                    .await
+                }
+                MpcBackendKind::Avss => {
+                    futures::future::join_all(
+                        local_clients
+                            .iter()
+                            .filter(|client| client.input.has_input())
+                            .cloned()
+                            .map(|client| {
+                                run_avss_offchain_client(
+                                    client,
+                                    execution_id,
+                                    node_rpc_addrs.clone(),
+                                    coord_port,
+                                    self.parties,
+                                    threshold,
+                                    timeout,
+                                )
+                            }),
+                    )
+                    .await
+                }
             }
-            all_results
         };
         let party_outputs_future = futures::future::join_all(
             children
@@ -325,14 +322,14 @@ impl LocalCoordinatorRunner {
                 "program must contain at least one function".to_owned(),
             ));
         }
-        if self.parties < 4 {
-            return Err(LocalCoordinatorRunnerError::Configuration(
-                "local coordinator runner requires at least 4 parties".to_owned(),
-            ));
-        }
-        if self.parties < self.threshold.saturating_mul(4).saturating_add(1) {
+        self.backend
+            .validate_party_count(self.parties)
+            .map_err(|error| LocalCoordinatorRunnerError::Configuration(error.to_string()))?;
+        if matches!(self.backend, MpcBackendKind::HoneyBadger)
+            && self.parties < self.threshold.saturating_mul(4).saturating_add(1)
+        {
             return Err(LocalCoordinatorRunnerError::Configuration(format!(
-                "parties ({}) must be >= 4 * threshold ({}) + 1",
+                "HoneyBadger parties ({}) must be >= 4 * threshold ({}) + 1",
                 self.parties, self.threshold
             )));
         }
@@ -351,21 +348,6 @@ impl LocalCoordinatorRunner {
         if self.timeout.is_zero() {
             return Err(LocalCoordinatorRunnerError::Configuration(
                 "timeout must be greater than zero".to_owned(),
-            ));
-        }
-        if self.persistent_runs == 0 {
-            return Err(LocalCoordinatorRunnerError::Configuration(
-                "persistent run count must be greater than zero".to_owned(),
-            ));
-        }
-        if self.persistent_runs > 1 && !matches!(self.backend, MpcBackendKind::HoneyBadger) {
-            return Err(LocalCoordinatorRunnerError::Configuration(
-                "persistent local coordinator runs currently support HoneyBadger only".to_owned(),
-            ));
-        }
-        if self.persistent_runs > 1 && !matches!(self.curve_config, MpcCurveConfig::Bls12_381) {
-            return Err(LocalCoordinatorRunnerError::Configuration(
-                "persistent local coordinator runs currently support bls12-381 only".to_owned(),
             ));
         }
         self.validate_expected_clients()?;
@@ -600,6 +582,10 @@ impl LocalCoordinatorRunner {
             .arg(&context.identity.key_path)
             .arg("--timestamp")
             .arg(context.timestamp.to_string())
+            .arg("--local-store")
+            .arg(&context.local_store_path)
+            .arg("--execution-id")
+            .arg(context.execution_id.to_string())
             .env("STOFFEL_AUTH_TOKEN", &self.auth_token)
             // Tie each spawned party to this runner's lifetime: `kill_on_drop`
             // handles a graceful drop, and the parent-death watchdog (keyed off
@@ -609,25 +595,6 @@ impl LocalCoordinatorRunner {
             .kill_on_drop(true)
             .stdout(Stdio::piped())
             .stderr(Stdio::piped());
-        if self.persistent_runs > 1 {
-            std::fs::create_dir_all(&context.preproc_store_dir)?;
-            command
-                .arg("--persistent-runs")
-                .arg(self.persistent_runs.to_string())
-                .arg("--preproc-store")
-                .arg(&context.preproc_store_dir)
-                .arg("--node-rpc-addrs")
-                .arg(
-                    context
-                        .all_node_rpc_addrs
-                        .iter()
-                        .map(ToString::to_string)
-                        .collect::<Vec<_>>()
-                        .join(","),
-                )
-                .arg("--node-rpc-designated-party-cert")
-                .arg(context.reset_designated_cert);
-        }
         if !context.clients.is_empty() {
             command
                 .arg("--expected-clients")
@@ -797,11 +764,6 @@ impl LocalCoordinatorRunnerBuilder {
         self
     }
 
-    pub fn persistent_runs(mut self, runs: usize) -> Self {
-        self.runner.persistent_runs = runs;
-        self
-    }
-
     /// Override the number of output values a client receives via
     /// `send_to_client`. When unset, the count is taken from the program's
     /// client-IO manifest (the statically recorded output schema).
@@ -939,6 +901,7 @@ struct LocalClientIdentity {
 
 async fn run_honeybadger_offchain_client(
     client: LocalClientIdentity,
+    execution_id: ExecutionId,
     node_rpc_addrs: Vec<SocketAddr>,
     coord_port: u16,
     parties: usize,
@@ -961,12 +924,13 @@ async fn run_honeybadger_offchain_client(
             client.client_slot
         );
         let mut coord: OffChainCoordinatorClient<Fr, RobustShare<Fr>> =
-            OffChainCoordinatorClient::start_rpc_client(
+            OffChainCoordinatorClient::start_rpc_client_for_execution(
                 "127.0.0.1",
                 coord_port,
                 threshold as u64,
                 parties as u64,
                 client.output_count,
+                CoordinatorExecutionId::from_bytes(*execution_id.as_bytes()),
                 client.cert_der.clone(),
                 std::fs::read(&client.key_path)?,
             )
@@ -987,10 +951,11 @@ async fn run_honeybadger_offchain_client(
             .map(|addr| (addr.ip().to_string(), addr.port()))
             .collect::<Vec<_>>();
         let node_rpc: OffChainNodeRPCClient<Fr, RobustShare<Fr>> =
-            OffChainNodeRPCClient::start_rpc_client(
+            OffChainNodeRPCClient::start_rpc_client_for_execution(
                 parties,
                 threshold,
                 rpc_addrs,
+                CoordinatorExecutionId::from_bytes(*execution_id.as_bytes()),
                 client.cert_der,
                 std::fs::read(&client.key_path)?,
             )
@@ -1051,6 +1016,7 @@ fn fr_to_u64(value: &Fr) -> u64 {
 
 async fn run_avss_offchain_client(
     client: LocalClientIdentity,
+    execution_id: ExecutionId,
     node_rpc_addrs: Vec<SocketAddr>,
     coord_port: u16,
     parties: usize,
@@ -1069,12 +1035,13 @@ async fn run_avss_offchain_client(
             .map(|value| parse_input_as_field(value))
             .collect::<LocalCoordinatorRunnerResult<Vec<_>>>()?;
         let mut coord: OffChainCoordinatorClient<Fr, FeldmanShamirShare<Fr, G1Projective>> =
-            OffChainCoordinatorClient::start_rpc_client(
+            OffChainCoordinatorClient::start_rpc_client_for_execution(
                 "127.0.0.1",
                 coord_port,
                 threshold as u64,
                 parties as u64,
                 input_values.len() as u64,
+                CoordinatorExecutionId::from_bytes(*execution_id.as_bytes()),
                 client.cert_der.clone(),
                 std::fs::read(&client.key_path)?,
             )
@@ -1094,10 +1061,11 @@ async fn run_avss_offchain_client(
             .map(|addr| (addr.ip().to_string(), addr.port()))
             .collect::<Vec<_>>();
         let node_rpc: OffChainNodeRPCClient<Fr, FeldmanShamirShare<Fr, G1Projective>> =
-            OffChainNodeRPCClient::start_rpc_client(
+            OffChainNodeRPCClient::start_rpc_client_for_execution(
                 parties,
                 threshold,
                 rpc_addrs,
+                CoordinatorExecutionId::from_bytes(*execution_id.as_bytes()),
                 client.cert_der,
                 std::fs::read(&client.key_path)?,
             )
@@ -1266,9 +1234,8 @@ struct SpawnPartyContext<'a> {
     program_path: &'a Path,
     identity: &'a NodeIdentity,
     rpc_addr: SocketAddr,
-    all_node_rpc_addrs: &'a [SocketAddr],
-    reset_designated_cert: &'a Path,
-    preproc_store_dir: PathBuf,
+    local_store_path: PathBuf,
+    execution_id: ExecutionId,
     role: PartyRole,
     clients: &'a [LocalClientIdentity],
     coord_port: u16,
@@ -1464,19 +1431,6 @@ fn local_run_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-fn local_runner_curve_from_manifest(
-    curve: stoffel_vm_types::compiled_binary::MpcCurve,
-) -> MpcCurveConfig {
-    match curve {
-        stoffel_vm_types::compiled_binary::MpcCurve::Bls12_381 => MpcCurveConfig::Bls12_381,
-        stoffel_vm_types::compiled_binary::MpcCurve::Bn254 => MpcCurveConfig::Bn254,
-        stoffel_vm_types::compiled_binary::MpcCurve::Curve25519 => MpcCurveConfig::Curve25519,
-        stoffel_vm_types::compiled_binary::MpcCurve::Ed25519 => MpcCurveConfig::Ed25519,
-        stoffel_vm_types::compiled_binary::MpcCurve::Secp256k1 => MpcCurveConfig::Secp256k1,
-        stoffel_vm_types::compiled_binary::MpcCurve::Secp256r1 => MpcCurveConfig::Secp256r1,
-    }
-}
-
 fn socket_with_port_pair() -> std::io::Result<SocketAddr> {
     // Mix the wall-clock nanos with the process id and a per-call counter so
     // that runner processes launched concurrently (e.g. parallel CLI tests)
@@ -1555,6 +1509,45 @@ mod tests {
             .expect("binding");
         assert_eq!(n_inputs, 0);
         assert_eq!(output_clients, vec![vec![10], vec![11]]);
+    }
+
+    #[test]
+    fn enforces_backend_specific_minimum_party_counts() {
+        let avss_error = match test_runner(CompiledBinary::new())
+            .backend(MpcBackendKind::Avss)
+            .parties(3)
+            .build()
+        {
+            Ok(_) => panic!("AVSS must reject fewer than four parties"),
+            Err(error) => error,
+        };
+        assert!(avss_error
+            .to_string()
+            .contains("AVSS requires at least 4 parties"));
+
+        test_runner(CompiledBinary::new())
+            .backend(MpcBackendKind::Avss)
+            .parties(4)
+            .build()
+            .expect("AVSS should accept four parties");
+
+        let hb_error = match test_runner(CompiledBinary::new())
+            .backend(MpcBackendKind::HoneyBadger)
+            .parties(4)
+            .build()
+        {
+            Ok(_) => panic!("HoneyBadger must reject fewer than five parties"),
+            Err(error) => error,
+        };
+        assert!(hb_error
+            .to_string()
+            .contains("HoneyBadger requires at least 5 parties"));
+
+        test_runner(CompiledBinary::new())
+            .backend(MpcBackendKind::HoneyBadger)
+            .parties(5)
+            .build()
+            .expect("HoneyBadger should accept five parties");
     }
 
     #[test]

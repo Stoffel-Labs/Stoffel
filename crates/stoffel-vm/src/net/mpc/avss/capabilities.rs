@@ -1,4 +1,4 @@
-use super::{field_from_usize, usize_seed, AvssMpcEngine};
+use super::{field_from_usize, usize_seed, AvssExecutionNetwork, AvssMpcEngine};
 use crate::net::client_store::{
     ClientInputHydrationCount, ClientInputStore, ClientOutputShareCount,
 };
@@ -19,7 +19,6 @@ use stoffel_vm_types::core_types::{ClearShareInput, ClearShareValue, ShareData, 
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
 use stoffelmpc_mpc::common::MPCProtocol;
 use stoffelnet::network_utils::ClientId;
-use stoffelnet::transports::quic::QuicNetworkManager;
 
 impl<F, G> AvssMpcEngine<F, G>
 where
@@ -28,7 +27,7 @@ where
 {
     async fn broadcast_open_avss_exp_payload(&self, payload: Vec<u8>) -> Result<(), String> {
         crate::net::broadcast::broadcast_to_other_parties(
-            self.net.as_ref(),
+            self.protocol_net.as_ref(),
             self.topology.n_parties(),
             self.topology.party_id(),
             &payload,
@@ -226,7 +225,7 @@ where
         )?;
 
         crate::net::block_on_current(crate::net::broadcast::broadcast_to_other_parties(
-            self.net.as_ref(),
+            self.protocol_net.as_ref(),
             self.topology.n_parties(),
             self.topology.party_id(),
             &wire_payload,
@@ -317,7 +316,7 @@ where
         )?;
 
         crate::net::broadcast::broadcast_to_other_parties(
-            self.net.as_ref(),
+            self.protocol_net.as_ref(),
             self.topology.n_parties(),
             self.topology.party_id(),
             &wire_payload,
@@ -388,7 +387,7 @@ where
                 } else {
                     Self::run_multiply_round(
                         self.avss_node.clone(),
-                        self.net.clone(),
+                        self.protocol_net.clone(),
                         left_bytes,
                         right_bytes,
                     )
@@ -542,9 +541,9 @@ where
                     });
                 }
                 let mut node_clone = self.clone_avss_node().await;
-                MPCProtocol::<F, FeldmanShamirShare<F, G>, QuicNetworkManager>::rand(
+                MPCProtocol::<F, FeldmanShamirShare<F, G>, AvssExecutionNetwork>::rand(
                     &mut *node_clone,
-                    self.net.clone(),
+                    self.protocol_net.clone(),
                 )
                 .await
                 .map_err(|e| format!("random_share (multi-dealer RanSha) failed: {:?}", e))
@@ -754,7 +753,7 @@ where
         } else {
             Self::run_multiply_round(
                 self.avss_node.clone(),
-                self.net.clone(),
+                self.protocol_net.clone(),
                 left.to_vec(),
                 right.to_vec(),
             )
@@ -900,9 +899,9 @@ where
                 return Self::share_to_share_data(&share);
             }
             let mut node_clone = self.clone_avss_node().await;
-            let share = MPCProtocol::<F, FeldmanShamirShare<F, G>, QuicNetworkManager>::rand(
+            let share = MPCProtocol::<F, FeldmanShamirShare<F, G>, AvssExecutionNetwork>::rand(
                 &mut *node_clone,
-                self.net.clone(),
+                self.protocol_net.clone(),
             )
             .await
             .map_err(|e| format!("random_share (multi-dealer RanSha) failed: {:?}", e))?;

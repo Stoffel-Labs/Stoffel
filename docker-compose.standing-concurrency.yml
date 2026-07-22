@@ -1,0 +1,210 @@
+# Production-shaped five-party standing deployment. Execution concurrency is
+# exercised over this single long-lived physical mesh by the acceptance driver.
+
+x-build: &build
+  context: .
+  dockerfile: Dockerfile
+  target: standing-runtime
+  additional_contexts:
+    coordinator: "${STOFFEL_COORDINATOR_CONTEXT:?Set an absolute coordinator checkout}"
+    networking: "${STOFFEL_NETWORK_CONTEXT:?Set an absolute networking checkout}"
+
+x-node-environment: &node-environment
+  STOFFEL_AUTH_TOKEN: ${STOFFEL_AUTH_TOKEN:-stoffel-standing-compose-token}
+  STOFFEL_STANDING_POOL_ID: ${STOFFEL_STANDING_POOL_ID:?Set a unique nonzero standing pool ID}
+  STOFFEL_PREPROCESSING_TRIPLES: ${STOFFEL_STANDING_TEST_TRIPLES:-2048}
+  STOFFEL_EXECUTION_COORDINATION_TIMEOUT_SECONDS: ${STOFFEL_EXECUTION_COORDINATION_TIMEOUT_SECONDS:-120}
+  STOFFEL_MPC_PROTOCOL_TIMEOUT_SECONDS: ${STOFFEL_MPC_PROTOCOL_TIMEOUT_SECONDS:-600}
+  RUST_LOG: ${RUST_LOG:-info}
+  RUST_BACKTRACE: "1"
+  RUST_MIN_STACK: ${RUST_MIN_STACK:-67108864}
+
+x-node-command: &node-command |
+  exec /app/stoffel-run \
+    --standing-node \
+    --control-dir /var/run/stoffel/control \
+    --program-dir /var/lib/stoffel/programs \
+    --client-cert-dir /app/ids/clients \
+    --party-cert-dir /app/ids/nodes \
+    --reservoir-burst-capacity 9 \
+    --pool-id "$${STOFFEL_STANDING_POOL_ID}" \
+    $${LEADER_ARGS:-} $${BOOTSTRAP_ARGS:-} \
+    --party-id "$${PARTY_ID}" \
+    --bind "$${BIND_ADDR}" \
+    --advertise "$${ADVERTISE_ADDR}" \
+    --n-parties 5 \
+    --threshold 1 \
+    --cert /run/secrets/stoffel_identity.crt \
+    --key /run/secrets/stoffel_identity.key \
+    --preproc-store /var/lib/stoffel/preproc \
+    --local-store /var/lib/stoffel/local/vm.redb
+
+x-node: &node
+  image: ${STOFFEL_STANDING_NODE_IMAGE:-stoffel-standing-node:local}
+  build: *build
+  entrypoint: ["/bin/sh", "-ec"]
+  command: [*node-command]
+  environment: *node-environment
+  stop_grace_period: 45s
+  init: true
+
+x-client: &client
+  image: ${STOFFEL_STANDING_NODE_IMAGE:-stoffel-standing-node:local}
+  build: *build
+  profiles: ["tools"]
+  environment:
+    STOFFEL_ROLE: client
+    STOFFEL_AUTH_TOKEN: ${STOFFEL_AUTH_TOKEN:-stoffel-standing-compose-token}
+    STOFFEL_EXECUTION_COORDINATION_TIMEOUT_SECONDS: ${STOFFEL_EXECUTION_COORDINATION_TIMEOUT_SECONDS:-120}
+    STOFFEL_MPC_PROTOCOL_TIMEOUT_SECONDS: ${STOFFEL_MPC_PROTOCOL_TIMEOUT_SECONDS:-600}
+    RUST_LOG: ${RUST_LOG:-info}
+    RUST_BACKTRACE: "1"
+  networks: [standing-net]
+
+services:
+  party0:
+    <<: *node
+    environment:
+      <<: *node-environment
+      PARTY_ID: "0"
+      BIND_ADDR: 172.33.0.10:9000
+      ADVERTISE_ADDR: 172.33.0.10:10000
+      LEADER_ARGS: --leader
+      BOOTSTRAP_ARGS: ""
+    volumes:
+      - ${STOFFEL_STANDING_STATE_DIR:?Set state directory}/programs:/var/lib/stoffel/programs:ro
+      - ${STOFFEL_STANDING_STATE_DIR:?Set state directory}/party0/control:/var/run/stoffel/control
+      - standing-party0-preproc:/var/lib/stoffel/preproc
+      - standing-party0-local:/var/lib/stoffel/local
+    secrets:
+      - {source: standing-party0-cert, target: stoffel_identity.crt}
+      - {source: standing-party0-key, target: stoffel_identity.key}
+    networks:
+      standing-net: {ipv4_address: 172.33.0.10}
+
+  party1:
+    <<: *node
+    environment:
+      <<: *node-environment
+      PARTY_ID: "1"
+      BIND_ADDR: 172.33.0.11:9001
+      ADVERTISE_ADDR: 172.33.0.11:9001
+      LEADER_ARGS: ""
+      BOOTSTRAP_ARGS: --bootstrap 172.33.0.10:9000
+    volumes:
+      - ${STOFFEL_STANDING_STATE_DIR:?Set state directory}/programs:/var/lib/stoffel/programs:ro
+      - ${STOFFEL_STANDING_STATE_DIR:?Set state directory}/party1/control:/var/run/stoffel/control
+      - standing-party1-preproc:/var/lib/stoffel/preproc
+      - standing-party1-local:/var/lib/stoffel/local
+    secrets:
+      - {source: standing-party1-cert, target: stoffel_identity.crt}
+      - {source: standing-party1-key, target: stoffel_identity.key}
+    networks:
+      standing-net: {ipv4_address: 172.33.0.11}
+
+  party2:
+    <<: *node
+    environment:
+      <<: *node-environment
+      PARTY_ID: "2"
+      BIND_ADDR: 172.33.0.12:9002
+      ADVERTISE_ADDR: 172.33.0.12:9002
+      LEADER_ARGS: ""
+      BOOTSTRAP_ARGS: --bootstrap 172.33.0.10:9000
+    volumes:
+      - ${STOFFEL_STANDING_STATE_DIR:?Set state directory}/programs:/var/lib/stoffel/programs:ro
+      - ${STOFFEL_STANDING_STATE_DIR:?Set state directory}/party2/control:/var/run/stoffel/control
+      - standing-party2-preproc:/var/lib/stoffel/preproc
+      - standing-party2-local:/var/lib/stoffel/local
+    secrets:
+      - {source: standing-party2-cert, target: stoffel_identity.crt}
+      - {source: standing-party2-key, target: stoffel_identity.key}
+    networks:
+      standing-net: {ipv4_address: 172.33.0.12}
+
+  party3:
+    <<: *node
+    environment:
+      <<: *node-environment
+      PARTY_ID: "3"
+      BIND_ADDR: 172.33.0.13:9003
+      ADVERTISE_ADDR: 172.33.0.13:9003
+      LEADER_ARGS: ""
+      BOOTSTRAP_ARGS: --bootstrap 172.33.0.10:9000
+    volumes:
+      - ${STOFFEL_STANDING_STATE_DIR:?Set state directory}/programs:/var/lib/stoffel/programs:ro
+      - ${STOFFEL_STANDING_STATE_DIR:?Set state directory}/party3/control:/var/run/stoffel/control
+      - standing-party3-preproc:/var/lib/stoffel/preproc
+      - standing-party3-local:/var/lib/stoffel/local
+    secrets:
+      - {source: standing-party3-cert, target: stoffel_identity.crt}
+      - {source: standing-party3-key, target: stoffel_identity.key}
+    networks:
+      standing-net: {ipv4_address: 172.33.0.13}
+
+  party4:
+    <<: *node
+    environment:
+      <<: *node-environment
+      PARTY_ID: "4"
+      BIND_ADDR: 172.33.0.14:9004
+      ADVERTISE_ADDR: 172.33.0.14:9004
+      LEADER_ARGS: ""
+      BOOTSTRAP_ARGS: --bootstrap 172.33.0.10:9000
+    volumes:
+      - ${STOFFEL_STANDING_STATE_DIR:?Set state directory}/programs:/var/lib/stoffel/programs:ro
+      - ${STOFFEL_STANDING_STATE_DIR:?Set state directory}/party4/control:/var/run/stoffel/control
+      - standing-party4-preproc:/var/lib/stoffel/preproc
+      - standing-party4-local:/var/lib/stoffel/local
+    secrets:
+      - {source: standing-party4-cert, target: stoffel_identity.crt}
+      - {source: standing-party4-key, target: stoffel_identity.key}
+    networks:
+      standing-net: {ipv4_address: 172.33.0.14}
+
+  client0:
+    <<: *client
+    secrets:
+      - {source: standing-client0-cert, target: stoffel_identity.crt}
+      - {source: standing-client0-key, target: stoffel_identity.key}
+
+  client1:
+    <<: *client
+    secrets:
+      - {source: standing-client1-cert, target: stoffel_identity.crt}
+      - {source: standing-client1-key, target: stoffel_identity.key}
+
+networks:
+  standing-net:
+    driver: bridge
+    ipam:
+      config:
+        - {subnet: 172.33.0.0/24, gateway: 172.33.0.1}
+
+volumes:
+  standing-party0-preproc: {}
+  standing-party0-local: {}
+  standing-party1-preproc: {}
+  standing-party1-local: {}
+  standing-party2-preproc: {}
+  standing-party2-local: {}
+  standing-party3-preproc: {}
+  standing-party3-local: {}
+  standing-party4-preproc: {}
+  standing-party4-local: {}
+
+secrets:
+  standing-party0-cert: {file: ./ids/nodes/cert0.crt}
+  standing-party0-key: {file: ./ids/nodes/key0.der}
+  standing-party1-cert: {file: ./ids/nodes/cert1.crt}
+  standing-party1-key: {file: ./ids/nodes/key1.der}
+  standing-party2-cert: {file: ./ids/nodes/cert2.crt}
+  standing-party2-key: {file: ./ids/nodes/key2.der}
+  standing-party3-cert: {file: ./ids/nodes/cert3.crt}
+  standing-party3-key: {file: ./ids/nodes/key3.der}
+  standing-party4-cert: {file: ./ids/nodes/cert4.crt}
+  standing-party4-key: {file: ./ids/nodes/key4.der}
+  standing-client0-cert: {file: ./ids/clients/cert0.crt}
+  standing-client0-key: {file: ./ids/clients/key0.der}
+  standing-client1-cert: {file: ./ids/clients/cert1.crt}
+  standing-client1-key: {file: ./ids/clients/key1.der}

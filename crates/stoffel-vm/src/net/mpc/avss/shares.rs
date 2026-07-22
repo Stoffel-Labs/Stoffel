@@ -44,16 +44,27 @@ where
         &self,
         key_name: &str,
     ) -> Result<FeldmanShamirShare<F, G>, String> {
-        self.generate_random_share_with_network(key_name, self.net.clone())
+        self.generate_random_share_using_network(key_name, self.protocol_net.clone())
             .await
     }
 
-    /// Like `generate_random_share`, but uses a custom `Network` implementation.
+    /// Like `generate_random_share`, but uses a custom execution-scoped network.
     ///
     /// This is useful when the network's `send(party_id, msg)` routing differs
     /// from party-id-based indexing (e.g. stoffelnet's sender_id system).
     pub async fn generate_random_share_with_network<
-        N: stoffelnet::network_utils::Network + Send + Sync + 'static,
+        N: stoffelnet::network_utils::Network + Clone + Send + Sync + 'static,
+    >(
+        &self,
+        key_name: &str,
+        net: Arc<crate::net::ExecutionScopedNetwork<N>>,
+    ) -> Result<FeldmanShamirShare<F, G>, String> {
+        self.generate_random_share_using_network(key_name, net)
+            .await
+    }
+
+    async fn generate_random_share_using_network<
+        N: stoffelnet::network_utils::Network + Clone + Send + Sync + 'static,
     >(
         &self,
         key_name: &str,
@@ -69,7 +80,7 @@ where
         // party to start the round locally, which is not how this API is used.
         let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
         let secret = F::rand(&mut rng);
-        self.generate_share_with_secret_and_network(key_name, secret, net)
+        self.generate_share_with_secret_using_network(key_name, secret, net)
             .await
     }
 
@@ -79,12 +90,24 @@ where
         key_name: &str,
         secret: F,
     ) -> Result<FeldmanShamirShare<F, G>, String> {
-        self.generate_share_with_secret_and_network(key_name, secret, self.net.clone())
+        self.generate_share_with_secret_using_network(key_name, secret, self.protocol_net.clone())
             .await
     }
 
-    /// Like `generate_share_with_secret`, but uses a custom `Network` implementation.
+    /// Like `generate_share_with_secret`, but uses a custom execution-scoped network.
     pub async fn generate_share_with_secret_and_network<
+        N: stoffelnet::network_utils::Network + Clone + Send + Sync + 'static,
+    >(
+        &self,
+        key_name: &str,
+        secret: F,
+        net: Arc<crate::net::ExecutionScopedNetwork<N>>,
+    ) -> Result<FeldmanShamirShare<F, G>, String> {
+        self.generate_share_with_secret_using_network(key_name, secret, net)
+            .await
+    }
+
+    async fn generate_share_with_secret_using_network<
         N: stoffelnet::network_utils::Network + Send + Sync + 'static,
     >(
         &self,
@@ -236,22 +259,35 @@ where
         Self::encode_group_element(&share.commitments[0])
     }
 
-    /// Process an incoming wire-format message via the AVSS protocol node.
+    /// Process an execution-admitted MPC payload via the AVSS protocol node.
     ///
-    /// The node handles all message routing internally (RBC, AVSS, multiplication).
-    /// Callers should pass the raw bytes received from the network to this method.
+    /// The execution transport owns envelope validation and routing. The node
+    /// handles the backend payload (RBC, AVSS, multiplication) and emits every
+    /// response through its execution-scoped network.
     pub async fn process_wrapped_message(
         &self,
         sender_id: usize,
         data: &[u8],
     ) -> Result<(), String> {
-        self.process_wrapped_message_with_network(sender_id, data, self.net.clone())
+        self.process_wrapped_message_using_network(sender_id, data, self.protocol_net.clone())
             .await
     }
 
-    /// Like `process_wrapped_message`, but uses a custom `Network` implementation
-    /// for protocol responses.
+    /// Like `process_wrapped_message`, but uses a custom execution-scoped
+    /// network for protocol responses.
     pub async fn process_wrapped_message_with_network<
+        N: stoffelnet::network_utils::Network + Clone + Send + Sync + 'static,
+    >(
+        &self,
+        sender_id: usize,
+        data: &[u8],
+        net: Arc<crate::net::ExecutionScopedNetwork<N>>,
+    ) -> Result<(), String> {
+        self.process_wrapped_message_using_network(sender_id, data, net)
+            .await
+    }
+
+    async fn process_wrapped_message_using_network<
         N: stoffelnet::network_utils::Network + Send + Sync + 'static,
     >(
         &self,

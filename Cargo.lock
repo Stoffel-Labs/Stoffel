@@ -831,7 +831,7 @@ dependencies = [
  "fnv",
  "hashbrown 0.15.5",
  "itertools 0.13.0",
- "num-bigint 0.4.8",
+ "num-bigint 0.4.6",
  "num-integer",
  "num-traits",
  "zeroize",
@@ -860,7 +860,7 @@ dependencies = [
  "ark-serialize 0.3.0",
  "ark-std 0.3.0",
  "derivative",
- "num-bigint 0.4.8",
+ "num-bigint 0.4.6",
  "num-traits",
  "paste",
  "rustc_version 0.3.3",
@@ -880,7 +880,7 @@ dependencies = [
  "derivative",
  "digest 0.10.7",
  "itertools 0.10.5",
- "num-bigint 0.4.8",
+ "num-bigint 0.4.6",
  "num-traits",
  "paste",
  "rustc_version 0.4.1",
@@ -901,7 +901,7 @@ dependencies = [
  "digest 0.10.7",
  "educe",
  "itertools 0.13.0",
- "num-bigint 0.4.8",
+ "num-bigint 0.4.6",
  "num-traits",
  "paste",
  "zeroize",
@@ -919,7 +919,7 @@ dependencies = [
  "ark-std 0.6.0",
  "digest 0.10.7",
  "educe",
- "num-bigint 0.4.8",
+ "num-bigint 0.4.6",
  "num-traits",
  "zeroize",
 ]
@@ -970,7 +970,7 @@ version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "db2fd794a08ccb318058009eefdf15bcaaaaf6f8161eb3345f907222bac38b20"
 dependencies = [
- "num-bigint 0.4.8",
+ "num-bigint 0.4.6",
  "num-traits",
  "quote",
  "syn 1.0.109",
@@ -982,7 +982,7 @@ version = "0.4.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7abe79b0e4288889c4574159ab790824d0033b9fdcb2a112a3182fac2e514565"
 dependencies = [
- "num-bigint 0.4.8",
+ "num-bigint 0.4.6",
  "num-traits",
  "proc-macro2",
  "quote",
@@ -995,7 +995,7 @@ version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "09be120733ee33f7693ceaa202ca41accd5653b779563608f1234f78ae07c4b3"
 dependencies = [
- "num-bigint 0.4.8",
+ "num-bigint 0.4.6",
  "num-traits",
  "proc-macro2",
  "quote",
@@ -1008,7 +1008,7 @@ version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4a0691ed21ef00ef89c1e9bda832eba493dda3ec2f8d892fb25b705f73f06bb8"
 dependencies = [
- "num-bigint 0.4.8",
+ "num-bigint 0.4.6",
  "num-traits",
  "proc-macro2",
  "quote",
@@ -1070,7 +1070,7 @@ checksum = "adb7b85a02b83d2f22f89bd5cac66c9c89474240cb6207cb1efc16d098e822a5"
 dependencies = [
  "ark-std 0.4.0",
  "digest 0.10.7",
- "num-bigint 0.4.8",
+ "num-bigint 0.4.6",
 ]
 
 [[package]]
@@ -1083,7 +1083,7 @@ dependencies = [
  "ark-std 0.5.0",
  "arrayvec",
  "digest 0.10.7",
- "num-bigint 0.4.8",
+ "num-bigint 0.4.6",
 ]
 
 [[package]]
@@ -1095,7 +1095,7 @@ dependencies = [
  "ark-serialize-derive 0.6.0",
  "ark-std 0.6.0",
  "digest 0.10.7",
- "num-bigint 0.4.8",
+ "num-bigint 0.4.6",
  "serde_with",
 ]
 
@@ -1572,9 +1572,9 @@ checksum = "1fd0f2584146f6f2ef48085050886acf353beff7305ebd1ae69500e27c67f64b"
 
 [[package]]
 name = "bytes"
-version = "1.12.1"
+version = "1.12.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "fc652a48c352aef3ea3aed32080501cf3ef6ed5da78602a020c991775b0aff04"
+checksum = "8ae3f5d315924270530207e2a68396c3cc547f6dca3fbdca317cfb1a51edb593"
 dependencies = [
  "serde",
 ]
@@ -2156,7 +2156,7 @@ dependencies = [
  "asn1-rs 0.6.2",
  "displaydoc",
  "nom",
- "num-bigint 0.4.8",
+ "num-bigint 0.4.6",
  "num-traits",
  "rusticata-macros",
 ]
@@ -2170,7 +2170,7 @@ dependencies = [
  "asn1-rs 0.7.2",
  "displaydoc",
  "nom",
- "num-bigint 0.4.8",
+ "num-bigint 0.4.6",
  "num-traits",
  "rusticata-macros",
 ]
@@ -3905,9 +3905,9 @@ dependencies = [
 
 [[package]]
 name = "num-bigint"
-version = "0.4.8"
+version = "0.4.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c89e69e7e0f03bea5ef08013795c25018e101932225a656383bd384495ecc367"
+checksum = "a5e44f723f1133c9deac646763579fdb3ac745e418f2a7af9cd0c431da1f20b9"
 dependencies = [
  "num-integer",
  "num-traits",
@@ -5030,7 +5030,7 @@ dependencies = [
  "bytes",
  "fastrlp 0.3.1",
  "fastrlp 0.4.0",
- "num-bigint 0.4.8",
+ "num-bigint 0.4.6",
  "num-integer",
  "num-traits",
  "parity-scale-codec",
@@ -5706,7 +5706,7 @@ dependencies = [
 [[package]]
 name = "stoffel-mpc-coordinator-off-chain"
 version = "0.1.0"
-source = "git+https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git?branch=dev#abac1fb778730d42ecd775d993123f05482685db"
+source = "git+https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git?branch=codex%2Fpersistent-execution-coordination#2661aa59b512e889a669c01472e5192d9e2bec7f"
 dependencies = [
  "ark-bls12-381",
  "ark-ff 0.5.0",
@@ -5727,7 +5727,7 @@ dependencies = [
 [[package]]
 name = "stoffel-mpc-coordinator-shared"
 version = "0.1.0"
-source = "git+https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git?branch=dev#abac1fb778730d42ecd775d993123f05482685db"
+source = "git+https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git?branch=codex%2Fpersistent-execution-coordination#2661aa59b512e889a669c01472e5192d9e2bec7f"
 dependencies = [
  "ark-bls12-381",
  "ark-ec",
@@ -5735,6 +5735,7 @@ dependencies = [
  "ark-serialize 0.5.0",
  "async-trait",
  "futures-util",
+ "hex",
  "hpke",
  "hyper",
  "hyper-util",
@@ -5762,6 +5763,7 @@ version = "0.1.2"
 dependencies = [
  "aes",
  "ark-bls12-381",
+ "ark-ec",
  "ark-ff 0.5.0",
  "ark-serialize 0.5.0",
  "csv",
@@ -5769,9 +5771,11 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-stdout",
  "opentelemetry_sdk",
+ "rand 0.8.6",
  "rustls",
  "serde",
  "serde_json",
+ "sha2",
  "stoffel-bindgen",
  "stoffel-mpc-coordinator-off-chain",
  "stoffel-mpc-coordinator-shared",
@@ -5868,11 +5872,14 @@ dependencies = [
  "ark-std 0.5.0",
  "async-trait",
  "bincode",
+ "blake3",
  "futures",
  "hex",
  "libc",
+ "rcgen",
  "rustls",
  "serde",
+ "serde_json",
  "stoffel-mpc-coordinator-off-chain",
  "stoffel-mpc-coordinator-shared",
  "stoffel-vm",
@@ -5880,8 +5887,10 @@ dependencies = [
  "stoffelcrypto",
  "stoffellang",
  "stoffelnet",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-util",
  "tracing",
  "uuid",
  "x509-parser 0.18.1",
@@ -5891,7 +5900,7 @@ dependencies = [
 name = "stoffel-vm-types"
 version = "0.1.2"
 dependencies = [
- "num-bigint 0.4.8",
+ "num-bigint 0.4.6",
  "num-integer",
  "num-traits",
  "parking_lot 0.12.5",
@@ -5918,7 +5927,7 @@ dependencies = [
  "chacha20poly1305",
  "futures",
  "itertools 0.14.0",
- "num-bigint 0.4.8",
+ "num-bigint 0.4.6",
  "num-integer",
  "num-traits",
  "rand 0.7.3",
@@ -5974,8 +5983,7 @@ dependencies = [
 [[package]]
 name = "stoffelnet"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3dedfe14784d0d5d9fa4a3c5c9c36b49581c43789ac44449be3ade72fa025223"
+source = "git+https://github.com/Stoffel-Labs/stoffel-networking.git?branch=codex%2Fconcurrent-execution-transport#6a099b21f11150c9d7cd89ed24f275807f01aacf"
 dependencies = [
  "ark-ff 0.5.0",
  "async-trait",
@@ -6264,9 +6272,9 @@ dependencies = [
 
 [[package]]
 name = "tinyvec"
-version = "1.12.0"
+version = "1.11.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "bb4ebadaa0af04fab11ae01eb5f9fdb5f9c5b875506e210e71c07873528baa7f"
+checksum = "3e61e67053d25a4e82c844e8424039d9745781b3fc4f32b8d55ed50f5f667ef3"
 dependencies = [
  "tinyvec_macros",
 ]

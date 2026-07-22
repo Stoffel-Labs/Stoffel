@@ -21,6 +21,10 @@ def main(a: int64, b: int64) -> int64:
   return a + b
 "#;
 
+fn offchain_config_builder() -> OffChainClientConfigBuilder {
+    OffChainClientConfig::builder().execution_id(ExecutionId::from_bytes([0x51; 32]))
+}
+
 mod federated_average_bindings {
     include!("fixtures/mpc_client_federated_average_bindings.rs");
 }
@@ -2457,7 +2461,7 @@ fn stoffel_direct_participant_builders_do_not_require_compilation() -> stoffel::
 
 #[test]
 fn offchain_client_config_defaults_to_five_party_topology() -> stoffel::Result<()> {
-    let config = OffChainClientConfig::builder()
+    let config = offchain_config_builder()
         .coordinator("127.0.0.1", 19000)
         .timestamp(1)
         .node_rpc_addresses(["127.0.0.1:19100"])
@@ -2467,7 +2471,7 @@ fn offchain_client_config_defaults_to_five_party_topology() -> stoffel::Result<(
     assert_eq!(config.threshold, 1);
     assert_eq!(config.backend, MpcBackend::HoneyBadger);
 
-    let invalid_topology = OffChainClientConfig::builder()
+    let invalid_topology = offchain_config_builder()
         .coordinator("127.0.0.1", 19000)
         .timestamp(1)
         .parties(4)
@@ -2481,7 +2485,7 @@ fn offchain_client_config_defaults_to_five_party_topology() -> stoffel::Result<(
         stoffel::Error::Configuration(message) if message.contains("at least 5")
     ));
 
-    let zero_threshold = OffChainClientConfig::builder()
+    let zero_threshold = offchain_config_builder()
         .coordinator("127.0.0.1", 19000)
         .timestamp(1)
         .threshold(0)
@@ -2499,7 +2503,13 @@ fn offchain_client_config_defaults_to_five_party_topology() -> stoffel::Result<(
 
 #[test]
 fn offchain_client_config_reports_actionable_validation_errors() {
-    let missing_port = OffChainClientConfig::builder()
+    let missing_execution_id = OffChainClientConfig::builder().build().unwrap_err();
+    assert!(matches!(
+        missing_execution_id,
+        stoffel::Error::Configuration(message) if message.contains("execution ID")
+    ));
+
+    let missing_port = offchain_config_builder()
         .timestamp(1)
         .node_rpc_address("127.0.0.1:19100")
         .identity_der(vec![1], vec![2])
@@ -2510,7 +2520,7 @@ fn offchain_client_config_reports_actionable_validation_errors() {
         stoffel::Error::Configuration(message) if message.contains("coordinator port")
     ));
 
-    let missing_timestamp = OffChainClientConfig::builder()
+    let missing_timestamp = offchain_config_builder()
         .coordinator("127.0.0.1", 19000)
         .node_rpc_address("127.0.0.1:19100")
         .identity_der(vec![1], vec![2])
@@ -2521,7 +2531,7 @@ fn offchain_client_config_reports_actionable_validation_errors() {
         stoffel::Error::Configuration(message) if message.contains("timestamp")
     ));
 
-    let missing_cert = OffChainClientConfig::builder()
+    let missing_cert = offchain_config_builder()
         .coordinator("127.0.0.1", 19000)
         .timestamp(1)
         .node_rpc_address("127.0.0.1:19100")
@@ -2532,7 +2542,7 @@ fn offchain_client_config_reports_actionable_validation_errors() {
         stoffel::Error::Configuration(message) if message.contains("certificate")
     ));
 
-    let empty_host = OffChainClientConfig::builder()
+    let empty_host = offchain_config_builder()
         .coordinator(" ", 19000)
         .timestamp(1)
         .node_rpc_address("127.0.0.1:19100")
@@ -2544,7 +2554,7 @@ fn offchain_client_config_reports_actionable_validation_errors() {
         stoffel::Error::Configuration(message) if message.contains("host")
     ));
 
-    let unsupported_curve = OffChainClientConfig::builder()
+    let unsupported_curve = offchain_config_builder()
         .coordinator("127.0.0.1", 19000)
         .timestamp(1)
         .avss(Curve::Bn254)
@@ -2554,7 +2564,7 @@ fn offchain_client_config_reports_actionable_validation_errors() {
         .unwrap_err();
     assert!(matches!(unsupported_curve, stoffel::Error::Unsupported(_)));
 
-    let invalid_threshold = OffChainClientConfig::builder()
+    let invalid_threshold = offchain_config_builder()
         .coordinator("127.0.0.1", 19000)
         .timestamp(1)
         .parties(5)
@@ -2566,7 +2576,7 @@ fn offchain_client_config_reports_actionable_validation_errors() {
         .unwrap_err();
     assert!(matches!(invalid_threshold, stoffel::Error::Unsupported(_)));
 
-    let missing_rpc = OffChainClientConfig::builder()
+    let missing_rpc = offchain_config_builder()
         .coordinator("127.0.0.1", 19000)
         .timestamp(1)
         .identity_der(vec![1], vec![2])
@@ -2577,7 +2587,7 @@ fn offchain_client_config_reports_actionable_validation_errors() {
         stoffel::Error::Configuration(message) if message.contains("node RPC")
     ));
 
-    let invalid_rpc = OffChainClientConfig::builder()
+    let invalid_rpc = offchain_config_builder()
         .coordinator("127.0.0.1", 19000)
         .timestamp(1)
         .node_rpc_address("not-a-socket")
@@ -2586,7 +2596,7 @@ fn offchain_client_config_reports_actionable_validation_errors() {
         .unwrap_err();
     assert!(matches!(invalid_rpc, stoffel::Error::Configuration(_)));
 
-    let zero_timeout = OffChainClientConfig::builder()
+    let zero_timeout = offchain_config_builder()
         .coordinator("127.0.0.1", 19000)
         .timestamp(1)
         .node_rpc_address("127.0.0.1:19100")
@@ -2608,7 +2618,7 @@ fn offchain_client_config_round_trips_toml_and_identity_files() -> stoffel::Resu
     std::fs::write(&cert_path, [1_u8, 2, 3])?;
     std::fs::write(&key_path, [4_u8, 5, 6])?;
 
-    let config = OffChainClientConfig::builder()
+    let config = offchain_config_builder()
         .coordinator("localhost", 19000)
         .timestamp(42)
         .parties(5)
@@ -2629,7 +2639,7 @@ fn offchain_client_config_round_trips_toml_and_identity_files() -> stoffel::Resu
     reparsed.validate()?;
     assert_eq!(reparsed, config);
 
-    let missing_identity = OffChainClientConfig::builder()
+    let missing_identity = offchain_config_builder()
         .coordinator("localhost", 19000)
         .timestamp(42)
         .node_rpc_address("127.0.0.1:19100")
@@ -2710,6 +2720,7 @@ def main() -> int64:
     .build()?;
     let config = runtime
         .offchain_client_config(0)?
+        .execution_id(ExecutionId::from_bytes([0x52; 32]))
         .coordinator("127.0.0.1", 9)
         .timestamp(1)
         .node_rpc_addresses(["127.0.0.1:19100"])
@@ -2747,6 +2758,7 @@ def main() -> int64:
 
     let config = runtime
         .offchain_client_config(0)?
+        .execution_id(ExecutionId::from_bytes([0x53; 32]))
         .coordinator("127.0.0.1", 19000)
         .timestamp(1)
         .node_rpc_addresses(["127.0.0.1:19100"])

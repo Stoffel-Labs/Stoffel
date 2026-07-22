@@ -81,8 +81,8 @@ pub use config::{
 };
 pub use consensus::{ConsensusGate, NodePublicKey, VerifiedOrdering};
 pub use coordinator::{
-    Coordinator, OffChainCoordinator, OffChainCoordinatorClient, OffChainCoordinatorServer,
-    ShareBound,
+    Coordinator, ExecutionId, OffChainCoordinator, OffChainCoordinatorClient,
+    OffChainCoordinatorServer, ShareBound,
 };
 pub use error::{ConsensusError, CoordinatorError, Error, ErrorCategory, NetworkError, Result};
 pub use input_file::{load_client_inputs_file, load_named_inputs_file};

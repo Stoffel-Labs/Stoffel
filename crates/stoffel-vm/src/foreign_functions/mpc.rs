@@ -111,6 +111,14 @@ impl<'a> ForeignFunctionContext<'a> {
         self.services.open_share_as_field_data(ty, share_data)
     }
 
+    pub(crate) fn batch_open_shares_as_field_data(
+        &self,
+        ty: ShareType,
+        shares: &[ShareData],
+    ) -> VmResult<Vec<Vec<u8>>> {
+        self.services.batch_open_shares_as_field_data(ty, shares)
+    }
+
     pub(crate) fn open_share_in_exp_data(
         &self,
         ty: ShareType,
@@ -130,6 +138,28 @@ impl<'a> ForeignFunctionContext<'a> {
     ) -> VmResult<Vec<u8>> {
         self.services
             .open_share_in_exp_group_data(group, ty, share_data, generator_bytes)
+    }
+
+    pub(crate) fn batch_open_shares_in_exp_group_data(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[ShareData],
+        generator_bytes: &[u8],
+    ) -> VmResult<Vec<Vec<u8>>> {
+        self.services
+            .batch_open_shares_in_exp_group_data(group, ty, shares, generator_bytes)
+    }
+
+    pub(crate) fn batch_open_shares_in_exp_group_custom_data(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[ShareData],
+        generators: &[Vec<u8>],
+    ) -> VmResult<Vec<Vec<u8>>> {
+        self.services
+            .batch_open_shares_in_exp_group_custom_data(group, ty, shares, generators)
     }
 
     pub(crate) fn secret_share_add_data(

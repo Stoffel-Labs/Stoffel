@@ -329,6 +329,12 @@ pub(crate) trait ForeignMpcServices {
 
     fn open_share_as_field_data(&self, ty: ShareType, share_data: &ShareData) -> VmResult<Vec<u8>>;
 
+    fn batch_open_shares_as_field_data(
+        &self,
+        ty: ShareType,
+        shares: &[ShareData],
+    ) -> VmResult<Vec<Vec<u8>>>;
+
     fn open_share_in_exp_data(
         &self,
         ty: ShareType,
@@ -343,6 +349,22 @@ pub(crate) trait ForeignMpcServices {
         share_data: &ShareData,
         generator_bytes: &[u8],
     ) -> VmResult<Vec<u8>>;
+
+    fn batch_open_shares_in_exp_group_data(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[ShareData],
+        generator_bytes: &[u8],
+    ) -> VmResult<Vec<Vec<u8>>>;
+
+    fn batch_open_shares_in_exp_group_custom_data(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[ShareData],
+        generators: &[Vec<u8>],
+    ) -> VmResult<Vec<Vec<u8>>>;
 
     fn secret_share_add_data(
         &self,
@@ -496,6 +518,14 @@ impl ForeignMpcServices for VMState {
         VMState::open_share_as_field_data(self, ty, share_data)
     }
 
+    fn batch_open_shares_as_field_data(
+        &self,
+        ty: ShareType,
+        shares: &[ShareData],
+    ) -> VmResult<Vec<Vec<u8>>> {
+        VMState::batch_open_shares_as_field_data(self, ty, shares)
+    }
+
     fn open_share_in_exp_data(
         &self,
         ty: ShareType,
@@ -513,6 +543,26 @@ impl ForeignMpcServices for VMState {
         generator_bytes: &[u8],
     ) -> VmResult<Vec<u8>> {
         VMState::open_share_in_exp_group_data(self, group, ty, share_data, generator_bytes)
+    }
+
+    fn batch_open_shares_in_exp_group_data(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[ShareData],
+        generator_bytes: &[u8],
+    ) -> VmResult<Vec<Vec<u8>>> {
+        VMState::batch_open_shares_in_exp_group_data(self, group, ty, shares, generator_bytes)
+    }
+
+    fn batch_open_shares_in_exp_group_custom_data(
+        &self,
+        group: MpcExponentGroup,
+        ty: ShareType,
+        shares: &[ShareData],
+        generators: &[Vec<u8>],
+    ) -> VmResult<Vec<Vec<u8>>> {
+        VMState::batch_open_shares_in_exp_group_custom_data(self, group, ty, shares, generators)
     }
 
     fn secret_share_add_data(

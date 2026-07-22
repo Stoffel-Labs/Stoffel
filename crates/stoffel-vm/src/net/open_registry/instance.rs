@@ -1165,6 +1165,79 @@ impl InstanceRegistry {
         }
     }
 
+    /// Wait for one already-inserted batch and return its authenticated party
+    /// IDs plus raw contributions for every position. Callers can reconstruct
+    /// values whose representation is not `ClearShareValue`, such as group
+    /// points used by batched exponent opening.
+    pub(crate) async fn batch_collect_at_async(
+        &self,
+        party_id: usize,
+        type_key: String,
+        sequence: usize,
+        shares: Vec<Vec<u8>>,
+        required: usize,
+    ) -> Result<(Vec<usize>, Vec<Vec<Vec<u8>>>), String> {
+        if shares.is_empty() {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        if required == 0 {
+            return Err("batch collection requires at least one contribution".to_string());
+        }
+
+        let batch_size = shares.len();
+        let deadline = tokio::time::Instant::now()
+            + tokio::time::Duration::from_secs(OPEN_REGISTRY_WAIT_TIMEOUT.as_secs());
+        loop {
+            let notified = self.batch_notify.notified();
+            let current_count = {
+                let reg = self.batch.lock();
+                let key = (sequence, type_key.clone(), batch_size);
+                let entry = reg.get(&key).ok_or_else(|| {
+                    Self::missing_batch_entry_error(sequence, &type_key, batch_size)
+                })?;
+                let local_position = entry
+                    .party_ids
+                    .iter()
+                    .position(|id| *id == party_id)
+                    .ok_or_else(|| {
+                        format!(
+                            "batch collection sequence {sequence}, type '{type_key}' is missing local party {party_id}"
+                        )
+                    })?;
+                let local: Vec<_> = entry
+                    .shares_per_position
+                    .iter()
+                    .filter_map(|position| position.get(local_position).cloned())
+                    .collect();
+                if local != shares {
+                    return Err(format!(
+                        "conflicting local batch collection payload for sequence {sequence}, type '{type_key}'"
+                    ));
+                }
+                if entry.party_ids.len() >= required {
+                    let party_ids = entry.party_ids.iter().take(required).copied().collect();
+                    let contributions = entry
+                        .shares_per_position
+                        .iter()
+                        .map(|position| position.iter().take(required).cloned().collect())
+                        .collect();
+                    return Ok((party_ids, contributions));
+                }
+                entry.party_ids.len()
+            };
+
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "Timeout waiting for raw batch contributions ({current_count}/{required})"
+                ));
+            }
+            tokio::select! {
+                _ = notified => {}
+                _ = tokio::time::sleep_until(deadline) => {}
+            }
+        }
+    }
+
     fn batch_open_poll<R>(
         &self,
         party_id: usize,

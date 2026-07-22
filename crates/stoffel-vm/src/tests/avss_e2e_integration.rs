@@ -36,7 +36,10 @@ use tracing::{error, info, warn};
 use crate::core_vm::VirtualMachine;
 use crate::net::avss_engine::{AvssEngineConfig, AvssMpcEngine};
 use crate::net::avss_server::{AvssQuicConfig, AvssQuicServer};
-use crate::net::MpcSessionConfig;
+use crate::net::session::ExecutionId;
+use crate::net::{
+    ExecutionEnvelopeV1, ExecutionMessageKind, ExecutionScopedNetwork, MpcSessionConfig,
+};
 use crate::tests::test_utils::{
     init_crypto_provider, read_vm_table_byte_array, setup_test_tracing,
 };
@@ -50,6 +53,7 @@ use crate::tests::test_utils::{
 /// routing which doesn't match AVSS party indices.
 ///
 /// Connections are stored in a vector indexed by party_id (0..N-1).
+#[derive(Clone)]
 struct SimplePartyNetwork {
     node_id: usize,
     n: usize,
@@ -193,6 +197,16 @@ fn build_simple_network(
         connections: conns,
         self_tx,
     })
+}
+
+fn scope_simple_network(
+    network: Arc<SimplePartyNetwork>,
+    execution_id: ExecutionId,
+) -> Arc<ExecutionScopedNetwork<SimplePartyNetwork>> {
+    Arc::new(
+        ExecutionScopedNetwork::for_party((*network).clone(), execution_id)
+            .expect("test execution ID is nonzero"),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -707,10 +721,10 @@ async fn test_avss_full_mesh_concurrent_startup_survives_duplicate_dials() {
 /// Spawn AVSS message processors that read from each node's channel and
 /// dispatch to the engine's `process_wrapped_message_with_network`.
 ///
-/// Messages on the wire are `AvssWrappedMessage` enums (not raw `AvssMessage`).
-/// The engine handles both RBC protocol messages (SEND/ECHO/READY) and final
-/// AVSS payloads. We pass a `SimplePartyNetwork` so that RBC responses
-/// (ECHO/READY broadcasts, self-delivery) route correctly by party_id.
+/// Messages on the wire use the execution envelope. This ingress validates and
+/// unwraps it before dispatching open messages or the backend payload. A scoped
+/// `SimplePartyNetwork` keeps RBC responses isolated while routing them by the
+/// protocol party ID.
 fn spawn_avss_message_processors(
     nodes: &mut [AvssTestNode],
     engines: &[Arc<AvssMpcEngine<Fr, G1>>],
@@ -720,12 +734,30 @@ fn spawn_avss_message_processors(
         let engine = engines[i].clone();
         let open_message_router = engine.open_message_router();
         let simple_net = node.simple_net.clone().unwrap();
+        let protocol_net = Arc::new(
+            ExecutionScopedNetwork::for_party((*simple_net).clone(), engine.execution_id())
+                .expect("test execution ID is nonzero"),
+        );
         let node_id = node.node_id;
 
         tokio::spawn(async move {
             let mut rx = rx;
             while let Some((sender_id, data)) = rx.recv().await {
-                match open_message_router.try_handle_wire_message(sender_id, &data) {
+                let envelope = match ExecutionEnvelopeV1::decode(&data) {
+                    Ok(envelope)
+                        if envelope.execution_id() == engine.execution_id()
+                            && envelope.kind() == ExecutionMessageKind::Mpc =>
+                    {
+                        envelope
+                    }
+                    Ok(_) => continue,
+                    Err(error) => {
+                        error!("[AVSS] Node {node_id} rejected execution frame: {error}");
+                        continue;
+                    }
+                };
+                let payload = envelope.payload();
+                match open_message_router.try_handle_wire_message(sender_id, payload) {
                     Ok(true) => continue,
                     Err(e) => {
                         error!(
@@ -737,7 +769,7 @@ fn spawn_avss_message_processors(
                     Ok(false) => {}
                 }
                 match engine
-                    .process_wrapped_message_with_network(sender_id, &data, simple_net.clone())
+                    .process_wrapped_message_with_network(sender_id, payload, protocol_net.clone())
                     .await
                 {
                     Ok(()) => {}
@@ -820,7 +852,10 @@ async fn test_avss_e2e_distributed_key_generation() {
         nodes[0].node_id, key_name
     );
 
-    let simple_net_0 = nodes[0].simple_net.clone().unwrap();
+    let simple_net_0 = scope_simple_network(
+        nodes[0].simple_net.clone().unwrap(),
+        engines[0].execution_id(),
+    );
     let share = engines[0]
         .generate_random_share_with_network(key_name, simple_net_0)
         .await
@@ -942,7 +977,10 @@ async fn test_avss_e2e_vm_public_key_extraction() {
 
     // Party 0 deals
     let key_name = "vm_test_key";
-    let simple_net_0 = nodes[0].simple_net.clone().unwrap();
+    let simple_net_0 = scope_simple_network(
+        nodes[0].simple_net.clone().unwrap(),
+        engines[0].execution_id(),
+    );
     let share_party0 = engines[0]
         .generate_random_share_with_network(key_name, simple_net_0)
         .await
@@ -1110,7 +1148,10 @@ async fn test_avss_e2e_multiple_keys() {
 
     // Generate first key
     let key1 = "key_alpha";
-    let simple_net_0 = nodes[0].simple_net.clone().unwrap();
+    let simple_net_0 = scope_simple_network(
+        nodes[0].simple_net.clone().unwrap(),
+        engines[0].execution_id(),
+    );
     let share1 = engines[0]
         .generate_random_share_with_network(key1, simple_net_0.clone())
         .await

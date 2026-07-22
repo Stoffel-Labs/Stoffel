@@ -13,3 +13,6 @@ resolver = "2"
 exclude = [
     "vendor/mpc-protocols-limit-test",
 ]
+
+[patch.crates-io]
+stoffelnet = { git = "https://github.com/Stoffel-Labs/stoffel-networking.git", branch = "codex/concurrent-execution-transport" }

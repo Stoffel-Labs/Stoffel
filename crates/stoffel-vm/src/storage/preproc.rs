@@ -9,6 +9,7 @@ use crate::net::mpc_engine::DurableIdentityDigest;
 use ark_ff::FftField;
 use ark_serialize::{Compress, Validate};
 use serde::{Deserialize, Serialize};
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use stoffelmpc_mpc::honeybadger::{
     fpmul::f256::Gf256, robust_interpolate::robust_interpolate::RobustShare,
@@ -148,7 +149,7 @@ impl PreprocKey {
 }
 
 /// Common namespace for preprocessing material keys belonging to one party.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct PreprocKeyScope {
     pub program_hash: [u8; 32],
     pub field_kind: MpcFieldKind,
@@ -175,14 +176,14 @@ impl PreprocKeyScope {
     }
 
     pub fn key(self, kind: MaterialKind) -> PreprocKey {
-        PreprocKey::new(
-            self.program_hash,
-            self.field_kind,
-            self.n,
-            self.t,
-            self.node_identity,
+        PreprocKey {
+            program_hash: self.program_hash,
+            field_kind: self.field_kind,
+            n: self.n,
+            t: self.t,
+            node_identity: self.node_identity,
             kind,
-        )
+        }
     }
 
     pub fn beaver_triple(self) -> PreprocKey {
@@ -228,19 +229,105 @@ fn usize_to_u32(value: usize, field: &'static str) -> Result<u32, PreprocStoreEr
     })
 }
 
-/// Metadata stored separately from the raw data so that `reserve()` and
-/// `available()` avoid deserializing the (potentially large) data blob.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Metadata stored separately so cursor checks and inventory reads avoid
+/// deserializing the potentially large data blob.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PreprocMeta {
     pub count: u32,
     pub consumed: u32,
     pub item_size: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StandingPreprocAction {
+    Reuse,
+    TopUp,
+    Rebuild,
+}
+
+/// Party-exchanged inventory for one correlated preprocessing reservoir.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StandingPreprocSnapshot {
+    pub generation_id: Option<[u8; 32]>,
+    pub beaver: PreprocMeta,
+    pub random: PreprocMeta,
+    pub prand_bit: PreprocMeta,
+    pub prand_int: PreprocMeta,
+}
+
+impl StandingPreprocSnapshot {
+    pub fn availability(self) -> PoolAvailability {
+        PoolAvailability {
+            beaver: self.beaver.available(),
+            random: self.random.available(),
+            prand_bit: self.prand_bit.available(),
+            prand_int: self.prand_int.available(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct StandingPreprocPlan {
+    pub action: StandingPreprocAction,
+    pub needed: PoolAvailability,
+    pub generation_id: [u8; 32],
+}
+
+/// Agree on reuse, top-up, or rebuild from party-indexed inventories.
+pub fn agree_standing_preproc_plan(
+    targets: PreprocTargets,
+    snapshots: &[StandingPreprocSnapshot],
+    fresh_generation_id: [u8; 32],
+) -> Result<StandingPreprocPlan, String> {
+    let (&baseline, rest) = snapshots
+        .split_first()
+        .ok_or_else(|| "standing preprocessing agreement requires at least one party".to_owned())?;
+    if baseline.generation_id.is_none() || rest.iter().any(|snapshot| *snapshot != baseline) {
+        return Ok(StandingPreprocPlan {
+            action: StandingPreprocAction::Rebuild,
+            needed: targets,
+            generation_id: fresh_generation_id,
+        });
+    }
+    let available = baseline.availability();
+    let needed = PoolAvailability {
+        beaver: targets.beaver.saturating_sub(available.beaver),
+        random: targets.random.saturating_sub(available.random),
+        prand_bit: targets.prand_bit.saturating_sub(available.prand_bit),
+        prand_int: targets.prand_int.saturating_sub(available.prand_int),
+    };
+    let action = if needed == PoolAvailability::default() {
+        StandingPreprocAction::Reuse
+    } else {
+        StandingPreprocAction::TopUp
+    };
+    Ok(StandingPreprocPlan {
+        action,
+        needed,
+        generation_id: if action == StandingPreprocAction::Reuse {
+            baseline.generation_id.expect("generation checked above")
+        } else {
+            fresh_generation_id
+        },
+    })
+}
+
 impl PreprocMeta {
     pub fn available(&self) -> u32 {
         self.count.saturating_sub(self.consumed)
     }
+}
+
+/// Material atomically removed from the front of a preprocessing pool.
+///
+/// `data` contains exactly `count * item_size` bytes. The backing store no
+/// longer contains these bytes when this value is returned, so a crash or a
+/// second execution cannot allocate the same correlated material again.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TakenPreproc {
+    pub count: u32,
+    pub item_size: u32,
+    pub data: Vec<u8>,
 }
 
 /// Serialized preprocessing material with metadata + data.
@@ -258,12 +345,67 @@ pub struct PoolAvailability {
     pub prand_int: u32,
 }
 
+impl PoolAvailability {
+    pub fn covers(self, required: Self) -> bool {
+        self.beaver >= required.beaver
+            && self.random >= required.random
+            && self.prand_bit >= required.prand_bit
+            && self.prand_int >= required.prand_int
+    }
+
+    const fn get(self, kind: MaterialKind) -> u32 {
+        match kind {
+            MaterialKind::BeaverTriple => self.beaver,
+            MaterialKind::RandomShare => self.random,
+            MaterialKind::PRandBit => self.prand_bit,
+            MaterialKind::PRandInt => self.prand_int,
+        }
+    }
+
+    fn set(&mut self, kind: MaterialKind, count: u32) {
+        match kind {
+            MaterialKind::BeaverTriple => self.beaver = count,
+            MaterialKind::RandomShare => self.random = count,
+            MaterialKind::PRandBit => self.prand_bit = count,
+            MaterialKind::PRandInt => self.prand_int = count,
+        }
+    }
+}
+
 pub type PreprocTargets = PoolAvailability;
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-pub struct TopUpReport {
-    pub generated: PoolAvailability,
-    pub skipped: bool,
+/// Preprocessing material removed atomically from a stable reservoir.
+///
+/// This value deliberately is not `Clone`: one successful take creates one
+/// owner, and dropping that owner burns the material rather than making it
+/// available to another execution.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct OwnedPreprocBundle {
+    pub beaver: Option<TakenPreproc>,
+    pub random: Option<TakenPreproc>,
+    pub prand_bit: Option<TakenPreproc>,
+    pub prand_int: Option<TakenPreproc>,
+    pub remaining: PoolAvailability,
+}
+
+impl OwnedPreprocBundle {
+    pub fn availability(&self) -> PoolAvailability {
+        PoolAvailability {
+            beaver: self.beaver.as_ref().map_or(0, |material| material.count),
+            random: self.random.as_ref().map_or(0, |material| material.count),
+            prand_bit: self.prand_bit.as_ref().map_or(0, |material| material.count),
+            prand_int: self.prand_int.as_ref().map_or(0, |material| material.count),
+        }
+    }
+
+    fn set(&mut self, kind: MaterialKind, material: TakenPreproc) {
+        match kind {
+            MaterialKind::BeaverTriple => self.beaver = Some(material),
+            MaterialKind::RandomShare => self.random = Some(material),
+            MaterialKind::PRandBit => self.prand_bit = Some(material),
+            MaterialKind::PRandInt => self.prand_int = Some(material),
+        }
+    }
 }
 
 impl PreprocBlob {
@@ -383,8 +525,15 @@ pub trait PreprocStore: Send + Sync + 'static {
         data: &[u8],
     ) -> Result<u32, PreprocStoreError>;
 
-    /// Atomically advance the consumed cursor. Returns new consumed count.
-    async fn reserve(&self, key: &PreprocKey, n: u32) -> Result<u32, PreprocStoreError>;
+    /// Atomically remove an owned bundle from a stable preprocessing reservoir.
+    ///
+    /// All four material kinds are validated and physically compacted in one
+    /// LMDB transaction. A zero requested count produces `None` for that kind.
+    async fn take_bundle_from_reservoir(
+        &self,
+        source: &PreprocKeyScope,
+        requested: PoolAvailability,
+    ) -> Result<OwnedPreprocBundle, PreprocStoreError>;
 
     /// Atomically advance the consumed cursor only if it is at `expected_consumed`.
     /// Returns new consumed count.
@@ -401,9 +550,8 @@ pub trait PreprocStore: Send + Sync + 'static {
         &self,
         scope: &PreprocKeyScope,
     ) -> Result<PoolAvailability, PreprocStoreError>;
-    async fn exists(&self, key: &PreprocKey) -> Result<bool, PreprocStoreError>;
+
     async fn delete(&self, key: &PreprocKey) -> Result<(), PreprocStoreError>;
-    async fn compact(&self, key: &PreprocKey) -> Result<(), PreprocStoreError>;
     async fn atomic_increment(&self, ns: &[u8], key: &[u8]) -> Result<u64, PreprocStoreError>;
 
     /// Store an opaque byte blob under a namespaced key (for reservations etc.).
@@ -411,49 +559,138 @@ pub trait PreprocStore: Send + Sync + 'static {
         -> Result<(), PreprocStoreError>;
     /// Load an opaque byte blob by namespaced key.
     async fn load_blob(&self, ns: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>, PreprocStoreError>;
+    /// Delete an opaque namespaced blob.
+    async fn delete_blob(&self, ns: &[u8], key: &[u8]) -> Result<(), PreprocStoreError>;
+}
+
+const STANDING_PREPROC_GENERATION_NAMESPACE: &[u8] = b"standing-preproc-generation-v1:";
+
+fn standing_generation_key(scope: PreprocKeyScope) -> Result<Vec<u8>, PreprocStoreError> {
+    scope.beaver_triple().encode()
+}
+
+pub async fn standing_preproc_snapshot(
+    store: &dyn PreprocStore,
+    scope: PreprocKeyScope,
+) -> Result<StandingPreprocSnapshot, PreprocStoreError> {
+    let generation_id = store
+        .load_blob(
+            STANDING_PREPROC_GENERATION_NAMESPACE,
+            &standing_generation_key(scope)?,
+        )
+        .await?
+        .map(|bytes| {
+            bytes.try_into().map_err(|bytes: Vec<u8>| {
+                PreprocStoreError::Deserialization(format!(
+                    "standing preprocessing generation has {} bytes, expected 32",
+                    bytes.len()
+                ))
+            })
+        })
+        .transpose()?;
+    Ok(StandingPreprocSnapshot {
+        generation_id,
+        beaver: store
+            .meta(&scope.beaver_triple())
+            .await?
+            .unwrap_or_default(),
+        random: store.meta(&scope.random_share()).await?.unwrap_or_default(),
+        prand_bit: store.meta(&scope.prand_bit()).await?.unwrap_or_default(),
+        prand_int: store.meta(&scope.prand_int()).await?.unwrap_or_default(),
+    })
+}
+
+pub async fn store_standing_preproc_generation(
+    store: &dyn PreprocStore,
+    scope: PreprocKeyScope,
+    generation_id: [u8; 32],
+) -> Result<(), PreprocStoreError> {
+    store
+        .store_blob(
+            STANDING_PREPROC_GENERATION_NAMESPACE,
+            &standing_generation_key(scope)?,
+            &generation_id,
+        )
+        .await
+}
+
+/// Apply one party-agreed reservoir plan and return the resulting inventory.
+/// Backend code supplies only its material generator; clearing, generation
+/// ownership, and the final store read stay identical across MPC backends.
+pub async fn apply_standing_preproc_plan<F, Fut>(
+    store: &dyn PreprocStore,
+    scope: PreprocKeyScope,
+    plan: StandingPreprocPlan,
+    top_up: F,
+) -> Result<StandingPreprocSnapshot, String>
+where
+    F: FnOnce(PoolAvailability) -> Fut,
+    Fut: Future<Output = Result<(), String>>,
+{
+    match plan.action {
+        StandingPreprocAction::Reuse => {}
+        StandingPreprocAction::TopUp => top_up(plan.needed).await?,
+        StandingPreprocAction::Rebuild => {
+            clear_standing_preproc_scope(store, scope).await?;
+            top_up(plan.needed).await?;
+        }
+    }
+    if plan.action != StandingPreprocAction::Reuse {
+        store_standing_preproc_generation(store, scope, plan.generation_id).await?;
+    }
+    standing_preproc_snapshot(store, scope)
+        .await
+        .map_err(String::from)
+}
+
+pub async fn clear_standing_preproc_scope(
+    store: &dyn PreprocStore,
+    scope: PreprocKeyScope,
+) -> Result<(), PreprocStoreError> {
+    for kind in MATERIAL_KINDS {
+        store.delete(&scope.key(kind)).await?;
+    }
+    store
+        .delete_blob(
+            STANDING_PREPROC_GENERATION_NAMESPACE,
+            &standing_generation_key(scope)?,
+        )
+        .await
 }
 
 // ---------------------------------------------------------------------------
 // LMDB actor backend
 // ---------------------------------------------------------------------------
 
-/// Request sent to the LMDB actor thread.
-enum DbRequest {
-    PutMulti {
-        pairs: Vec<(Vec<u8>, Vec<u8>)>,
-        reply: tokio::sync::oneshot::Sender<Result<(), PreprocStoreError>>,
-    },
-    Get {
-        key: Vec<u8>,
-        reply: tokio::sync::oneshot::Sender<Result<Option<Vec<u8>>, PreprocStoreError>>,
-    },
-    Delete {
-        keys: Vec<Vec<u8>>,
-        reply: tokio::sync::oneshot::Sender<Result<(), PreprocStoreError>>,
-    },
-    Reserve {
-        meta_key: Vec<u8>,
-        expected_consumed: Option<u32>,
-        n: u32,
-        reply: tokio::sync::oneshot::Sender<Result<u32, PreprocStoreError>>,
-    },
-    Append {
-        meta_key: Vec<u8>,
-        data_key: Vec<u8>,
-        item_size: u32,
-        added: u32,
-        data: Vec<u8>,
-        reply: tokio::sync::oneshot::Sender<Result<u32, PreprocStoreError>>,
-    },
-    Compact {
-        meta_key: Vec<u8>,
-        data_key: Vec<u8>,
-        reply: tokio::sync::oneshot::Sender<Result<(), PreprocStoreError>>,
-    },
-    AtomicIncrement {
-        key: Vec<u8>,
-        reply: tokio::sync::oneshot::Sender<Result<u64, PreprocStoreError>>,
-    },
+type LmdbDatabase = heed::Database<heed::types::Bytes, heed::types::Bytes>;
+type DbJob = Box<dyn FnOnce(&heed::Env, &LmdbDatabase) + Send + 'static>;
+
+const MATERIAL_KINDS: [MaterialKind; 4] = [
+    MaterialKind::BeaverTriple,
+    MaterialKind::RandomShare,
+    MaterialKind::PRandBit,
+    MaterialKind::PRandInt,
+];
+struct ReservoirMaterialKeys {
+    kind: MaterialKind,
+    meta_key: Vec<u8>,
+    data_key: Vec<u8>,
+}
+
+fn reservoir_material_keys(
+    source: &PreprocKeyScope,
+) -> Result<Vec<ReservoirMaterialKeys>, PreprocStoreError> {
+    MATERIAL_KINDS
+        .into_iter()
+        .map(|kind| {
+            let key = source.key(kind);
+            Ok(ReservoirMaterialKeys {
+                kind,
+                meta_key: key.meta_key()?,
+                data_key: key.encode()?,
+            })
+        })
+        .collect()
 }
 
 /// LMDB-backed preprocessing store using the actor pattern.
@@ -463,10 +700,10 @@ enum DbRequest {
 /// channel and await `oneshot` replies, guaranteeing that LMDB never
 /// touches a tokio worker thread.
 ///
-/// Metadata and data are stored under separate keys so that `reserve()` and
-/// `available()` never touch the (potentially large) data blob.
+/// Metadata and data are stored under separate keys so inventory reads never
+/// touch the potentially large data blob.
 pub struct LmdbPreprocStore {
-    tx: std::sync::mpsc::Sender<DbRequest>,
+    tx: std::sync::mpsc::Sender<DbJob>,
     _thread: std::thread::JoinHandle<()>,
 }
 
@@ -475,20 +712,22 @@ impl LmdbPreprocStore {
         std::fs::create_dir_all(path.as_ref())?;
         let env = unsafe {
             heed::EnvOpenOptions::new()
-                .map_size(1024 * 1024 * 1024) // 1 GB
+                .map_size(1024 * 1024 * 1024)
                 .max_dbs(1)
                 .open(path.as_ref())
         }?;
-        let mut wtxn = env.write_txn()?;
-        let db: heed::Database<heed::types::Bytes, heed::types::Bytes> =
-            env.create_database(&mut wtxn, Some("store"))?;
-        wtxn.commit()?;
+        let mut transaction = env.write_txn()?;
+        let database = env.create_database(&mut transaction, Some("store"))?;
+        transaction.commit()?;
 
-        let (tx, rx) = std::sync::mpsc::channel::<DbRequest>();
+        let (tx, rx) = std::sync::mpsc::channel::<DbJob>();
         let thread = std::thread::Builder::new()
             .name("lmdb-actor".into())
-            .spawn(move || Self::actor_loop(env, db, rx))
-            .map_err(PreprocStoreError::Io)?;
+            .spawn(move || {
+                while let Ok(job) = rx.recv() {
+                    job(&env, &database);
+                }
+            })?;
 
         Ok(Self {
             tx,
@@ -503,379 +742,108 @@ impl LmdbPreprocStore {
             .join("store")
     }
 
-    fn actor_loop(
-        env: heed::Env,
-        db: heed::Database<heed::types::Bytes, heed::types::Bytes>,
-        rx: std::sync::mpsc::Receiver<DbRequest>,
-    ) {
-        while let Ok(req) = rx.recv() {
-            match req {
-                DbRequest::PutMulti { pairs, reply } => {
-                    let r = (|| {
-                        let mut wtxn = env.write_txn()?;
-                        for (k, v) in &pairs {
-                            db.put(&mut wtxn, k, v)?;
-                        }
-                        wtxn.commit()?;
-                        Ok(())
-                    })();
-                    let _ = reply.send(r);
-                }
-                DbRequest::Get { key, reply } => {
-                    let r = (|| {
-                        let rtxn = env.read_txn()?;
-                        Ok(db.get(&rtxn, &key)?.map(|v| v.to_vec()))
-                    })();
-                    let _ = reply.send(r);
-                }
-                DbRequest::Delete { keys, reply } => {
-                    let r = (|| {
-                        let mut wtxn = env.write_txn()?;
-                        for k in &keys {
-                            db.delete(&mut wtxn, k)?;
-                        }
-                        wtxn.commit()?;
-                        Ok(())
-                    })();
-                    let _ = reply.send(r);
-                }
-                DbRequest::Reserve {
-                    meta_key,
-                    expected_consumed,
-                    n,
-                    reply,
-                } => {
-                    let r = (|| {
-                        let mut wtxn = env.write_txn()?;
-                        let raw = db
-                            .get(&wtxn, &meta_key)?
-                            .ok_or(PreprocStoreError::NotFound)?;
-                        let mut meta: PreprocMeta = bincode::deserialize(raw)?;
-                        if let Some(expected) = expected_consumed {
-                            if meta.consumed != expected {
-                                return Err(PreprocStoreError::CursorMismatch {
-                                    expected,
-                                    actual: meta.consumed,
-                                });
-                            }
-                        }
-                        let consumed =
-                            meta.consumed
-                                .checked_add(n)
-                                .ok_or(PreprocStoreError::U32Overflow {
-                                    field: "preprocessing consumed count",
-                                    value: u64::from(meta.consumed) + u64::from(n),
-                                })?;
-                        if consumed > meta.count {
-                            return Err(PreprocStoreError::Insufficient {
-                                need: n,
-                                available: meta.available(),
-                            });
-                        }
-                        meta.consumed = consumed;
-                        let v = bincode::serialize(&meta)?;
-                        db.put(&mut wtxn, &meta_key, &v)?;
-                        wtxn.commit()?;
-                        Ok(consumed)
-                    })();
-                    let _ = reply.send(r);
-                }
-                DbRequest::Append {
-                    meta_key,
-                    data_key,
-                    item_size,
-                    added,
-                    data,
-                    reply,
-                } => {
-                    let r = (|| {
-                        let item_size_usize =
-                            u32_to_usize(item_size, "append preprocessing item size")?;
-                        if item_size_usize == 0 && (!data.is_empty() || added > 0) {
-                            return Err(PreprocStoreError::PartialItem {
-                                data_len: data.len(),
-                                item_size,
-                            });
-                        }
-                        if item_size_usize != 0 && data.len() % item_size_usize != 0 {
-                            return Err(PreprocStoreError::PartialItem {
-                                data_len: data.len(),
-                                item_size,
-                            });
-                        }
-                        let expected_len = u32_to_usize(added, "append preprocessing count")?
-                            .checked_mul(item_size_usize)
-                            .ok_or_else(|| {
-                                PreprocStoreError::Serialization(format!(
-                                    "append data length overflows usize: added={added}, item_size={item_size}"
-                                ))
-                            })?;
-                        if data.len() != expected_len {
-                            return Err(PreprocStoreError::Serialization(format!(
-                                "append data length {} does not match added*item_size {}",
-                                data.len(),
-                                expected_len
-                            )));
-                        }
-
-                        let mut wtxn = env.write_txn()?;
-                        let mut meta = match db.get(&wtxn, &meta_key)? {
-                            Some(raw) => {
-                                let meta: PreprocMeta = bincode::deserialize(raw)?;
-                                if meta.item_size != item_size {
-                                    return Err(PreprocStoreError::ItemSizeMismatch {
-                                        expected: meta.item_size,
-                                        actual: item_size,
-                                    });
-                                }
-                                meta
-                            }
-                            None => PreprocMeta {
-                                count: 0,
-                                consumed: 0,
-                                item_size,
-                            },
-                        };
-                        let mut blob = db
-                            .get(&wtxn, &data_key)?
-                            .map(|raw| raw.to_vec())
-                            .unwrap_or_default();
-                        blob.extend_from_slice(&data);
-                        meta.count = meta.count.checked_add(added).ok_or(
-                            PreprocStoreError::U32Overflow {
-                                field: "preprocessing item count",
-                                value: u64::from(meta.count) + u64::from(added),
-                            },
-                        )?;
-                        let meta_v = bincode::serialize(&meta)?;
-                        db.put(&mut wtxn, &data_key, &blob)?;
-                        db.put(&mut wtxn, &meta_key, &meta_v)?;
-                        wtxn.commit()?;
-                        Ok(meta.count)
-                    })();
-                    let _ = reply.send(r);
-                }
-                DbRequest::Compact {
-                    meta_key,
-                    data_key,
-                    reply,
-                } => {
-                    let r = (|| {
-                        let mut wtxn = env.write_txn()?;
-                        let raw = match db.get(&wtxn, &meta_key)? {
-                            Some(raw) => raw,
-                            None => {
-                                wtxn.commit()?;
-                                return Ok(());
-                            }
-                        };
-                        let mut meta: PreprocMeta = bincode::deserialize(raw)?;
-                        if meta.consumed == 0 {
-                            wtxn.commit()?;
-                            return Ok(());
-                        }
-                        let data = db
-                            .get(&wtxn, &data_key)?
-                            .ok_or(PreprocStoreError::NotFound)?;
-                        let offset = byte_offset(
-                            meta.consumed,
-                            meta.item_size,
-                            "compact preprocessing consumed offset",
-                        )?;
-                        if offset > data.len() {
-                            return Err(PreprocStoreError::Deserialization(format!(
-                                "compact offset {offset} exceeds data len {}",
-                                data.len()
-                            )));
-                        }
-                        let compacted = data[offset..].to_vec();
-                        meta.count = meta.count.saturating_sub(meta.consumed);
-                        meta.consumed = 0;
-                        let meta_v = bincode::serialize(&meta)?;
-                        db.put(&mut wtxn, &data_key, &compacted)?;
-                        db.put(&mut wtxn, &meta_key, &meta_v)?;
-                        wtxn.commit()?;
-                        Ok(())
-                    })();
-                    let _ = reply.send(r);
-                }
-                DbRequest::AtomicIncrement { key, reply } => {
-                    let r = (|| {
-                        let mut wtxn = env.write_txn()?;
-                        let current = match db.get(&wtxn, &key)? {
-                            Some(raw) => {
-                                if raw.len() != 8 {
-                                    return Err(PreprocStoreError::Deserialization(format!(
-                                        "atomic increment value has {} bytes, expected 8",
-                                        raw.len()
-                                    )));
-                                }
-                                u64::from_le_bytes(raw.try_into().map_err(|_| {
-                                    PreprocStoreError::Deserialization(
-                                        "bad atomic increment bytes".into(),
-                                    )
-                                })?)
-                            }
-                            None => 0,
-                        };
-                        let next = current.checked_add(1).ok_or_else(|| {
-                            PreprocStoreError::Serialization(
-                                "atomic increment overflowed u64".to_owned(),
-                            )
-                        })?;
-                        db.put(&mut wtxn, &key, &next.to_le_bytes())?;
-                        wtxn.commit()?;
-                        Ok(next)
-                    })();
-                    let _ = reply.send(r);
-                }
-            }
-        }
-    }
-
-    async fn send(&self, req: DbRequest) -> Result<(), PreprocStoreError> {
+    async fn run<T, F>(&self, operation: F) -> Result<T, PreprocStoreError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&heed::Env, &LmdbDatabase) -> Result<T, PreprocStoreError> + Send + 'static,
+    {
+        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
         self.tx
-            .send(req)
-            .map_err(|_| PreprocStoreError::Lmdb("actor thread gone".into()))
-    }
-
-    async fn get(&self, key: Vec<u8>) -> Result<Option<Vec<u8>>, PreprocStoreError> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.send(DbRequest::Get {
-            key,
-            reply: reply_tx,
-        })
-        .await?;
+            .send(Box::new(move |env, database| {
+                let _ = reply_tx.send(operation(env, database));
+            }))
+            .map_err(|_| PreprocStoreError::Lmdb("actor thread gone".into()))?;
         reply_rx
             .await
             .map_err(|_| PreprocStoreError::Lmdb("actor reply dropped".into()))?
     }
 
-    async fn put_multi(&self, pairs: Vec<(Vec<u8>, Vec<u8>)>) -> Result<(), PreprocStoreError> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.send(DbRequest::PutMulti {
-            pairs,
-            reply: reply_tx,
-        })
-        .await?;
-        reply_rx
-            .await
-            .map_err(|_| PreprocStoreError::Lmdb("actor reply dropped".into()))?
-    }
-
-    async fn delete_keys(&self, keys: Vec<Vec<u8>>) -> Result<(), PreprocStoreError> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.send(DbRequest::Delete {
-            keys,
-            reply: reply_tx,
-        })
-        .await?;
-        reply_rx
-            .await
-            .map_err(|_| PreprocStoreError::Lmdb("actor reply dropped".into()))?
-    }
-
-    async fn reserve_keys(
+    async fn reserve_cursor(
         &self,
-        meta_key: Vec<u8>,
-        expected_consumed: Option<u32>,
-        n: u32,
+        key: &PreprocKey,
+        expected: u32,
+        count: u32,
     ) -> Result<u32, PreprocStoreError> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.send(DbRequest::Reserve {
-            meta_key,
-            expected_consumed,
-            n,
-            reply: reply_tx,
+        let meta_key = key.meta_key()?;
+        self.run(move |env, database| {
+            let mut transaction = env.write_txn()?;
+            let raw = database
+                .get(&transaction, &meta_key)?
+                .ok_or(PreprocStoreError::NotFound)?;
+            let mut meta: PreprocMeta = bincode::deserialize(raw)?;
+            if meta.consumed != expected {
+                return Err(PreprocStoreError::CursorMismatch {
+                    expected,
+                    actual: meta.consumed,
+                });
+            }
+            let consumed =
+                meta.consumed
+                    .checked_add(count)
+                    .ok_or(PreprocStoreError::U32Overflow {
+                        field: "preprocessing consumed count",
+                        value: u64::from(meta.consumed) + u64::from(count),
+                    })?;
+            if consumed > meta.count {
+                return Err(PreprocStoreError::Insufficient {
+                    need: count,
+                    available: meta.available(),
+                });
+            }
+            meta.consumed = consumed;
+            database.put(&mut transaction, &meta_key, &bincode::serialize(&meta)?)?;
+            transaction.commit()?;
+            Ok(consumed)
         })
-        .await?;
-        reply_rx
-            .await
-            .map_err(|_| PreprocStoreError::Lmdb("actor reply dropped".into()))?
-    }
-
-    async fn append_keys(
-        &self,
-        meta_key: Vec<u8>,
-        data_key: Vec<u8>,
-        item_size: u32,
-        added: u32,
-        data: Vec<u8>,
-    ) -> Result<u32, PreprocStoreError> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.send(DbRequest::Append {
-            meta_key,
-            data_key,
-            item_size,
-            added,
-            data,
-            reply: reply_tx,
-        })
-        .await?;
-        reply_rx
-            .await
-            .map_err(|_| PreprocStoreError::Lmdb("actor reply dropped".into()))?
-    }
-
-    async fn compact_keys(
-        &self,
-        meta_key: Vec<u8>,
-        data_key: Vec<u8>,
-    ) -> Result<(), PreprocStoreError> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.send(DbRequest::Compact {
-            meta_key,
-            data_key,
-            reply: reply_tx,
-        })
-        .await?;
-        reply_rx
-            .await
-            .map_err(|_| PreprocStoreError::Lmdb("actor reply dropped".into()))?
-    }
-
-    async fn atomic_increment_key(&self, key: Vec<u8>) -> Result<u64, PreprocStoreError> {
-        let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
-        self.send(DbRequest::AtomicIncrement {
-            key,
-            reply: reply_tx,
-        })
-        .await?;
-        reply_rx
-            .await
-            .map_err(|_| PreprocStoreError::Lmdb("actor reply dropped".into()))?
+        .await
     }
 }
-
 #[async_trait::async_trait]
 impl PreprocStore for LmdbPreprocStore {
     async fn store(&self, key: &PreprocKey, blob: &PreprocBlob) -> Result<(), PreprocStoreError> {
-        let meta_v = bincode::serialize(&blob.meta)?;
-        self.put_multi(vec![
-            (key.meta_key()?, meta_v),
-            (key.encode()?, blob.data.clone()),
-        ])
+        let meta_key = key.meta_key()?;
+        let data_key = key.encode()?;
+        let meta = bincode::serialize(&blob.meta)?;
+        let data = blob.data.clone();
+        self.run(move |env, database| {
+            let mut transaction = env.write_txn()?;
+            database.put(&mut transaction, &meta_key, &meta)?;
+            database.put(&mut transaction, &data_key, &data)?;
+            transaction.commit()?;
+            Ok(())
+        })
         .await
     }
 
     async fn load(&self, key: &PreprocKey) -> Result<Option<PreprocBlob>, PreprocStoreError> {
-        let meta_bytes = match self.get(key.meta_key()?).await? {
-            Some(b) => b,
-            None => return Ok(None),
-        };
-        let meta: PreprocMeta = bincode::deserialize(&meta_bytes)?;
-        let data = self
-            .get(key.encode()?)
-            .await?
-            .ok_or(PreprocStoreError::NotFound)?;
-        Ok(Some(PreprocBlob { meta, data }))
+        let meta_key = key.meta_key()?;
+        let data_key = key.encode()?;
+        self.run(move |env, database| {
+            let transaction = env.read_txn()?;
+            let Some(raw_meta) = database.get(&transaction, &meta_key)? else {
+                return Ok(None);
+            };
+            let meta = bincode::deserialize(raw_meta)?;
+            let data = database
+                .get(&transaction, &data_key)?
+                .ok_or(PreprocStoreError::NotFound)?
+                .to_vec();
+            Ok(Some(PreprocBlob { meta, data }))
+        })
+        .await
     }
 
     async fn meta(&self, key: &PreprocKey) -> Result<Option<PreprocMeta>, PreprocStoreError> {
-        self.get(key.meta_key()?)
-            .await?
-            .map(|raw| bincode::deserialize(&raw).map_err(PreprocStoreError::from))
-            .transpose()
+        let key = key.meta_key()?;
+        self.run(move |env, database| {
+            let transaction = env.read_txn()?;
+            database
+                .get(&transaction, &key)?
+                .map(bincode::deserialize)
+                .transpose()
+                .map_err(PreprocStoreError::from)
+        })
+        .await
     }
 
     async fn append_items(
@@ -885,28 +853,179 @@ impl PreprocStore for LmdbPreprocStore {
         added: u32,
         data: &[u8],
     ) -> Result<u32, PreprocStoreError> {
-        self.append_keys(
-            key.meta_key()?,
-            key.encode()?,
-            item_size,
-            added,
-            data.to_vec(),
-        )
+        let item_size_usize = u32_to_usize(item_size, "append preprocessing item size")?;
+        let expected_len = u32_to_usize(added, "append preprocessing count")?
+            .checked_mul(item_size_usize)
+            .ok_or_else(|| {
+                PreprocStoreError::Serialization(format!(
+                    "append data length overflows usize: added={added}, item_size={item_size}"
+                ))
+            })?;
+        if data.len() != expected_len || (item_size == 0 && added != 0) {
+            return Err(PreprocStoreError::PartialItem {
+                data_len: data.len(),
+                item_size,
+            });
+        }
+
+        let meta_key = key.meta_key()?;
+        let data_key = key.encode()?;
+        let data = data.to_vec();
+        self.run(move |env, database| {
+            let mut transaction = env.write_txn()?;
+            let mut meta = match database.get(&transaction, &meta_key)? {
+                Some(raw) => {
+                    let meta: PreprocMeta = bincode::deserialize(raw)?;
+                    if meta.item_size != item_size {
+                        return Err(PreprocStoreError::ItemSizeMismatch {
+                            expected: meta.item_size,
+                            actual: item_size,
+                        });
+                    }
+                    meta
+                }
+                None => PreprocMeta {
+                    count: 0,
+                    consumed: 0,
+                    item_size,
+                },
+            };
+            let mut stored = database
+                .get(&transaction, &data_key)?
+                .map_or_else(Vec::new, ToOwned::to_owned);
+            stored.extend_from_slice(&data);
+            meta.count = meta
+                .count
+                .checked_add(added)
+                .ok_or(PreprocStoreError::U32Overflow {
+                    field: "preprocessing item count",
+                    value: u64::from(meta.count) + u64::from(added),
+                })?;
+            database.put(&mut transaction, &data_key, &stored)?;
+            database.put(&mut transaction, &meta_key, &bincode::serialize(&meta)?)?;
+            transaction.commit()?;
+            Ok(meta.count)
+        })
         .await
     }
 
-    async fn reserve(&self, key: &PreprocKey, n: u32) -> Result<u32, PreprocStoreError> {
-        self.reserve_keys(key.meta_key()?, None, n).await
+    async fn take_bundle_from_reservoir(
+        &self,
+        source: &PreprocKeyScope,
+        requested: PoolAvailability,
+    ) -> Result<OwnedPreprocBundle, PreprocStoreError> {
+        let materials = reservoir_material_keys(source)?;
+
+        self.run(move |env, database| {
+            let mut transaction = env.write_txn()?;
+            let mut bundle = OwnedPreprocBundle::default();
+            for material in materials {
+                let count = requested.get(material.kind);
+                let Some(raw_meta) = database.get(&transaction, &material.meta_key)? else {
+                    if database.get(&transaction, &material.data_key)?.is_some() {
+                        return Err(PreprocStoreError::Deserialization(format!(
+                            "preprocessing reservoir {:?} has data without metadata",
+                            material.kind
+                        )));
+                    }
+                    if count > 0 {
+                        return Err(PreprocStoreError::NotFound);
+                    }
+                    continue;
+                };
+                let meta: PreprocMeta = bincode::deserialize(raw_meta)?;
+                if meta.consumed > meta.count || (meta.count > 0 && meta.item_size == 0) {
+                    return Err(PreprocStoreError::Deserialization(format!(
+                        "invalid preprocessing reservoir metadata for {:?}",
+                        material.kind
+                    )));
+                }
+                if count > meta.available() {
+                    return Err(PreprocStoreError::Insufficient {
+                        need: count,
+                        available: meta.available(),
+                    });
+                }
+                let source_data = database
+                    .get(&transaction, &material.data_key)?
+                    .ok_or(PreprocStoreError::NotFound)?
+                    .to_vec();
+                let expected_len = byte_offset(
+                    meta.count,
+                    meta.item_size,
+                    "preprocessing reservoir source size",
+                )?;
+                if source_data.len() != expected_len {
+                    return Err(PreprocStoreError::Deserialization(format!(
+                        "preprocessing reservoir {:?} contains {} bytes, expected {expected_len}",
+                        material.kind,
+                        source_data.len()
+                    )));
+                }
+
+                let start = byte_offset(
+                    meta.consumed,
+                    meta.item_size,
+                    "preprocessing reservoir bundle start",
+                )?;
+                let end_index =
+                    meta.consumed
+                        .checked_add(count)
+                        .ok_or(PreprocStoreError::U32Overflow {
+                            field: "preprocessing reservoir bundle end",
+                            value: u64::from(meta.consumed) + u64::from(count),
+                        })?;
+                let end = byte_offset(
+                    end_index,
+                    meta.item_size,
+                    "preprocessing reservoir bundle end",
+                )?;
+                let remaining = meta.count - end_index;
+                bundle.remaining.set(material.kind, remaining);
+
+                if count > 0 {
+                    bundle.set(
+                        material.kind,
+                        TakenPreproc {
+                            count,
+                            item_size: meta.item_size,
+                            data: source_data[start..end].to_vec(),
+                        },
+                    );
+                }
+
+                if remaining == 0 {
+                    database.delete(&mut transaction, &material.meta_key)?;
+                    database.delete(&mut transaction, &material.data_key)?;
+                } else if meta.consumed == 0 && count == 0 {
+                    // The bytes are already compact and this kind was not
+                    // requested; validating it is sufficient.
+                } else {
+                    database.put(
+                        &mut transaction,
+                        &material.meta_key,
+                        &bincode::serialize(&PreprocMeta {
+                            count: remaining,
+                            consumed: 0,
+                            item_size: meta.item_size,
+                        })?,
+                    )?;
+                    database.put(&mut transaction, &material.data_key, &source_data[end..])?;
+                }
+            }
+            transaction.commit()?;
+            Ok(bundle)
+        })
+        .await
     }
 
     async fn reserve_at(
         &self,
         key: &PreprocKey,
         expected_consumed: u32,
-        n: u32,
+        count: u32,
     ) -> Result<u32, PreprocStoreError> {
-        self.reserve_keys(key.meta_key()?, Some(expected_consumed), n)
-            .await
+        self.reserve_cursor(key, expected_consumed, count).await
     }
 
     async fn available(&self, key: &PreprocKey) -> Result<u32, PreprocStoreError> {
@@ -917,64 +1036,110 @@ impl PreprocStore for LmdbPreprocStore {
         &self,
         scope: &PreprocKeyScope,
     ) -> Result<PoolAvailability, PreprocStoreError> {
-        let beaver_key = scope.beaver_triple();
-        let random_key = scope.random_share();
-        let prand_bit_key = scope.prand_bit();
-        let prand_int_key = scope.prand_int();
-        let (beaver, random, prand_bit, prand_int) = tokio::try_join!(
-            self.available(&beaver_key),
-            self.available(&random_key),
-            self.available(&prand_bit_key),
-            self.available(&prand_int_key),
-        )?;
-        Ok(PoolAvailability {
-            beaver,
-            random,
-            prand_bit,
-            prand_int,
+        let keys = MATERIAL_KINDS
+            .into_iter()
+            .map(|kind| Ok((kind, scope.key(kind).meta_key()?)))
+            .collect::<Result<Vec<_>, PreprocStoreError>>()?;
+        self.run(move |env, database| {
+            let transaction = env.read_txn()?;
+            let mut availability = PoolAvailability::default();
+            for (kind, key) in keys {
+                let count = database
+                    .get(&transaction, &key)?
+                    .map(bincode::deserialize::<PreprocMeta>)
+                    .transpose()?
+                    .map_or(0, |meta| meta.available());
+                availability.set(kind, count);
+            }
+            Ok(availability)
         })
-    }
-
-    async fn exists(&self, key: &PreprocKey) -> Result<bool, PreprocStoreError> {
-        Ok(self.get(key.meta_key()?).await?.is_some())
+        .await
     }
 
     async fn delete(&self, key: &PreprocKey) -> Result<(), PreprocStoreError> {
-        self.delete_keys(vec![key.meta_key()?, key.encode()?]).await
+        let meta_key = key.meta_key()?;
+        let data_key = key.encode()?;
+        self.run(move |env, database| {
+            let mut transaction = env.write_txn()?;
+            database.delete(&mut transaction, &meta_key)?;
+            database.delete(&mut transaction, &data_key)?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
     }
 
-    async fn compact(&self, key: &PreprocKey) -> Result<(), PreprocStoreError> {
-        self.compact_keys(key.meta_key()?, key.encode()?).await
-    }
-
-    async fn atomic_increment(&self, ns: &[u8], key: &[u8]) -> Result<u64, PreprocStoreError> {
-        let mut full_key = ns.to_vec();
-        full_key.extend_from_slice(key);
-        self.atomic_increment_key(full_key).await
+    async fn atomic_increment(
+        &self,
+        namespace: &[u8],
+        key: &[u8],
+    ) -> Result<u64, PreprocStoreError> {
+        let key = [namespace, key].concat();
+        self.run(move |env, database| {
+            let mut transaction = env.write_txn()?;
+            let current = match database.get(&transaction, &key)? {
+                Some(raw) if raw.len() == 8 => {
+                    u64::from_le_bytes(raw.try_into().expect("length checked"))
+                }
+                Some(raw) => {
+                    return Err(PreprocStoreError::Deserialization(format!(
+                        "atomic increment value has {} bytes, expected 8",
+                        raw.len()
+                    )));
+                }
+                None => 0,
+            };
+            let next = current.checked_add(1).ok_or_else(|| {
+                PreprocStoreError::Serialization("atomic increment overflowed u64".to_owned())
+            })?;
+            database.put(&mut transaction, &key, &next.to_le_bytes())?;
+            transaction.commit()?;
+            Ok(next)
+        })
+        .await
     }
 
     async fn store_blob(
         &self,
-        ns: &[u8],
+        namespace: &[u8],
         key: &[u8],
         data: &[u8],
     ) -> Result<(), PreprocStoreError> {
-        let mut k = ns.to_vec();
-        k.extend_from_slice(key);
-        self.put_multi(vec![(k, data.to_vec())]).await
+        let key = [namespace, key].concat();
+        let data = data.to_vec();
+        self.run(move |env, database| {
+            let mut transaction = env.write_txn()?;
+            database.put(&mut transaction, &key, &data)?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
     }
 
-    async fn load_blob(&self, ns: &[u8], key: &[u8]) -> Result<Option<Vec<u8>>, PreprocStoreError> {
-        let mut k = ns.to_vec();
-        k.extend_from_slice(key);
-        self.get(k).await
+    async fn load_blob(
+        &self,
+        namespace: &[u8],
+        key: &[u8],
+    ) -> Result<Option<Vec<u8>>, PreprocStoreError> {
+        let key = [namespace, key].concat();
+        self.run(move |env, database| {
+            let transaction = env.read_txn()?;
+            Ok(database.get(&transaction, &key)?.map(ToOwned::to_owned))
+        })
+        .await
+    }
+
+    async fn delete_blob(&self, namespace: &[u8], key: &[u8]) -> Result<(), PreprocStoreError> {
+        let key = [namespace, key].concat();
+        self.run(move |env, database| {
+            let mut transaction = env.write_txn()?;
+            database.delete(&mut transaction, &key)?;
+            transaction.commit()?;
+            Ok(())
+        })
+        .await
     }
 }
-
-// ---------------------------------------------------------------------------
-// Serialization helpers (HoneyBadger)
-// ---------------------------------------------------------------------------
-
 fn write_robust_share<F: FftField>(
     share: &RobustShare<F>,
     buf: &mut Vec<u8>,
@@ -1494,35 +1659,6 @@ mod tests {
         assert_eq!(loaded.meta.available(), 10);
         assert_eq!(loaded.data, blob.data);
     }
-
-    #[tokio::test]
-    async fn lmdb_reserve_metadata_only() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = LmdbPreprocStore::open(dir.path()).unwrap();
-
-        let key = PreprocKey::new(
-            [0x02; 32],
-            MpcFieldKind::Bls12_381Fr,
-            3,
-            1,
-            legacy_identity(0),
-            MaterialKind::BeaverTriple,
-        );
-        let blob = PreprocBlob::new(vec![0; 480], 48, 10);
-
-        store.store(&key, &blob).await.unwrap();
-
-        let consumed = store.reserve(&key, 4).await.unwrap();
-        assert_eq!(consumed, 4);
-        assert_eq!(store.available(&key).await.unwrap(), 6);
-
-        let consumed = store.reserve(&key, 6).await.unwrap();
-        assert_eq!(consumed, 10);
-        assert_eq!(store.available(&key).await.unwrap(), 0);
-
-        assert!(store.reserve(&key, 1).await.is_err());
-    }
-
     #[tokio::test]
     async fn lmdb_reserve_at_rejects_stale_cursor() {
         let dir = tempfile::tempdir().unwrap();
@@ -1632,31 +1768,185 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn lmdb_compact_preserves_alignment() {
+    async fn reservoir_bundle_takes_multiple_kinds_and_physically_compacts_sources() {
         let dir = tempfile::tempdir().unwrap();
         let store = LmdbPreprocStore::open(dir.path()).unwrap();
-        let key = PreprocKey::new(
-            [0x07; 32],
-            MpcFieldKind::Bn254Fr,
-            4,
-            1,
-            legacy_identity(0),
-            MaterialKind::RandomShare,
-        );
-        let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(9);
-        let shares: Vec<_> = (0..5).map(|_| random_share(&mut rng)).collect();
-        let (data, item_size) = serialize_robust_shares::<Fr>(&shares).unwrap();
-        store.append_items(&key, item_size, 5, &data).await.unwrap();
-        store.reserve_at(&key, 0, 2).await.unwrap();
-        store.compact(&key).await.unwrap();
+        let identity = legacy_identity(3);
+        let source = PreprocKeyScope::new([0x31; 32], MpcFieldKind::Bn254Fr, 5, 1, identity);
 
-        let blob = store.load(&key).await.unwrap().unwrap();
-        assert_eq!(blob.meta.count, 3);
-        assert_eq!(blob.meta.consumed, 0);
-        let decoded = deserialize_robust_shares::<Fr>(&blob.data, blob.meta.item_size, 0).unwrap();
-        assert_eq!(decoded[0].share[0], shares[2].share[0]);
+        store
+            .store(
+                &source.random_share(),
+                &PreprocBlob::new(vec![10, 11, 20, 21, 30, 31], 2, 3),
+            )
+            .await
+            .unwrap();
+        store
+            .store(
+                &source.beaver_triple(),
+                &PreprocBlob::new(vec![40, 41, 42, 43], 1, 4),
+            )
+            .await
+            .unwrap();
+        // A legacy consumed prefix is physically discarded by the move too.
+        store
+            .reserve_at(&source.random_share(), 0, 1)
+            .await
+            .unwrap();
+
+        let bundle = store
+            .take_bundle_from_reservoir(
+                &source,
+                PoolAvailability {
+                    beaver: 4,
+                    random: 1,
+                    prand_bit: 0,
+                    prand_int: 0,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(bundle.random.unwrap().data, vec![20, 21]);
+        assert_eq!(bundle.beaver.unwrap().data, vec![40, 41, 42, 43]);
+        assert!(bundle.prand_bit.is_none());
+        assert!(bundle.prand_int.is_none());
+        assert_eq!(bundle.remaining.random, 1);
+        assert_eq!(bundle.remaining.beaver, 0);
+
+        let source_random = store.load(&source.random_share()).await.unwrap().unwrap();
+        assert_eq!(source_random.meta.count, 1);
+        assert_eq!(source_random.meta.consumed, 0);
+        assert_eq!(source_random.data, vec![30, 31]);
+        assert!(store.load(&source.beaver_triple()).await.unwrap().is_none());
+        assert_eq!(
+            store.scope_availability(&source).await.unwrap(),
+            bundle.remaining
+        );
     }
 
+    #[tokio::test]
+    async fn reservoir_bundle_is_all_or_nothing_when_any_kind_is_insufficient() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LmdbPreprocStore::open(dir.path()).unwrap();
+        let identity = legacy_identity(4);
+        let source = PreprocKeyScope::new([0x32; 32], MpcFieldKind::Bn254Fr, 5, 1, identity);
+        store
+            .store(
+                &source.random_share(),
+                &PreprocBlob::new(vec![1, 2, 3], 1, 3),
+            )
+            .await
+            .unwrap();
+        store
+            .store(&source.beaver_triple(), &PreprocBlob::new(vec![9], 1, 1))
+            .await
+            .unwrap();
+
+        let error = store
+            .take_bundle_from_reservoir(
+                &source,
+                PoolAvailability {
+                    beaver: 2,
+                    random: 2,
+                    prand_bit: 0,
+                    prand_int: 0,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PreprocStoreError::Insufficient {
+                need: 2,
+                available: 1
+            }
+        ));
+        assert_eq!(
+            store
+                .load(&source.random_share())
+                .await
+                .unwrap()
+                .unwrap()
+                .data,
+            vec![1, 2, 3]
+        );
+        assert_eq!(
+            store
+                .load(&source.beaver_triple())
+                .await
+                .unwrap()
+                .unwrap()
+                .data,
+            vec![9]
+        );
+    }
+
+    #[tokio::test]
+    async fn reservoir_bundle_zero_counts_return_none_and_compact_unrequested_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LmdbPreprocStore::open(dir.path()).unwrap();
+        let identity = legacy_identity(5);
+        let source = PreprocKeyScope::new([0x33; 32], MpcFieldKind::Bn254Fr, 5, 1, identity);
+        store
+            .store(
+                &source.random_share(),
+                &PreprocBlob::new(vec![1, 2, 3], 1, 3),
+            )
+            .await
+            .unwrap();
+        store
+            .reserve_at(&source.random_share(), 0, 1)
+            .await
+            .unwrap();
+
+        let bundle = store
+            .take_bundle_from_reservoir(&source, PoolAvailability::default())
+            .await
+            .unwrap();
+        assert!(bundle.random.is_none());
+        assert!(bundle.beaver.is_none());
+        assert!(bundle.prand_bit.is_none());
+        assert!(bundle.prand_int.is_none());
+        assert_eq!(bundle.remaining.random, 2);
+
+        let remaining = store.load(&source.random_share()).await.unwrap().unwrap();
+        assert_eq!(remaining.meta.count, 2);
+        assert_eq!(remaining.meta.consumed, 0);
+        assert_eq!(remaining.data, vec![2, 3]);
+    }
+
+    #[tokio::test]
+    async fn reservoir_bundle_rejects_corrupt_sources_before_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LmdbPreprocStore::open(dir.path()).unwrap();
+        let identity = legacy_identity(6);
+        let source = PreprocKeyScope::new([0x34; 32], MpcFieldKind::Bn254Fr, 5, 1, identity);
+        store
+            .store(&source.random_share(), &PreprocBlob::new(vec![1, 2], 1, 2))
+            .await
+            .unwrap();
+
+        // store() intentionally permits raw blobs; bundle taking is the security
+        // boundary that validates exact physical sizing before moving anything.
+        store
+            .store(&source.beaver_triple(), &PreprocBlob::new(vec![9], 2, 1))
+            .await
+            .unwrap();
+        let corrupt = store
+            .take_bundle_from_reservoir(
+                &source,
+                PoolAvailability {
+                    beaver: 1,
+                    random: 1,
+                    prand_bit: 0,
+                    prand_int: 0,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(corrupt, PreprocStoreError::Deserialization(_)));
+        assert_eq!(store.available(&source.random_share()).await.unwrap(), 2);
+    }
     #[tokio::test]
     async fn lmdb_atomic_increment_is_unique() {
         let dir = tempfile::tempdir().unwrap();

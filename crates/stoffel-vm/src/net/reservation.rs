@@ -122,25 +122,27 @@ pub struct ReservationRegistry {
 }
 
 const RESERVATION_NS: &[u8] = b"rsv:";
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct ReservationPersistenceKey {
     program_hash: [u8; 32],
     node_identity: DurableIdentityDigest,
+    run_id: u64,
 }
 
 impl ReservationPersistenceKey {
-    fn new(program_hash: [u8; 32], node_identity: DurableIdentityDigest) -> Self {
+    fn new(program_hash: [u8; 32], node_identity: DurableIdentityDigest, run_id: u64) -> Self {
         Self {
             program_hash,
             node_identity,
+            run_id,
         }
     }
 
     fn encode(self) -> Vec<u8> {
-        let mut key = Vec::with_capacity(64);
+        let mut key = Vec::with_capacity(72);
         key.extend_from_slice(&self.program_hash);
         key.extend_from_slice(&self.node_identity.as_bytes());
+        key.extend_from_slice(&self.run_id.to_le_bytes());
         key
     }
 }
@@ -293,6 +295,18 @@ impl ReservationRegistry {
                 .all(|status| matches!(status, SlotStatus::Consumed(_)))
     }
 
+    /// True only after the entire declared run capacity was allocated and
+    /// consumed. A partially allocated crash must remain recoverable even when
+    /// every slot allocated so far happened to be consumed.
+    pub async fn is_fully_consumed(&self) -> bool {
+        let s = self.state.read().await;
+        s.next_index == s.capacity
+            && usize::try_from(s.capacity).ok() == Some(s.slots.len())
+            && s.slots
+                .values()
+                .all(|status| matches!(status, SlotStatus::Consumed(_)))
+    }
+
     pub async fn get_masked_input(&self, index: u64) -> Option<Vec<u8>> {
         let s = self.state.read().await;
         s.masked_inputs.get(&index).cloned()
@@ -309,7 +323,9 @@ impl ReservationRegistry {
     pub async fn persist(&self, store: &dyn PreprocStore) -> Result<(), ReservationError> {
         let state = self.snapshot().await;
         state.validate()?;
-        let key = ReservationPersistenceKey::new(state.program_hash, state.node_identity).encode();
+        let key =
+            ReservationPersistenceKey::new(state.program_hash, state.node_identity, state.run_id)
+                .encode();
         let data = bincode::serialize(&state)
             .map_err(|e| PreprocStoreError::Serialization(e.to_string()))?;
         store.store_blob(RESERVATION_NS, &key, &data).await?;
@@ -321,12 +337,29 @@ impl ReservationRegistry {
         program_hash: &[u8; 32],
         node_identity: DurableIdentityDigest,
     ) -> Result<Option<Self>, ReservationError> {
-        let key = ReservationPersistenceKey::new(*program_hash, node_identity).encode();
+        Self::load_for_run(store, program_hash, node_identity, 0).await
+    }
+
+    pub async fn load_for_run(
+        store: &dyn PreprocStore,
+        program_hash: &[u8; 32],
+        node_identity: DurableIdentityDigest,
+        run_id: u64,
+    ) -> Result<Option<Self>, ReservationError> {
+        let key = ReservationPersistenceKey::new(*program_hash, node_identity, run_id).encode();
         let data = store.load_blob(RESERVATION_NS, &key).await?;
         match data {
             Some(bytes) => {
                 let state: RegistryState = bincode::deserialize(&bytes)
-                    .map_err(|e| PreprocStoreError::Deserialization(e.to_string()))?;
+                    .map_err(|error| PreprocStoreError::Deserialization(error.to_string()))?;
+                if state.program_hash != *program_hash
+                    || state.node_identity != node_identity
+                    || state.run_id != run_id
+                {
+                    return Err(ReservationError::InvalidState(format!(
+                        "persisted reservation identity does not match requested program, node, and run {run_id}"
+                    )));
+                }
                 Ok(Some(Self::try_from_state(state)?))
             }
             None => Ok(None),
@@ -394,6 +427,10 @@ mod tests {
             "consumed masked input payload should be evicted"
         );
         assert!(reg.all_reserved_slots_consumed().await);
+        assert!(
+            !reg.is_fully_consumed().await,
+            "consuming a partial allocation must remain crash-recoverable"
+        );
 
         let err = reg.consume(&indices).await.unwrap_err();
         assert!(matches!(err, ReservationError::AlreadyConsumed(_)));
@@ -432,6 +469,60 @@ mod tests {
             .unwrap();
         assert_eq!(restored.available().await, 16);
         assert_eq!(restored.get_masked_input(0).await, Some(vec![0xFF]));
+    }
+
+    #[tokio::test]
+    async fn persistence_isolated_by_run_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = LmdbPreprocStore::open(dir.path()).unwrap();
+        let program_hash = [0x43; 32];
+        let node_identity = identity(2);
+
+        let first = ReservationRegistry::new_for_run(
+            program_hash,
+            node_identity,
+            20,
+            11,
+            PoolAvailability::default(),
+        );
+        first.reserve(client(5), 2).await.unwrap();
+        first
+            .submit_masked_input(client(5), 0, vec![0x11])
+            .await
+            .unwrap();
+        first.persist(&store).await.unwrap();
+
+        let second = ReservationRegistry::new_for_run(
+            program_hash,
+            node_identity,
+            20,
+            12,
+            PoolAvailability::default(),
+        );
+        second.reserve(client(6), 5).await.unwrap();
+        second
+            .submit_masked_input(client(6), 0, vec![0x12])
+            .await
+            .unwrap();
+        second.persist(&store).await.unwrap();
+
+        let restored_first =
+            ReservationRegistry::load_for_run(&store, &program_hash, node_identity, 11)
+                .await
+                .unwrap()
+                .unwrap();
+        let restored_second =
+            ReservationRegistry::load_for_run(&store, &program_hash, node_identity, 12)
+                .await
+                .unwrap()
+                .unwrap();
+
+        assert_eq!(restored_first.run_id().await, 11);
+        assert_eq!(restored_first.available().await, 18);
+        assert_eq!(restored_first.get_masked_input(0).await, Some(vec![0x11]));
+        assert_eq!(restored_second.run_id().await, 12);
+        assert_eq!(restored_second.available().await, 15);
+        assert_eq!(restored_second.get_masked_input(0).await, Some(vec![0x12]));
     }
 
     #[tokio::test]
@@ -476,7 +567,7 @@ mod tests {
             slots: BTreeMap::new(),
             masked_inputs: BTreeMap::new(),
         };
-        let key = ReservationPersistenceKey::new(program_hash, identity(0)).encode();
+        let key = ReservationPersistenceKey::new(program_hash, identity(0), 0).encode();
         let data = bincode::serialize(&state).unwrap();
         store.store_blob(RESERVATION_NS, &key, &data).await.unwrap();
 

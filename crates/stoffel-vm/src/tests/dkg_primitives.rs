@@ -88,6 +88,11 @@ async fn test_open_share_in_exp_known_value() {
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
+                let Some(raw_msg) =
+                    crate::tests::test_utils::decode_one_shot_party_message(instance_id, &raw_msg)
+                else {
+                    continue;
+                };
                 match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {
@@ -281,6 +286,11 @@ async fn test_simulated_dkg_flow() {
         let mut rx = recv.remove(0);
         tokio::spawn(async move {
             while let Some((sender_id, raw_msg)) = rx.recv().await {
+                let Some(raw_msg) =
+                    crate::tests::test_utils::decode_one_shot_party_message(instance_id, &raw_msg)
+                else {
+                    continue;
+                };
                 match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
                     Ok(true) => continue,
                     Err(e) => {

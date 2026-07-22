@@ -16,6 +16,7 @@
 // to work correctly with the AVSS protocol.
 
 use crate::net::engine_config::{DeploymentMode, MpcSessionConfig};
+use crate::net::execution_transport::ExecutionScopedNetwork;
 use crate::net::mpc_engine::{DurableIdentityDigest, MpcPartyId, MpcSessionTopology};
 use ark_ec::CurveGroup;
 use ark_ff::{FftField, PrimeField};
@@ -49,6 +50,13 @@ mod shares;
 mod tests;
 pub use config::AvssEngineConfig;
 pub use operations::AvssOperations;
+pub use preprocessing::{
+    agree_standing_preproc_plan, StandingPreprocAction, StandingPreprocPlan,
+    StandingPreprocSnapshot,
+};
+/// Network type used by the AVSS protocol internals. It is execution-scoped
+/// for both one-shot and standing executions.
+pub type AvssExecutionNetwork = ExecutionScopedNetwork<QuicNetworkManager>;
 pub type Bls12381AvssField = ark_bls12_381::Fr;
 pub type Bls12381AvssGroup = ark_bls12_381::G1Projective;
 pub type Bls12381AvssShare = FeldmanShamirShare<Bls12381AvssField, Bls12381AvssGroup>;
@@ -126,7 +134,10 @@ where
     topology: MpcSessionTopology,
     current_instance_id: AtomicU64,
     local_identity: DurableIdentityDigest,
+    /// Physical manager retained for connection admission and status. AVSS
+    /// protocol traffic uses `protocol_net`.
     net: Arc<QuicNetworkManager>,
+    protocol_net: Arc<AvssExecutionNetwork>,
     input_ids: Vec<ClientId>,
     /// Full AVSS MPC node (share gen, multiplication, preprocessing, message routing)
     avss_node: Arc<Mutex<AvssMpcNode<F, Avid<AvssSessionId>, G>>>,
@@ -150,15 +161,24 @@ where
     preproc_store: tokio::sync::RwLock<Option<Arc<dyn crate::storage::preproc::PreprocStore>>>,
     /// Program hash and field kind for keying stored material.
     preproc_config: tokio::sync::RwLock<Option<([u8; 32], crate::net::curve::MpcFieldKind)>>,
-    /// Maps VM/client protocol indices to transport-derived client IDs.
-    client_output_id_map: RwLock<Vec<ClientId>>,
+    /// Background reservoir engines persist into the stable program lane while
+    /// keeping protocol traffic isolated by their full execution envelope.
+    use_program_preproc_reservoir: AtomicBool,
+    /// Party-agreed gate for correlated standing AVSS top-up/rebuild.
+    standing_preproc_plan: Mutex<Option<preprocessing::StandingPreprocPlan>>,
+    /// Maps VM-visible manifest slots to transport-derived client IDs.
+    /// One-shot sessions install the equivalent ordinal map (0, 1, ...).
+    client_output_id_map: RwLock<BTreeMap<ClientId, ClientId>>,
+    /// Manifest-driven maps reject unknown slots; direct one-shot sessions use
+    /// transport IDs.
+    strict_client_output_id_map: AtomicBool,
     /// Optional in-process capture used by coordinator-backed output delivery.
     client_output_capture: Mutex<Option<Vec<AvssClientOutputRecord<F, G>>>>,
     /// Router that owns open-message accumulation for this AVSS runtime.
     open_message_router: Arc<crate::net::open_registry::OpenMessageRouter>,
     /// Per-instance open share accumulation registry.
     open_registry: StdRwLock<Arc<crate::net::open_registry::InstanceRegistry>>,
-    /// Deployment lifetime semantics. OneShot preserves legacy load/delete/RAM behavior.
+    /// Deployment lifetime semantics for one-shot and standing execution.
     deployment_mode: DeploymentMode,
 }
 
@@ -275,7 +295,7 @@ where
         <AvssMpcNode<F, Avid<AvssSessionId>, G> as MPCProtocol<
             F,
             FeldmanShamirShare<F, G>,
-            QuicNetworkManager,
+            AvssExecutionNetwork,
         >>::setup(self.topology.party_id(), opts, self.input_ids.clone())
         .map_err(|e| format!("Failed to recreate AvssMpcNode: {:?}", e))
     }
@@ -314,7 +334,10 @@ where
 
         self.current_instance_id
             .store(new_instance_id, Ordering::SeqCst);
+        *self.standing_preproc_plan.lock().await = None;
         self.client_output_id_map.write().await.clear();
+        self.strict_client_output_id_map
+            .store(false, Ordering::SeqCst);
         {
             let mut capture = self.client_output_capture.lock().await;
             if capture.is_some() {
@@ -332,15 +355,20 @@ where
             secret_key,
             public_keys,
             deployment_mode,
+            protocol_network,
             n_random_shares,
             n_triples,
         } = config;
+        let execution_id = session.execution_id();
         let (topology, local_identity, network, input_ids, open_message_router) =
             session.into_parts();
         let instance_id = topology.instance_id();
         let party_id = topology.party_id();
         let n_parties = topology.n_parties();
         let threshold = topology.threshold();
+        crate::net::MpcBackendKind::Avss
+            .validate_party_count(n_parties)
+            .map_err(|error| error.to_string())?;
 
         // Create the AvssMpcNode via MPCProtocol::setup
         let instance_id_u32 = protocol_instance_id_u32(instance_id);
@@ -358,15 +386,22 @@ where
         let avss_node = <AvssMpcNode<F, Avid<AvssSessionId>, G> as MPCProtocol<
             F,
             FeldmanShamirShare<F, G>,
-            QuicNetworkManager,
+            AvssExecutionNetwork,
         >>::setup(party_id, opts, input_ids.clone())
         .map_err(|e| format!("Failed to create AvssMpcNode: {:?}", e))?;
+
+        let protocol_net = match protocol_network {
+            Some(network) => network,
+            None => ExecutionScopedNetwork::for_party(network.as_ref().clone(), execution_id)
+                .map_err(|error| format!("invalid AVSS execution transport: {error}"))?,
+        };
 
         Ok(Arc::new(Self {
             topology,
             current_instance_id: AtomicU64::new(instance_id),
             local_identity,
             net: network,
+            protocol_net: Arc::new(protocol_net),
             input_ids: input_ids.clone(),
             avss_node: Arc::new(Mutex::new(avss_node)),
             in_flight: Arc::new(AtomicUsize::new(0)),
@@ -379,7 +414,10 @@ where
             _marker: PhantomData,
             preproc_store: tokio::sync::RwLock::new(None),
             preproc_config: tokio::sync::RwLock::new(None),
-            client_output_id_map: RwLock::new(Vec::new()),
+            use_program_preproc_reservoir: AtomicBool::new(false),
+            standing_preproc_plan: Mutex::new(None),
+            client_output_id_map: RwLock::new(BTreeMap::new()),
+            strict_client_output_id_map: AtomicBool::new(false),
             client_output_capture: Mutex::new(None),
             open_message_router: open_message_router.clone(),
             open_registry: StdRwLock::new(open_message_router.register_instance(instance_id)),
@@ -388,16 +426,38 @@ where
     }
 
     pub async fn set_client_output_id_map(&self, client_ids: Vec<ClientId>) {
-        *self.client_output_id_map.write().await = client_ids;
+        *self.client_output_id_map.write().await = client_ids.into_iter().enumerate().collect();
+        self.strict_client_output_id_map
+            .store(false, Ordering::SeqCst);
     }
 
-    pub(crate) async fn client_output_transport_id(&self, client_id: ClientId) -> ClientId {
-        self.client_output_id_map
+    /// Install an explicit VM manifest-slot to authenticated transport mapping.
+    /// Standing admissions use this when roster slots are sparse or permuted.
+    pub async fn set_client_output_slot_map(&self, client_ids: BTreeMap<ClientId, ClientId>) {
+        *self.client_output_id_map.write().await = client_ids;
+        self.strict_client_output_id_map
+            .store(true, Ordering::SeqCst);
+    }
+
+    pub(crate) async fn client_output_transport_id(
+        &self,
+        client_id: ClientId,
+    ) -> Result<ClientId, String> {
+        if let Some(transport_id) = self
+            .client_output_id_map
             .read()
             .await
-            .get(client_id)
+            .get(&client_id)
             .copied()
-            .unwrap_or(client_id)
+        {
+            return Ok(transport_id);
+        }
+        if self.strict_client_output_id_map.load(Ordering::SeqCst) {
+            return Err(format!(
+                "VM output references client slot {client_id}, which is not present in the standing admission"
+            ));
+        }
+        Ok(client_id)
     }
 
     pub async fn enable_client_output_capture(&self) {
@@ -475,6 +535,13 @@ where
         self.deployment_mode == DeploymentMode::Standing
     }
 
+    /// Route persistent preprocessing storage to this program's stable
+    /// reservoir lane. Configure this before snapshot agreement/preprocessing.
+    pub fn use_program_preproc_reservoir(&self) {
+        self.use_program_preproc_reservoir
+            .store(true, Ordering::SeqCst);
+    }
+
     /// Returns a handle to the inner MPC node for direct access (e.g., InputServer init).
     pub fn node_handle(&self) -> &Arc<Mutex<AvssMpcNode<F, Avid<AvssSessionId>, G>>> {
         &self.avss_node
@@ -498,6 +565,16 @@ where
     /// Get network manager
     pub fn net(&self) -> Arc<QuicNetworkManager> {
         self.net.clone()
+    }
+
+    /// Execution-scoped network used for every AVSS protocol response.
+    pub fn protocol_net(&self) -> Arc<AvssExecutionNetwork> {
+        self.protocol_net.clone()
+    }
+
+    /// Full standing-execution identity carried by the protocol transport.
+    pub fn execution_id(&self) -> crate::net::session::ExecutionId {
+        self.protocol_net.execution_id()
     }
 }
 

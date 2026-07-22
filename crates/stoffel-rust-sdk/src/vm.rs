@@ -593,6 +593,24 @@ fn workspace_root() -> Option<PathBuf> {
 
 fn parse_runner_return_value(value: &str) -> Result<Value> {
     let value = value.trim();
+    if let Some(rest) = value.strip_prefix("byte[") {
+        let (declared_len, encoded) = rest.split_once("] 0x").ok_or_else(|| {
+            Error::Computation(format!("invalid byte-array runner result '{value}'"))
+        })?;
+        let declared_len = declared_len.parse::<usize>().map_err(|error| {
+            Error::Computation(format!(
+                "invalid byte-array length in runner result '{value}': {error}"
+            ))
+        })?;
+        let bytes = hex_decode(encoded)?;
+        if bytes.len() != declared_len {
+            return Err(Error::Computation(format!(
+                "runner result declared {declared_len} byte(s), encoded {}",
+                bytes.len()
+            )));
+        }
+        return Ok(Value::Bytes(bytes));
+    }
     if value == "true" {
         return Ok(Value::Bool(true));
     }
@@ -612,6 +630,35 @@ fn parse_runner_return_value(value: &str) -> Result<Value> {
         return Ok(Value::Float(value));
     }
     Ok(Value::String(value.to_owned()))
+}
+
+fn hex_decode(encoded: &str) -> Result<Vec<u8>> {
+    if encoded.len() % 2 != 0 {
+        return Err(Error::Computation(
+            "runner byte-array result contains odd-length hex".to_owned(),
+        ));
+    }
+    encoded
+        .as_bytes()
+        .chunks_exact(2)
+        .map(|pair| {
+            let high = hex_nibble(pair[0])?;
+            let low = hex_nibble(pair[1])?;
+            Ok((high << 4) | low)
+        })
+        .collect()
+}
+
+fn hex_nibble(byte: u8) -> Result<u8> {
+    match byte {
+        b'0'..=b'9' => Ok(byte - b'0'),
+        b'a'..=b'f' => Ok(byte - b'a' + 10),
+        b'A'..=b'F' => Ok(byte - b'A' + 10),
+        _ => Err(Error::Computation(format!(
+            "runner byte-array result contains non-hex byte {:?}",
+            char::from(byte)
+        ))),
+    }
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -752,9 +799,10 @@ fn sdk_value_from_vm_value(
 #[cfg(test)]
 mod tests {
     use super::{
-        find_binary_in_path, local_program_output_without_return_markers, path_is_under,
-        target_profile_dir_from_exe,
+        find_binary_in_path, local_program_output_without_return_markers,
+        parse_runner_return_value, path_is_under, target_profile_dir_from_exe,
     };
+    use crate::types::Value;
     use std::path::PathBuf;
 
     #[test]
@@ -765,6 +813,19 @@ mod tests {
             local_program_output_without_return_markers(stdout),
             "polynomial p\n"
         );
+    }
+
+    #[test]
+    fn runner_byte_array_result_decodes_to_sdk_bytes() {
+        assert_eq!(
+            parse_runner_return_value("byte[4] 0x0011aaff").unwrap(),
+            Value::Bytes(vec![0x00, 0x11, 0xaa, 0xff])
+        );
+    }
+
+    #[test]
+    fn runner_byte_array_result_rejects_length_mismatch() {
+        assert!(parse_runner_return_value("byte[3] 0x0011").is_err());
     }
 
     #[test]

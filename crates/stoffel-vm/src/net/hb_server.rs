@@ -703,7 +703,7 @@ mod tests {
     async fn test_server() -> HoneyBadgerQuicServer<Fr> {
         let (tx, _rx) = mpsc::channel(8);
         let bind_address = "127.0.0.1:0".parse().expect("valid local bind address");
-        let opts = honeybadger_node_opts(4, 1, 0, 0, 0).expect("valid HB options");
+        let opts = honeybadger_node_opts(5, 1, 0, 0, 0).expect("valid HB options");
         HoneyBadgerQuicServer::new(
             0,
             bind_address,
