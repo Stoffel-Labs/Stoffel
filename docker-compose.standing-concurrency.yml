@@ -28,6 +28,8 @@ x-node-command: &node-command |
     --party-cert-dir /app/ids/nodes \
     --reservoir-burst-capacity 9 \
     --pool-id "$${STOFFEL_STANDING_POOL_ID}" \
+    --off-chain-coord coordinator:31415 \
+    --rpc-bind 0.0.0.0:16180 \
     $${LEADER_ARGS:-} $${BOOTSTRAP_ARGS:-} \
     --party-id "$${PARTY_ID}" \
     --bind "$${BIND_ADDR}" \
@@ -47,6 +49,8 @@ x-node: &node
   environment: *node-environment
   stop_grace_period: 45s
   init: true
+  depends_on:
+    coordinator: {condition: service_healthy}
 
 x-client: &client
   image: ${STOFFEL_STANDING_NODE_IMAGE:-stoffel-standing-node:local}
@@ -62,6 +66,39 @@ x-client: &client
   networks: [standing-net]
 
 services:
+  coordinator:
+    image: ${STOFFEL_STANDING_COORDINATOR_IMAGE:-stoffel-standing-coordinator:local}
+    build:
+      context: .
+      dockerfile: docker/coordinator.Dockerfile
+      additional_contexts:
+        coordinator: "${STOFFEL_COORDINATOR_CONTEXT:?Set an absolute coordinator checkout}"
+    command:
+      - --bind-addr
+      - 0.0.0.0
+      - --port
+      - "31415"
+      - --server-cert
+      - /app/ids/server_cert.crt
+      - --server-key
+      - /app/ids/server_key.der
+      - --n
+      - "5"
+      - --t
+      - "1"
+      - --initial-mpc-nodes
+      - /app/ids/nodes/cert0.crt,/app/ids/nodes/cert1.crt,/app/ids/nodes/cert2.crt,/app/ids/nodes/cert3.crt,/app/ids/nodes/cert4.crt
+    init: true
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD-SHELL", "netstat -tuln | grep -q ':31415' || exit 1"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+      start_period: 5s
+    networks:
+      standing-net: {ipv4_address: 172.33.0.5}
+
   party0:
     <<: *node
     environment:

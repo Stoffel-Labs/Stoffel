@@ -961,11 +961,13 @@ async fn run_honeybadger_offchain_client(
             )
             .await?;
 
-        let mut masks = Vec::with_capacity(input_values.len());
-        for _ in 0..input_values.len() {
-            eprintln!("[local-client {}] receiving mask", client.client_slot);
-            masks.push(node_rpc.receive_mask().await?);
-        }
+        eprintln!(
+            "[local-client {}] receiving assigned masks",
+            client.client_slot
+        );
+        let masks = node_rpc
+            .receive_assigned_masks(client.reserved_index_start, input_values.len() as u64)
+            .await?;
 
         for (offset, (input, mask)) in input_values.into_iter().zip(masks).enumerate() {
             let index = client.reserved_index_start + offset as u64;
@@ -1071,11 +1073,13 @@ async fn run_avss_offchain_client(
             )
             .await?;
 
-        let mut masks = Vec::with_capacity(input_values.len());
-        for _ in 0..input_values.len() {
-            eprintln!("[local-client {}] receiving AVSS mask", client.client_slot);
-            masks.push(node_rpc.receive_mask().await?);
-        }
+        eprintln!(
+            "[local-client {}] receiving assigned AVSS masks",
+            client.client_slot
+        );
+        let masks = node_rpc
+            .receive_assigned_masks(client.reserved_index_start, input_values.len() as u64)
+            .await?;
 
         for (offset, (input, mask)) in input_values.into_iter().zip(masks).enumerate() {
             let index = client.reserved_index_start + offset as u64;

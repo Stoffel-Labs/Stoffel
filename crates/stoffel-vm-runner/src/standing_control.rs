@@ -22,7 +22,6 @@ use stoffel_vm_types::compiled_binary::{
     ClientIoManifest, CompiledBinary, PreprocessingDemand,
     PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION,
 };
-use stoffelnet::network_utils::{CertificateIdentity, NodePublicKey};
 use tokio_util::sync::CancellationToken;
 use x509_parser::prelude::FromDer;
 use x509_parser::prelude::X509Certificate;
@@ -87,9 +86,9 @@ pub struct ResolvedStandingExecutionAdmissionV1 {
     pub program_id: [u8; 32],
     pub entry: String,
     pub clients: Vec<StandingClientAdmissionV1>,
-    /// Ordered, certificate-exact client principals frozen during Prepare.
+    /// Public-key identities used by the coordinator's mutual-TLS authorization.
     /// Vector position is the execution-local client ordinal.
-    pub expected_client_identities: Vec<CertificateIdentity>,
+    pub expected_client_public_keys: Vec<Vec<u8>>,
     pub config_digest: [u8; 32],
 }
 
@@ -166,7 +165,7 @@ impl StandingProgramCatalog {
 
 /// Client certificate identities frozen alongside the program catalog at startup.
 #[derive(Debug)]
-pub struct StandingClientCatalog(BTreeMap<String, NodePublicKey>);
+pub struct StandingClientCatalog(BTreeMap<String, Vec<u8>>);
 
 impl StandingClientCatalog {
     pub fn load(directory: &Path) -> Result<Self, StandingControlError> {
@@ -207,20 +206,19 @@ impl StandingClientCatalog {
             }
             identities.insert(
                 name.to_owned(),
-                NodePublicKey(parsed.public_key().raw.to_vec()),
+                parsed
+                    .public_key()
+                    .subject_public_key
+                    .data
+                    .as_ref()
+                    .to_vec(),
             );
         }
         Ok(Self(identities))
     }
 
-    fn get(&self, filename: &str) -> Option<CertificateIdentity> {
-        self.0
-            .get(filename)
-            .map(NodePublicKey::certificate_identity)
-    }
-
-    pub fn public_keys(&self) -> impl Iterator<Item = NodePublicKey> + '_ {
-        self.0.values().cloned()
+    fn get(&self, filename: &str) -> Option<Vec<u8>> {
+        self.0.get(filename).cloned()
     }
 }
 
@@ -455,22 +453,22 @@ impl StandingNodeControl {
         }
         validate_client_io_admission(&admission.clients, &program.client_io_manifest)?;
 
-        let mut expected_client_identities = Vec::with_capacity(admission.clients.len());
+        let mut expected_client_public_keys = Vec::with_capacity(admission.clients.len());
         let mut unique_client_identities = HashSet::with_capacity(admission.clients.len());
         for client in &admission.clients {
-            let identity = self.clients.get(&client.certificate).ok_or_else(|| {
+            let public_key = self.clients.get(&client.certificate).ok_or_else(|| {
                 StandingControlError::InvalidCommand(format!(
                     "client certificate {:?} is not in the standing startup catalog",
                     client.certificate
                 ))
             })?;
-            if !unique_client_identities.insert(identity) {
+            if !unique_client_identities.insert(public_key.clone()) {
                 return Err(StandingControlError::InvalidCommand(format!(
                     "standing client roster contains duplicate SPKI identity at {:?}",
                     client.certificate
                 )));
             }
-            expected_client_identities.push(identity);
+            expected_client_public_keys.push(public_key);
         }
 
         let canonical = serde_json::to_vec(&admission)
@@ -478,9 +476,10 @@ impl StandingNodeControl {
         let mut hasher = blake3::Hasher::new();
         hasher.update(b"stoffel-standing-admission-v1");
         hasher.update(&canonical);
-        hasher.update(&(expected_client_identities.len() as u64).to_le_bytes());
-        for identity in &expected_client_identities {
-            hasher.update(identity.as_bytes());
+        hasher.update(&(expected_client_public_keys.len() as u64).to_le_bytes());
+        for identity in &expected_client_public_keys {
+            hasher.update(&(identity.len() as u64).to_le_bytes());
+            hasher.update(identity);
         }
         let config_digest = *hasher.finalize().as_bytes();
 
@@ -489,7 +488,7 @@ impl StandingNodeControl {
             program_id,
             entry: admission.entry,
             clients: admission.clients,
-            expected_client_identities,
+            expected_client_public_keys,
             config_digest,
         })
     }

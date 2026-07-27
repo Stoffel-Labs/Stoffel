@@ -25,7 +25,10 @@ from typing import Any, Callable, Iterable
 
 
 PARTIES = [f"party{party}" for party in range(5)]
-SERVERS = "172.33.0.10:10000,172.33.0.11:9001,172.33.0.12:9002,172.33.0.13:9003,172.33.0.14:9004"
+NODE_RPC_SERVERS = ",".join(
+    f"172.33.0.{party + 10}:16180" for party in range(5)
+)
+COORDINATOR = "coordinator:31415"
 HEX_ID = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -142,7 +145,7 @@ class Harness:
         args = ["logs", "--no-color"]
         if tail is not None:
             args.extend(["--tail", str(tail)])
-        args.extend([party] if party else PARTIES)
+        args.extend([party] if party else [*PARTIES, "coordinator"])
         return self.compose(*args, check=False, capture=True).stdout or ""
 
     def require_checkout(self, variable: str, marker: str) -> Path:
@@ -668,12 +671,20 @@ test -z "$(find /app /run/secrets -type f \( -name '*.der' -o -name '*.key' \) !
         inputs = client.get("inputs", [])
         if inputs:
             args.extend(["--inputs", ",".join(str(value) for value in inputs)])
+            input_index = 0
+            for admitted in execution.get("clients", []):
+                if admitted is client or admitted == client:
+                    break
+                input_index += len(admitted.get("inputs", []))
+            args.extend(["--client-index", str(input_index)])
         args.extend(
             [
                 "--outputs",
                 str(client["outputs"]),
                 "--servers",
-                SERVERS,
+                NODE_RPC_SERVERS,
+                "--off-chain-coord",
+                COORDINATOR,
                 "--n-parties",
                 "5",
                 "--threshold",
@@ -1036,8 +1047,12 @@ done
             "/tmp/programs",
             "--client-cert-dir",
             "/app/ids/clients",
+            "--off-chain-coord",
+            COORDINATOR,
             "--bind",
             "127.0.0.1:19000",
+            "--rpc-bind",
+            "127.0.0.1:19001",
         ]
         for service, roster, expected_error in (
             ("party1", "/app/ids/nodes", "does not match"),
@@ -1446,22 +1461,16 @@ def run_adversarial(harness: Harness) -> None:
         online_ready[item["name"]] = harness.expect_ready(
             command_sequence, item, harness.coordination_seconds + 30
         )
-    input_marker = "Stored inputs for protocol index"
+    input_marker = "masked client inputs received"
     party4_inputs = harness.marker_count("party4", input_marker)
     jobs = [harness.start_client("fault", item, item["clients"][0]) for item in online]
-    # Freeze only after party4 has reconstructed both masked inputs. Counting
-    # client messages is insufficient because extra INST frames are valid and
-    # carry no input-protocol progress.
     deadline = time.monotonic() + harness.coordination_seconds + 30
-    while (
-        harness.marker_count("party4", input_marker)
-        < party4_inputs + len(online)
-    ):
+    while harness.marker_count("party4", input_marker) < party4_inputs + len(online):
         if time.monotonic() >= deadline:
             raise AcceptanceFailure(
                 "party4 did not enter both concurrent online executions"
             )
-        time.sleep(0.1)
+        time.sleep(0.01)
     for item in online:
         if harness.find_event(
             "party4",
