@@ -9,7 +9,7 @@ def main() -> int64:
   var value: secret int64 = ClientStore.take_share(0, 0)
   var one = Share.from_clear_int(1, 64)
 
-  for round in 0..256:
+  for round in 0..1800:
     value = Share.mul(value, one)
 
   if Mpc.has_capability("client-output"):

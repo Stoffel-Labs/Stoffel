@@ -1206,10 +1206,9 @@ where
             config.key_der.clone(),
         )
         .await?;
-        let mut masks = Vec::with_capacity(inputs.len());
-        for _ in 0..inputs.len() {
-            masks.push(node_rpc.receive_mask().await?);
-        }
+        let masks = node_rpc
+            .receive_assigned_masks(config.input_start_index, inputs.len() as u64)
+            .await?;
         for (ordinal, (input, share_type)) in
             inputs.iter().zip(config.input_types.iter()).enumerate()
         {

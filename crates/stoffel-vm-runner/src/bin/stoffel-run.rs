@@ -16,7 +16,9 @@ use std::time::Duration;
 use stoffel_mpc_coordinator_off_chain::node_rpc::{
     NodeRPCClient as OffChainNodeRPCClient, NodeRPCServer as OffChainNodeRPCServer,
 };
-use stoffel_mpc_coordinator_off_chain::OffChainCoordinatorClient;
+use stoffel_mpc_coordinator_off_chain::{
+    ExecutionRegistration, InputAssignment, InputSlotAssignment, OffChainCoordinatorClient,
+};
 use stoffel_mpc_coordinator_shared::{
     Coordinator, ExecutionId as CoordinatorExecutionId, NodeRPCError, Round,
 };
@@ -65,7 +67,7 @@ use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustS
 use stoffelmpc_mpc::honeybadger::SessionId as HbSessionId;
 use stoffelmpc_mpc::honeybadger::{HoneyBadgerMPCClient, HoneyBadgerMPCNode};
 use stoffelnet::network_utils::Network;
-use stoffelnet::network_utils::{CertificateIdentity, ClientId, NetworkError, NodePublicKey};
+use stoffelnet::network_utils::{ClientId, NetworkError, NodePublicKey};
 use stoffelnet::transports::quic::{NetworkManager, QuicNetworkManager};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -298,11 +300,9 @@ fn plan_preprocessing(
 
 type HbOffChainCoordinator<F> = OffChainCoordinatorClient<F, HbCoordinatorShare<F>>;
 type HbOffChainNodeRpcClient<F> = OffChainNodeRPCClient<F, HbCoordinatorShare<F>>;
-type HbOffChainNodeRpcServer<F> = OffChainNodeRPCServer<F, HbCoordinatorShare<F>>;
 type AvssCoordinatorShare<F, G> = FeldmanShamirShare<F, G>;
 type AvssOffChainCoordinator<F, G> = OffChainCoordinatorClient<F, AvssCoordinatorShare<F, G>>;
 type AvssOffChainNodeRpcClient<F, G> = OffChainNodeRPCClient<F, AvssCoordinatorShare<F, G>>;
-type AvssOffChainNodeRpcServer<F, G> = OffChainNodeRPCServer<F, AvssCoordinatorShare<F, G>>;
 
 macro_rules! dispatch_avss_curve {
     ($curve:expr, $call:ident) => {
@@ -1184,11 +1184,11 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn collect_hb_coordinator_inputs_for_bls(
+async fn collect_hb_coordinator_inputs<F, G>(
     vm: &mut VirtualMachine,
-    engine: &Arc<HoneyBadgerMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projective>>,
-    coord: &mut HbOffChainCoordinator<ark_bls12_381::Fr>,
-    node_rpc: &HbOffChainNodeRpcServer<ark_bls12_381::Fr>,
+    engine: &Arc<HoneyBadgerMpcEngine<F, G>>,
+    coord: &mut HbOffChainCoordinator<F>,
+    node_rpc: &OffChainNodeRPCServer,
     execution_id: CoordinatorExecutionId,
     input_ids: &[Vec<u8>],
     client_input_total: usize,
@@ -1199,7 +1199,11 @@ async fn collect_hb_coordinator_inputs_for_bls(
     run_id: u64,
     my_id: usize,
     as_leader: bool,
-) -> Result<(), String> {
+) -> Result<(), String>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
     if input_ids.is_empty() {
         return Ok(());
     }
@@ -1240,15 +1244,6 @@ async fn collect_hb_coordinator_inputs_for_bls(
         )
     };
 
-    if let Some(ref mask_shares) = precomputed_mask_shares {
-        for (i, share) in mask_shares.iter().enumerate() {
-            node_rpc
-                .add_mask_share_for_execution(execution_id, i as u64, share)
-                .await
-                .map_err(|e| format!("add_mask_share: {:?}", e))?;
-        }
-    }
-
     if as_leader {
         eprintln!("[party {my_id}] coordinator -> InputMaskReservation");
         coord
@@ -1274,16 +1269,21 @@ async fn collect_hb_coordinator_inputs_for_bls(
     // Standing engines destructively remove each corresponding mask from LMDB
     // here and retain it only in process memory until input reconstruction has
     // completed. This prevents a later program/execution from reusing it.
-    let mut reserved_mask_indices = client_to_indices
-        .values()
-        .flatten()
-        .copied()
+    let mut reserved_masks = client_to_indices
+        .iter()
+        .flat_map(|(client, indices)| {
+            let client_id = input_ids.iter().position(|expected| expected == client);
+            indices.iter().copied().map(move |index| (index, client_id))
+        })
         .collect::<Vec<_>>();
-    reserved_mask_indices.sort_unstable();
-    reserved_mask_indices.dedup();
+    reserved_masks.sort_unstable_by_key(|(index, _)| *index);
+    let reserved_mask_indices = reserved_masks
+        .iter()
+        .map(|(index, _)| *index)
+        .collect::<Vec<_>>();
     if engine.is_standing() {
         let reservations = engine.reservation_ops().map_err(|e| e.to_string())?;
-        for (expected, index) in reserved_mask_indices.iter().copied().enumerate() {
+        for (expected, (index, client_id)) in reserved_masks.iter().copied().enumerate() {
             let expected = u64::try_from(expected)
                 .map_err(|_| "coordinator mask index exceeds u64 range".to_owned())?;
             if index != expected {
@@ -1291,8 +1291,11 @@ async fn collect_hb_coordinator_inputs_for_bls(
                     "coordinator returned non-canonical mask index {index}; expected {expected}"
                 ));
             }
+            let client_id = client_id.ok_or_else(|| {
+                format!("coordinator reserved mask index {index} for an unadmitted client identity")
+            })?;
             let grant = reservations
-                .reserve_masks(usize::try_from(index).unwrap_or(usize::MAX), 1)
+                .reserve_masks(client_id, 1)
                 .await
                 .map_err(|e| e.to_string())?;
             if grant.start != index || grant.count != 1 {
@@ -1314,18 +1317,6 @@ async fn collect_hb_coordinator_inputs_for_bls(
         )
         .await?;
 
-        for idx in client_to_indices.values().flatten().copied() {
-            let slot = usize::try_from(idx)
-                .map_err(|_| format!("reserved index {idx} exceeds usize range"))?;
-            let share = mask_shares
-                .get(slot)
-                .ok_or_else(|| format!("reserved index {idx} exceeds mask share slots"))?;
-            node_rpc
-                .add_mask_share_for_execution(execution_id, idx, share)
-                .await
-                .map_err(|e| format!("add_mask_share: {:?}", e))?;
-        }
-
         mask_shares
     };
 
@@ -1344,6 +1335,17 @@ async fn collect_hb_coordinator_inputs_for_bls(
                     other => Err(format!("add_reserved_index: {:?}", other)),
                 })?;
         }
+    }
+    for index in &reserved_mask_indices {
+        let slot = usize::try_from(*index)
+            .map_err(|_| format!("reserved index {index} exceeds usize range"))?;
+        let share = mask_shares
+            .get(slot)
+            .ok_or_else(|| format!("reserved index {index} exceeds mask share slots"))?;
+        node_rpc
+            .add_mask_share_for_execution(execution_id, *index, share)
+            .await
+            .map_err(|error| format!("add mask share: {error:?}"))?;
     }
 
     if as_leader {
@@ -1914,6 +1916,7 @@ struct PartyClients {
     manifest_driven: bool,
 }
 
+#[cfg(test)]
 fn bind_admitted_client_slots(
     route_ids: &[ClientId],
     manifest_slots: &[usize],
@@ -2100,20 +2103,15 @@ fn client_output_slot_map(bindings: &[ClientProtocolBinding]) -> BTreeMap<Client
         .collect()
 }
 
-fn client_reservation_identity_map(
-    identities: &[CertificateIdentity],
-) -> BTreeMap<ClientId, DurableIdentityDigest> {
-    identities
+fn standing_client_key(
+    admission: &ResolvedStandingExecutionAdmissionV1,
+    manifest_slot: ClientId,
+) -> Option<&Vec<u8>> {
+    admission
+        .clients
         .iter()
-        .copied()
-        .enumerate()
-        .map(|(ordinal, identity)| {
-            (
-                ordinal,
-                DurableIdentityDigest::from_certificate_identity(identity),
-            )
-        })
-        .collect()
+        .zip(&admission.expected_client_public_keys)
+        .find_map(|(client, key)| (client.manifest_slot == manifest_slot).then_some(key))
 }
 
 fn input_client_ids_from_output_ids(
@@ -2894,10 +2892,10 @@ async fn run_avss_offchain_coordinator_client_for_curve<F, G>(
 {
     let AvssOffchainCoordinatorClientArgs {
         execution_id,
-        curve_config,
+        curve_config: _,
         client_inputs,
         client_outputs,
-        output_format: _output_format,
+        output_format,
         server_addrs,
         coord_addr,
         cert_der,
@@ -2911,17 +2909,15 @@ async fn run_avss_offchain_coordinator_client_for_curve<F, G>(
         .expect("install rustls crypto");
 
     let t = threshold.unwrap_or(1);
-    let input_str = client_inputs.unwrap_or_else(|| {
-        eprintln!("Error: --inputs required in coordinator client mode");
-        exit(2);
-    });
-    let input_values = parse_inputs_as_field::<F>(&input_str);
-    if input_values.is_empty() {
-        eprintln!("Error: coordinator client mode requires at least one input value");
-        exit(2);
-    }
+    let input_values = client_inputs
+        .as_deref()
+        .map(parse_inputs_as_field::<F>)
+        .unwrap_or_default();
     let output_len = client_outputs.unwrap_or(input_values.len());
     let reserved_index = coordinator_client_index.unwrap_or_else(|| {
+        if input_values.is_empty() {
+            return 0;
+        }
         eprintln!(
             "Error: coordinator client mode requires --client-index to claim a reserved input slot"
         );
@@ -2946,49 +2942,60 @@ async fn run_avss_offchain_coordinator_client_for_curve<F, G>(
         });
 
     coord.wait_for_round(Round::Preprocessing).await.unwrap();
-    coord
-        .wait_for_round(Round::InputMaskReservation)
-        .await
-        .unwrap();
-    for offset in 0..input_values.len() {
-        let index = reserved_index + offset as u64;
-        eprintln!("[client slot {index}] reserving input mask");
-        coord.reserve_mask_index(index).await.unwrap();
-    }
-
-    let rpc_addrs: Vec<(String, u16)> = server_addrs
-        .iter()
-        .map(|addr| (addr.ip().to_string(), addr.port()))
-        .collect();
-    let node_rpc_client: AvssOffChainNodeRpcClient<F, G> =
-        AvssOffChainNodeRpcClient::<F, G>::start_rpc_client_for_execution(
-            rpc_addrs.len(),
-            t,
-            rpc_addrs,
-            coordinator_execution_id(execution_id),
-            cert_der,
-            key_der,
-        )
-        .await
-        .unwrap_or_else(|error| {
-            eprintln!("Failed to connect to AVSS node RPC servers: {error}");
-            exit(13);
-        });
-    let mut masks = Vec::with_capacity(input_values.len());
-    for offset in 0..input_values.len() {
-        let index = reserved_index + offset as u64;
-        eprintln!("[client slot {index}] waiting for mask shares");
-        masks.push(node_rpc_client.receive_mask().await.unwrap());
-    }
-
-    coord.wait_for_round(Round::InputCollection).await.unwrap();
-    for (offset, (input_value, mask)) in input_values.iter().zip(masks).enumerate() {
-        let index = reserved_index + offset as u64;
-        eprintln!("[client slot {index}] submitting masked input");
+    if !input_values.is_empty() {
         coord
-            .send_masked_input(mask + *input_value, index)
+            .wait_for_round(Round::InputMaskReservation)
             .await
             .unwrap();
+        for offset in 0..input_values.len() {
+            let index = reserved_index + offset as u64;
+            eprintln!("[client slot {index}] reserving input mask");
+            coord.reserve_mask_index(index).await.unwrap();
+        }
+
+        let rpc_addrs: Vec<(String, u16)> = server_addrs
+            .iter()
+            .map(|addr| (addr.ip().to_string(), addr.port()))
+            .collect();
+        let node_rpc_client = if input_values.is_empty() {
+            None
+        } else {
+            Some(
+                AvssOffChainNodeRpcClient::<F, G>::start_rpc_client_for_execution(
+                    rpc_addrs.len(),
+                    t,
+                    rpc_addrs,
+                    coordinator_execution_id(execution_id),
+                    cert_der,
+                    key_der,
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    eprintln!("Failed to connect to AVSS node RPC servers: {error}");
+                    exit(13);
+                }),
+            )
+        };
+        eprintln!("[client slot {reserved_index}] waiting for assigned mask shares");
+        let masks = node_rpc_client
+            .as_ref()
+            .expect("input clients create a node RPC client")
+            .receive_assigned_masks(
+                reserved_index,
+                u64::try_from(input_values.len()).expect("client input count exceeds u64"),
+            )
+            .await
+            .unwrap();
+
+        coord.wait_for_round(Round::InputCollection).await.unwrap();
+        for (offset, (input_value, mask)) in input_values.iter().zip(masks).enumerate() {
+            let index = reserved_index + offset as u64;
+            eprintln!("[client slot {index}] submitting masked input");
+            coord
+                .send_masked_input(mask + *input_value, index)
+                .await
+                .unwrap();
+        }
     }
     if output_len == 0 {
         eprintln!("[client slot {reserved_index}] input submission complete; no outputs requested");
@@ -3001,8 +3008,10 @@ async fn run_avss_offchain_coordinator_client_for_curve<F, G>(
         .await
         .unwrap();
     let outputs = coord.obtain_outputs().await.unwrap();
-    let output_hex = field_outputs_to_hex(&outputs, curve_config);
-    println!("Client output: field[{}] 0x{}", outputs.len(), output_hex);
+    println!(
+        "outputs: {}",
+        format_coordinator_outputs(&outputs, output_format)
+    );
 }
 async fn run_avss_offchain_coordinator_client(args: AvssOffchainCoordinatorClientArgs) {
     macro_rules! run {
@@ -3035,14 +3044,15 @@ async fn run_hb_coordinator_client_for_field<F>(
         .expect("install rustls crypto");
 
     let t = threshold.unwrap_or(1);
-    let input_str = client_inputs.expect("--inputs required in client mode");
-    let input_values = parse_inputs_as_field::<F>(&input_str);
-    if input_values.is_empty() {
-        eprintln!("Error: coordinator client mode requires at least one input value");
-        exit(2);
-    }
+    let input_values = client_inputs
+        .as_deref()
+        .map(parse_inputs_as_field::<F>)
+        .unwrap_or_default();
     let output_len = client_outputs.unwrap_or(input_values.len());
     let reserved_index = coordinator_client_index.unwrap_or_else(|| {
+        if input_values.is_empty() {
+            return 0;
+        }
         eprintln!(
             "Error: coordinator client mode requires --client-index to claim a reserved input slot"
         );
@@ -3077,49 +3087,60 @@ async fn run_hb_coordinator_client_for_field<F>(
         });
 
     coord.wait_for_round(Round::Preprocessing).await.unwrap();
-    coord
-        .wait_for_round(Round::InputMaskReservation)
-        .await
-        .unwrap();
-    for offset in 0..input_values.len() {
-        let index = reserved_index + offset as u64;
-        eprintln!("[client slot {index}] reserving input mask");
-        coord.reserve_mask_index(index).await.unwrap();
-    }
-
-    let rpc_addrs: Vec<(String, u16)> = server_addrs
-        .iter()
-        .map(|a| (a.ip().to_string(), a.port()))
-        .collect();
-    let node_rpc_client: HbOffChainNodeRpcClient<F> =
-        HbOffChainNodeRpcClient::<F>::start_rpc_client_for_execution(
-            rpc_addrs.len(),
-            t,
-            rpc_addrs,
-            coordinator_execution_id(execution_id),
-            cert_der,
-            key_der,
-        )
-        .await
-        .unwrap_or_else(|error| {
-            eprintln!("Failed to connect to node RPC servers: {error}");
-            exit(13);
-        });
-    let mut masks = Vec::with_capacity(input_values.len());
-    for offset in 0..input_values.len() {
-        let index = reserved_index + offset as u64;
-        eprintln!("[client slot {index}] waiting for mask shares");
-        masks.push(node_rpc_client.receive_mask().await.unwrap());
-    }
-
-    coord.wait_for_round(Round::InputCollection).await.unwrap();
-    for (offset, (input_value, mask)) in input_values.iter().zip(masks).enumerate() {
-        let index = reserved_index + offset as u64;
-        eprintln!("[client slot {index}] submitting masked input");
+    if !input_values.is_empty() {
         coord
-            .send_masked_input(mask + *input_value, index)
+            .wait_for_round(Round::InputMaskReservation)
             .await
             .unwrap();
+        for offset in 0..input_values.len() {
+            let index = reserved_index + offset as u64;
+            eprintln!("[client slot {index}] reserving input mask");
+            coord.reserve_mask_index(index).await.unwrap();
+        }
+
+        let rpc_addrs: Vec<(String, u16)> = server_addrs
+            .iter()
+            .map(|a| (a.ip().to_string(), a.port()))
+            .collect();
+        let node_rpc_client = if input_values.is_empty() {
+            None
+        } else {
+            Some(
+                HbOffChainNodeRpcClient::<F>::start_rpc_client_for_execution(
+                    rpc_addrs.len(),
+                    t,
+                    rpc_addrs,
+                    coordinator_execution_id(execution_id),
+                    cert_der,
+                    key_der,
+                )
+                .await
+                .unwrap_or_else(|error| {
+                    eprintln!("Failed to connect to node RPC servers: {error}");
+                    exit(13);
+                }),
+            )
+        };
+        eprintln!("[client slot {reserved_index}] waiting for assigned mask shares");
+        let masks = node_rpc_client
+            .as_ref()
+            .expect("input clients create a node RPC client")
+            .receive_assigned_masks(
+                reserved_index,
+                u64::try_from(input_values.len()).expect("client input count exceeds u64"),
+            )
+            .await
+            .unwrap();
+
+        coord.wait_for_round(Round::InputCollection).await.unwrap();
+        for (offset, (input_value, mask)) in input_values.iter().zip(masks).enumerate() {
+            let index = reserved_index + offset as u64;
+            eprintln!("[client slot {index}] submitting masked input");
+            coord
+                .send_masked_input(mask + *input_value, index)
+                .await
+                .unwrap();
+        }
     }
     if output_len == 0 {
         eprintln!("[client slot {reserved_index}] input submission complete; no outputs requested");
@@ -4238,16 +4259,15 @@ where
         .await
         .map_err(|error| format!("Failed to connect to AVSS off-chain coordinator: {error}"))?;
 
-    let node_rpc: AvssOffChainNodeRpcServer<F, G> =
-        AvssOffChainNodeRpcServer::<F, G>::start_for_execution(
-            &rpc_addr.0,
-            rpc_addr.1,
-            coordinator_execution_id,
-            cert_der.clone(),
-            key_der.clone(),
-        )
-        .await
-        .map_err(|error| format!("Failed to start AVSS node RPC server: {error}"))?;
+    let node_rpc: OffChainNodeRPCServer = OffChainNodeRPCServer::start_for_execution(
+        &rpc_addr.0,
+        rpc_addr.1,
+        coordinator_execution_id,
+        cert_der.clone(),
+        key_der.clone(),
+    )
+    .await
+    .map_err(|error| format!("Failed to start AVSS node RPC server: {error}"))?;
 
     if as_leader {
         coord
@@ -4613,9 +4633,14 @@ struct StandingRunnerExecutionHandler {
     preproc_store: Arc<dyn PreprocStore>,
     persistent_identity: DurableIdentityDigest,
     party_id: usize,
+    coordinator_leader: bool,
     parties: usize,
     threshold: usize,
     pool_id: ExecutionId,
+    coordinator_addr: (String, u16),
+    coordinator_cert_der: Vec<u8>,
+    coordinator_key_der: Vec<u8>,
+    node_rpc: Arc<OffChainNodeRPCServer>,
     reservoirs: BTreeMap<[u8; 32], Arc<StandingReservoirState>>,
     reservoir_cancellation: CancellationToken,
 }
@@ -4679,17 +4704,121 @@ impl PreparedNodeExecution for StandingPreparedExecution {
 }
 
 impl StandingRunnerExecutionHandler {
-    fn expected_client_bindings(
+    fn coordinator_registration(
         &self,
         admission: &ResolvedStandingExecutionAdmissionV1,
-    ) -> Arc<Vec<ClientProtocolBinding>> {
-        let clients = &admission.clients;
-        let route_ids = (0..clients.len()).collect::<Vec<_>>();
-        let manifest_slots = clients
+        program: &StandingProgram,
+    ) -> Result<ExecutionRegistration, String> {
+        let schemas = program
+            .client_io_manifest
+            .clients
             .iter()
-            .map(|client| client.manifest_slot)
-            .collect::<Vec<_>>();
-        Arc::new(bind_admitted_client_slots(&route_ids, &manifest_slots))
+            .map(|schema| (schema.client_slot, schema))
+            .collect::<BTreeMap<_, _>>();
+        let mut input_slots = Vec::new();
+        let mut output_clients = Vec::new();
+        for (client, public_key) in admission
+            .clients
+            .iter()
+            .zip(&admission.expected_client_public_keys)
+        {
+            let manifest_slot = u64::try_from(client.manifest_slot)
+                .map_err(|_| "standing client manifest slot exceeds u64".to_owned())?;
+            let schema = schemas.get(&manifest_slot).ok_or_else(|| {
+                format!(
+                    "standing client slot {} is absent from the program manifest",
+                    client.manifest_slot
+                )
+            })?;
+            if !schema.outputs.is_empty() {
+                output_clients.push(public_key.clone());
+            }
+            for input_ordinal in 0..schema.inputs.len() {
+                input_slots.push(InputSlotAssignment {
+                    client: public_key.clone(),
+                    label: u64::try_from(input_ordinal)
+                        .map_err(|_| "client input ordinal exceeds u64".to_owned())?,
+                });
+            }
+        }
+        let min_output_shares = match program.backend {
+            MpcBackendKind::HoneyBadger => self
+                .threshold
+                .checked_mul(2)
+                .and_then(|threshold| threshold.checked_add(1)),
+            MpcBackendKind::Avss => self.threshold.checked_add(1),
+        }
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or_else(|| "coordinator output quorum overflows u64".to_owned())?;
+        Ok(ExecutionRegistration {
+            execution_id: coordinator_execution_id(admission.execution_id),
+            program_hash: admission.program_id,
+            n_inputs: u64::try_from(input_slots.len())
+                .map_err(|_| "coordinator input count exceeds u64".to_owned())?,
+            output_clients,
+            input_assignment: InputAssignment { input_slots },
+            min_output_shares,
+        })
+    }
+
+    async fn register_coordinator_execution(
+        &self,
+        admission: &ResolvedStandingExecutionAdmissionV1,
+        program: &StandingProgram,
+    ) -> Result<(), String> {
+        let execution_id = coordinator_execution_id(admission.execution_id);
+        let registration = self.coordinator_registration(admission, program)?;
+        self.node_rpc
+            .register_execution(execution_id)
+            .await
+            .map_err(|error| format!("register standing node RPC execution: {error}"))?;
+        let coord =
+            match HbOffChainCoordinator::<ark_bls12_381::Fr>::start_rpc_client_for_execution(
+                &self.coordinator_addr.0,
+                self.coordinator_addr.1,
+                self.threshold as u64,
+                self.parties as u64,
+                0,
+                execution_id,
+                self.coordinator_cert_der.clone(),
+                self.coordinator_key_der.clone(),
+            )
+            .await
+            {
+                Ok(coord) => coord,
+                Err(error) => {
+                    self.node_rpc.retire_execution(execution_id).await;
+                    return Err(format!("connect to standing coordinator: {error}"));
+                }
+            };
+        let result = coord
+            .register_execution(registration)
+            .await
+            .map_err(|error| format!("register standing coordinator execution: {error}"));
+        if result.is_err() {
+            let _ = coord.retire_execution().await;
+            self.node_rpc.retire_execution(execution_id).await;
+        }
+        result
+    }
+
+    fn expected_client_identities(
+        &self,
+        admission: &ResolvedStandingExecutionAdmissionV1,
+    ) -> Arc<BTreeMap<ClientId, DurableIdentityDigest>> {
+        Arc::new(
+            admission
+                .expected_client_public_keys
+                .iter()
+                .enumerate()
+                .map(|(client_id, public_key)| {
+                    (
+                        client_id,
+                        DurableIdentityDigest::from_public_key_bytes(public_key),
+                    )
+                })
+                .collect(),
+        )
     }
 
     async fn warm_reservoirs(
@@ -5085,20 +5214,309 @@ impl StandingRunnerExecutionHandler {
         &self,
         context: &NodeExecutionContext,
     ) -> Result<(), String> {
+        let execution_id = coordinator_execution_id(context.spec.execution_id);
+        self.node_rpc.retire_execution(execution_id).await;
+        let coordinator_cleanup =
+            match HbOffChainCoordinator::<ark_bls12_381::Fr>::start_rpc_client_for_execution(
+                &self.coordinator_addr.0,
+                self.coordinator_addr.1,
+                self.threshold as u64,
+                self.parties as u64,
+                0,
+                execution_id,
+                self.coordinator_cert_der.clone(),
+                self.coordinator_key_der.clone(),
+            )
+            .await
+            {
+                Ok(coordinator) => coordinator
+                    .retire_execution()
+                    .await
+                    .map_err(|error| format!("retire coordinator execution: {error}")),
+                Err(error) => Err(format!("connect for coordinator cleanup: {error}")),
+            };
+
         // Preprocessing was already removed from LMDB into the execution's
         // owned in-memory bundle. Cleanup only retires local VM state; dropping
         // the bundle burns any unused correlated material.
         let Some(storage) = self.local_store.as_ref() else {
-            return Ok(());
+            return coordinator_cleanup;
         };
         let storage = storage.clone();
-        let execution_id = context.spec.execution_id;
+        let local_execution_id = context.spec.execution_id;
         tokio::task::spawn_blocking(move || {
-            let mut namespace = storage.with_namespace(*execution_id.as_bytes());
+            let mut namespace = storage.with_namespace(*local_execution_id.as_bytes());
             namespace.clear().map_err(String::from)
         })
         .await
-        .map_err(|error| format!("Redb cleanup worker failed: {error}"))?
+        .map_err(|error| format!("Redb cleanup worker failed: {error}"))??;
+        coordinator_cleanup
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_hb_standing<F, G>(
+        &self,
+        vm: &mut VirtualMachine,
+        engine: Arc<HoneyBadgerMpcEngine<F, G>>,
+        admission: &ResolvedStandingExecutionAdmissionV1,
+        program: &StandingProgram,
+        client_input_types: &BTreeMap<usize, Vec<ShareType>>,
+        client_input_count: usize,
+    ) -> Result<VmCooperativeExecutionMetrics, String>
+    where
+        F: SupportedMpcField,
+        G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+    {
+        let execution_id = coordinator_execution_id(admission.execution_id);
+        let mut coord = HbOffChainCoordinator::<F>::start_rpc_client_for_execution(
+            &self.coordinator_addr.0,
+            self.coordinator_addr.1,
+            self.threshold as u64,
+            self.parties as u64,
+            0,
+            execution_id,
+            self.coordinator_cert_der.clone(),
+            self.coordinator_key_der.clone(),
+        )
+        .await
+        .map_err(|error| format!("connect to standing coordinator: {error}"))?;
+        if self.coordinator_leader {
+            coord
+                .start_preprocessing()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        coord
+            .wait_for_round(Round::Preprocessing)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        engine.enable_client_output_capture().await;
+        let input_total = self.coordinator_registration(admission, program)?.n_inputs as usize;
+        let client_slots = admission
+            .clients
+            .iter()
+            .map(|client| client.manifest_slot)
+            .collect::<Vec<_>>();
+        collect_hb_coordinator_inputs(
+            vm,
+            &engine,
+            &mut coord,
+            self.node_rpc.as_ref(),
+            execution_id,
+            &admission.expected_client_public_keys,
+            input_total,
+            client_input_count,
+            &client_slots,
+            client_input_types,
+            standing_preproc_pool_program_id(self.pool_id, admission.program_id),
+            0,
+            self.party_id,
+            self.coordinator_leader,
+        )
+        .await?;
+
+        if self.coordinator_leader {
+            coord.start_mpc().await.map_err(|error| error.to_string())?;
+        }
+        coord
+            .wait_for_round(Round::MPCExecution)
+            .await
+            .map_err(|error| error.to_string())?;
+        let (result, metrics) = vm
+            .execute_async_with_metrics(&admission.entry, engine.as_ref())
+            .await
+            .map_err(|error| format!("VM execution failed: {error}"))?;
+
+        if self.coordinator_leader {
+            coord
+                .send_output()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        coord
+            .wait_for_round(Round::OutputDistribution)
+            .await
+            .map_err(|error| error.to_string())?;
+        for record in engine.drain_client_output_records().await {
+            let client_key = standing_client_key(admission, record.client_id).ok_or_else(|| {
+                format!(
+                    "HoneyBadger output client slot {} is absent from the admission",
+                    record.client_id
+                )
+            })?;
+            coord
+                .send_output_shares(client_key.clone(), client_key.clone(), record.shares)
+                .await
+                .map_err(|error| format!("send HoneyBadger output shares: {error}"))?;
+        }
+        if self.coordinator_leader {
+            coord.finalize().await.map_err(|error| error.to_string())?;
+        }
+        coord
+            .wait_for_round(Round::ProgramFinished)
+            .await
+            .map_err(|error| error.to_string())?;
+        print_vm_result(vm, result);
+        Ok(metrics)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_avss_standing<F, G>(
+        &self,
+        vm: &mut VirtualMachine,
+        engine: Arc<stoffel_vm::net::avss_engine::AvssMpcEngine<F, G>>,
+        admission: &ResolvedStandingExecutionAdmissionV1,
+        program: &StandingProgram,
+        client_input_types: &BTreeMap<usize, Vec<ShareType>>,
+        client_input_count: usize,
+    ) -> Result<VmCooperativeExecutionMetrics, String>
+    where
+        F: SupportedMpcField,
+        G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+    {
+        let execution_id = coordinator_execution_id(admission.execution_id);
+        let coord = AvssOffChainCoordinator::<F, G>::start_rpc_client_for_execution(
+            &self.coordinator_addr.0,
+            self.coordinator_addr.1,
+            self.threshold as u64,
+            self.parties as u64,
+            0,
+            execution_id,
+            self.coordinator_cert_der.clone(),
+            self.coordinator_key_der.clone(),
+        )
+        .await
+        .map_err(|error| format!("connect to standing coordinator: {error}"))?;
+        if self.coordinator_leader {
+            coord
+                .start_preprocessing()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        coord
+            .wait_for_round(Round::Preprocessing)
+            .await
+            .map_err(|error| error.to_string())?;
+
+        engine.enable_client_output_capture().await;
+        let input_total = self.coordinator_registration(admission, program)?.n_inputs as usize;
+        let client_slots = admission
+            .clients
+            .iter()
+            .map(|client| client.manifest_slot)
+            .collect::<Vec<_>>();
+        if input_total > 0 {
+            let mask_shares = {
+                let node = engine.node_handle().lock().await;
+                let shares = node
+                    .preprocessing_material
+                    .lock()
+                    .await
+                    .take_v_random_shares(input_total)
+                    .map_err(|error| {
+                        format!(
+                            "not enough AVSS random shares for {input_total} client inputs: {error:?}"
+                        )
+                    })?;
+                shares
+            };
+            if self.coordinator_leader {
+                coord
+                    .reserve_input_masks()
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            coord
+                .wait_for_round(Round::InputMaskReservation)
+                .await
+                .map_err(|error| error.to_string())?;
+            let client_to_indices = normalize_client_to_indices(
+                coord
+                    .wait_for_indices(input_total as u64)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            );
+            for (client, indices) in &client_to_indices {
+                for index in indices {
+                    self.node_rpc
+                        .add_reserved_index_for_execution(execution_id, client.clone(), *index)
+                        .await
+                        .map_err(|error| format!("add AVSS reserved index: {error:?}"))?;
+                }
+            }
+            for (index, share) in mask_shares.iter().enumerate() {
+                self.node_rpc
+                    .add_mask_share_for_execution(execution_id, index as u64, share)
+                    .await
+                    .map_err(|error| format!("add AVSS mask share: {error:?}"))?;
+            }
+            if self.coordinator_leader {
+                coord
+                    .collect_inputs()
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
+            coord
+                .wait_for_round(Round::InputCollection)
+                .await
+                .map_err(|error| error.to_string())?;
+            let client_inputs = coord
+                .wait_for_inputs(input_total as u64, mask_shares)
+                .await
+                .map_err(|error| error.to_string())?;
+            store_reserved_client_inputs_feldman::<F, G, _>(
+                vm,
+                &client_to_indices,
+                client_inputs,
+                client_input_count,
+                &client_slots,
+                client_input_types,
+            );
+        }
+
+        if self.coordinator_leader {
+            coord.start_mpc().await.map_err(|error| error.to_string())?;
+        }
+        coord
+            .wait_for_round(Round::MPCExecution)
+            .await
+            .map_err(|error| error.to_string())?;
+        let (result, metrics) = vm
+            .execute_async_with_metrics(&admission.entry, engine.as_ref())
+            .await
+            .map_err(|error| format!("VM execution failed: {error}"))?;
+        if self.coordinator_leader {
+            coord
+                .send_output()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        coord
+            .wait_for_round(Round::OutputDistribution)
+            .await
+            .map_err(|error| error.to_string())?;
+        for record in engine.drain_client_output_records().await {
+            let client_key = standing_client_key(admission, record.client_id).ok_or_else(|| {
+                format!(
+                    "AVSS output client slot {} is absent from the admission",
+                    record.client_id
+                )
+            })?;
+            coord
+                .send_output_shares(client_key.clone(), client_key.clone(), record.shares)
+                .await
+                .map_err(|error| format!("send AVSS output shares: {error}"))?;
+        }
+        if self.coordinator_leader {
+            coord.finalize().await.map_err(|error| error.to_string())?;
+        }
+        coord
+            .wait_for_round(Round::ProgramFinished)
+            .await
+            .map_err(|error| error.to_string())?;
+        print_vm_result(vm, result);
+        Ok(metrics)
     }
 
     async fn execute_inner(
@@ -5122,12 +5540,6 @@ impl StandingRunnerExecutionHandler {
         let client_input_types = manifest_client_input_types(&program.client_io_manifest);
         let manifest_client_input_count =
             client_input_types.values().map(Vec::len).max().unwrap_or(0);
-        let expected_client_bindings = self.expected_client_bindings(admission);
-        let expected_client_reservation_identities = Arc::new(client_reservation_identity_map(
-            &admission.expected_client_identities,
-        ));
-        let expected_client_count =
-            (!expected_client_bindings.is_empty()).then_some(expected_client_bindings.len());
         let execution_id = context.spec.execution_id;
         let instance_id =
             stoffel_vm::net::derive_instance_id_for_execution(&context.spec.execution_id);
@@ -5143,16 +5555,12 @@ impl StandingRunnerExecutionHandler {
             n: self.parties,
             t: self.threshold,
             instance_id,
-            expected_client_count,
-            expected_client_bindings: Some(Arc::clone(&expected_client_bindings)),
-            expected_client_reservation_identities: (program.backend
-                == MpcBackendKind::HoneyBadger)
-                .then_some(expected_client_reservation_identities),
-            client_count_hint: if program.backend == MpcBackendKind::Avss {
-                admission.clients.len()
-            } else {
-                0
-            },
+            expected_client_count: None,
+            expected_client_bindings: None,
+            expected_client_reservation_identities: Some(
+                self.expected_client_identities(&admission),
+            ),
+            client_count_hint: admission.clients.len(),
             client_input_count: manifest_client_input_count,
             client_input_types: &client_input_types,
             preprocessing_demand: program.client_io_manifest.preprocessing_demand,
@@ -5161,7 +5569,7 @@ impl StandingRunnerExecutionHandler {
             preprocessing: PartyPreprocessing::Execution(preprocessing_bundle),
             execution_tasks: Some(execution_tasks),
         });
-        let cooperative_engine: Arc<dyn AsyncMpcEngine> = match program.backend {
+        let metrics = match program.backend {
             MpcBackendKind::HoneyBadger => {
                 macro_rules! setup_hb_standing {
                     ($F:ty, $G:ty) => {{
@@ -5170,7 +5578,15 @@ impl StandingRunnerExecutionHandler {
                             setup.take().expect("execution setup is consumed once"),
                         )
                         .await?;
-                        engine as Arc<dyn AsyncMpcEngine>
+                        self.execute_hb_standing(
+                            &mut vm,
+                            engine,
+                            admission,
+                            program,
+                            &client_input_types,
+                            manifest_client_input_count,
+                        )
+                        .await?
                     }};
                 }
                 dispatch_hb_curve!(program.curve, setup_hb_standing, {
@@ -5188,17 +5604,20 @@ impl StandingRunnerExecutionHandler {
                             setup.take().expect("execution setup is consumed once"),
                         )
                         .await?;
-                        engine as Arc<dyn AsyncMpcEngine>
+                        self.execute_avss_standing(
+                            &mut vm,
+                            engine,
+                            admission,
+                            program,
+                            &client_input_types,
+                            manifest_client_input_count,
+                        )
+                        .await?
                     }};
                 }
                 dispatch_avss_curve!(program.curve, setup_avss_standing)
             }
         };
-
-        let (_, metrics) = vm
-            .execute_async_with_metrics(&admission.entry, cooperative_engine.as_ref())
-            .await
-            .map_err(|error| format!("VM execution failed: {error}"))?;
         eprintln!(
             "[party {}][execution {}] cooperative VM execution: instruction_budget_yields={} online_effect_yields={}",
             self.party_id,
@@ -5233,10 +5652,7 @@ impl StandingExecutionHandler for StandingRunnerExecutionHandler {
         // preprocessing material into the execution scope.
         let execution_inbox = self
             .mux
-            .register_with_client_identities(
-                context.spec.execution_id,
-                admission.expected_client_identities.clone(),
-            )
+            .register_with_client_identities(context.spec.execution_id, Vec::new())
             .map_err(|error| format!("register prepared execution transport: {error}"))?;
         let execution_registration =
             ExecutionInboxRegistrationGuard::new(self.mux.clone(), context.spec.execution_id);
@@ -5249,6 +5665,8 @@ impl StandingExecutionHandler for StandingRunnerExecutionHandler {
                 &context.cancellation,
                 &mut execution_inbox.control,
             )
+            .await?;
+        self.register_coordinator_execution(&admission, &reservoir.program)
             .await?;
         // Once allocation succeeds, always return an owned prepared value.
         // If cancellation raced with allocation, the supervisor takes its
@@ -5316,6 +5734,20 @@ fn standing_required_flag(args: &[String], name: &str) -> Result<String, String>
     standing_flag_value(args, name).ok_or_else(|| format!("{name} is required in standing mode"))
 }
 
+fn standing_host_port(args: &[String], name: &str) -> Result<(String, u16), String> {
+    let value = standing_required_flag(args, name)?;
+    let (host, port) = value
+        .rsplit_once(':')
+        .ok_or_else(|| format!("{name} must be formatted as <host>:<port>"))?;
+    if host.is_empty() {
+        return Err(format!("{name} host must not be empty"));
+    }
+    let port = port
+        .parse::<u16>()
+        .map_err(|error| format!("invalid {name} port: {error}"))?;
+    Ok((host.to_owned(), port))
+}
+
 fn load_standing_party_public_keys(
     directory: &PathBuf,
     parties: usize,
@@ -5342,6 +5774,7 @@ fn load_standing_party_public_keys(
 }
 
 async fn run_standing_node(raw_args: &[String]) -> Result<(), String> {
+    let _ = rustls::crypto::ring::default_provider().install_default();
     let party_id = standing_required_flag(raw_args, "--party-id")?
         .parse::<usize>()
         .map_err(|error| format!("invalid --party-id: {error}"))?;
@@ -5384,6 +5817,20 @@ async fn run_standing_node(raw_args: &[String]) -> Result<(), String> {
     let key_path = standing_required_flag(raw_args, "--key")?;
     let cert_der = fs::read(&cert_path).map_err(|error| format!("read --cert: {error}"))?;
     let key_der = fs::read(&key_path).map_err(|error| format!("read --key: {error}"))?;
+    let coordinator_addr = standing_host_port(raw_args, "--off-chain-coord")?;
+    let node_rpc_bind = standing_required_flag(raw_args, "--rpc-bind")?
+        .parse::<SocketAddr>()
+        .map_err(|error| format!("invalid --rpc-bind: {error}"))?;
+    let node_rpc = Arc::new(
+        OffChainNodeRPCServer::start(
+            &node_rpc_bind.ip().to_string(),
+            node_rpc_bind.port(),
+            cert_der.clone(),
+            key_der.clone(),
+        )
+        .await
+        .map_err(|error| format!("start standing node RPC listener: {error}"))?,
+    );
     let party_public_keys = load_standing_party_public_keys(&party_cert_dir, parties)?;
     let local_public_key = QuicNetworkManager::public_key_from_certificate_der(&cert_der)
         .map_err(|error| format!("parse --cert: {error}"))?;
@@ -5421,7 +5868,6 @@ async fn run_standing_node(raw_args: &[String]) -> Result<(), String> {
     }
     let as_leader = is_flag_present(raw_args, "--leader");
 
-    let _ = rustls::crypto::ring::default_provider().install_default();
     let (bootnode, party_bind) = if as_leader {
         let bootnode = bind;
         tokio::spawn(async move {
@@ -5446,7 +5892,7 @@ async fn run_standing_node(raw_args: &[String]) -> Result<(), String> {
 
     let mut network = QuicNetworkManager::with_node_id(party_id);
     network
-        .set_local_certificate_der(cert_der, key_der)
+        .set_local_certificate_der(cert_der.clone(), key_der.clone())
         .map_err(|error| format!("configure node certificate: {error}"))?;
     network
         .install_expected_server_public_keys(
@@ -5477,13 +5923,6 @@ async fn run_standing_node(raw_args: &[String]) -> Result<(), String> {
     )
     .await
     .map_err(|error| format!("standing mesh registration failed: {error}"))?;
-    // The transport's TLS allowlist is connection-wide. Admit deployment
-    // client certificates at TLS, then let the execution envelope mux enforce
-    // the exact per-execution certificate roster.
-    for public_key in client_catalog.public_keys() {
-        network.add_allowed_certificate_public_key(public_key);
-    }
-
     let party_public_key_map = party_public_keys.into_iter().collect::<BTreeMap<_, _>>();
     let reconnect_peers = standing_session
         .parties
@@ -5522,9 +5961,14 @@ async fn run_standing_node(raw_args: &[String]) -> Result<(), String> {
         preproc_store,
         persistent_identity,
         party_id: protocol_party_id,
+        coordinator_leader: party_id == 0,
         parties,
         threshold,
         pool_id,
+        coordinator_addr,
+        coordinator_cert_der: cert_der,
+        coordinator_key_der: key_der,
+        node_rpc,
         reservoirs: BTreeMap::new(),
         reservoir_cancellation: reservoir_cancellation.clone(),
     };
@@ -6697,7 +7141,7 @@ async fn main() {
 
     // Coordinator initialization (both leader and party modes)
     let mut coord_opt: Option<HbOffChainCoordinator<ark_bls12_381::Fr>> = None;
-    let mut node_rpc_opt: Option<HbOffChainNodeRpcServer<ark_bls12_381::Fr>> = None;
+    let mut node_rpc_opt: Option<OffChainNodeRPCServer> = None;
     let mut input_ids: Vec<Vec<u8>> = Vec::new();
     let mut output_ids: Vec<Vec<u8>> = Vec::new();
     let mut hb_bls12381_coord_engine: Option<
@@ -6742,7 +7186,7 @@ async fn main() {
 
             if let Some(ref rpc) = rpc_addr {
                 let node_cert_der = cert_der.clone().unwrap();
-                let node_rpc = HbOffChainNodeRpcServer::<ark_bls12_381::Fr>::start_for_execution(
+                let node_rpc = OffChainNodeRPCServer::start_for_execution(
                     &rpc.0,
                     rpc.1,
                     coordinator_execution_id(execution_id),
@@ -6901,7 +7345,7 @@ async fn main() {
                             .as_ref()
                             .expect("--rpc-bind required with coordinator");
 
-                        if let Err(e) = collect_hb_coordinator_inputs_for_bls(
+                        if let Err(e) = collect_hb_coordinator_inputs(
                             &mut vm,
                             &engine,
                             coord,
@@ -7209,7 +7653,7 @@ Flags:
   --control-dir <path>    Mounted standing-node command/event directory
   --program-dir <path>    Content-addressed standing-node program artifacts
   --client-cert-dir <path>
-                          Trusted client certificate artifacts named by standing admissions
+                          Coordinator client certificates named by standing admissions
   --pool-id <64-hex>      Nonzero identity for the process-lifetime party mesh
   --reservoir-burst-capacity <n>
                           Per-program preprocessing burst capacity warmed before
@@ -7243,12 +7687,12 @@ Flags:
                           Number of input shares each direct host-mode client submits
                           (default: 1; use with --wait-for-clients)
   --off-chain-coord <addr:port>
-                          Off-chain coordinator address
+                          Off-chain coordinator address (required in standing mode)
   --on-chain-coord <address>
                           Temporarily unavailable in the crates.io-ready build
   --eth-node <url>        Reserved for future on-chain coordinator support
   --wallet-sk <hex>       Reserved for future on-chain coordinator support
-  --rpc-bind <addr:port>  Node RPC server bind address (for mask distribution)
+  --rpc-bind <addr:port>  Node mask-RPC bind address (required in standing mode)
   --cert <path>           Path to DER-encoded X.509 certificate
   --key <path>            Path to DER-encoded private key
   --client-index <u64>    Reserved coordinator input index (coordinator client mode)
