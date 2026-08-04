@@ -17,7 +17,7 @@ crate-type = ["rlib", "cdylib"]
 
 [dependencies]
 libc = "=0.2.186"
-stoffelmpc-mpc = { package = "stoffelcrypto", version = "=0.1.0" }
+stoffelmpc-mpc = { package = "stoffelcrypto", version = "=0.1.0", features = ["statistics"] }
 stoffelnet = "=0.1.0"
 stoffel-vm-types = { version = "=0.1.2", path = "../stoffel-vm-types" }
 alloy = "=1.8.3"
@@ -74,6 +74,7 @@ default = []
 hb_itest = []
 avss_itest = []
 nat = []
+statistics = []
 
 [dev-dependencies]
 criterion = { version = "=0.6.0", features = ["html_reports"] }
