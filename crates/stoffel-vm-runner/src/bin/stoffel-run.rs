@@ -63,7 +63,11 @@ use stoffelmpc_mpc::common::rbc::rbc::Avid;
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
 use stoffelmpc_mpc::common::MPCProtocol;
 use stoffelmpc_mpc::honeybadger::input::InputError;
+#[cfg(feature = "statistics")]
+use stoffelmpc_mpc::avss_mpc::statistics::NodeStatisticsCounters as AvssNodeStatisticsCounters;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
+#[cfg(feature = "statistics")]
+use stoffelmpc_mpc::honeybadger::statistics::NodeStatisticsCounters;
 use stoffelmpc_mpc::honeybadger::SessionId as HbSessionId;
 use stoffelmpc_mpc::honeybadger::{HoneyBadgerMPCClient, HoneyBadgerMPCNode};
 use stoffelnet::network_utils::Network;
@@ -74,6 +78,17 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use x509_parser::prelude::*;
 type HbCoordinatorShare<F> = RobustShare<F>;
+
+fn read_trimmed_u64(path: &str) -> Option<u64> {
+    fs::read_to_string(path)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+}
+
+fn current_cgroup_memory_bytes() -> Option<u64> {
+    read_trimmed_u64("/sys/fs/cgroup/memory.current")
+        .or_else(|| read_trimmed_u64("/sys/fs/cgroup/memory/memory.usage_in_bytes"))
+}
 
 /// Owns the detached routing work for one standing execution.
 ///
@@ -3454,6 +3469,17 @@ where
     .map_err(|e| format!("Failed to create MPC node: {:?}", e))?;
     eprintln!("[party {}] MPC node setup complete", my_id);
 
+    // Wire a send hook into the shared QuicNetworkManager so that ALL outbound
+    // sends - both reactive sends from process() and proactive sends from the
+    // engine during preprocessing/operations - are counted.
+    #[cfg(feature = "statistics")]
+    {
+        let counters = mpc_node.statistics_counters.clone();
+        net.set_send_hook(std::sync::Arc::new(move |data: &[u8], n: usize| {
+            counters.record_outbound(data, n as u64);
+        }));
+    }
+
     // Created via from_existing_node which wraps the protocol node in Arc<Mutex>.
     let open_message_router = Arc::new(stoffel_vm::net::OpenMessageRouter::new());
     let topology = MpcSessionTopology::try_new(instance_id, my_id, n, t)
@@ -3642,10 +3668,20 @@ where
             .await
             .map_err(|e| format!("MPC preprocessing failed: {}", e))?;
         eprintln!(
-            "[party {}] MPC preprocessing complete! elapsed_ms={}",
+            "[party {}] MPC preprocessing complete! PP_SECS: {:.3}",
             my_id,
-            preprocessing_started_at.elapsed().as_millis()
+            preprocessing_started_at.elapsed().as_secs_f64()
         );
+        match current_cgroup_memory_bytes() {
+            Some(bytes) => eprintln!(
+                "[party {}] POST_PREPROCESSING_CGROUP_MEM_BYTES: {}",
+                my_id, bytes
+            ),
+            None => eprintln!(
+                "[party {}] POST_PREPROCESSING_CGROUP_MEM_BYTES: unavailable",
+                my_id
+            ),
+        }
     }
     if n > 1 && standing_preprocessing_action != Some(StandingPreprocAction::Reuse) {
         eprintln!(
@@ -3955,6 +3991,14 @@ where
         engine.set_client_output_id_map(input_ids.clone()).await;
     }
 
+    #[cfg(feature = "statistics")]
+    {
+        let counters = engine.node_handle().lock().await.statistics_counters.clone();
+        net.set_send_hook(std::sync::Arc::new(move |data: &[u8], n: usize| {
+            counters.record_outbound(data, n as u64);
+        }));
+    }
+
     engine
         .start_async()
         .await
@@ -4081,8 +4125,13 @@ where
         );
     } else {
         eprintln!("[party {}] Starting AVSS preprocessing...", my_id);
+        let preprocessing_started_at = std::time::Instant::now();
         engine.preprocess().await?;
-        eprintln!("[party {}] AVSS preprocessing complete!", my_id);
+        eprintln!(
+            "[party {}] AVSS preprocessing complete! PP_SECS: {:.3}",
+            my_id,
+            preprocessing_started_at.elapsed().as_secs_f64()
+        );
     }
 
     if n > 1 && standing_preprocessing_action != Some(StandingPreprocAction::Reuse) {
@@ -4470,6 +4519,12 @@ where
         if as_leader {
             coord.finalize().await.map_err(|e| e.to_string())?;
         }
+    }
+
+    #[cfg(feature = "statistics")]
+    {
+        let node = engine.node_handle().lock().await;
+        eprintln!("AVSS statistics:\n{}", node.statistics_snapshot());
     }
 
     print_vm_result(vm, result);
@@ -7175,6 +7230,10 @@ async fn main() {
     // online execution must always use the cooperative scheduler; limiting this
     // to the BLS12-381 coordinator path makes concurrent jobs block one another.
     let mut cooperative_engine: Option<Arc<dyn AsyncMpcEngine>> = None;
+    #[cfg(feature = "statistics")]
+    let mut hb_node_counters: Option<Arc<NodeStatisticsCounters>> = None;
+    #[cfg(feature = "statistics")]
+    let mut avss_node_counters: Option<Arc<AvssNodeStatisticsCounters>> = None;
 
     if matches!(backend_kind, MpcBackendKind::HoneyBadger) {
         if let Some(ref ca) = coord_addr {
@@ -7305,7 +7364,17 @@ async fn main() {
                         )
                         .await
                         {
-                            Ok(engine) => cooperative_engine = Some(engine),
+                            Ok(engine) => {
+                                #[cfg(feature = "statistics")]
+                                {
+                                    hb_node_counters = engine
+                                        .node_handle()
+                                        .try_lock()
+                                        .ok()
+                                        .map(|guard| Arc::clone(&guard.statistics_counters));
+                                }
+                                cooperative_engine = Some(engine);
+                            }
                             Err(e) => {
                                 eprintln!("[party {}] HoneyBadger setup failed: {}", my_id, e);
                                 exit(13);
@@ -7507,7 +7576,17 @@ async fn main() {
                         )
                         .await
                         {
-                            Ok(engine) => cooperative_engine = Some(engine),
+                            Ok(engine) => {
+                                #[cfg(feature = "statistics")]
+                                {
+                                    avss_node_counters = engine
+                                        .node_handle()
+                                        .try_lock()
+                                        .ok()
+                                        .map(|guard| Arc::clone(&guard.statistics_counters));
+                                }
+                                cooperative_engine = Some(engine);
+                            }
                             Err(e) => {
                                 eprintln!("[party {}] AVSS setup failed: {}", my_id, e);
                                 exit(13);
@@ -7566,8 +7645,8 @@ async fn main() {
         );
     }
     eprintln!(
-        "online VM execution complete! elapsed_ms={}",
-        online_started_at.elapsed().as_millis()
+        "online VM execution complete! EXEC_SECS: {:.3}",
+        online_started_at.elapsed().as_secs_f64()
     );
 
     match execution_result {
@@ -7662,6 +7741,16 @@ async fn main() {
             eprintln!("Execution error in '{}': {}", agreed_entry, err);
             exit(4);
         }
+    }
+
+    #[cfg(feature = "statistics")]
+    if let Some(engine) = hb_bls12381_coord_engine.as_ref() {
+        let node = engine.node_handle().lock().await;
+        eprintln!("HoneyBadger MPC statistics:\n{}", node.statistics_snapshot());
+    } else if let Some(counters) = hb_node_counters.as_ref() {
+        eprintln!("HoneyBadger MPC statistics:\n{}", counters.snapshot());
+    } else if let Some(counters) = avss_node_counters.as_ref() {
+        eprintln!("AVSS statistics:\n{}", counters.snapshot());
     }
 }
 
