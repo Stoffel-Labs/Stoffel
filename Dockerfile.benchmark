@@ -80,9 +80,9 @@ RUN --mount=type=ssh \
         export RUSTFLAGS="-C force-frame-pointers=yes"; \
     fi; \
     if [ "$ENABLE_NAT" = "true" ]; then \
-        cargo build --release --package stoffel-vm-runner --bin stoffel-run --features nat; \
+        cargo build --release --package stoffel-vm-runner --bin stoffel-run --features nat,statistics; \
     else \
-        cargo build --release --package stoffel-vm-runner --bin stoffel-run; \
+        cargo build --release --package stoffel-vm-runner --bin stoffel-run --features statistics; \
     fi; \
     if [ "$PROFILE_BUILD" != "true" ]; then \
         strip target/release/stoffel-run; \
