@@ -1332,6 +1332,10 @@ where
         .collect::<Vec<_>>();
     if engine.is_standing() {
         let reservations = engine.reservation_ops().map_err(|e| e.to_string())?;
+        // Reserve in maximal same-client contiguous runs instead of one index at a time: each
+        // `reserve_masks` call round-trips through the reservation registry (and, for standing
+        // engines, the mask-share cache lock), so issuing one call per index serializes that
+        // cost across every reserved index instead of every client.
         for run in canonical_mask_reservation_runs(&reserved_masks)? {
             let run_end = run
                 .start
@@ -1364,32 +1368,34 @@ where
     };
 
     for (cid, indices) in &client_to_indices {
-        for idx in indices {
-            node_rpc
-                .add_reserved_index_for_execution(execution_id, cid.clone(), *idx)
-                .await
-                .or_else(|e| match e {
-                    NodeRPCError::JSONError => {
-                        eprintln!(
-                            "[party {my_id}] add_reserved_index observed a stale client sink for index {idx}; continuing"
-                        );
-                        Ok(())
-                    }
-                    other => Err(format!("add_reserved_index: {:?}", other)),
-                })?;
-        }
-    }
-    for index in &reserved_mask_indices {
-        let slot = usize::try_from(*index)
-            .map_err(|_| format!("reserved index {index} exceeds usize range"))?;
-        let share = mask_shares
-            .get(slot)
-            .ok_or_else(|| format!("reserved index {index} exceeds mask share slots"))?;
         node_rpc
-            .add_mask_share_for_execution(execution_id, *index, share)
+            .add_reserved_indices_for_execution(execution_id, cid.clone(), indices.clone())
             .await
-            .map_err(|error| format!("add mask share: {error:?}"))?;
+            .or_else(|e| match e {
+                NodeRPCError::JSONError => {
+                    eprintln!(
+                        "[party {my_id}] add_reserved_indices observed a stale client sink for client {cid:?}; continuing"
+                    );
+                    Ok(())
+                }
+                other => Err(format!("add_reserved_indices: {:?}", other)),
+            })?;
     }
+    let mask_share_pairs = reserved_mask_indices
+        .iter()
+        .map(|index| {
+            let slot = usize::try_from(*index)
+                .map_err(|_| format!("reserved index {index} exceeds usize range"))?;
+            let share = mask_shares
+                .get(slot)
+                .ok_or_else(|| format!("reserved index {index} exceeds mask share slots"))?;
+            Ok((*index, share))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    node_rpc
+        .add_mask_shares_for_execution(execution_id, &mask_share_pairs)
+        .await
+        .map_err(|error| format!("add mask shares: {error:?}"))?;
 
     if as_leader {
         eprintln!("[party {my_id}] coordinator -> InputCollection");
@@ -2990,11 +2996,14 @@ async fn run_avss_offchain_coordinator_client_for_curve<F, G>(
             .wait_for_round(Round::InputMaskReservation)
             .await
             .unwrap();
-        for offset in 0..input_values.len() {
-            let index = reserved_index + offset as u64;
-            eprintln!("[client slot {index}] reserving input mask");
-            coord.reserve_mask_index(index).await.unwrap();
-        }
+        let reserve_indices: Vec<u64> = (0..input_values.len() as u64)
+            .map(|offset| reserved_index + offset)
+            .collect();
+        eprintln!(
+            "[client slot {reserved_index}] reserving {} input mask(s)",
+            reserve_indices.len()
+        );
+        coord.reserve_mask_indices(&reserve_indices).await.unwrap();
 
         let rpc_addrs: Vec<(String, u16)> = server_addrs
             .iter()
@@ -3031,14 +3040,17 @@ async fn run_avss_offchain_coordinator_client_for_curve<F, G>(
             .unwrap();
 
         coord.wait_for_round(Round::InputCollection).await.unwrap();
-        for (offset, (input_value, mask)) in input_values.iter().zip(masks).enumerate() {
-            let index = reserved_index + offset as u64;
-            eprintln!("[client slot {index}] submitting masked input");
-            coord
-                .send_masked_input(mask + *input_value, index)
-                .await
-                .unwrap();
-        }
+        let masked_inputs: Vec<(u64, F)> = input_values
+            .iter()
+            .zip(masks)
+            .enumerate()
+            .map(|(offset, (input_value, mask))| (reserved_index + offset as u64, mask + *input_value))
+            .collect();
+        eprintln!(
+            "[client slot {reserved_index}] submitting {} masked input(s)",
+            masked_inputs.len()
+        );
+        coord.send_masked_inputs(&masked_inputs).await.unwrap();
     }
     if output_len == 0 {
         eprintln!("[client slot {reserved_index}] input submission complete; no outputs requested");
@@ -3135,11 +3147,14 @@ async fn run_hb_coordinator_client_for_field<F>(
             .wait_for_round(Round::InputMaskReservation)
             .await
             .unwrap();
-        for offset in 0..input_values.len() {
-            let index = reserved_index + offset as u64;
-            eprintln!("[client slot {index}] reserving input mask");
-            coord.reserve_mask_index(index).await.unwrap();
-        }
+        let reserve_indices: Vec<u64> = (0..input_values.len() as u64)
+            .map(|offset| reserved_index + offset)
+            .collect();
+        eprintln!(
+            "[client slot {reserved_index}] reserving {} input mask(s)",
+            reserve_indices.len()
+        );
+        coord.reserve_mask_indices(&reserve_indices).await.unwrap();
 
         let rpc_addrs: Vec<(String, u16)> = server_addrs
             .iter()
@@ -3176,14 +3191,17 @@ async fn run_hb_coordinator_client_for_field<F>(
             .unwrap();
 
         coord.wait_for_round(Round::InputCollection).await.unwrap();
-        for (offset, (input_value, mask)) in input_values.iter().zip(masks).enumerate() {
-            let index = reserved_index + offset as u64;
-            eprintln!("[client slot {index}] submitting masked input");
-            coord
-                .send_masked_input(mask + *input_value, index)
-                .await
-                .unwrap();
-        }
+        let masked_inputs: Vec<(u64, F)> = input_values
+            .iter()
+            .zip(masks)
+            .enumerate()
+            .map(|(offset, (input_value, mask))| (reserved_index + offset as u64, mask + *input_value))
+            .collect();
+        eprintln!(
+            "[client slot {reserved_index}] submitting {} masked input(s)",
+            masked_inputs.len()
+        );
+        coord.send_masked_inputs(&masked_inputs).await.unwrap();
     }
     if output_len == 0 {
         eprintln!("[client slot {reserved_index}] input submission complete; no outputs requested");
@@ -4412,12 +4430,15 @@ where
                 })?;
             local_shares
         };
-        for (idx, share) in mask_shares.iter().enumerate() {
-            node_rpc
-                .add_mask_share_for_execution(coordinator_execution_id, idx as u64, share)
-                .await
-                .map_err(|e| format!("add_mask_share: {:?}", e))?;
-        }
+        let mask_share_pairs: Vec<(u64, &_)> = mask_shares
+            .iter()
+            .enumerate()
+            .map(|(idx, share)| (idx as u64, share))
+            .collect();
+        node_rpc
+            .add_mask_shares_for_execution(coordinator_execution_id, &mask_share_pairs)
+            .await
+            .map_err(|e| format!("add_mask_shares: {:?}", e))?;
 
         if as_leader {
             coord
@@ -4438,21 +4459,19 @@ where
         );
 
         for (cid, indices) in &client_to_indices {
-            for idx in indices {
-                node_rpc
-                    .add_reserved_index_for_execution(coordinator_execution_id, cid.clone(), *idx)
-                    .await
-                    .or_else(|e| match e {
-                        NodeRPCError::JSONError => {
-                            eprintln!(
-                                "[party {}] add_reserved_index observed a stale client sink for index {}; continuing",
-                                my_id, idx
-                            );
-                            Ok(())
-                        }
-                        other => Err(format!("add_reserved_index: {:?}", other)),
-                    })?;
-            }
+            node_rpc
+                .add_reserved_indices_for_execution(coordinator_execution_id, cid.clone(), indices.clone())
+                .await
+                .or_else(|e| match e {
+                    NodeRPCError::JSONError => {
+                        eprintln!(
+                            "[party {}] add_reserved_indices observed a stale client sink for client {:?}; continuing",
+                            my_id, cid
+                        );
+                        Ok(())
+                    }
+                    other => Err(format!("add_reserved_indices: {:?}", other)),
+                })?;
         }
 
         if as_leader {
@@ -5534,19 +5553,20 @@ impl StandingRunnerExecutionHandler {
                     .map_err(|error| error.to_string())?,
             );
             for (client, indices) in &client_to_indices {
-                for index in indices {
-                    self.node_rpc
-                        .add_reserved_index_for_execution(execution_id, client.clone(), *index)
-                        .await
-                        .map_err(|error| format!("add AVSS reserved index: {error:?}"))?;
-                }
-            }
-            for (index, share) in mask_shares.iter().enumerate() {
                 self.node_rpc
-                    .add_mask_share_for_execution(execution_id, index as u64, share)
+                    .add_reserved_indices_for_execution(execution_id, client.clone(), indices.clone())
                     .await
-                    .map_err(|error| format!("add AVSS mask share: {error:?}"))?;
+                    .map_err(|error| format!("add AVSS reserved indices: {error:?}"))?;
             }
+            let mask_share_pairs: Vec<(u64, &_)> = mask_shares
+                .iter()
+                .enumerate()
+                .map(|(index, share)| (index as u64, share))
+                .collect();
+            self.node_rpc
+                .add_mask_shares_for_execution(execution_id, &mask_share_pairs)
+                .await
+                .map_err(|error| format!("add AVSS mask shares: {error:?}"))?;
             if self.coordinator_leader {
                 coord
                     .collect_inputs()
