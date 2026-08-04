@@ -177,6 +177,9 @@ build_command() {
         BIND_PORT=$(echo "${STOFFEL_BIND_ADDR}" | awk -F: '{print $NF}')
         ADVERTISE_PORT=$((BIND_PORT + 1000))
         cmd="${cmd} --advertise ${STOFFEL_ADVERTISE_IP}:${ADVERTISE_PORT}"
+        if [ -n "${STOFFEL_ONE_OFF:-}" ]; then
+            cmd="${cmd} --one-off"
+        fi
     elif [ "${STOFFEL_ROLE}" = "bootnode" ]; then
         # Bootnode-only mode (no program execution)
         cmd="/app/stoffel-run --bootnode"
