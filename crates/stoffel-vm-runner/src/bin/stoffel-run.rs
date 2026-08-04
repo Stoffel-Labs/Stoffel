@@ -4306,6 +4306,7 @@ async fn run_avss_coordinated_party_for_curve<F, G>(
     program_hash: [u8; 32],
     preproc_store: Option<Arc<dyn PreprocStore>>,
     as_leader: bool,
+    one_off: bool,
     agreed_entry: &str,
 ) -> Result<(), String>
 where
@@ -4527,6 +4528,12 @@ where
         .await
         .map_err(|e| e.to_string())?;
 
+    if as_leader && one_off {
+        if let Err(e) = coord.request_shutdown().await {
+            eprintln!("Warning: failed to request off-chain coordinator shutdown: {}", e);
+        }
+    }
+
     #[cfg(feature = "statistics")]
     {
         let node = engine.node_handle().lock().await;
@@ -4559,6 +4566,7 @@ async fn run_avss_coordinated_party(
     program_hash: [u8; 32],
     preproc_store: Option<Arc<dyn PreprocStore>>,
     as_leader: bool,
+    one_off: bool,
     agreed_entry: &str,
 ) -> Result<(), String> {
     macro_rules! run {
@@ -4584,6 +4592,7 @@ async fn run_avss_coordinated_party(
                 program_hash,
                 preproc_store,
                 as_leader,
+                one_off,
                 agreed_entry,
             )
             .await
@@ -6169,6 +6178,7 @@ async fn main() {
     let mut as_bootnode = false;
     let mut as_leader = false;
     let mut as_client = false;
+    let mut one_off = false;
     let mut bind_addr: Option<SocketAddr> = None;
     let mut party_id: Option<usize> = None;
     let mut bootstrap_addr: Option<SocketAddr> = None;
@@ -6219,6 +6229,8 @@ async fn main() {
             as_leader = true;
         } else if arg == "--client" {
             as_client = true;
+        } else if arg == "--one-off" {
+            one_off = true;
         } else if arg == "--nat" {
             _enable_nat = true;
         } else if let Some(_rest) = arg.strip_prefix("--bind") {
@@ -7528,6 +7540,7 @@ async fn main() {
                         program_id,
                         preproc_store.clone(),
                         as_leader,
+                        one_off,
                         &agreed_entry,
                     )
                     .await
@@ -7741,6 +7754,15 @@ async fn main() {
                         .await
                         .unwrap();
 
+                    if as_leader && one_off {
+                        if let Err(e) = coord.request_shutdown().await {
+                            eprintln!(
+                                "Warning: failed to request off-chain coordinator shutdown: {}",
+                                e
+                            );
+                        }
+                    }
+
                     print_vm_result(&mut vm, result.clone());
                 }
 
@@ -7791,6 +7813,9 @@ Flags:
   --bootnode              Run as bootnode only (coordinates party discovery)
   --leader                Run as leader: bootnode + party 0 in one process
   --client                Run as client (provide inputs to MPC network)
+  --one-off               After confirming the off-chain coordinator's ProgramFinished
+                          round, tell it to shut down (leader only; coordinator must
+                          have been started with --one-off itself)
   --bind <addr:port>      Bind address for bootnode or party listen
   --party-id <usize>      Party id (party mode, 0-indexed)
   --bootstrap <addr:port> Bootnode address (party mode or client mode)
