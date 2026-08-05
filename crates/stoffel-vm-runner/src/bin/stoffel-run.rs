@@ -6139,6 +6139,18 @@ async fn run_standing_node(raw_args: &[String]) -> Result<(), String> {
 // Use a Tokio runtime for async operations
 #[tokio::main]
 async fn main() {
+    // The MPC protocol code (honeybadger/avss engines, preprocessing, etc.) emits
+    // `tracing` events, but nothing consumes them unless a subscriber is installed.
+    // RUST_LOG controls the level/target filter (e.g. `RUST_LOG=stoffel_vm=debug`);
+    // it defaults to "info" so protocol-round messages show up out of the box.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_writer(std::io::stderr)
+        .init();
+
     // When spawned by the local coordinator runner, tie this process's lifetime
     // to its parent: if the parent (the test/CLI/SDK process) dies — including a
     // SIGKILL, where the parent's `kill_on_drop` cleanup cannot run — this party
