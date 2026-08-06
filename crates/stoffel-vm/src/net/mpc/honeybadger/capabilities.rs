@@ -345,6 +345,14 @@ where
             .map_mpc_engine_operation("async_random_share")
     }
 
+    fn try_random_share_cached(&self, _ty: ShareType) -> Option<MpcEngineResult<ShareData>> {
+        self.try_reserve_random_share().map(|share| {
+            Self::encode_share(&share)
+                .map(|bytes| ShareData::Opaque(bytes.into()))
+                .map_mpc_engine_operation("cached_random_share")
+        })
+    }
+
     async fn random_integer_share_async(&self, ty: ShareType) -> MpcEngineResult<ShareData> {
         self.random_integer_share_async_impl(ty)
             .await

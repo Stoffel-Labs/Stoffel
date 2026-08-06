@@ -1066,7 +1066,7 @@ where
     }
 
     pub(super) fn encode_share(share: &RobustShare<F>) -> Result<Vec<u8>, String> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(share.compressed_size());
         share
             .serialize_compressed(&mut out)
             .map_err(|e| format!("serialize share: {}", e))?;

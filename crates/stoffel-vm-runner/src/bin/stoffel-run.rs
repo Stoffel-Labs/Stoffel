@@ -8,7 +8,7 @@ use std::fs;
 use std::fs::File;
 use std::io::BufReader;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::exit;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -178,8 +178,7 @@ struct MaskReservationRun {
 /// correlated share batch per client run instead of one share per RPC index.
 fn canonical_mask_reservation_runs(
     reserved_masks: &[(u64, Option<ClientId>)],
-) -> Result<Vec<MaskReservationRun>, String> {
-    let mut runs: Vec<MaskReservationRun> = Vec::new();
+) -> Result<impl Iterator<Item = MaskReservationRun> + '_, String> {
     for (position, (index, client_id)) in reserved_masks.iter().copied().enumerate() {
         let expected = u64::try_from(position)
             .map_err(|_| "coordinator mask index exceeds u64 range".to_owned())?;
@@ -188,29 +187,17 @@ fn canonical_mask_reservation_runs(
                 "coordinator returned non-canonical mask index {index}; expected {expected}"
             ));
         }
-        let client_id = client_id.ok_or_else(|| {
+        client_id.ok_or_else(|| {
             format!("coordinator reserved mask index {index} for an unadmitted client identity")
         })?;
-        if let Some(run) = runs.last_mut() {
-            let run_end = run
-                .start
-                .checked_add(run.count)
-                .ok_or_else(|| "standing mask reservation run overflows u64".to_owned())?;
-            if run.client_id == client_id && run_end == index {
-                run.count = run
-                    .count
-                    .checked_add(1)
-                    .ok_or_else(|| "standing mask reservation count overflows u64".to_owned())?;
-                continue;
-            }
-        }
-        runs.push(MaskReservationRun {
-            start: index,
-            count: 1,
-            client_id,
-        });
     }
-    Ok(runs)
+    Ok(reserved_masks
+        .chunk_by(|left, right| left.1 == right.1)
+        .map(|run| MaskReservationRun {
+            start: run[0].0,
+            count: u64::try_from(run.len()).expect("validated mask run length fits u64"),
+            client_id: run[0].1.expect("validated mask run has a client identity"),
+        }))
 }
 
 /// Planned preprocessing material counts for one program run.
@@ -579,10 +566,10 @@ where
                             phase,
                             message: PreprocessingExchangeMessage::Ack(digest),
                         })?;
-                        for peer_id in 0..parties {
-                            if peer_id != party_id && !ack_advertised[peer_id] {
+                        for (peer_id, advertised) in ack_advertised.iter_mut().enumerate() {
+                            if peer_id != party_id && !*advertised {
                                 match network.send(peer_id, &ack).await {
-                                    Ok(_) => ack_advertised[peer_id] = true,
+                                    Ok(_) => *advertised = true,
                                     Err(error) => eprintln!("party {} failed to acknowledge preprocessing transcript to party {peer_id}: {error}", party_id),
                                 }
                             }
@@ -3284,14 +3271,12 @@ async fn admit_execution_clients(
             match inbound.source {
                 ExecutionTransportSource::Client(client_id)
                     if inbound.kind == ExecutionMessageKind::Control
-                        && inbound.payload == EXECUTION_CLIENT_HELLO_V1 =>
+                        && inbound.payload == EXECUTION_CLIENT_HELLO_V1
+                        && expected_client_ids
+                            .as_ref()
+                            .is_none_or(|allowed| allowed.contains(&client_id)) =>
                 {
-                    if expected_client_ids
-                        .as_ref()
-                        .is_none_or(|allowed| allowed.contains(&client_id))
-                    {
-                        clients.insert(client_id);
-                    }
+                    clients.insert(client_id);
                 }
                 // Valid clients wait for INST before sending MPC payloads.
                 // Premature or unrelated traffic is not replayed into the
@@ -5599,7 +5584,7 @@ impl StandingRunnerExecutionHandler {
             expected_client_count: None,
             expected_client_bindings: None,
             expected_client_reservation_identities: Some(
-                self.expected_client_identities(&admission),
+                self.expected_client_identities(admission),
             ),
             client_count_hint: admission.clients.len(),
             client_input_count: manifest_client_input_count,
@@ -5790,7 +5775,7 @@ fn standing_host_port(args: &[String], name: &str) -> Result<(String, u16), Stri
 }
 
 fn load_standing_party_public_keys(
-    directory: &PathBuf,
+    directory: &Path,
     parties: usize,
 ) -> Result<Vec<(usize, NodePublicKey)>, String> {
     (0..parties)
@@ -6658,10 +6643,8 @@ async fn main() {
             }
         }
         cli_backend
-    } else if let Some(manifest_backend) = manifest_backend {
-        manifest_backend
     } else {
-        MpcBackendKind::default()
+        manifest_backend.unwrap_or_default()
     };
 
     let curve_config = if let Some(ref name) = mpc_curve {
@@ -8046,15 +8029,17 @@ mod tests {
 
     #[test]
     fn standing_mask_reservations_are_grouped_by_contiguous_client_run() {
-        let runs = canonical_mask_reservation_runs(&[
+        let reservations = [
             (0, Some(4)),
             (1, Some(4)),
             (2, Some(9)),
             (3, Some(9)),
             (4, Some(9)),
             (5, Some(4)),
-        ])
-        .unwrap();
+        ];
+        let runs = canonical_mask_reservation_runs(&reservations)
+            .unwrap()
+            .collect::<Vec<_>>();
         assert_eq!(runs.len(), 3);
         assert_eq!((runs[0].start, runs[0].count, runs[0].client_id), (0, 2, 4));
         assert_eq!((runs[1].start, runs[1].count, runs[1].client_id), (2, 3, 9));

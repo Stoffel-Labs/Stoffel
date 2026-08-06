@@ -11,6 +11,7 @@ pub use crate::storage::preproc::{
 };
 use ark_ec::{CurveGroup, PrimeGroup};
 use ark_std::rand::SeedableRng;
+use std::collections::VecDeque;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -321,7 +322,12 @@ where
         // single-item front drain is quadratic over a large execution.
         if self.is_standing() {
             if let Some(shares) = random.take() {
-                self.random_share_cache.lock().await.extend(shares);
+                let mut cache = self.random_share_cache.lock().await;
+                if cache.is_empty() {
+                    *cache = shares.into();
+                } else {
+                    cache.extend(shares);
+                }
             }
         }
         self.clone_node()
@@ -614,6 +620,27 @@ where
         Ok(())
     }
 
+    async fn fill_random_share_cache(
+        &self,
+        cache: &mut VecDeque<RobustShare<F>>,
+    ) -> Result<(), String> {
+        let node = self.clone_node().await;
+        let mut prep_material = node.preprocessing_material.lock().await;
+        let upstream = prep_material.length().random_shr;
+        if upstream == 0 {
+            return Ok(());
+        }
+        let shares = prep_material
+            .take_random_shares(upstream)
+            .map_err(|error| format!("Failed to refill random-share cache: {error:?}"))?;
+        if cache.is_empty() {
+            *cache = shares.into();
+        } else {
+            cache.extend(shares);
+        }
+        Ok(())
+    }
+
     pub(super) async fn reserve_random_shares(
         &self,
         num_shares: usize,
@@ -628,18 +655,7 @@ where
                     // Move the whole remaining upstream Vec in one drain. Its
                     // front-drain cost is then paid once, with no tail left to
                     // shift, rather than once per random builtin invocation.
-                    let node = self.clone_node().await;
-                    let mut prep_material = node.preprocessing_material.lock().await;
-                    let upstream = prep_material.length().random_shr;
-                    if upstream > 0 {
-                        let shares =
-                            prep_material
-                                .take_random_shares(upstream)
-                                .map_err(|error| {
-                                    format!("Failed to refill random-share cache: {error:?}")
-                                })?;
-                        cache.extend(shares);
-                    }
+                    self.fill_random_share_cache(&mut cache).await?;
                 }
                 if cache.len() >= num_shares {
                     return Ok(cache.drain(..num_shares).collect());
@@ -659,24 +675,25 @@ where
 
     /// Reserve one random share without allocating a temporary one-element
     /// vector. This is the hot path for `Share.random_field()`.
+    pub(super) fn try_reserve_random_share(&self) -> Option<RobustShare<F>> {
+        self.random_share_cache.try_lock().ok()?.pop_front()
+    }
+
     pub(super) async fn reserve_random_share(&self) -> Result<RobustShare<F>, String> {
+        // The VM normally consumes random shares sequentially. Avoid building
+        // and polling a mutex future on that overwhelmingly common path while
+        // retaining the async fallback for concurrent callers.
+        if let Some(share) = self.try_reserve_random_share() {
+            return Ok(share);
+        }
+
         loop {
             let available = {
                 let mut cache = self.random_share_cache.lock().await;
                 if let Some(share) = cache.pop_front() {
                     return Ok(share);
                 }
-                let node = self.clone_node().await;
-                let mut prep_material = node.preprocessing_material.lock().await;
-                let upstream = prep_material.length().random_shr;
-                if upstream > 0 {
-                    let shares = prep_material
-                        .take_random_shares(upstream)
-                        .map_err(|error| {
-                            format!("Failed to refill random-share cache: {error:?}")
-                        })?;
-                    cache.extend(shares);
-                }
+                self.fill_random_share_cache(&mut cache).await?;
                 if let Some(share) = cache.pop_front() {
                     return Ok(share);
                 }
