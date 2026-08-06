@@ -135,6 +135,140 @@ fn robust_reconstruction_with_byzantine_share_rejects_two_t_plus_one_quorum() {
     assert_eq!(recovered, secret);
 }
 
+#[tokio::test]
+async fn individual_random_reservations_transfer_the_upstream_vec_once_in_order() {
+    let engine = test_engine(
+        Arc::new(crate::net::open_registry::OpenMessageRouter::new()),
+        next_instance_id(),
+        0,
+        5,
+        1,
+    );
+    let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0xCA_C4_E0);
+    let shares = (0..8)
+        .map(|_| RobustShare::new(ark_bls12_381::Fr::rand(&mut rng), 1, 1))
+        .collect::<Vec<_>>();
+    engine
+        .clone_node()
+        .await
+        .preprocessing_material
+        .lock()
+        .await
+        .add(None, None, Some(shares.clone()), None, None, None);
+
+    for (index, expected) in shares.iter().enumerate() {
+        let taken = engine.reserve_random_share().await.unwrap();
+        assert_eq!(taken.share, expected.share);
+        if index == 0 {
+            assert_eq!(
+                engine
+                    .clone_node()
+                    .await
+                    .preprocessing_material
+                    .lock()
+                    .await
+                    .length()
+                    .random_shr,
+                0,
+                "the first reservation should move the complete upstream Vec"
+            );
+            assert_eq!(
+                engine.random_share_cache.lock().await.len(),
+                shares.len() - 1
+            );
+        }
+    }
+    assert!(engine.random_share_cache.lock().await.is_empty());
+}
+
+/// Scale regression for the `Share.random_field()` hot path. The user-facing
+/// stress program executes exactly this many individual reservations. Keep it
+/// ignored in the regular suite because its purpose is to validate the large
+/// production workload explicitly, not to add a large allocation to every
+/// unit-test run.
+#[tokio::test]
+#[ignore = "large 409,600-share regression workload"]
+async fn random_field_program_scales_to_client_mask_workload() {
+    const RANDOM_SHARE_COUNT: usize = 4_096 * 100;
+
+    let source = r#"
+def main() -> int64:
+  var num_elements: int64 = 4096
+  var num_clients: int64 = 100
+  var i: int64 = 0
+
+  while i < num_elements * num_clients:
+    var s: Share = Share.random_field()
+    i = i + 1
+  return 0
+"#;
+    let options = stoffellang::CompilerOptions {
+        optimize: true,
+        mpc_backend: stoffel_vm_types::compiled_binary::MpcBackend::HoneyBadger,
+        ..Default::default()
+    };
+    let compiled = stoffellang::compile(source, "<random-field-stress>", &options)
+        .expect("stress program should compile");
+    let functions = stoffellang::convert_to_binary(&compiled)
+        .try_to_vm_functions()
+        .expect("stress program should decode");
+
+    let engine = test_engine(
+        Arc::new(crate::net::open_registry::OpenMessageRouter::new()),
+        next_instance_id(),
+        0,
+        5,
+        1,
+    );
+    let expected = RobustShare::new(ark_bls12_381::Fr::from(42_u64), 1, 1);
+    engine
+        .clone_node()
+        .await
+        .preprocessing_material
+        .lock()
+        .await
+        .add(
+            None,
+            None,
+            Some(vec![expected.clone(); RANDOM_SHARE_COUNT]),
+            None,
+            None,
+            None,
+        );
+    engine.ready.store(true, Ordering::SeqCst);
+
+    let mut vm = crate::core_vm::VirtualMachine::builder()
+        .with_mpc_engine(engine.clone())
+        .build();
+    for function in functions {
+        vm.try_register_function(function)
+            .expect("register stress program function");
+    }
+    let started = std::time::Instant::now();
+    let result = vm
+        .execute_async("main", engine.as_ref())
+        .await
+        .expect("stress program should execute");
+    eprintln!(
+        "409,600 Share.random_field calls completed in {:?}",
+        started.elapsed()
+    );
+
+    assert_eq!(result, stoffel_vm_types::core_types::Value::I64(0));
+    assert!(engine.random_share_cache.lock().await.is_empty());
+    assert_eq!(
+        engine
+            .clone_node()
+            .await
+            .preprocessing_material
+            .lock()
+            .await
+            .length()
+            .random_shr,
+        0
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn preprocess_reserves_persistent_random_shares_when_loaded() {
     let dir = tempfile::tempdir().unwrap();
@@ -586,7 +720,9 @@ async fn standing_hb_activation_requires_complete_owned_bundle_without_top_up() 
     );
     let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(0xC1D1);
     let stable_random = vec![RobustShare::new(ark_bls12_381::Fr::rand(&mut rng), 1, t)];
-    let execution_random = vec![RobustShare::new(ark_bls12_381::Fr::rand(&mut rng), 1, t)];
+    let execution_random = (0..4)
+        .map(|_| RobustShare::new(ark_bls12_381::Fr::rand(&mut rng), 1, t))
+        .collect::<Vec<_>>();
     let (data, item_size) = preproc::serialize_robust_shares(&stable_random).unwrap();
     store
         .store(
@@ -607,7 +743,7 @@ async fn standing_hb_activation_requires_complete_owned_bundle_without_top_up() 
     .try_with_execution_id(execution_id)
     .unwrap();
     let engine = Engine::from_config(
-        HoneyBadgerEngineConfig::new(session, HoneyBadgerPreprocessingConfig::new(0, 1))
+        HoneyBadgerEngineConfig::new(session, HoneyBadgerPreprocessingConfig::new(0, 4))
             .with_deployment_mode(DeploymentMode::Standing),
     )
     .unwrap();
@@ -634,7 +770,7 @@ async fn standing_hb_activation_requires_complete_owned_bundle_without_top_up() 
     let (data, item_size) = preproc::serialize_robust_shares(&execution_random).unwrap();
     let bundle = OwnedPreprocBundle {
         random: Some(TakenPreproc {
-            count: 1,
+            count: execution_random.len() as u32,
             item_size,
             data,
         }),
@@ -642,8 +778,24 @@ async fn standing_hb_activation_requires_complete_owned_bundle_without_top_up() 
     };
     engine.activate_preallocated_standing(bundle).await.unwrap();
     assert!(engine.is_ready());
-    let taken = engine.reserve_random_shares(1).await.unwrap();
-    assert_eq!(taken[0].share, execution_random[0].share);
+    assert_eq!(
+        engine
+            .clone_node()
+            .await
+            .preprocessing_material
+            .lock()
+            .await
+            .length()
+            .random_shr,
+        0,
+        "standing activation should bypass the upstream front-draining Vec"
+    );
+    assert_eq!(engine.random_share_cache.lock().await.len(), 4);
+    for expected in &execution_random {
+        let taken = engine.reserve_random_share().await.unwrap();
+        assert_eq!(taken.share, expected.share);
+    }
+    assert!(engine.random_share_cache.lock().await.is_empty());
     assert_eq!(
         store.available(&stable.random_share()).await.unwrap(),
         1,

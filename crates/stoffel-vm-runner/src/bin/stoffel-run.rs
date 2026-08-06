@@ -166,6 +166,53 @@ fn checked_client_input_total(counts: impl IntoIterator<Item = usize>) -> Result
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MaskReservationRun {
+    start: u64,
+    count: u64,
+    client_id: ClientId,
+}
+
+/// Validate the coordinator's canonical mask order and coalesce adjacent
+/// indices owned by the same client. Standing engines can then remove one
+/// correlated share batch per client run instead of one share per RPC index.
+fn canonical_mask_reservation_runs(
+    reserved_masks: &[(u64, Option<ClientId>)],
+) -> Result<Vec<MaskReservationRun>, String> {
+    let mut runs: Vec<MaskReservationRun> = Vec::new();
+    for (position, (index, client_id)) in reserved_masks.iter().copied().enumerate() {
+        let expected = u64::try_from(position)
+            .map_err(|_| "coordinator mask index exceeds u64 range".to_owned())?;
+        if index != expected {
+            return Err(format!(
+                "coordinator returned non-canonical mask index {index}; expected {expected}"
+            ));
+        }
+        let client_id = client_id.ok_or_else(|| {
+            format!("coordinator reserved mask index {index} for an unadmitted client identity")
+        })?;
+        if let Some(run) = runs.last_mut() {
+            let run_end = run
+                .start
+                .checked_add(run.count)
+                .ok_or_else(|| "standing mask reservation run overflows u64".to_owned())?;
+            if run.client_id == client_id && run_end == index {
+                run.count = run
+                    .count
+                    .checked_add(1)
+                    .ok_or_else(|| "standing mask reservation count overflows u64".to_owned())?;
+                continue;
+            }
+        }
+        runs.push(MaskReservationRun {
+            start: index,
+            count: 1,
+            client_id,
+        });
+    }
+    Ok(runs)
+}
+
 /// Planned preprocessing material counts for one program run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PlannedPreprocessing {
@@ -1283,25 +1330,19 @@ where
         .collect::<Vec<_>>();
     if engine.is_standing() {
         let reservations = engine.reservation_ops().map_err(|e| e.to_string())?;
-        for (expected, (index, client_id)) in reserved_masks.iter().copied().enumerate() {
-            let expected = u64::try_from(expected)
-                .map_err(|_| "coordinator mask index exceeds u64 range".to_owned())?;
-            if index != expected {
-                return Err(format!(
-                    "coordinator returned non-canonical mask index {index}; expected {expected}"
-                ));
-            }
-            let client_id = client_id.ok_or_else(|| {
-                format!("coordinator reserved mask index {index} for an unadmitted client identity")
-            })?;
+        for run in canonical_mask_reservation_runs(&reserved_masks)? {
+            let run_end = run
+                .start
+                .checked_add(run.count)
+                .ok_or_else(|| "standing mask reservation run overflows u64".to_owned())?;
             let grant = reservations
-                .reserve_masks(client_id, 1)
+                .reserve_masks(run.client_id, run.count)
                 .await
                 .map_err(|e| e.to_string())?;
-            if grant.start != index || grant.count != 1 {
+            if grant.start != run.start || grant.count != run.count {
                 return Err(format!(
-                    "node reservation diverged from coordinator index {index}: start={}, count={}",
-                    grant.start, grant.count
+                    "node reservation diverged from coordinator run {}..{}: start={}, count={}",
+                    run.start, run_end, grant.start, grant.count,
                 ));
             }
         }
@@ -7774,12 +7815,13 @@ Examples:
 #[cfg(test)]
 mod tests {
     use super::{
-        band_pow2, bind_admitted_client_slots, checked_client_input_total,
-        client_input_completion_quorum, client_input_setup_plan, client_output_slot_map,
-        client_transport_recipient, decode_preprocessing_exchange, direct_client_inbound_message,
-        encode_preprocessing_exchange, field_outputs_to_hex, format_coordinator_outputs,
-        hb_input_only_completion_proven, input_client_ids_from_output_ids, mpc_input_protocol_ids,
-        plan_preprocessing, preprocessing_transcript_digest, record_preprocessing_exchange_value,
+        band_pow2, bind_admitted_client_slots, canonical_mask_reservation_runs,
+        checked_client_input_total, client_input_completion_quorum, client_input_setup_plan,
+        client_output_slot_map, client_transport_recipient, decode_preprocessing_exchange,
+        direct_client_inbound_message, encode_preprocessing_exchange, field_outputs_to_hex,
+        format_coordinator_outputs, hb_input_only_completion_proven,
+        input_client_ids_from_output_ids, mpc_input_protocol_ids, plan_preprocessing,
+        preprocessing_transcript_digest, record_preprocessing_exchange_value,
         render_fixed_point_i64, resolve_client_protocol_bindings, standing_preproc_pool_program_id,
         standing_reservoir_plan, standing_reservoir_refill_execution_id,
         validate_preprocessing_proposals, validate_reservoir_allocation_admission,
@@ -8000,6 +8042,26 @@ mod tests {
         assert!(checked_client_input_total([usize::MAX, 1])
             .unwrap_err()
             .contains("overflows usize"));
+    }
+
+    #[test]
+    fn standing_mask_reservations_are_grouped_by_contiguous_client_run() {
+        let runs = canonical_mask_reservation_runs(&[
+            (0, Some(4)),
+            (1, Some(4)),
+            (2, Some(9)),
+            (3, Some(9)),
+            (4, Some(9)),
+            (5, Some(4)),
+        ])
+        .unwrap();
+        assert_eq!(runs.len(), 3);
+        assert_eq!((runs[0].start, runs[0].count, runs[0].client_id), (0, 2, 4));
+        assert_eq!((runs[1].start, runs[1].count, runs[1].client_id), (2, 3, 9));
+        assert_eq!((runs[2].start, runs[2].count, runs[2].client_id), (5, 1, 4));
+
+        assert!(canonical_mask_reservation_runs(&[(1, Some(4))]).is_err());
+        assert!(canonical_mask_reservation_runs(&[(0, None)]).is_err());
     }
 
     #[test]
