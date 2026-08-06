@@ -42,6 +42,90 @@ fn preprocessing_progress_interval() -> Option<Duration> {
         .map(Duration::from_secs)
 }
 
+// HoneyBadger turns each requested Beaver triple into two temporary random
+// shares before constructing the triple.  Letting a large standing-reservoir
+// deficit flow through one `run_preprocessing` call pipelines every RanSha
+// batch at once.  At the AES reservoir watermark (131,072 triples) that is 43
+// simultaneous RanSha sessions and is large enough to starve the execution
+// transport before any session can finish.  Keep each call at the largest
+// workload exercised reliably by the regular 65,536-triple preprocessing path.
+const STANDING_TOP_UP_RANDOM_WORK_LIMIT: u64 = 132 * 1024;
+const STANDING_TOP_UP_DERIVED_SHARE_LIMIT: u64 = 65_536;
+
+fn div_ceil_u64(value: u64, divisor: u64) -> u64 {
+    if value == 0 {
+        0
+    } else {
+        1 + (value - 1) / divisor
+    }
+}
+
+fn split_u32(total: u32, parts: u64, index: u64) -> u32 {
+    let total = u64::from(total);
+    let value = total / parts + u64::from(index < total % parts);
+    u32::try_from(value).expect("a partition of a u32 count always fits in u32")
+}
+
+fn standing_top_up_random_work(chunk: PoolAvailability, threshold: usize) -> u64 {
+    let group_size = u64::try_from(threshold)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(2)
+        .saturating_add(1);
+    let beaver = u64::from(chunk.beaver);
+    let rounded_beaver = div_ceil_u64(beaver, group_size).saturating_mul(group_size);
+    rounded_beaver
+        .saturating_mul(2)
+        .saturating_add(u64::from(chunk.random))
+}
+
+/// Split one agreed standing-store deficit into deterministic protocol calls.
+/// Every party computes the same chunks from the authenticated target, keeping
+/// HoneyBadger session counters aligned while bounding the number of pipelined
+/// RanSha and derived-share sessions in any one call.
+fn standing_top_up_chunks(needed: PoolAvailability, threshold: usize) -> Vec<PoolAvailability> {
+    if needed == PoolAvailability::default() {
+        return Vec::new();
+    }
+
+    let group_size = u64::try_from(threshold)
+        .unwrap_or(u64::MAX)
+        .saturating_mul(2)
+        .saturating_add(1);
+    let random_work_limit = STANDING_TOP_UP_RANDOM_WORK_LIMIT.max(group_size.saturating_mul(2));
+    let total_random_work = standing_top_up_random_work(needed, threshold);
+    let mut part_count = div_ceil_u64(total_random_work, random_work_limit)
+        .max(div_ceil_u64(
+            u64::from(needed.prand_bit),
+            STANDING_TOP_UP_DERIVED_SHARE_LIMIT,
+        ))
+        .max(div_ceil_u64(
+            u64::from(needed.prand_int),
+            STANDING_TOP_UP_DERIVED_SHARE_LIMIT,
+        ))
+        .max(1);
+
+    loop {
+        let chunks = (0..part_count)
+            .map(|index| PoolAvailability {
+                beaver: split_u32(needed.beaver, part_count, index),
+                random: split_u32(needed.random, part_count, index),
+                prand_bit: split_u32(needed.prand_bit, part_count, index),
+                prand_int: split_u32(needed.prand_int, part_count, index),
+            })
+            .filter(|chunk| *chunk != PoolAvailability::default())
+            .collect::<Vec<_>>();
+        let within_limits = chunks.iter().all(|chunk| {
+            standing_top_up_random_work(*chunk, threshold) <= random_work_limit
+                && u64::from(chunk.prand_bit) <= STANDING_TOP_UP_DERIVED_SHARE_LIMIT
+                && u64::from(chunk.prand_int) <= STANDING_TOP_UP_DERIVED_SHARE_LIMIT
+        });
+        if within_limits {
+            return chunks;
+        }
+        part_count = part_count.saturating_add(1);
+    }
+}
+
 impl<F, G> HoneyBadgerMpcEngine<F, G>
 where
     F: SupportedMpcField,
@@ -301,56 +385,77 @@ where
         }
         let (store, _hash, scope) = self.preproc_scope().await?;
         let mut node = self.clone_node().await;
-        node.params.n_triples = needed.beaver as usize;
-        node.params.n_random_shares = needed.random as usize;
-        node.params.n_prandbit = needed.prand_bit as usize;
-        node.params.n_prandint = needed.prand_int as usize;
+        let chunks = standing_top_up_chunks(needed, self.topology.threshold());
+        for (chunk_index, chunk) in chunks.iter().copied().enumerate() {
+            node.params.n_triples = chunk.beaver as usize;
+            node.params.n_random_shares = chunk.random as usize;
+            node.params.n_prandbit = chunk.prand_bit as usize;
+            node.params.n_prandint = chunk.prand_int as usize;
 
-        let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
-        node.run_preprocessing(self.protocol_net.clone(), &mut rng)
-            .await
-            .map_err(|e| format!("Failed to top up preprocessing material: {:?}", e))?;
+            eprintln!(
+                "[party {}] standing preprocessing top-up chunk {}/{}: {:?}",
+                self.topology.party_id(),
+                chunk_index + 1,
+                chunks.len(),
+                chunk,
+            );
+            let mut rng = ark_std::rand::rngs::StdRng::from_entropy();
+            node.run_preprocessing(self.protocol_net.clone(), &mut rng)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Failed to top up preprocessing material in chunk {}/{}: {:?}",
+                        chunk_index + 1,
+                        chunks.len(),
+                        e
+                    )
+                })?;
 
-        let mut to_append = Vec::new();
-        {
-            let mut prep = node.preprocessing_material.lock().await;
-            let lengths = prep.length();
-            if lengths.beaver_triples > 0 {
-                let items = prep
-                    .take_beaver_triples(lengths.beaver_triples)
-                    .map_err(|e| format!("{e:?}"))?;
-                let (data, item_size) = preproc::serialize_beaver_triples::<F>(&items)?;
-                let added = preproc::u32_index(items.len() as u64, "generated beaver")?;
-                to_append.push((scope.beaver_triple(), item_size, added, data));
+            // Drain and commit each completed chunk before beginning the next
+            // one. This bounds memory and leaves an inspectable partial store if
+            // a later chunk fails, while the generation marker remains pending
+            // until `apply_standing_preproc_plan` commits the complete plan.
+            let mut to_append = Vec::new();
+            {
+                let mut prep = node.preprocessing_material.lock().await;
+                let lengths = prep.length();
+                if lengths.beaver_triples > 0 {
+                    let items = prep
+                        .take_beaver_triples(lengths.beaver_triples)
+                        .map_err(|e| format!("{e:?}"))?;
+                    let (data, item_size) = preproc::serialize_beaver_triples::<F>(&items)?;
+                    let added = preproc::u32_index(items.len() as u64, "generated beaver")?;
+                    to_append.push((scope.beaver_triple(), item_size, added, data));
+                }
+                if lengths.random_shr > 0 {
+                    let items = prep
+                        .take_random_shares(lengths.random_shr)
+                        .map_err(|e| format!("{e:?}"))?;
+                    let (data, item_size) = preproc::serialize_robust_shares::<F>(&items)?;
+                    let added = preproc::u32_index(items.len() as u64, "generated random")?;
+                    to_append.push((scope.random_share(), item_size, added, data));
+                }
+                if lengths.prandbit > 0 {
+                    let items = prep
+                        .take_prandbit_shares(lengths.prandbit)
+                        .map_err(|e| format!("{e:?}"))?;
+                    let (data, item_size) = preproc::serialize_prandbit_shares::<F>(&items)?;
+                    let added = preproc::u32_index(items.len() as u64, "generated prandbit")?;
+                    to_append.push((scope.prand_bit(), item_size, added, data));
+                }
+                if lengths.prandint > 0 {
+                    let items = prep
+                        .take_prandint_shares(lengths.prandint)
+                        .map_err(|e| format!("{e:?}"))?;
+                    let (data, item_size) = preproc::serialize_robust_shares::<F>(&items)?;
+                    let added = preproc::u32_index(items.len() as u64, "generated prandint")?;
+                    to_append.push((scope.prand_int(), item_size, added, data));
+                }
             }
-            if lengths.random_shr > 0 {
-                let items = prep
-                    .take_random_shares(lengths.random_shr)
-                    .map_err(|e| format!("{e:?}"))?;
-                let (data, item_size) = preproc::serialize_robust_shares::<F>(&items)?;
-                let added = preproc::u32_index(items.len() as u64, "generated random")?;
-                to_append.push((scope.random_share(), item_size, added, data));
-            }
-            if lengths.prandbit > 0 {
-                let items = prep
-                    .take_prandbit_shares(lengths.prandbit)
-                    .map_err(|e| format!("{e:?}"))?;
-                let (data, item_size) = preproc::serialize_prandbit_shares::<F>(&items)?;
-                let added = preproc::u32_index(items.len() as u64, "generated prandbit")?;
-                to_append.push((scope.prand_bit(), item_size, added, data));
-            }
-            if lengths.prandint > 0 {
-                let items = prep
-                    .take_prandint_shares(lengths.prandint)
-                    .map_err(|e| format!("{e:?}"))?;
-                let (data, item_size) = preproc::serialize_robust_shares::<F>(&items)?;
-                let added = preproc::u32_index(items.len() as u64, "generated prandint")?;
-                to_append.push((scope.prand_int(), item_size, added, data));
-            }
-        }
 
-        for (key, item_size, added, data) in to_append {
-            store.append_items(&key, item_size, added, &data).await?;
+            for (key, item_size, added, data) in to_append {
+                store.append_items(&key, item_size, added, &data).await?;
+            }
         }
 
         Ok(())
@@ -677,6 +782,63 @@ mod standing_agreement_tests {
                 item_size: 48,
             },
         }
+    }
+
+    fn sum_chunks(chunks: &[PoolAvailability]) -> PoolAvailability {
+        chunks
+            .iter()
+            .fold(PoolAvailability::default(), |sum, chunk| PoolAvailability {
+                beaver: sum.beaver + chunk.beaver,
+                random: sum.random + chunk.random,
+                prand_bit: sum.prand_bit + chunk.prand_bit,
+                prand_int: sum.prand_int + chunk.prand_int,
+            })
+    }
+
+    #[test]
+    fn small_standing_top_up_stays_in_one_protocol_call() {
+        let needed = PoolAvailability {
+            beaver: 2_048,
+            random: 128,
+            prand_bit: 64,
+            prand_int: 32,
+        };
+        assert_eq!(standing_top_up_chunks(needed, 1), vec![needed]);
+    }
+
+    #[test]
+    fn aes_standing_reservoir_top_up_is_split_at_safe_ransha_workload() {
+        let needed = PoolAvailability {
+            beaver: 131_072,
+            random: 1_152,
+            prand_bit: 0,
+            prand_int: 0,
+        };
+        let chunks = standing_top_up_chunks(needed, 1);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(sum_chunks(&chunks), needed);
+        assert_eq!(chunks[0].beaver, 65_536);
+        assert_eq!(chunks[0].random, 576);
+        assert!(chunks.iter().all(|chunk| {
+            standing_top_up_random_work(*chunk, 1) <= STANDING_TOP_UP_RANDOM_WORK_LIMIT
+        }));
+    }
+
+    #[test]
+    fn standing_top_up_chunking_preserves_all_material_counts() {
+        let needed = PoolAvailability {
+            beaver: 262_145,
+            random: 200_003,
+            prand_bit: 131_073,
+            prand_int: 65_537,
+        };
+        let chunks = standing_top_up_chunks(needed, 2);
+        assert_eq!(sum_chunks(&chunks), needed);
+        assert!(chunks.iter().all(|chunk| {
+            standing_top_up_random_work(*chunk, 2) <= STANDING_TOP_UP_RANDOM_WORK_LIMIT
+                && u64::from(chunk.prand_bit) <= STANDING_TOP_UP_DERIVED_SHARE_LIMIT
+                && u64::from(chunk.prand_int) <= STANDING_TOP_UP_DERIVED_SHARE_LIMIT
+        }));
     }
 
     #[test]
