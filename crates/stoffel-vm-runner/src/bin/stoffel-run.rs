@@ -4515,11 +4515,15 @@ where
                 .await
                 .map_err(|e| format!("send_output_shares: {e}"))?;
         }
-
-        if as_leader {
-            coord.finalize().await.map_err(|e| e.to_string())?;
-        }
     }
+
+    if as_leader {
+        coord.finalize().await.map_err(|e| e.to_string())?;
+    }
+    coord
+        .wait_for_round(Round::ProgramFinished)
+        .await
+        .map_err(|e| e.to_string())?;
 
     #[cfg(feature = "statistics")]
     {
@@ -7720,15 +7724,21 @@ async fn main() {
                                 );
                             }
                         }
-                        if as_leader {
-                            if let Err(e) = coord.finalize().await {
-                                eprintln!(
-                                    "Warning: failed to finalize off-chain coordinator round: {}",
-                                    e
-                                );
-                            }
+                    }
+
+                    if as_leader {
+                        if let Err(e) = coord.finalize().await {
+                            eprintln!(
+                                "Warning: failed to finalize off-chain coordinator round: {}",
+                                e
+                            );
                         }
                     }
+                    coord
+                        .wait_for_round(Round::ProgramFinished)
+                        .await
+                        .unwrap();
+
                     print_vm_result(&mut vm, result.clone());
                 }
 
