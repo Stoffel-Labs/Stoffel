@@ -6,7 +6,7 @@ use crate::net::reservation::ReservationRegistry;
 use crate::net::session::ExecutionId;
 use crate::storage::preproc::PreprocStore;
 use ark_ec::{CurveGroup, PrimeGroup};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::marker::PhantomData;
 use std::ops::{Deref, DerefMut};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -81,6 +81,14 @@ where
     /// reservation index. Material is removed from LMDB before insertion here
     /// and erased after the masked-input exchange completes.
     reserved_mask_shares: Mutex<BTreeMap<u64, Vec<u8>>>,
+    /// Execution-local random shares in consumption order.
+    ///
+    /// The upstream preprocessing container is a `Vec` whose
+    /// `take_random_shares(1)` implementation drains from the front, shifting
+    /// every remaining element. Pulling the upstream pool into this deque once
+    /// keeps repeated `Share.random_field()` calls linear overall while
+    /// preserving the party-aligned share order.
+    random_share_cache: Mutex<VecDeque<RobustShare<F>>>,
     /// Optional in-process capture used by coordinator-backed output delivery.
     client_output_capture: Mutex<Option<Vec<HoneyBadgerClientOutputRecord<F>>>>,
     /// Maps VM-visible manifest slots to transport-derived client IDs.
@@ -300,6 +308,7 @@ where
             .store(new_instance_id, Ordering::SeqCst);
         *self.reservation.write().await = None;
         self.reserved_mask_shares.lock().await.clear();
+        self.random_share_cache.lock().await.clear();
         self.client_output_id_map.write().await.clear();
         self.strict_client_output_id_map
             .store(false, Ordering::SeqCst);
@@ -397,6 +406,7 @@ where
             persistent_identity: StdRwLock::new(local_identity),
             reservation: tokio::sync::RwLock::new(None),
             reserved_mask_shares: Mutex::new(BTreeMap::new()),
+            random_share_cache: Mutex::new(VecDeque::new()),
             client_output_capture: Mutex::new(None),
             client_output_id_map: RwLock::new(BTreeMap::new()),
             strict_client_output_id_map: AtomicBool::new(false),
@@ -594,6 +604,7 @@ where
             persistent_identity: StdRwLock::new(local_identity),
             reservation: tokio::sync::RwLock::new(None),
             reserved_mask_shares: Mutex::new(BTreeMap::new()),
+            random_share_cache: Mutex::new(VecDeque::new()),
             client_output_capture: Mutex::new(None),
             client_output_id_map: RwLock::new(BTreeMap::new()),
             strict_client_output_id_map: AtomicBool::new(false),

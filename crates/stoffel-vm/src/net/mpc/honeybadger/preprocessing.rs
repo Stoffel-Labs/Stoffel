@@ -291,7 +291,7 @@ where
                     .map_err(|error| error.to_string())
             },
         )?;
-        let random = decode(
+        let mut random = decode(
             bundle.random,
             "preallocated random shares",
             |data, item_size| {
@@ -315,6 +315,15 @@ where
                     .map_err(|error| error.to_string())
             },
         )?;
+        // Standing executions never return their owned preprocessing bundle to
+        // persistent storage. Install program-visible random shares directly
+        // into the O(1) front-pop cache instead of the upstream Vec, whose
+        // single-item front drain is quadratic over a large execution.
+        if self.is_standing() {
+            if let Some(shares) = random.take() {
+                self.random_share_cache.lock().await.extend(shares);
+            }
+        }
         self.clone_node()
             .await
             .preprocessing_material
@@ -609,28 +618,77 @@ where
         &self,
         num_shares: usize,
     ) -> Result<Vec<RobustShare<F>>, String> {
+        if num_shares == 0 {
+            return Ok(Vec::new());
+        }
         loop {
-            let attempt = {
-                let node = self.clone_node().await;
-                let mut prep_material = node.preprocessing_material.lock().await;
-                prep_material.take_random_shares(num_shares)
+            let available = {
+                let mut cache = self.random_share_cache.lock().await;
+                if cache.len() < num_shares {
+                    // Move the whole remaining upstream Vec in one drain. Its
+                    // front-drain cost is then paid once, with no tail left to
+                    // shift, rather than once per random builtin invocation.
+                    let node = self.clone_node().await;
+                    let mut prep_material = node.preprocessing_material.lock().await;
+                    let upstream = prep_material.length().random_shr;
+                    if upstream > 0 {
+                        let shares =
+                            prep_material
+                                .take_random_shares(upstream)
+                                .map_err(|error| {
+                                    format!("Failed to refill random-share cache: {error:?}")
+                                })?;
+                        cache.extend(shares);
+                    }
+                }
+                if cache.len() >= num_shares {
+                    return Ok(cache.drain(..num_shares).collect());
+                }
+                cache.len()
             };
 
-            match attempt {
-                Ok(shares) => return Ok(shares),
-                Err(HoneyBadgerError::NotEnoughPreprocessing) if self.is_standing() => {
-                    return Err(format!(
-                        "standing execution exhausted its owned random-share bundle (need {num_shares})"
-                    ));
-                }
-                Err(HoneyBadgerError::NotEnoughPreprocessing) => {
-                    self.regenerate_random_shares(num_shares).await?;
-                    continue;
-                }
-                Err(other) => {
-                    return Err(format!("Failed to take random shares: {:?}", other));
-                }
+            if self.is_standing() {
+                return Err(format!(
+                    "standing execution exhausted its owned random-share bundle (need {num_shares}, have {available})"
+                ));
             }
+            self.regenerate_random_shares(num_shares.saturating_sub(available))
+                .await?;
+        }
+    }
+
+    /// Reserve one random share without allocating a temporary one-element
+    /// vector. This is the hot path for `Share.random_field()`.
+    pub(super) async fn reserve_random_share(&self) -> Result<RobustShare<F>, String> {
+        loop {
+            let available = {
+                let mut cache = self.random_share_cache.lock().await;
+                if let Some(share) = cache.pop_front() {
+                    return Ok(share);
+                }
+                let node = self.clone_node().await;
+                let mut prep_material = node.preprocessing_material.lock().await;
+                let upstream = prep_material.length().random_shr;
+                if upstream > 0 {
+                    let shares = prep_material
+                        .take_random_shares(upstream)
+                        .map_err(|error| {
+                            format!("Failed to refill random-share cache: {error:?}")
+                        })?;
+                    cache.extend(shares);
+                }
+                if let Some(share) = cache.pop_front() {
+                    return Ok(share);
+                }
+                cache.len()
+            };
+
+            if self.is_standing() {
+                return Err(format!(
+                    "standing execution exhausted its owned random-share bundle (need 1, have {available})"
+                ));
+            }
+            self.regenerate_random_shares(1).await?;
         }
     }
 
@@ -740,8 +798,8 @@ where
         &self,
         _ty: ShareType,
     ) -> Result<ShareData, String> {
-        let shares = self.reserve_random_shares(1).await?;
-        Self::encode_share(&shares[0]).map(|v| ShareData::Opaque(v.into()))
+        let share = self.reserve_random_share().await?;
+        Self::encode_share(&share).map(|v| ShareData::Opaque(v.into()))
     }
 
     /// Pull one pre-generated PRandInt share from the preprocessing pool.
