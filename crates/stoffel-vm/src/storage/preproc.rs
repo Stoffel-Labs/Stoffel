@@ -968,8 +968,7 @@ impl PreprocStore for LmdbPreprocStore {
                 }
                 let source_data = database
                     .get(&transaction, &material.data_key)?
-                    .ok_or(PreprocStoreError::NotFound)?
-                    .to_vec();
+                    .ok_or(PreprocStoreError::NotFound)?;
                 let expected_len = byte_offset(
                     meta.count,
                     meta.item_size,
@@ -1003,13 +1002,20 @@ impl PreprocStore for LmdbPreprocStore {
                 let remaining = meta.count - end_index;
                 bundle.remaining.set(material.kind, remaining);
 
-                if count > 0 {
+                // Retain only the slices that outlive this transaction. This
+                // avoids cloning the complete reservoir blob before extracting
+                // one execution's bundle.
+                let taken_data = (count > 0).then(|| source_data[start..end].to_vec());
+                let compacted_remaining = (remaining > 0 && !(meta.consumed == 0 && count == 0))
+                    .then(|| source_data[end..].to_vec());
+
+                if let Some(data) = taken_data {
                     bundle.set(
                         material.kind,
                         TakenPreproc {
                             count,
                             item_size: meta.item_size,
-                            data: source_data[start..end].to_vec(),
+                            data,
                         },
                     );
                 }
@@ -1030,7 +1036,13 @@ impl PreprocStore for LmdbPreprocStore {
                             item_size: meta.item_size,
                         })?,
                     )?;
-                    database.put(&mut transaction, &material.data_key, &source_data[end..])?;
+                    database.put(
+                        &mut transaction,
+                        &material.data_key,
+                        compacted_remaining
+                            .as_deref()
+                            .expect("non-compact reservoir has remaining bytes"),
+                    )?;
                 }
             }
             transaction.commit()?;

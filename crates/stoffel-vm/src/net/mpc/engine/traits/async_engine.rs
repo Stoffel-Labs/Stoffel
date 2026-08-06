@@ -207,12 +207,22 @@ pub trait AsyncMpcEngine: MpcEngine {
     }
 
     /// Generate random bytes as a secret-shared value asynchronously.
+    ///
+    /// Engines backed by preprocessed randomness can expose an immediately
+    /// available share through [`Self::try_random_share_cached`], avoiding an
+    /// allocated async-trait future on the VM's per-share hot path.
     async fn random_share_async(&self, _ty: ShareType) -> MpcEngineResult<ShareData> {
         Err(self.async_capability_unavailable(
             "async_random_share",
             MpcCapability::Randomness,
             "random_share_async",
         ))
+    }
+
+    /// Return a preprocessed random share without waiting, or `None` when the
+    /// engine must use its asynchronous generation/refill path.
+    fn try_random_share_cached(&self, _ty: ShareType) -> Option<MpcEngineResult<ShareData>> {
+        None
     }
 
     /// Generate an integer random secret share suitable for typed integer reveals.

@@ -3866,6 +3866,7 @@ fn turmoil_async_mpc_builtins_cover_every_async_backend_operation() -> turmoil::
         );
 
         let random_share = vm.execute_async("turmoil_random", engine.as_ref()).await?;
+        assert!(matches!(random_share, Value::Object(_)));
         assert_eq!(
             vm.execute_async_with_args("turmoil_open_arg", &[random_share], engine.as_ref())
                 .await?,

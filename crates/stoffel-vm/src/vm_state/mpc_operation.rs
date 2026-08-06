@@ -550,10 +550,13 @@ impl PendingMpcBuiltinCall {
                 CompletedMpcBuiltinResult::ByteArray(bytes)
             }
             PendingMpcBuiltinOperation::Random { share_type } => {
-                let share_data = engine
-                    .random_share_async(share_type)
-                    .await
-                    .map_mpc_backend_err("async_random_share")?;
+                let share_data = match engine.try_random_share_cached(share_type) {
+                    Some(result) => result.map_mpc_backend_err("cached_random_share")?,
+                    None => engine
+                        .random_share_async(share_type)
+                        .await
+                        .map_mpc_backend_err("async_random_share")?,
+                };
                 CompletedMpcBuiltinResult::ShareObject {
                     share_type,
                     share_data,
