@@ -170,7 +170,7 @@ where
                     tracing::warn!("wait_for_share: drain_rbc_output failed: {e:?}");
                 }
                 let shares = node.share_gen_avss.avss.shares.lock().await;
-                if let Some(Some(share_vec)) = shares.get(&session_id) {
+                if let Some((_, Some(share_vec))) = shares.get(&session_id) {
                     if let Some(share) = share_vec.first() {
                         return Ok(share.clone());
                     }
@@ -209,7 +209,7 @@ where
                 let shares = node.share_gen_avss.avss.shares.lock().await;
                 let stored = self.stored_shares.lock().await;
 
-                for share_vec in shares.values().flatten() {
+                for share_vec in shares.values().filter_map(|(_, share_vec)| share_vec.as_ref()) {
                     if let Some(share) = share_vec.first() {
                         let already_stored = stored
                             .values()
@@ -404,7 +404,7 @@ where
         generator: G,
         partial_point: G,
     ) -> Result<Vec<u8>, String> {
-        if !verify_feldman(share.clone()) {
+        if !verify_feldman(share.clone(), share.feldmanshare.id) {
             return Err(
                 "AVSS open-in-exponent local Feldman share failed commitment verification"
                     .to_string(),
@@ -507,7 +507,7 @@ where
         context: &str,
     ) -> Result<Vec<(usize, Vec<u8>)>, String> {
         let expected_share = Self::decode_feldman_share(expected_share_bytes)?;
-        if !verify_feldman(expected_share.clone()) {
+        if !verify_feldman(expected_share.clone(), expected_share.feldmanshare.id) {
             return Err(format!(
                 "{context}: local Feldman share failed commitment verification"
             ));
@@ -599,7 +599,7 @@ where
         use ark_ec::{pairing::Pairing, PrimeGroup};
 
         let expected_share = Self::decode_feldman_share(expected_share_bytes)?;
-        if !verify_feldman(expected_share.clone()) {
+        if !verify_feldman(expected_share.clone(), expected_share.feldmanshare.id) {
             return Err(format!(
                 "{context}: local Feldman share failed commitment verification"
             ));
@@ -744,7 +744,7 @@ where
             .checked_add(1)
             .ok_or_else(|| format!("{context}: valid contribution count overflowed"))?;
 
-        if !verify_feldman(expected_share.clone()) {
+        if !verify_feldman(expected_share.clone(), expected_share.feldmanshare.id) {
             return Err(format!(
                 "{context}: local Feldman share failed commitment verification"
             ));
@@ -760,7 +760,7 @@ where
                 continue;
             }
 
-            if verify_feldman(share.clone()) {
+            if verify_feldman(share.clone(), share.feldmanshare.id) {
                 verified.push(share);
                 if verified.len() == required_valid {
                     break;

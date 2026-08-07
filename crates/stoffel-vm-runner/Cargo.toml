@@ -19,7 +19,7 @@ stoffel-vm = { version = "0.1.0", path = "../stoffel-vm" }
 stoffel-vm-types = { version = "0.1.0", path = "../stoffel-vm-types" }
 stoffel-mpc-coordinator-shared = { git = "https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git", branch = "codex/persistent-execution-coordination" }
 stoffel-mpc-coordinator-off-chain = { git = "https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git", branch = "codex/persistent-execution-coordination" }
-stoffelmpc-mpc = { package = "stoffelcrypto", version = "0.1.0" }
+stoffelmpc-mpc = { package = "stoffelcrypto", version = "0.1.0", features = ["statistics"] }
 stoffelnet = "0.1.0"
 ark-bls12-381 = "0.5.0"
 ark-bn254 = "0.5.0"
@@ -44,8 +44,12 @@ thiserror = "2"
 tokio = { version = "1.47.1", features = ["full"] }
 tokio-util = { version = "0.7.16", features = ["rt"] }
 tracing = "0.1.41"
+tracing-subscriber = { version = "0.3.19", features = ["env-filter"] }
 uuid = { version = "1.17.0", features = ["v4"] }
 x509-parser = "0.18.1"
+
+[features]
+statistics = ["stoffelmpc-mpc/statistics"]
 
 [dev-dependencies]
 rcgen = "0.14.2"
