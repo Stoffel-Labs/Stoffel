@@ -1247,7 +1247,6 @@ async fn collect_hb_coordinator_inputs<F, G>(
     program_id: [u8; 32],
     run_id: u64,
     my_id: usize,
-    as_leader: bool,
 ) -> Result<(), String>
 where
     F: SupportedMpcField,
@@ -1293,13 +1292,11 @@ where
         )
     };
 
-    if as_leader {
-        eprintln!("[party {my_id}] coordinator -> InputMaskReservation");
-        coord
-            .reserve_input_masks()
-            .await
-            .map_err(|e| e.to_string())?;
-    }
+    eprintln!("[party {my_id}] proposing InputMaskReservation");
+    coord
+        .reserve_input_masks()
+        .await
+        .map_err(|e| e.to_string())?;
     coord
         .wait_for_round(Round::InputMaskReservation)
         .await
@@ -1397,10 +1394,8 @@ where
         .await
         .map_err(|error| format!("add mask shares: {error:?}"))?;
 
-    if as_leader {
-        eprintln!("[party {my_id}] coordinator -> InputCollection");
-        coord.collect_inputs().await.map_err(|e| e.to_string())?;
-    }
+    eprintln!("[party {my_id}] proposing InputCollection");
+    coord.collect_inputs().await.map_err(|e| e.to_string())?;
     coord
         .wait_for_round(Round::InputCollection)
         .await
@@ -4365,12 +4360,10 @@ where
     .await
     .map_err(|error| format!("Failed to start AVSS node RPC server: {error}"))?;
 
-    if as_leader {
-        coord
-            .start_preprocessing()
-            .await
-            .map_err(|e| e.to_string())?;
-    }
+    coord
+        .start_preprocessing()
+        .await
+        .map_err(|e| e.to_string())?;
 
     let engine = setup_avss_party_for_curve::<F, G>(
         vm,
@@ -4440,12 +4433,10 @@ where
             .await
             .map_err(|e| format!("add_mask_shares: {:?}", e))?;
 
-        if as_leader {
-            coord
-                .reserve_input_masks()
-                .await
-                .map_err(|e| e.to_string())?;
-        }
+        coord
+            .reserve_input_masks()
+            .await
+            .map_err(|e| e.to_string())?;
         coord
             .wait_for_round(Round::InputMaskReservation)
             .await
@@ -4474,9 +4465,7 @@ where
                 })?;
         }
 
-        if as_leader {
-            coord.collect_inputs().await.map_err(|e| e.to_string())?;
-        }
+        coord.collect_inputs().await.map_err(|e| e.to_string())?;
         coord
             .wait_for_round(Round::InputCollection)
             .await
@@ -4496,9 +4485,7 @@ where
         );
     }
 
-    if as_leader {
-        coord.start_mpc().await.map_err(|e| e.to_string())?;
-    }
+    coord.start_mpc().await.map_err(|e| e.to_string())?;
     coord
         .wait_for_round(Round::MPCExecution)
         .await
@@ -4517,9 +4504,7 @@ where
 
     let captured_outputs = engine.drain_client_output_records().await;
     if !captured_outputs.is_empty() {
-        if as_leader {
-            coord.send_output().await.map_err(|e| e.to_string())?;
-        }
+        coord.send_output().await.map_err(|e| e.to_string())?;
         coord
             .wait_for_round(Round::OutputDistribution)
             .await
@@ -4539,14 +4524,14 @@ where
         }
     }
 
-    if as_leader {
-        coord.finalize().await.map_err(|e| e.to_string())?;
-    }
+    coord.finalize().await.map_err(|e| e.to_string())?;
     coord
         .wait_for_round(Round::ProgramFinished)
         .await
         .map_err(|e| e.to_string())?;
 
+    // Shutting the coordinator process down is an administrative action for one-off runs, not a
+    // protocol round, so it stays with a single party rather than becoming a quorum proposal.
     if as_leader && one_off {
         if let Err(e) = coord.request_shutdown().await {
             eprintln!("Warning: failed to request off-chain coordinator shutdown: {}", e);
@@ -4748,7 +4733,6 @@ struct StandingRunnerExecutionHandler {
     preproc_store: Arc<dyn PreprocStore>,
     persistent_identity: DurableIdentityDigest,
     party_id: usize,
-    coordinator_leader: bool,
     parties: usize,
     threshold: usize,
     pool_id: ExecutionId,
@@ -5325,31 +5309,60 @@ impl StandingRunnerExecutionHandler {
         result
     }
 
+    /// Tells the coordinator this node is finished with `execution_id`, retrying a few times.
+    ///
+    /// Retirement now needs only `n - t` acknowledgements, so one node giving up does not pin the
+    /// execution. Retrying still matters for the node's own accounting: a cleanup that fails on a
+    /// transient connection error is indistinguishable from a node that crashed, and each
+    /// unacknowledged execution consumes one of the coordinator's sealed-execution records.
+    async fn retire_coordinator_execution(
+        &self,
+        execution_id: CoordinatorExecutionId,
+    ) -> Result<(), String> {
+        const RETIREMENT_ATTEMPTS: usize = 3;
+        const RETIREMENT_BACKOFF: Duration = Duration::from_millis(200);
+
+        let mut last_error = String::new();
+        for attempt in 0..RETIREMENT_ATTEMPTS {
+            if attempt > 0 {
+                tokio::time::sleep(RETIREMENT_BACKOFF * attempt as u32).await;
+            }
+            let outcome =
+                match HbOffChainCoordinator::<ark_bls12_381::Fr>::start_rpc_client_for_execution(
+                    &self.coordinator_addr.0,
+                    self.coordinator_addr.1,
+                    self.threshold as u64,
+                    self.parties as u64,
+                    0,
+                    execution_id,
+                    self.coordinator_cert_der.clone(),
+                    self.coordinator_key_der.clone(),
+                )
+                .await
+                {
+                    Ok(coordinator) => coordinator
+                        .retire_execution()
+                        .await
+                        .map_err(|error| format!("retire coordinator execution: {error}")),
+                    Err(error) => Err(format!("connect for coordinator cleanup: {error}")),
+                };
+            match outcome {
+                Ok(()) => return Ok(()),
+                Err(error) => last_error = error,
+            }
+        }
+        Err(format!(
+            "coordinator retirement failed after {RETIREMENT_ATTEMPTS} attempts: {last_error}"
+        ))
+    }
+
     async fn cleanup_execution_resources(
         &self,
         context: &NodeExecutionContext,
     ) -> Result<(), String> {
         let execution_id = coordinator_execution_id(context.spec.execution_id);
         self.node_rpc.retire_execution(execution_id).await;
-        let coordinator_cleanup =
-            match HbOffChainCoordinator::<ark_bls12_381::Fr>::start_rpc_client_for_execution(
-                &self.coordinator_addr.0,
-                self.coordinator_addr.1,
-                self.threshold as u64,
-                self.parties as u64,
-                0,
-                execution_id,
-                self.coordinator_cert_der.clone(),
-                self.coordinator_key_der.clone(),
-            )
-            .await
-            {
-                Ok(coordinator) => coordinator
-                    .retire_execution()
-                    .await
-                    .map_err(|error| format!("retire coordinator execution: {error}")),
-                Err(error) => Err(format!("connect for coordinator cleanup: {error}")),
-            };
+        let coordinator_cleanup = self.retire_coordinator_execution(execution_id).await;
 
         // Preprocessing was already removed from LMDB into the execution's
         // owned in-memory bundle. Cleanup only retires local VM state; dropping
@@ -5395,12 +5408,10 @@ impl StandingRunnerExecutionHandler {
         )
         .await
         .map_err(|error| format!("connect to standing coordinator: {error}"))?;
-        if self.coordinator_leader {
-            coord
-                .start_preprocessing()
-                .await
-                .map_err(|error| error.to_string())?;
-        }
+        coord
+            .start_preprocessing()
+            .await
+            .map_err(|error| error.to_string())?;
         coord
             .wait_for_round(Round::Preprocessing)
             .await
@@ -5427,13 +5438,10 @@ impl StandingRunnerExecutionHandler {
             standing_preproc_pool_program_id(self.pool_id, admission.program_id),
             0,
             self.party_id,
-            self.coordinator_leader,
         )
         .await?;
 
-        if self.coordinator_leader {
-            coord.start_mpc().await.map_err(|error| error.to_string())?;
-        }
+        coord.start_mpc().await.map_err(|error| error.to_string())?;
         coord
             .wait_for_round(Round::MPCExecution)
             .await
@@ -5443,12 +5451,10 @@ impl StandingRunnerExecutionHandler {
             .await
             .map_err(|error| format!("VM execution failed: {error}"))?;
 
-        if self.coordinator_leader {
-            coord
-                .send_output()
-                .await
-                .map_err(|error| error.to_string())?;
-        }
+        coord
+            .send_output()
+            .await
+            .map_err(|error| error.to_string())?;
         coord
             .wait_for_round(Round::OutputDistribution)
             .await
@@ -5465,9 +5471,7 @@ impl StandingRunnerExecutionHandler {
                 .await
                 .map_err(|error| format!("send HoneyBadger output shares: {error}"))?;
         }
-        if self.coordinator_leader {
-            coord.finalize().await.map_err(|error| error.to_string())?;
-        }
+        coord.finalize().await.map_err(|error| error.to_string())?;
         coord
             .wait_for_round(Round::ProgramFinished)
             .await
@@ -5503,12 +5507,10 @@ impl StandingRunnerExecutionHandler {
         )
         .await
         .map_err(|error| format!("connect to standing coordinator: {error}"))?;
-        if self.coordinator_leader {
-            coord
-                .start_preprocessing()
-                .await
-                .map_err(|error| error.to_string())?;
-        }
+        coord
+            .start_preprocessing()
+            .await
+            .map_err(|error| error.to_string())?;
         coord
             .wait_for_round(Round::Preprocessing)
             .await
@@ -5536,12 +5538,10 @@ impl StandingRunnerExecutionHandler {
                     })?;
                 shares
             };
-            if self.coordinator_leader {
-                coord
-                    .reserve_input_masks()
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
+            coord
+                .reserve_input_masks()
+                .await
+                .map_err(|error| error.to_string())?;
             coord
                 .wait_for_round(Round::InputMaskReservation)
                 .await
@@ -5567,12 +5567,10 @@ impl StandingRunnerExecutionHandler {
                 .add_mask_shares_for_execution(execution_id, &mask_share_pairs)
                 .await
                 .map_err(|error| format!("add AVSS mask shares: {error:?}"))?;
-            if self.coordinator_leader {
-                coord
-                    .collect_inputs()
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
+            coord
+                .collect_inputs()
+                .await
+                .map_err(|error| error.to_string())?;
             coord
                 .wait_for_round(Round::InputCollection)
                 .await
@@ -5591,9 +5589,7 @@ impl StandingRunnerExecutionHandler {
             );
         }
 
-        if self.coordinator_leader {
-            coord.start_mpc().await.map_err(|error| error.to_string())?;
-        }
+        coord.start_mpc().await.map_err(|error| error.to_string())?;
         coord
             .wait_for_round(Round::MPCExecution)
             .await
@@ -5602,12 +5598,10 @@ impl StandingRunnerExecutionHandler {
             .execute_async_with_metrics(&admission.entry, engine.as_ref())
             .await
             .map_err(|error| format!("VM execution failed: {error}"))?;
-        if self.coordinator_leader {
-            coord
-                .send_output()
-                .await
-                .map_err(|error| error.to_string())?;
-        }
+        coord
+            .send_output()
+            .await
+            .map_err(|error| error.to_string())?;
         coord
             .wait_for_round(Round::OutputDistribution)
             .await
@@ -5624,9 +5618,7 @@ impl StandingRunnerExecutionHandler {
                 .await
                 .map_err(|error| format!("send AVSS output shares: {error}"))?;
         }
-        if self.coordinator_leader {
-            coord.finalize().await.map_err(|error| error.to_string())?;
-        }
+        coord.finalize().await.map_err(|error| error.to_string())?;
         coord
             .wait_for_round(Round::ProgramFinished)
             .await
@@ -6077,7 +6069,6 @@ async fn run_standing_node(raw_args: &[String]) -> Result<(), String> {
         preproc_store,
         persistent_identity,
         party_id: protocol_party_id,
-        coordinator_leader: party_id == 0,
         parties,
         threshold,
         pool_id,
@@ -7376,9 +7367,7 @@ async fn main() {
                 _execution_scanner = Some(scanner);
                 // Phase 1: Coordinator preprocessing trigger
                 if let Some(ref mut coord) = coord_opt {
-                    if as_leader {
-                        coord.start_preprocessing().await.unwrap();
-                    }
+                    coord.start_preprocessing().await.unwrap();
                 }
                 // Phase 2: Create MPC engine + preprocessing + coordinator input phases
                 macro_rules! setup_hb {
@@ -7502,7 +7491,6 @@ async fn main() {
                             program_id,
                             0,
                             my_id,
-                            as_leader,
                         )
                         .await
                         {
@@ -7658,10 +7646,8 @@ async fn main() {
 
     // Coordinator: signal MPC execution phase
     if let Some(ref mut coord) = coord_opt {
-        if as_leader {
-            eprintln!("[party] coordinator -> MPCExecution");
-            coord.start_mpc().await.unwrap();
-        }
+        eprintln!("[party] proposing MPCExecution");
+        coord.start_mpc().await.unwrap();
         coord.wait_for_round(Round::MPCExecution).await.unwrap();
     }
 
@@ -7747,9 +7733,7 @@ async fn main() {
                             shares.extend(record.shares);
                         }
 
-                        if as_leader {
-                            coord.send_output().await.unwrap();
-                        }
+                        coord.send_output().await.unwrap();
                         coord
                             .wait_for_round(Round::OutputDistribution)
                             .await
@@ -7773,19 +7757,19 @@ async fn main() {
                         }
                     }
 
-                    if as_leader {
-                        if let Err(e) = coord.finalize().await {
-                            eprintln!(
-                                "Warning: failed to finalize off-chain coordinator round: {}",
-                                e
-                            );
-                        }
+                    if let Err(e) = coord.finalize().await {
+                        eprintln!(
+                            "Warning: failed to finalize off-chain coordinator round: {}",
+                            e
+                        );
                     }
                     coord
                         .wait_for_round(Round::ProgramFinished)
                         .await
                         .unwrap();
 
+                    // Coordinator shutdown is administrative rather than a protocol round, so it
+                    // stays with a single party instead of becoming a quorum proposal.
                     if as_leader && one_off {
                         if let Err(e) = coord.request_shutdown().await {
                             eprintln!(
