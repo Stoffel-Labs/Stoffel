@@ -17,7 +17,7 @@ use stoffel_mpc_coordinator_off_chain::node_rpc::{
     NodeRPCClient as OffChainNodeRPCClient, NodeRPCServer as OffChainNodeRPCServer,
 };
 use stoffel_mpc_coordinator_off_chain::{
-    ExecutionRegistration, InputAssignment, InputSlotAssignment, OffChainCoordinatorClient,
+    ExecutionRegistration, InputAssignment, InputClientRange, OffChainCoordinatorClient,
 };
 use stoffel_mpc_coordinator_shared::{
     Coordinator, ExecutionId as CoordinatorExecutionId, NodeRPCError, Round,
@@ -5748,7 +5748,14 @@ impl StandingRunnerExecutionHandler {
             .iter()
             .map(|schema| (schema.client_slot, schema))
             .collect::<BTreeMap<_, _>>();
-        let mut input_slots = Vec::new();
+        // `InputClientRange` references its owning client by index into `input_clients`, and
+        // covers that client's whole contiguous block of inputs in one entry — a client with
+        // many inputs (e.g. a federated-learning model vector) would otherwise need one wire
+        // entry per input instead of one per client, which for a wide roster is enough on its
+        // own to blow past the RPC transport's request-size cap.
+        let mut input_clients = Vec::new();
+        let mut input_ranges = Vec::new();
+        let mut n_inputs: u64 = 0;
         let mut output_clients = Vec::new();
         for (client, public_key) in admission
             .clients
@@ -5766,13 +5773,21 @@ impl StandingRunnerExecutionHandler {
             if !schema.outputs.is_empty() {
                 output_clients.push(public_key.clone());
             }
-            for input_ordinal in 0..schema.inputs.len() {
-                input_slots.push(InputSlotAssignment {
-                    client: public_key.clone(),
-                    label: u64::try_from(input_ordinal)
-                        .map_err(|_| "client input ordinal exceeds u64".to_owned())?,
-                });
+            if schema.inputs.is_empty() {
+                continue;
             }
+            let client_index = u32::try_from(input_clients.len())
+                .map_err(|_| "too many distinct input clients".to_owned())?;
+            input_clients.push(public_key.clone());
+            let count = u64::try_from(schema.inputs.len())
+                .map_err(|_| "client input count exceeds u64".to_owned())?;
+            n_inputs = n_inputs
+                .checked_add(count)
+                .ok_or_else(|| "coordinator input count exceeds u64".to_owned())?;
+            input_ranges.push(InputClientRange {
+                client_index,
+                count,
+            });
         }
         let min_output_shares = match program.backend {
             MpcBackendKind::HoneyBadger => self
@@ -5786,10 +5801,12 @@ impl StandingRunnerExecutionHandler {
         Ok(ExecutionRegistration {
             execution_id: coordinator_execution_id(admission.execution_id),
             program_hash: admission.program_id,
-            n_inputs: u64::try_from(input_slots.len())
-                .map_err(|_| "coordinator input count exceeds u64".to_owned())?,
+            n_inputs,
             output_clients,
-            input_assignment: InputAssignment { input_slots },
+            input_assignment: InputAssignment {
+                clients: input_clients,
+                ranges: input_ranges,
+            },
             min_output_shares,
         })
     }
