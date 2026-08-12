@@ -5706,7 +5706,7 @@ dependencies = [
 [[package]]
 name = "stoffel-mpc-coordinator-off-chain"
 version = "0.1.0"
-source = "git+https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git?branch=fixes%2Fconcurrent-execution-coordinator#3b0e0440e9bbbb622ff38448e1249c7e30169390"
+source = "git+https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git?branch=fixes%2Fconcurrent-execution-coordinator#13e16ac12600a7f9863b02555d11b992efc283bb"
 dependencies = [
  "ark-bls12-381",
  "ark-ff 0.5.0",
@@ -5727,7 +5727,7 @@ dependencies = [
 [[package]]
 name = "stoffel-mpc-coordinator-shared"
 version = "0.1.0"
-source = "git+https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git?branch=fixes%2Fconcurrent-execution-coordinator#3b0e0440e9bbbb622ff38448e1249c7e30169390"
+source = "git+https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git?branch=fixes%2Fconcurrent-execution-coordinator#13e16ac12600a7f9863b02555d11b992efc283bb"
 dependencies = [
  "ark-bls12-381",
  "ark-ec",
@@ -6892,7 +6892,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
