@@ -16,8 +16,8 @@ x-party-common: &party-common
     context: .
     dockerfile: Dockerfile
     additional_contexts:
-      coordinator: "${STOFFEL_COORDINATOR_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#dev}"
-      networking: "${STOFFEL_NETWORK_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-networking.git#feature/client-and-node-list-consensus}"
+      coordinator: "${STOFFEL_COORDINATOR_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#fixes/concurrent-execution-coordinator}"
+      networking: "${STOFFEL_NETWORK_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-networking.git#fixes/concurrent-execution-transport}"
   networks:
     stoffel-net:
   volumes:
@@ -41,7 +41,7 @@ services:
       context: .
       dockerfile: docker/coordinator.Dockerfile
       additional_contexts:
-        coordinator: "${STOFFEL_COORDINATOR_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#dev}"
+        coordinator: "${STOFFEL_COORDINATOR_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#fixes/concurrent-execution-coordinator}"
     container_name: stoffel-coordinator
     hostname: coordinator
     command:

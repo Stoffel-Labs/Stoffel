@@ -26,8 +26,8 @@ services:
       context: .
       dockerfile: Dockerfile
       additional_contexts:
-        coordinator: "${STOFFEL_COORDINATOR_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#dev}"
-        networking: "${STOFFEL_NETWORK_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-networking.git#feature/client-and-node-list-consensus}"
+        coordinator: "${STOFFEL_COORDINATOR_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#fixes/concurrent-execution-coordinator}"
+        networking: "${STOFFEL_NETWORK_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-networking.git#fixes/concurrent-execution-transport}"
       args:
         ENABLE_NAT: "true"
     container_name: stoffel-leader
@@ -55,8 +55,8 @@ services:
       context: .
       dockerfile: Dockerfile
       additional_contexts:
-        coordinator: "${STOFFEL_COORDINATOR_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#dev}"
-        networking: "${STOFFEL_NETWORK_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-networking.git#feature/client-and-node-list-consensus}"
+        coordinator: "${STOFFEL_COORDINATOR_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#fixes/concurrent-execution-coordinator}"
+        networking: "${STOFFEL_NETWORK_CONTEXT:-https://github.com/Stoffel-Labs/stoffel-networking.git#fixes/concurrent-execution-transport}"
       args:
         ENABLE_NAT: "true"
     container_name: stoffel-party
