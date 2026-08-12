@@ -4812,6 +4812,9 @@ where
         .await
         .map_err(|e| e.to_string())?;
 
+    // Arm one-off shutdown before this party retires. The coordinator keeps serving terminal
+    // round replays until every party retires, then exits immediately; a bounded server-side grace
+    // period still guarantees shutdown if a faulty party never acknowledges.
     if as_leader && one_off {
         if let Err(e) = coord.request_shutdown().await {
             eprintln!(
@@ -4819,6 +4822,12 @@ where
                 e
             );
         }
+    }
+    if one_off {
+        coord
+            .retire_execution()
+            .await
+            .map_err(|e| format!("retire AVSS coordinator execution: {e}"))?;
     }
 
     #[cfg(feature = "statistics")]
@@ -8114,9 +8123,15 @@ async fn main() {
     if let Some(ref mut coord) = coord_opt {
         if as_leader {
             eprintln!("[party] coordinator -> MPCExecution");
-            coord.start_mpc().await.unwrap();
+            if let Err(error) = coord.start_mpc().await {
+                eprintln!("Failed to propose coordinator MPCExecution round: {error}");
+                exit(13);
+            }
         }
-        coord.wait_for_round(Round::MPCExecution).await.unwrap();
+        if let Err(error) = coord.wait_for_round(Round::MPCExecution).await {
+            eprintln!("Failed waiting for coordinator MPCExecution round: {error}");
+            exit(13);
+        }
     }
 
     eprintln!("Starting VM execution of '{}'...", agreed_entry);
@@ -8202,12 +8217,19 @@ async fn main() {
                         }
 
                         if as_leader {
-                            coord.send_output().await.unwrap();
+                            if let Err(error) = coord.send_output().await {
+                                eprintln!(
+                                    "Failed to propose coordinator OutputDistribution round: {error}"
+                                );
+                                exit(13);
+                            }
                         }
-                        coord
-                            .wait_for_round(Round::OutputDistribution)
-                            .await
-                            .unwrap();
+                        if let Err(error) = coord.wait_for_round(Round::OutputDistribution).await {
+                            eprintln!(
+                                "Failed waiting for coordinator OutputDistribution round: {error}"
+                            );
+                            exit(13);
+                        }
 
                         for (cid, output_shares) in
                             output_ids.iter().zip(output_shares_by_client.into_iter())
@@ -8235,13 +8257,25 @@ async fn main() {
                             );
                         }
                     }
-                    coord.wait_for_round(Round::ProgramFinished).await.unwrap();
+                    if let Err(error) = coord.wait_for_round(Round::ProgramFinished).await {
+                        eprintln!("Failed waiting for coordinator ProgramFinished round: {error}");
+                        exit(13);
+                    }
 
+                    // Request first so the designated party cannot be the final acknowledgement
+                    // before the one-off coordinator has armed its graceful drain.
                     if as_leader && one_off {
                         if let Err(e) = coord.request_shutdown().await {
                             eprintln!(
                                 "Warning: failed to request off-chain coordinator shutdown: {}",
                                 e
+                            );
+                        }
+                    }
+                    if one_off {
+                        if let Err(error) = coord.retire_execution().await {
+                            eprintln!(
+                                "Warning: failed to retire completed coordinator execution: {error}"
                             );
                         }
                     }
