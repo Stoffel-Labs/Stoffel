@@ -5913,7 +5913,7 @@ dependencies = [
 [[package]]
 name = "stoffelcrypto"
 version = "0.1.0"
-source = "git+https://github.com/Stoffel-Labs/mpc-protocols.git?branch=fixes-concurrent-execution-protocols#84a6dbb6f638923637802992250bf033f55947cd"
+source = "git+https://github.com/Stoffel-Labs/mpc-protocols.git?branch=fixes-concurrent-execution-protocols#e86b5b258c27fcf67fc3de6b092134fa73f3643a"
 dependencies = [
  "ark-bls12-381",
  "ark-bn254",
@@ -5961,7 +5961,7 @@ dependencies = [
 [[package]]
 name = "stoffelmpc-network"
 version = "0.1.0"
-source = "git+https://github.com/Stoffel-Labs/mpc-protocols.git?branch=fixes-concurrent-execution-protocols#84a6dbb6f638923637802992250bf033f55947cd"
+source = "git+https://github.com/Stoffel-Labs/mpc-protocols.git?branch=fixes-concurrent-execution-protocols#e86b5b258c27fcf67fc3de6b092134fa73f3643a"
 dependencies = [
  "ark-ff 0.5.0",
  "ark-serialize 0.5.0",
