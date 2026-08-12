@@ -106,6 +106,9 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          build-contexts: |
+            coordinator=https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#fixes/concurrent-execution-coordinator
+            networking=https://github.com/Stoffel-Labs/stoffel-networking.git#fixes/concurrent-execution-transport
           push: false
           tags: stoffelvm:test
           cache-from: type=gha
@@ -124,6 +127,9 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          build-contexts: |
+            coordinator=https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#fixes/concurrent-execution-coordinator
+            networking=https://github.com/Stoffel-Labs/stoffel-networking.git#fixes/concurrent-execution-transport
           push: true
           tags: |
             ghcr.io/stoffel-labs/stoffelvm:latest

@@ -1,7 +1,7 @@
 # syntax=docker/dockerfile:1.4
 
 # Supply `--build-context coordinator=../stoffel-mpc-coordinator` for a local
-# build. Compose supplies the matching #dev source automatically by default.
+# build. Compose supplies the matching fixes branch automatically by default.
 
 FROM rustlang/rust:nightly-bookworm AS chef
 
