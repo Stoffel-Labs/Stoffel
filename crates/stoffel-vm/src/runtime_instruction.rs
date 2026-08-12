@@ -172,6 +172,7 @@ impl RuntimeCallTarget {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) enum RuntimeImmediate {
     Constant(RuntimeConstant),
@@ -179,6 +180,7 @@ pub(crate) enum RuntimeImmediate {
     Inline(Box<Value>),
 }
 
+#[allow(dead_code)]
 impl RuntimeImmediate {
     #[cfg(test)]
     pub(crate) fn inline(value: Value) -> Self {
@@ -196,11 +198,13 @@ impl RuntimeImmediate {
     }
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) enum RuntimeCall {
     Target(RuntimeCallTarget),
 }
 
+#[allow(dead_code)]
 impl RuntimeCall {
     pub(crate) fn direct_function_name(&self) -> VmResult<&str> {
         match self {
@@ -216,6 +220,7 @@ struct RuntimeInstructionEntry {
     instruction: PackedRuntimeInstruction,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) enum RuntimeInstruction {
     Noop,
@@ -277,7 +282,7 @@ pub(crate) enum RuntimeInstruction {
 
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RuntimeOpcode {
+pub(crate) enum RuntimeOpcode {
     Noop,
     LoadStack,
     LoadImmediate,
@@ -320,7 +325,7 @@ impl PackedRuntimeInstruction {
     }
 
     fn decode(self) -> RuntimeInstruction {
-        let opcode = RuntimeOpcode::from_u8(self.0[0]);
+        let opcode = self.opcode();
         let a = self.operand(1);
         let b = self.operand(5);
         let c = self.operand(9);
@@ -383,6 +388,12 @@ impl PackedRuntimeInstruction {
         }
     }
 
+    #[inline]
+    fn opcode(self) -> RuntimeOpcode {
+        RuntimeOpcode::from_u8(self.0[0])
+    }
+
+    #[inline]
     fn operand(self, offset: usize) -> u32 {
         u32::from_le_bytes([
             self.0[offset],
@@ -673,8 +684,81 @@ impl<'function> FetchedInstruction<'function> {
     }
 
     #[inline]
+    #[cfg(test)]
     pub(crate) fn runtime_instruction(&self) -> RuntimeInstruction {
         self.entry.instruction.decode()
+    }
+
+    #[inline]
+    pub(crate) fn opcode(self) -> RuntimeOpcode {
+        self.entry.instruction.opcode()
+    }
+
+    #[inline]
+    pub(crate) fn register_a(self) -> RuntimeRegister {
+        RuntimeRegister(self.entry.instruction.operand(1))
+    }
+
+    #[inline]
+    pub(crate) fn register_b(self) -> RuntimeRegister {
+        RuntimeRegister(self.entry.instruction.operand(5))
+    }
+
+    #[inline]
+    pub(crate) fn register_c(self) -> RuntimeRegister {
+        RuntimeRegister(self.entry.instruction.operand(9))
+    }
+
+    #[inline]
+    pub(crate) fn stack_offset_b(self) -> StackOffset {
+        StackOffset::new(self.entry.instruction.operand(5) as i32)
+    }
+
+    #[inline]
+    pub(crate) fn jump_target_a(self) -> JumpTarget {
+        JumpTarget(self.entry.instruction.operand(1))
+    }
+
+    #[inline]
+    pub(crate) fn operand_a_usize(self) -> usize {
+        self.entry.instruction.operand(1) as usize
+    }
+
+    #[inline]
+    pub(crate) fn operand_b_usize(self) -> usize {
+        self.entry.instruction.operand(5) as usize
+    }
+
+    #[inline]
+    pub(crate) fn direct_load_immediate_value(self) -> VmResult<&'function Value> {
+        self.function
+            .constant(RuntimeConstant(self.entry.instruction.operand(5)))
+    }
+
+    #[inline]
+    pub(crate) fn direct_call_target_name(self) -> VmResult<&'function str> {
+        self.function
+            .call_target(RuntimeCallTarget(self.entry.instruction.operand(1)))
+    }
+
+    /// Whether this opcode can cross an asynchronous MPC effect boundary.
+    ///
+    /// This is intentionally conservative: register-bank/value checks still
+    /// happen in the effect planner. Keeping definitely-local opcodes out of
+    /// that planner avoids decoding every clear instruction twice in the
+    /// cooperative executor.
+    #[inline]
+    pub(crate) fn may_yield_mpc_effect(self) -> bool {
+        matches!(
+            self.opcode(),
+            RuntimeOpcode::LoadImmediate
+                | RuntimeOpcode::Move
+                | RuntimeOpcode::Multiply
+                | RuntimeOpcode::BitAnd
+                | RuntimeOpcode::BitOr
+                | RuntimeOpcode::BitXor
+                | RuntimeOpcode::Call
+        )
     }
 
     #[inline]
@@ -684,6 +768,7 @@ impl<'function> FetchedInstruction<'function> {
     }
 
     #[inline]
+    #[cfg(test)]
     pub(crate) fn load_immediate_value(
         self,
         value: &'function RuntimeImmediate,
@@ -696,6 +781,7 @@ impl<'function> FetchedInstruction<'function> {
     }
 
     #[inline]
+    #[cfg(test)]
     pub(crate) fn call_target_name(
         self,
         function: &'function RuntimeCall,

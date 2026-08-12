@@ -5174,7 +5174,7 @@ dependencies = [
  "security-framework",
  "security-framework-sys",
  "webpki-root-certs 0.26.11",
- "windows-sys 0.52.0",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -5706,7 +5706,7 @@ dependencies = [
 [[package]]
 name = "stoffel-mpc-coordinator-off-chain"
 version = "0.1.0"
-source = "git+https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git?branch=codex%2Fpersistent-execution-coordination#dc5a9713a285a46448c05dedee21a539a9b43e31"
+source = "git+https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git?branch=fixes%2Fconcurrent-execution-coordinator#bfa4c42cf27481477bae0204265288efa48fe698"
 dependencies = [
  "ark-bls12-381",
  "ark-ff 0.5.0",
@@ -5727,7 +5727,7 @@ dependencies = [
 [[package]]
 name = "stoffel-mpc-coordinator-shared"
 version = "0.1.0"
-source = "git+https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git?branch=codex%2Fpersistent-execution-coordination#dc5a9713a285a46448c05dedee21a539a9b43e31"
+source = "git+https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git?branch=fixes%2Fconcurrent-execution-coordinator#bfa4c42cf27481477bae0204265288efa48fe698"
 dependencies = [
  "ark-bls12-381",
  "ark-ec",
@@ -5892,6 +5892,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tracing-subscriber",
  "uuid",
  "x509-parser 0.18.1",
 ]
@@ -5912,8 +5913,7 @@ dependencies = [
 [[package]]
 name = "stoffelcrypto"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f5dea6e2e0db0ec0ca2c66f03ea43f8054c0440c77dcc791c5e4b97d072fa7e5"
+source = "git+https://github.com/Stoffel-Labs/mpc-protocols.git?branch=fixes-concurrent-execution-protocols#84a6dbb6f638923637802992250bf033f55947cd"
 dependencies = [
  "ark-bls12-381",
  "ark-bn254",
@@ -5961,8 +5961,7 @@ dependencies = [
 [[package]]
 name = "stoffelmpc-network"
 version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "74a903efb1d7c87eb71a9bc11367dd04efbdc375b66366bcb21e506848f2e041"
+source = "git+https://github.com/Stoffel-Labs/mpc-protocols.git?branch=fixes-concurrent-execution-protocols#84a6dbb6f638923637802992250bf033f55947cd"
 dependencies = [
  "ark-ff 0.5.0",
  "ark-serialize 0.5.0",
@@ -5983,7 +5982,7 @@ dependencies = [
 [[package]]
 name = "stoffelnet"
 version = "0.1.0"
-source = "git+https://github.com/Stoffel-Labs/stoffel-networking.git?branch=codex%2Fconcurrent-execution-transport#257743809206fdd0db4ea3b63a548efe4e9c68d7"
+source = "git+https://github.com/Stoffel-Labs/stoffel-networking.git?branch=fixes%2Fconcurrent-execution-transport#e8d88e812b86e5e37a3010536d790bf39735e0a9"
 dependencies = [
  "ark-ff 0.5.0",
  "async-trait",
@@ -6114,7 +6113,7 @@ dependencies = [
  "getrandom 0.4.3",
  "once_cell",
  "rustix",
- "windows-sys 0.59.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

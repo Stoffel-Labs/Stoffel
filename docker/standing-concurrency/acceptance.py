@@ -28,6 +28,10 @@ PARTIES = [f"party{party}" for party in range(5)]
 NODE_RPC_SERVERS = ",".join(
     f"172.33.0.{party + 10}:16180" for party in range(5)
 )
+NODE_CLIENT_TRANSPORT_SERVERS = ",".join(
+    ["172.33.0.10:10000"]
+    + [f"172.33.0.{party + 10}:{9000 + party}" for party in range(1, 5)]
+)
 COORDINATOR = "coordinator:31415"
 HEX_ID = re.compile(r"^[0-9a-f]{64}$")
 
@@ -85,6 +89,10 @@ class Harness:
             "STOFFEL_STANDING_NODE_IMAGE", "stoffel-standing-node:local"
         )
         self.env = os.environ.copy()
+        self.env.setdefault(
+            "STOFFEL_COORDINATOR_CONTEXT",
+            str((self.root / "vendor" / "stoffel-mpc-coordinator").resolve()),
+        )
         self.env.update(
             {
                 "STOFFEL_STANDING_STATE_DIR": str(self.state),
@@ -148,20 +156,21 @@ class Harness:
         args.extend([party] if party else [*PARTIES, "coordinator"])
         return self.compose(*args, check=False, capture=True).stdout or ""
 
-    def require_checkout(self, variable: str, marker: str) -> Path:
+    def require_source(self, variable: str, marker: str, *, require_git: bool) -> Path:
         raw = self.env.get(variable, "")
         path = Path(raw)
         if not path.is_absolute() or not path.is_dir() or not (path / marker).is_file():
             raise AcceptanceFailure(
-                f"{variable} must be an absolute checkout containing {marker}"
+                f"{variable} must be an absolute source tree containing {marker}"
             )
-        result = self.command(
-            ["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"],
-            check=False,
-            capture=True,
-        )
-        if result.returncode != 0:
-            raise AcceptanceFailure(f"{variable} must be a Git checkout")
+        if require_git:
+            result = self.command(
+                ["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"],
+                check=False,
+                capture=True,
+            )
+            if result.returncode != 0:
+                raise AcceptanceFailure(f"{variable} must be a Git checkout")
         resolved = path.resolve()
         self.env[variable] = str(resolved)
         return resolved
@@ -170,10 +179,14 @@ class Harness:
         for tool in ("docker", "git"):
             if shutil.which(tool) is None:
                 raise AcceptanceFailure(f"required tool not found: {tool}")
-        coordinator = self.require_checkout(
-            "STOFFEL_COORDINATOR_CONTEXT", "crates/off-chain/Cargo.toml"
+        coordinator = self.require_source(
+            "STOFFEL_COORDINATOR_CONTEXT",
+            "crates/off-chain/Cargo.toml",
+            require_git=False,
         )
-        networking = self.require_checkout("STOFFEL_NETWORK_CONTEXT", "Cargo.toml")
+        networking = self.require_source(
+            "STOFFEL_NETWORK_CONTEXT", "Cargo.toml", require_git=True
+        )
         if self.coordination_seconds < 8:
             raise AcceptanceFailure("COORDINATION_TIMEOUT_SECS must be at least 8")
 
@@ -202,12 +215,32 @@ class Harness:
             ("coordinator", coordinator),
             ("networking", networking),
         ):
-            head = self.command(
-                ["git", "-C", str(path), "rev-parse", "HEAD"], capture=True
-            ).stdout.strip()
-            status = self.command(
-                ["git", "-C", str(path), "status", "--short"], capture=True
-            ).stdout.rstrip()
+            git_root = self.command(
+                ["git", "-C", str(path), "rev-parse", "--show-toplevel"],
+                capture=True,
+                check=False,
+            )
+            is_checkout_root = git_root.returncode == 0 and Path(
+                git_root.stdout.strip()
+            ).resolve() == path.resolve()
+            if is_checkout_root:
+                head = self.command(
+                    ["git", "-C", str(path), "rev-parse", "HEAD"], capture=True
+                ).stdout.strip()
+                status = self.command(
+                    ["git", "-C", str(path), "status", "--short"], capture=True
+                ).stdout.rstrip()
+            else:
+                digest = hashlib.sha256()
+                for source in sorted(item for item in path.rglob("*") if item.is_file()):
+                    relative = source.relative_to(path)
+                    if "target" in relative.parts:
+                        continue
+                    digest.update(str(relative).encode())
+                    digest.update(b"\0")
+                    digest.update(source.read_bytes())
+                head = f"vendored-sha256:{digest.hexdigest()}"
+                status = ""
             lines.extend([f"{label}_context={path}", f"{label}_head={head}", status])
         image = self.command(
             ["docker", "image", "inspect", "--format", "{{.Id}}", self.image],

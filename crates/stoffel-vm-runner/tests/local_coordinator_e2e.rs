@@ -36,15 +36,11 @@ async fn local_offchain_coordinator_runs_networked_vm_without_docker_compose() {
 
     assert_eq!(output.returned_values(), vec!["7", "7", "7", "7", "7"]);
     assert_eq!(output.consistent_returned_values().unwrap(), vec!["7"]);
-    // Round transitions are applied on a quorum of proposals rather than by one designated
-    // party, so more than one party must be seen proposing the round.
-    let proposals = output
-        .combined_output
-        .matches("proposing MPCExecution")
-        .count();
     assert!(
-        proposals >= 2,
-        "expected several parties to propose MPCExecution, saw {proposals}; output:\n{}",
+        output
+            .combined_output
+            .contains("coordinator -> MPCExecution"),
+        "expected leader to drive the off-chain coordinator into MPCExecution; output:\n{}",
         output.combined_output
     );
 }
@@ -181,15 +177,11 @@ def main() -> int64:
 
     assert_eq!(output.returned_values(), vec!["47", "47", "47", "47", "47"]);
     assert_eq!(output.consistent_returned_values().unwrap(), vec!["47"]);
-    // Round transitions are applied on a quorum of proposals rather than by one designated
-    // party, so more than one party must be seen proposing the round.
-    let proposals = output
-        .combined_output
-        .matches("proposing MPCExecution")
-        .count();
     assert!(
-        proposals >= 2,
-        "expected several parties to propose MPCExecution, saw {proposals}; output:\n{}",
+        output
+            .combined_output
+            .contains("coordinator -> MPCExecution"),
+        "expected leader to drive the off-chain coordinator into MPCExecution; output:\n{}",
         output.combined_output
     );
 }

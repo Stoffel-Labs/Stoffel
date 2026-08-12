@@ -91,7 +91,7 @@ fn upstream_ransha_commitment_transform_produces_verifiable_ed25519_shares() {
     }
 
     for share in &computed[2 * t..] {
-        assert!(verify_feldman(share.clone()));
+        assert!(verify_feldman(share.clone(), share.feldmanshare.id));
     }
 }
 
@@ -190,7 +190,7 @@ fn test_feldman_verification() {
             FeldmanShamirShare::new(y, i, t, commitments.clone()).expect("Failed to create share");
 
         assert!(
-            verify_feldman(share.clone()),
+            verify_feldman(share.clone(), share.feldmanshare.id),
             "Feldman verification failed for party {}",
             i
         );
@@ -514,7 +514,7 @@ async fn standing_avss_activation_normalizes_every_triple_without_reordering() {
     }
     let expected_a = triples
         .iter()
-        .map(|triple| triple.a.feldmanshare.share.clone())
+        .map(|triple| triple.a.feldmanshare.share)
         .collect::<Vec<_>>();
     let (data, item_size) = preproc::serialize_avss_triples::<Fr, G1>(&triples).unwrap();
 
@@ -558,7 +558,7 @@ async fn standing_avss_activation_normalizes_every_triple_without_reordering() {
     assert_eq!(
         installed
             .iter()
-            .map(|triple| triple.a.feldmanshare.share.clone())
+            .map(|triple| triple.a.feldmanshare.share)
             .collect::<Vec<_>>(),
         expected_a,
         "activation must preserve the correlated triple order"
@@ -888,7 +888,7 @@ where
         assert_eq!(share.feldmanshare.id, decoded.feldmanshare.id);
         assert_eq!(share.feldmanshare.degree, decoded.feldmanshare.degree);
         assert_eq!(share.feldmanshare.share, decoded.feldmanshare.share);
-        assert!(verify_feldman(decoded));
+        assert!(verify_feldman(decoded.clone(), decoded.feldmanshare.id));
     }
 
     let required = t + 1;
@@ -1112,7 +1112,7 @@ fn avss_open_reconstruction_rejects_non_verifiable_local_feldman_share() {
     corrupted_local.commitments = vec![G1::generator(); t + 1];
 
     assert!(
-        !verify_feldman(corrupted_local.clone()),
+        !verify_feldman(corrupted_local.clone(), corrupted_local.feldmanshare.id),
         "test setup should model a local Feldman share with invalid commitments"
     );
 
@@ -1490,11 +1490,11 @@ async fn test_avss_input_share_is_local_constant_sharing() {
         "parties evaluate at distinct share ids"
     );
     assert!(
-        stoffelmpc_mpc::common::share::avss::verify_feldman(s0.clone()),
+        stoffelmpc_mpc::common::share::avss::verify_feldman(s0.clone(), s0.feldmanshare.id),
         "constant share must pass Feldman verification"
     );
     assert!(
-        stoffelmpc_mpc::common::share::avss::verify_feldman(s1.clone()),
+        stoffelmpc_mpc::common::share::avss::verify_feldman(s1.clone(), s1.feldmanshare.id),
         "constant share must pass Feldman verification"
     );
 

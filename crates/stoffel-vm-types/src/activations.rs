@@ -11,8 +11,8 @@
 
 use crate::core_types::{Closure, Upvalue, Value};
 use crate::registers::{
-    ClearRegisterCopyResult, RegisterFile, RegisterIndex, RegisterLayout, RegisterSlot,
-    SecretRegisterCopyResult,
+    ClearRegisterCompareResult, ClearRegisterCopyResult, ClearRegisterOperationResult,
+    RegisterFile, RegisterIndex, RegisterLayout, RegisterSlot, SecretRegisterCopyResult,
 };
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -172,6 +172,7 @@ impl InstructionPointer {
         self.0.checked_sub(1).map(Self)
     }
 
+    #[inline]
     fn advance_after_fetch(self) -> Self {
         let index = self
             .0
@@ -223,14 +224,17 @@ impl ActivationStack {
         self.records.pop()
     }
 
+    #[inline]
     pub fn current(&self) -> Option<&ActivationRecord> {
         self.records.last()
     }
 
+    #[inline]
     pub fn current_mut(&mut self) -> Option<&mut ActivationRecord> {
         self.records.last_mut()
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         self.records.len()
     }
@@ -456,18 +460,22 @@ impl ActivationRecord {
         &self.registers
     }
 
+    #[inline]
     pub fn register_layout(&self) -> RegisterLayout {
         self.registers.layout()
     }
 
+    #[inline]
     pub fn register_count(&self) -> usize {
         self.registers.len()
     }
 
+    #[inline]
     pub fn register(&self, index: RegisterIndex) -> Option<&Value> {
         self.registers.get(index)
     }
 
+    #[inline]
     pub fn register_mut(&mut self, index: RegisterIndex) -> Option<&mut Value> {
         self.registers.get_mut(index)
     }
@@ -495,6 +503,27 @@ impl ActivationRecord {
         src: RegisterIndex,
     ) -> ClearRegisterCopyResult {
         self.registers.copy_clear_value(dest, src)
+    }
+
+    #[inline]
+    pub fn apply_clear_binary<E>(
+        &mut self,
+        dest: RegisterIndex,
+        lhs: RegisterIndex,
+        rhs: RegisterIndex,
+        op: impl FnOnce(&Value, &Value) -> Option<Result<Value, E>>,
+    ) -> Result<ClearRegisterOperationResult, E> {
+        self.registers.apply_clear_binary(dest, lhs, rhs, op)
+    }
+
+    #[inline]
+    pub fn compare_clear(
+        &self,
+        lhs: RegisterIndex,
+        rhs: RegisterIndex,
+        op: impl FnOnce(&Value, &Value) -> Option<Ordering>,
+    ) -> ClearRegisterCompareResult {
+        self.registers.compare_clear(lhs, rhs, op)
     }
 
     #[inline]
@@ -580,6 +609,7 @@ impl ActivationRecord {
         std::mem::replace(&mut self.stack, stack)
     }
 
+    #[inline]
     pub fn compare_flag(&self) -> CompareFlag {
         self.compare_flag
     }
@@ -588,10 +618,12 @@ impl ActivationRecord {
         self.compare_flag.as_i32()
     }
 
+    #[inline]
     pub fn set_compare_flag(&mut self, compare_flag: CompareFlag) {
         self.compare_flag = compare_flag;
     }
 
+    #[inline]
     pub fn instruction_pointer(&self) -> InstructionPointer {
         self.instruction_pointer
     }
@@ -603,6 +635,7 @@ impl ActivationRecord {
         Ok(())
     }
 
+    #[inline]
     pub fn advance_instruction_pointer_after_fetch(&mut self) {
         self.instruction_pointer = self.instruction_pointer.advance_after_fetch();
     }
@@ -613,6 +646,7 @@ impl ActivationRecord {
             .expect("instruction pointer overflow")
     }
 
+    #[inline]
     pub fn set_instruction_pointer(&mut self, instruction_pointer: InstructionPointer) {
         self.instruction_pointer = instruction_pointer;
     }

@@ -209,7 +209,10 @@ where
                 let shares = node.share_gen_avss.avss.shares.lock().await;
                 let stored = self.stored_shares.lock().await;
 
-                for share_vec in shares.values().filter_map(|(_, share_vec)| share_vec.as_ref()) {
+                for share_vec in shares
+                    .values()
+                    .filter_map(|(_, share_vec)| share_vec.as_ref())
+                {
                     if let Some(share) = share_vec.first() {
                         let already_stored = stored
                             .values()

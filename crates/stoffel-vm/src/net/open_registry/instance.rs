@@ -10,7 +10,16 @@ use super::accumulators::{
     ExpOpenRegistryKind, ExpOpenRequest, OpenAccumulator, OpenResult, RbcState, SingleKey,
 };
 
-const OPEN_REGISTRY_WAIT_TIMEOUT: Duration = Duration::from_secs(60);
+const DEFAULT_OPEN_REGISTRY_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
+
+fn open_registry_wait_timeout() -> Duration {
+    std::env::var("STOFFEL_MPC_PROTOCOL_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|seconds| *seconds > 0)
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_OPEN_REGISTRY_WAIT_TIMEOUT)
+}
 
 #[derive(Clone, Copy)]
 struct OpenSingleResultCodec<Wrap, Unwrap> {
@@ -239,8 +248,7 @@ impl InstanceRegistry {
         R: Fn(&[(usize, Vec<u8>)]) -> Result<Vec<u8>, String>,
     {
         let mut my_sequence: Option<usize> = None;
-        let deadline = tokio::time::Instant::now()
-            + tokio::time::Duration::from_secs(OPEN_REGISTRY_WAIT_TIMEOUT.as_secs());
+        let deadline = tokio::time::Instant::now() + open_registry_wait_timeout();
 
         loop {
             let notified = self.exp_notify(request.kind).notified();
@@ -268,7 +276,7 @@ impl InstanceRegistry {
     where
         R: Fn(&[(usize, Vec<u8>)]) -> Result<Vec<u8>, String>,
     {
-        let deadline = Instant::now() + OPEN_REGISTRY_WAIT_TIMEOUT;
+        let deadline = Instant::now() + open_registry_wait_timeout();
         let mut my_sequence: Option<usize> = None;
         loop {
             if let Some(result) = self.try_exp_open(request, &mut my_sequence, &reconstruct)? {
@@ -591,8 +599,7 @@ impl InstanceRegistry {
         Unwrap: Fn(OpenResult) -> Result<T, String> + Copy,
     {
         let mut my_sequence: Option<usize> = None;
-        let deadline = tokio::time::Instant::now()
-            + tokio::time::Duration::from_secs(OPEN_REGISTRY_WAIT_TIMEOUT.as_secs());
+        let deadline = tokio::time::Instant::now() + open_registry_wait_timeout();
 
         loop {
             let notified = self.single_notify.notified();
@@ -698,7 +705,7 @@ impl InstanceRegistry {
         Unwrap: Fn(OpenResult) -> Result<T, String> + Copy,
     {
         let mut my_sequence: Option<usize> = None;
-        let deadline = Instant::now() + OPEN_REGISTRY_WAIT_TIMEOUT;
+        let deadline = Instant::now() + open_registry_wait_timeout();
 
         loop {
             let mut reg = self.single.lock();
@@ -1055,8 +1062,7 @@ impl InstanceRegistry {
     {
         let batch_size = shares.len();
         let mut my_sequence: Option<usize> = None;
-        let deadline = tokio::time::Instant::now()
-            + tokio::time::Duration::from_secs(OPEN_REGISTRY_WAIT_TIMEOUT.as_secs());
+        let deadline = tokio::time::Instant::now() + open_registry_wait_timeout();
 
         loop {
             let notified = self.batch_notify.notified();
@@ -1185,8 +1191,7 @@ impl InstanceRegistry {
         }
 
         let batch_size = shares.len();
-        let deadline = tokio::time::Instant::now()
-            + tokio::time::Duration::from_secs(OPEN_REGISTRY_WAIT_TIMEOUT.as_secs());
+        let deadline = tokio::time::Instant::now() + open_registry_wait_timeout();
         loop {
             let notified = self.batch_notify.notified();
             let current_count = {
@@ -1252,7 +1257,7 @@ impl InstanceRegistry {
     {
         let batch_size = shares.len();
         let mut my_sequence: Option<usize> = None;
-        let deadline = Instant::now() + OPEN_REGISTRY_WAIT_TIMEOUT;
+        let deadline = Instant::now() + open_registry_wait_timeout();
 
         loop {
             let mut reg = self.batch.lock();

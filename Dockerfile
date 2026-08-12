@@ -24,6 +24,7 @@ FROM rustlang/rust:nightly-bookworm AS builder
 
 # Build argument to enable NAT traversal feature
 ARG ENABLE_NAT=false
+ARG STOFFEL_VM_PROFILE=false
 # Install build dependencies
 RUN apt-get update && apt-get install -y \
     pkg-config \
@@ -61,6 +62,9 @@ RUN mkdir -p ~/.ssh && \
 # Note: If using private repos with SSH, run with: docker build --ssh default .
 # If ENABLE_NAT is true, build with the nat feature
 RUN --mount=type=ssh \
+    if [ "$STOFFEL_VM_PROFILE" = "true" ]; then \
+        export RUSTFLAGS="-C debuginfo=2 -C force-frame-pointers=yes"; \
+    fi && \
     if [ "$ENABLE_NAT" = "true" ]; then \
         echo "Building with NAT traversal support..."; \
         cargo build --release --package stoffel-vm-runner --bin stoffel-run --features nat; \
@@ -68,7 +72,9 @@ RUN --mount=type=ssh \
         echo "Building without NAT traversal support..."; \
         cargo build --release --package stoffel-vm-runner --bin stoffel-run; \
     fi && \
-    strip target/release/stoffel-run
+    if [ "$STOFFEL_VM_PROFILE" != "true" ]; then \
+        strip target/release/stoffel-run; \
+    fi
 
 # Compile the AES-128 secret-bit circuit example into VM bytecode for compose runs.
 RUN cargo build --release --package stoffellang && \

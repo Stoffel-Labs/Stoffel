@@ -5,14 +5,19 @@ mesh. Each process remains ready until Compose sends SIGTERM; execution IDs are
 multiplexed over that mesh rather than creating a mesh or node per program.
 
 ```bash
-STOFFEL_COORDINATOR_CONTEXT=/absolute/path/to/stoffel-mpc-coordinator \
 STOFFEL_NETWORK_CONTEXT=/absolute/path/to/stoffel-networking \
 docker/test-standing-concurrency.sh
 
-STOFFEL_COORDINATOR_CONTEXT=/absolute/path/to/stoffel-mpc-coordinator \
 STOFFEL_NETWORK_CONTEXT=/absolute/path/to/stoffel-networking \
 docker/test-standing-adversarial.sh
+
+STOFFEL_NETWORK_CONTEXT=/absolute/path/to/stoffel-networking \
+docker/test-standing-all-examples.sh
 ```
+
+The acceptance harness uses the bundled coordinator source in
+`vendor/stoffel-mpc-coordinator` by default. Set `STOFFEL_COORDINATOR_CONTEXT`
+only to test a different absolute source tree.
 
 Both source paths must be local Git checkouts. The tests always rebuild the
 standing image from the current VM, coordinator, and networking worktrees and
@@ -51,6 +56,29 @@ same processes. Finally, only party 2's preprocessing volume is deleted; all
 five parties must choose rebuild and complete a fresh execution. This directly
 covers the retained-state hang, elastic refill, and asymmetric-store failure
 modes without rerunning the entire matrix for every restart.
+
+## Complete example catalog
+
+`test-standing-all-examples.sh` compiles every canonical
+`crates/stoffel-lang/examples/**/main.stfl` program, installs the artifacts by
+content address, replaces the mounted program directory with that exact catalog,
+and warms one execution per program. Independent examples run in concurrent
+waves of 16 by default, keeping substantial online overlap on the same five
+long-lived party processes without overwhelming the MPC protocol's first-round
+progress. Set `STOFFEL_ALL_EXAMPLES_WAVE_SIZE` to select another fan-out; `189`
+runs the all-at-once stress/profile shape. The certificate signing fixture is
+kept in a final ordered wave so the campaign remains compatible with the
+keygen/sign example relationship.
+
+Some examples deliberately use rejection sampling or runtime-sized loops. Their
+compiler manifests contain a conservative preprocessing floor with
+`dynamic=true`; the catalog campaign opts into those artifacts with
+`--allow-dynamic-preprocessing`. Ordinary standing-node startup remains strict
+and continues to reject dynamic manifests. The campaign uses a burst capacity
+of two and disables the small-fixture triple override so each reservoir follows
+the artifact's own demand estimate. Keeping two ready allocations prevents the
+one-use catalog warm-up from immediately starting a large background refill
+beside the online protocol.
 
 ## Adversarial campaign
 

@@ -58,13 +58,13 @@ use stoffel_vm_types::compiled_binary::{
 };
 use stoffel_vm_types::core_types::{ShareType, TableRef, Value};
 use stoffelmpc_mpc::avss_mpc::input::AvssInputError;
+#[cfg(feature = "statistics")]
+use stoffelmpc_mpc::avss_mpc::statistics::NodeStatisticsCounters as AvssNodeStatisticsCounters;
 use stoffelmpc_mpc::avss_mpc::{AvssMPCClient, AvssSessionId};
 use stoffelmpc_mpc::common::rbc::rbc::Avid;
 use stoffelmpc_mpc::common::share::feldman::FeldmanShamirShare;
 use stoffelmpc_mpc::common::MPCProtocol;
 use stoffelmpc_mpc::honeybadger::input::InputError;
-#[cfg(feature = "statistics")]
-use stoffelmpc_mpc::avss_mpc::statistics::NodeStatisticsCounters as AvssNodeStatisticsCounters;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 #[cfg(feature = "statistics")]
 use stoffelmpc_mpc::honeybadger::statistics::NodeStatisticsCounters;
@@ -72,12 +72,25 @@ use stoffelmpc_mpc::honeybadger::SessionId as HbSessionId;
 use stoffelmpc_mpc::honeybadger::{HoneyBadgerMPCClient, HoneyBadgerMPCNode};
 use stoffelnet::network_utils::Network;
 use stoffelnet::network_utils::{ClientId, NetworkError, NodePublicKey};
-use stoffelnet::transports::quic::{NetworkManager, QuicNetworkManager};
+use stoffelnet::transports::quic::{NetworkManager, PeerConnection, QuicNetworkManager};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use x509_parser::prelude::*;
 type HbCoordinatorShare<F> = RobustShare<F>;
+
+fn group_output_shares_by_client<T>(
+    records: impl IntoIterator<Item = (ClientId, Vec<T>)>,
+) -> BTreeMap<ClientId, Vec<T>> {
+    let mut grouped = BTreeMap::new();
+    for (client_id, mut shares) in records {
+        grouped
+            .entry(client_id)
+            .or_insert_with(Vec::new)
+            .append(&mut shares);
+    }
+    grouped
+}
 
 fn read_trimmed_u64(path: &str) -> Option<u64> {
     fs::read_to_string(path)
@@ -170,6 +183,15 @@ fn manifest_client_input_types(
                 .ok()
                 .map(|slot| (slot, schema.inputs.clone()))
         })
+        .collect()
+}
+
+fn manifest_client_input_slots(
+    client_input_types: &std::collections::BTreeMap<usize, Vec<ShareType>>,
+) -> Vec<usize> {
+    client_input_types
+        .iter()
+        .filter_map(|(slot, inputs)| (!inputs.is_empty()).then_some(*slot))
         .collect()
 }
 
@@ -284,8 +306,9 @@ fn band_pow2(n: u64) -> u64 {
 /// Turn the compiler's static preprocessing-demand estimate into concrete
 /// material counts to generate up front. Each count is rounded up to a power of
 /// two for privacy (see `band_pow2`); `dynamic` programs (data-dependent loops,
-/// recursion, runtime-sized batches) get an extra octave of headroom because the
-/// static estimate may undercount them. The triple count absorbs the dependency
+/// recursion, runtime-sized batches) get three extra octaves of headroom because
+/// the static estimate may only cover one dynamically-sized iteration. The
+/// triple count absorbs the dependency
 /// that prandbit generation itself consumes a triple per bit. The random count
 /// only covers program-visible random material; HoneyBadger generates the
 /// random shares needed to build triples inside `run_preprocessing`.
@@ -303,10 +326,13 @@ fn plan_preprocessing(
             .filter(|v| *v > 0)
     };
 
-    // Dynamic programs may undercount, so give them an extra octave before banding.
+    // Dynamic programs may undercount, so give them three extra octaves before
+    // banding. Standing mode only accepts such manifests when explicitly run
+    // with `--allow-dynamic-preprocessing`; the larger safety margin keeps that
+    // opt-in path from exhausting its fixed per-execution allocation.
     let with_headroom = |n: u64| -> u64 {
         if demand.dynamic {
-            n.saturating_mul(2)
+            n.saturating_mul(8)
         } else {
             n
         }
@@ -518,6 +544,7 @@ fn record_preprocessing_exchange_value<T: PartialEq>(
 }
 
 /// Route preprocessing coordination without creating a second inbox reader.
+#[allow(clippy::too_many_arguments)]
 async fn preprocessing_transcript_exchange<T>(
     network: &ExecutionScopedNetwork,
     receiver: &mut mpsc::Receiver<ExecutionInboundMessage>,
@@ -1247,6 +1274,7 @@ async fn collect_hb_coordinator_inputs<F, G>(
     program_id: [u8; 32],
     run_id: u64,
     my_id: usize,
+    as_leader: bool,
 ) -> Result<(), String>
 where
     F: SupportedMpcField,
@@ -1256,11 +1284,8 @@ where
         return Ok(());
     }
 
-    let total_input_count = if client_input_total.is_some() {
-        client_input_total.unwrap()
-    } else {
-        input_ids.len().saturating_mul(client_input_count)
-    };
+    let total_input_count =
+        client_input_total.unwrap_or_else(|| input_ids.len().saturating_mul(client_input_count));
 
     if engine.is_standing() {
         engine
@@ -1292,11 +1317,13 @@ where
         )
     };
 
-    eprintln!("[party {my_id}] proposing InputMaskReservation");
-    coord
-        .reserve_input_masks()
-        .await
-        .map_err(|e| e.to_string())?;
+    if as_leader {
+        eprintln!("[party {my_id}] coordinator -> InputMaskReservation");
+        coord
+            .reserve_input_masks()
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     coord
         .wait_for_round(Round::InputMaskReservation)
         .await
@@ -1394,8 +1421,10 @@ where
         .await
         .map_err(|error| format!("add mask shares: {error:?}"))?;
 
-    eprintln!("[party {my_id}] proposing InputCollection");
-    coord.collect_inputs().await.map_err(|e| e.to_string())?;
+    if as_leader {
+        eprintln!("[party {my_id}] coordinator -> InputCollection");
+        coord.collect_inputs().await.map_err(|e| e.to_string())?;
+    }
     coord
         .wait_for_round(Round::InputCollection)
         .await
@@ -1839,7 +1868,7 @@ fn fixed_width_be_bytes(bytes: &[u8], width: usize) -> Vec<u8> {
 async fn connect_to_all_servers(
     network: &Arc<tokio::sync::Mutex<QuicNetworkManager>>,
     server_addrs: &[SocketAddr],
-) {
+) -> Vec<Arc<dyn PeerConnection>> {
     let max_retries = 10;
     let retry_delay = Duration::from_millis(500);
     let mut connected_servers = Vec::with_capacity(server_addrs.len());
@@ -1898,7 +1927,7 @@ async fn connect_to_all_servers(
     );
 
     let mut seen_peers = HashSet::new();
-    for (addr, connection) in connected_servers {
+    for (addr, connection) in &connected_servers {
         let authenticated_peer = connection.remote_party_id().unwrap_or_else(|| {
             eprintln!(
                 "[client] Connected server {} has no authenticated party identity",
@@ -1931,6 +1960,77 @@ async fn connect_to_all_servers(
 
         let _ = connection;
     }
+    connected_servers
+        .into_iter()
+        .map(|(_, connection)| connection)
+        .collect()
+}
+
+async fn establish_coordinator_output_client_routes(
+    execution_id: ExecutionId,
+    server_addrs: &[SocketAddr],
+    cert_der: Vec<u8>,
+    key_der: Vec<u8>,
+) -> Arc<tokio::sync::Mutex<QuicNetworkManager>> {
+    let mut client_network = QuicNetworkManager::new();
+    client_network
+        .set_local_certificate_der(cert_der, key_der)
+        .unwrap_or_else(|error| {
+            eprintln!("Error: failed to configure coordinator-client certificate: {error}");
+            exit(2);
+        });
+    let network = Arc::new(tokio::sync::Mutex::new(client_network));
+    for (party_id, &address) in server_addrs.iter().enumerate() {
+        network
+            .lock()
+            .await
+            .add_node_with_party_id(party_id, address);
+    }
+    let hello_frame = stoffel_vm::net::encode_execution_frame(
+        execution_id,
+        ExecutionMessageKind::Control,
+        EXECUTION_CLIENT_HELLO_V1,
+    )
+    .unwrap_or_else(|error| {
+        eprintln!("[client] Failed to encode coordinator execution route: {error}");
+        exit(24);
+    });
+    let mut last_error = None;
+    for attempt in 1..=10 {
+        let connections = connect_to_all_servers(&network, server_addrs).await;
+        let mut send_result = Ok(());
+        for (party_id, connection) in connections.iter().enumerate() {
+            if let Err(error) = connection.send(&hello_frame).await {
+                send_result = Err(format!(
+                    "failed to send execution hello to party {party_id}: {error}"
+                ));
+                break;
+            }
+        }
+        match send_result {
+            Ok(()) => {
+                for _ in 0..2 {
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                    for connection in &connections {
+                        let _ = connection.send(&hello_frame).await;
+                    }
+                }
+                return network;
+            }
+            Err(error) => {
+                eprintln!(
+                    "[client] Coordinator execution route attempt {attempt}/10 failed: {error}"
+                );
+                last_error = Some(error);
+                tokio::time::sleep(Duration::from_millis(250)).await;
+            }
+        }
+    }
+    eprintln!(
+        "[client] Failed to establish coordinator execution route: {}",
+        last_error.as_deref().unwrap_or("unknown transport failure")
+    );
+    exit(24)
 }
 fn normalize_client_ids(mut ids: Vec<ClientId>) -> Vec<ClientId> {
     ids.sort_unstable();
@@ -2558,6 +2658,7 @@ async fn run_hb_client_for_curve(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_as_client(
     execution_id: ExecutionId,
     n_parties: Option<usize>,
@@ -2922,6 +3023,7 @@ struct AvssOffchainCoordinatorClientArgs {
     client_outputs: Option<usize>,
     output_format: CoordinatorOutputFormat,
     server_addrs: Vec<SocketAddr>,
+    client_transport_addrs: Vec<SocketAddr>,
     coord_addr: (String, u16),
     cert_der: Vec<u8>,
     key_der: Vec<u8>,
@@ -2941,6 +3043,7 @@ async fn run_avss_offchain_coordinator_client_for_curve<F, G>(
         client_outputs,
         output_format,
         server_addrs,
+        client_transport_addrs,
         coord_addr,
         cert_der,
         key_der,
@@ -2984,8 +3087,64 @@ async fn run_avss_offchain_coordinator_client_for_curve<F, G>(
             eprintln!("Failed to connect to AVSS off-chain coordinator: {error}");
             exit(13);
         });
+    // jsonrpsee multiplexes requests on one WebSocket. Starting a long-lived
+    // subscription concurrently with the input RPC on that same connection
+    // can make subscription acceptance wait behind the submission response
+    // while holding the coordinator's execution lock. Give eager output
+    // subscription its own authenticated connection.
+    let eager_output_coord = if !input_values.is_empty() && output_len > 0 {
+        Some(
+            AvssOffChainCoordinator::<F, G>::start_rpc_client_for_execution(
+                &coord_addr.0,
+                coord_addr.1,
+                t as u64,
+                server_addrs.len() as u64,
+                output_len as u64,
+                coordinator_execution_id(execution_id),
+                cert_der.clone(),
+                key_der.clone(),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("Failed to connect AVSS output subscription: {error}");
+                exit(13);
+            }),
+        )
+    } else {
+        None
+    };
+    if input_values.is_empty() && output_len > 0 {
+        if client_transport_addrs.len() != server_addrs.len() {
+            eprintln!(
+                "Error: output-only coordinator clients require one --client-transport-servers address per RPC server (got {} transport addresses for {} servers)",
+                client_transport_addrs.len(),
+                server_addrs.len()
+            );
+            exit(2);
+        }
+        // Subscribe for the result before releasing the parties' authenticated
+        // client-transport barrier. Fast programs can otherwise finish and be
+        // retired between the route handshake and the first output RPC.
+        let output_wait = async {
+            coord.wait_for_round(Round::Preprocessing).await.unwrap();
+            coord.obtain_outputs().await.unwrap()
+        };
+        let route_wait = establish_coordinator_output_client_routes(
+            execution_id,
+            &client_transport_addrs,
+            cert_der.clone(),
+            key_der.clone(),
+        );
+        let (outputs, _output_client_routes) = tokio::join!(output_wait, route_wait);
+        println!(
+            "outputs: {}",
+            format_coordinator_outputs(&outputs, output_format)
+        );
+        return;
+    }
 
     coord.wait_for_round(Round::Preprocessing).await.unwrap();
+    let mut eager_outputs = None;
     if !input_values.is_empty() {
         coord
             .wait_for_round(Round::InputMaskReservation)
@@ -3039,25 +3198,47 @@ async fn run_avss_offchain_coordinator_client_for_curve<F, G>(
             .iter()
             .zip(masks)
             .enumerate()
-            .map(|(offset, (input_value, mask))| (reserved_index + offset as u64, mask + *input_value))
+            .map(|(offset, (input_value, mask))| {
+                (reserved_index + offset as u64, mask + *input_value)
+            })
             .collect();
         eprintln!(
             "[client slot {reserved_index}] submitting {} masked input(s)",
             masked_inputs.len()
         );
-        coord.send_masked_inputs(&masked_inputs).await.unwrap();
+        if output_len == 0 {
+            coord.send_masked_inputs(&masked_inputs).await.unwrap();
+        } else {
+            // Let the input RPC fully release the coordinator execution lock
+            // before installing the long-lived output subscription. The
+            // coordinator retains shares and snapshots them for late waiters.
+            coord.send_masked_inputs(&masked_inputs).await.unwrap();
+            eager_outputs = Some(
+                eager_output_coord
+                    .as_ref()
+                    .expect("input/output clients create an output coordinator")
+                    .obtain_outputs()
+                    .await
+                    .unwrap(),
+            );
+        }
     }
     if output_len == 0 {
         eprintln!("[client slot {reserved_index}] input submission complete; no outputs requested");
         return;
     }
 
-    coord.wait_for_round(Round::MPCExecution).await.unwrap();
-    coord
-        .wait_for_round(Round::OutputDistribution)
-        .await
-        .unwrap();
-    let outputs = coord.obtain_outputs().await.unwrap();
+    let outputs = match eager_outputs {
+        Some(outputs) => outputs,
+        None => {
+            coord.wait_for_round(Round::MPCExecution).await.unwrap();
+            coord
+                .wait_for_round(Round::OutputDistribution)
+                .await
+                .unwrap();
+            coord.obtain_outputs().await.unwrap()
+        }
+    };
     println!(
         "outputs: {}",
         format_coordinator_outputs(&outputs, output_format)
@@ -3078,6 +3259,7 @@ async fn run_hb_coordinator_client_for_field<F>(
     client_outputs: Option<usize>,
     output_format: CoordinatorOutputFormat,
     server_addrs: Vec<SocketAddr>,
+    client_transport_addrs: Vec<SocketAddr>,
     coord_addr: Option<(String, u16)>,
     contract_addr: Option<String>,
     cert_der: Vec<u8>,
@@ -3135,8 +3317,63 @@ async fn run_hb_coordinator_client_for_field<F>(
             eprintln!("Failed to connect to off-chain coordinator: {error}");
             exit(13);
         });
+    // Keep the long-lived output subscription off the WebSocket carrying the
+    // input submission. Otherwise subscription acceptance can hold the
+    // coordinator execution lock while its handshake waits behind the input
+    // RPC response on the same connection.
+    let eager_output_coord = if !input_values.is_empty() && output_len > 0 {
+        Some(
+            HbOffChainCoordinator::<F>::start_rpc_client_for_execution(
+                &ca.0,
+                ca.1,
+                t as u64,
+                server_addrs.len() as u64,
+                output_len as u64,
+                coordinator_execution_id(execution_id),
+                cert_der.clone(),
+                key_der.clone(),
+            )
+            .await
+            .unwrap_or_else(|error| {
+                eprintln!("Failed to connect output subscription: {error}");
+                exit(13);
+            }),
+        )
+    } else {
+        None
+    };
+    if input_values.is_empty() && output_len > 0 {
+        if client_transport_addrs.len() != server_addrs.len() {
+            eprintln!(
+                "Error: output-only coordinator clients require one --client-transport-servers address per RPC server (got {} transport addresses for {} servers)",
+                client_transport_addrs.len(),
+                server_addrs.len()
+            );
+            exit(2);
+        }
+        // Subscribe for the result before releasing the parties' authenticated
+        // client-transport barrier. Fast programs can otherwise finish and be
+        // retired between the route handshake and the first output RPC.
+        let output_wait = async {
+            coord.wait_for_round(Round::Preprocessing).await.unwrap();
+            coord.obtain_outputs().await.unwrap()
+        };
+        let route_wait = establish_coordinator_output_client_routes(
+            execution_id,
+            &client_transport_addrs,
+            cert_der.clone(),
+            key_der.clone(),
+        );
+        let (outputs, _output_client_routes) = tokio::join!(output_wait, route_wait);
+        println!(
+            "outputs: {}",
+            format_coordinator_outputs(&outputs, output_format)
+        );
+        return;
+    }
 
     coord.wait_for_round(Round::Preprocessing).await.unwrap();
+    let mut eager_outputs = None;
     if !input_values.is_empty() {
         coord
             .wait_for_round(Round::InputMaskReservation)
@@ -3190,26 +3427,48 @@ async fn run_hb_coordinator_client_for_field<F>(
             .iter()
             .zip(masks)
             .enumerate()
-            .map(|(offset, (input_value, mask))| (reserved_index + offset as u64, mask + *input_value))
+            .map(|(offset, (input_value, mask))| {
+                (reserved_index + offset as u64, mask + *input_value)
+            })
             .collect();
         eprintln!(
             "[client slot {reserved_index}] submitting {} masked input(s)",
             masked_inputs.len()
         );
-        coord.send_masked_inputs(&masked_inputs).await.unwrap();
+        if output_len == 0 {
+            coord.send_masked_inputs(&masked_inputs).await.unwrap();
+        } else {
+            // Let the input RPC fully release the coordinator execution lock
+            // before installing the long-lived output subscription. The
+            // coordinator retains shares and snapshots them for late waiters.
+            coord.send_masked_inputs(&masked_inputs).await.unwrap();
+            eager_outputs = Some(
+                eager_output_coord
+                    .as_ref()
+                    .expect("input/output clients create an output coordinator")
+                    .obtain_outputs()
+                    .await
+                    .unwrap(),
+            );
+        }
     }
     if output_len == 0 {
         eprintln!("[client slot {reserved_index}] input submission complete; no outputs requested");
         return;
     }
 
-    coord.wait_for_round(Round::MPCExecution).await.unwrap();
-    eprintln!("[client slot {reserved_index}] waiting for output distribution");
-    coord
-        .wait_for_round(Round::OutputDistribution)
-        .await
-        .unwrap();
-    let outputs = coord.obtain_outputs().await.unwrap();
+    let outputs = match eager_outputs {
+        Some(outputs) => outputs,
+        None => {
+            coord.wait_for_round(Round::MPCExecution).await.unwrap();
+            eprintln!("[client slot {reserved_index}] waiting for output distribution");
+            coord
+                .wait_for_round(Round::OutputDistribution)
+                .await
+                .unwrap();
+            coord.obtain_outputs().await.unwrap()
+        }
+    };
     println!(
         "outputs: {}",
         format_coordinator_outputs(&outputs, output_format)
@@ -3223,6 +3482,7 @@ async fn run_hb_coordinator_client(
     client_outputs: Option<usize>,
     output_format: CoordinatorOutputFormat,
     server_addrs: Vec<SocketAddr>,
+    client_transport_addrs: Vec<SocketAddr>,
     coord_addr: Option<(String, u16)>,
     contract_addr: Option<String>,
     cert_der: Vec<u8>,
@@ -3240,6 +3500,7 @@ async fn run_hb_coordinator_client(
                 client_outputs,
                 output_format,
                 server_addrs,
+                client_transport_addrs,
                 coord_addr,
                 contract_addr,
                 cert_der,
@@ -4006,7 +4267,12 @@ where
 
     #[cfg(feature = "statistics")]
     {
-        let counters = engine.node_handle().lock().await.statistics_counters.clone();
+        let counters = engine
+            .node_handle()
+            .lock()
+            .await
+            .statistics_counters
+            .clone();
         net.set_send_hook(std::sync::Arc::new(move |data: &[u8], n: usize| {
             counters.record_outbound(data, n as u64);
         }));
@@ -4331,8 +4597,8 @@ where
         .iter()
         .map(|path| extract_pubkey_from_cert(&fs::read(path).expect("read client cert")))
         .collect();
-    let client_input_total = client_input_total
-        .unwrap_or_else(|| input_ids.len().saturating_mul(client_input_count));
+    let client_input_total =
+        client_input_total.unwrap_or_else(|| input_ids.len().saturating_mul(client_input_count));
     let (mux, execution_inbox, _execution_registration, _execution_scanner) =
         start_party_execution_transport(&net, execution_id)
             .map_err(|error| format!("Failed to start AVSS execution transport: {error}"))?;
@@ -4360,10 +4626,12 @@ where
     .await
     .map_err(|error| format!("Failed to start AVSS node RPC server: {error}"))?;
 
-    coord
-        .start_preprocessing()
-        .await
-        .map_err(|e| e.to_string())?;
+    if as_leader {
+        coord
+            .start_preprocessing()
+            .await
+            .map_err(|e| e.to_string())?;
+    }
 
     let engine = setup_avss_party_for_curve::<F, G>(
         vm,
@@ -4433,10 +4701,12 @@ where
             .await
             .map_err(|e| format!("add_mask_shares: {:?}", e))?;
 
-        coord
-            .reserve_input_masks()
-            .await
-            .map_err(|e| e.to_string())?;
+        if as_leader {
+            coord
+                .reserve_input_masks()
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         coord
             .wait_for_round(Round::InputMaskReservation)
             .await
@@ -4465,7 +4735,9 @@ where
                 })?;
         }
 
-        coord.collect_inputs().await.map_err(|e| e.to_string())?;
+        if as_leader {
+            coord.collect_inputs().await.map_err(|e| e.to_string())?;
+        }
         coord
             .wait_for_round(Round::InputCollection)
             .await
@@ -4485,7 +4757,9 @@ where
         );
     }
 
-    coord.start_mpc().await.map_err(|e| e.to_string())?;
+    if as_leader {
+        coord.start_mpc().await.map_err(|e| e.to_string())?;
+    }
     coord
         .wait_for_round(Round::MPCExecution)
         .await
@@ -4498,43 +4772,52 @@ where
         .map_err(|err| format!("Execution error in '{}': {}", agreed_entry, err))?;
     eprintln!(
         "[party {my_id}] cooperative VM execution: instruction_budget_yields={} online_effect_yields={}",
-        cooperative_metrics.instruction_budget_yields,
-        cooperative_metrics.online_effect_yields,
+        cooperative_metrics.instruction_budget_yields, cooperative_metrics.online_effect_yields,
     );
 
     let captured_outputs = engine.drain_client_output_records().await;
     if !captured_outputs.is_empty() {
-        coord.send_output().await.map_err(|e| e.to_string())?;
+        if as_leader {
+            coord.send_output().await.map_err(|e| e.to_string())?;
+        }
         coord
             .wait_for_round(Round::OutputDistribution)
             .await
             .map_err(|e| e.to_string())?;
 
-        for record in captured_outputs {
-            let client_key = input_ids.get(record.client_id).ok_or_else(|| {
+        let outputs_by_client = group_output_shares_by_client(
+            captured_outputs
+                .into_iter()
+                .map(|record| (record.client_id, record.shares)),
+        );
+        for (client_id, shares) in outputs_by_client {
+            let client_key = input_ids.get(client_id).ok_or_else(|| {
                 format!(
                     "AVSS output client index {} has no matching coordinator client identity",
-                    record.client_id
+                    client_id
                 )
             })?;
             coord
-                .send_output_shares(client_key.clone(), client_key.clone(), record.shares)
+                .send_output_shares(client_key.clone(), client_key.clone(), shares)
                 .await
                 .map_err(|e| format!("send_output_shares: {e}"))?;
         }
     }
 
-    coord.finalize().await.map_err(|e| e.to_string())?;
+    if as_leader {
+        coord.finalize().await.map_err(|e| e.to_string())?;
+    }
     coord
         .wait_for_round(Round::ProgramFinished)
         .await
         .map_err(|e| e.to_string())?;
 
-    // Shutting the coordinator process down is an administrative action for one-off runs, not a
-    // protocol round, so it stays with a single party rather than becoming a quorum proposal.
     if as_leader && one_off {
         if let Err(e) = coord.request_shutdown().await {
-            eprintln!("Warning: failed to request off-chain coordinator shutdown: {}", e);
+            eprintln!(
+                "Warning: failed to request off-chain coordinator shutdown: {}",
+                e
+            );
         }
     }
 
@@ -4733,6 +5016,7 @@ struct StandingRunnerExecutionHandler {
     preproc_store: Arc<dyn PreprocStore>,
     persistent_identity: DurableIdentityDigest,
     party_id: usize,
+    coordinator_leader: bool,
     parties: usize,
     threshold: usize,
     pool_id: ExecutionId,
@@ -4907,14 +5191,46 @@ impl StandingRunnerExecutionHandler {
     ) -> Arc<BTreeMap<ClientId, DurableIdentityDigest>> {
         Arc::new(
             admission
-                .expected_client_public_keys
+                .expected_client_certificate_identities
                 .iter()
                 .enumerate()
-                .map(|(client_id, public_key)| {
+                .map(|(client_id, identity)| {
                     (
                         client_id,
-                        DurableIdentityDigest::from_public_key_bytes(public_key),
+                        DurableIdentityDigest::from_certificate_identity(*identity),
                     )
+                })
+                .collect(),
+        )
+    }
+
+    fn expected_client_bindings(
+        &self,
+        admission: &ResolvedStandingExecutionAdmissionV1,
+        program: &StandingProgram,
+    ) -> Arc<Vec<ClientProtocolBinding>> {
+        let output_only_slots = program
+            .client_io_manifest
+            .clients
+            .iter()
+            .filter_map(|schema| {
+                if schema.inputs.is_empty() && !schema.outputs.is_empty() {
+                    usize::try_from(schema.client_slot).ok()
+                } else {
+                    None
+                }
+            })
+            .collect::<HashSet<_>>();
+        Arc::new(
+            admission
+                .clients
+                .iter()
+                .enumerate()
+                .filter(|(_, client)| output_only_slots.contains(&client.manifest_slot))
+                .map(|(client_id, client)| ClientProtocolBinding {
+                    protocol_index: client_id,
+                    route_id: client_id,
+                    manifest_slot: client.manifest_slot,
                 })
                 .collect(),
         )
@@ -5309,60 +5625,31 @@ impl StandingRunnerExecutionHandler {
         result
     }
 
-    /// Tells the coordinator this node is finished with `execution_id`, retrying a few times.
-    ///
-    /// Retirement now needs only `n - t` acknowledgements, so one node giving up does not pin the
-    /// execution. Retrying still matters for the node's own accounting: a cleanup that fails on a
-    /// transient connection error is indistinguishable from a node that crashed, and each
-    /// unacknowledged execution consumes one of the coordinator's sealed-execution records.
-    async fn retire_coordinator_execution(
-        &self,
-        execution_id: CoordinatorExecutionId,
-    ) -> Result<(), String> {
-        const RETIREMENT_ATTEMPTS: usize = 3;
-        const RETIREMENT_BACKOFF: Duration = Duration::from_millis(200);
-
-        let mut last_error = String::new();
-        for attempt in 0..RETIREMENT_ATTEMPTS {
-            if attempt > 0 {
-                tokio::time::sleep(RETIREMENT_BACKOFF * attempt as u32).await;
-            }
-            let outcome =
-                match HbOffChainCoordinator::<ark_bls12_381::Fr>::start_rpc_client_for_execution(
-                    &self.coordinator_addr.0,
-                    self.coordinator_addr.1,
-                    self.threshold as u64,
-                    self.parties as u64,
-                    0,
-                    execution_id,
-                    self.coordinator_cert_der.clone(),
-                    self.coordinator_key_der.clone(),
-                )
-                .await
-                {
-                    Ok(coordinator) => coordinator
-                        .retire_execution()
-                        .await
-                        .map_err(|error| format!("retire coordinator execution: {error}")),
-                    Err(error) => Err(format!("connect for coordinator cleanup: {error}")),
-                };
-            match outcome {
-                Ok(()) => return Ok(()),
-                Err(error) => last_error = error,
-            }
-        }
-        Err(format!(
-            "coordinator retirement failed after {RETIREMENT_ATTEMPTS} attempts: {last_error}"
-        ))
-    }
-
     async fn cleanup_execution_resources(
         &self,
         context: &NodeExecutionContext,
     ) -> Result<(), String> {
         let execution_id = coordinator_execution_id(context.spec.execution_id);
         self.node_rpc.retire_execution(execution_id).await;
-        let coordinator_cleanup = self.retire_coordinator_execution(execution_id).await;
+        let coordinator_cleanup =
+            match HbOffChainCoordinator::<ark_bls12_381::Fr>::start_rpc_client_for_execution(
+                &self.coordinator_addr.0,
+                self.coordinator_addr.1,
+                self.threshold as u64,
+                self.parties as u64,
+                0,
+                execution_id,
+                self.coordinator_cert_der.clone(),
+                self.coordinator_key_der.clone(),
+            )
+            .await
+            {
+                Ok(coordinator) => coordinator
+                    .retire_execution()
+                    .await
+                    .map_err(|error| format!("retire coordinator execution: {error}")),
+                Err(error) => Err(format!("connect for coordinator cleanup: {error}")),
+            };
 
         // Preprocessing was already removed from LMDB into the execution's
         // owned in-memory bundle. Cleanup only retires local VM state; dropping
@@ -5395,6 +5682,12 @@ impl StandingRunnerExecutionHandler {
         F: SupportedMpcField,
         G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
     {
+        // Installing the MPC engine clears engine-scoped VM state, including
+        // ClientStore. Restore the admitted roster only after setup so
+        // output-only clients remain visible to the Stoffel program.
+        if !admission.clients.is_empty() {
+            vm.set_client_roster(admission.clients.iter().map(|client| client.manifest_slot));
+        }
         let execution_id = coordinator_execution_id(admission.execution_id);
         let mut coord = HbOffChainCoordinator::<F>::start_rpc_client_for_execution(
             &self.coordinator_addr.0,
@@ -5408,10 +5701,27 @@ impl StandingRunnerExecutionHandler {
         )
         .await
         .map_err(|error| format!("connect to standing coordinator: {error}"))?;
-        coord
-            .start_preprocessing()
-            .await
-            .map_err(|error| error.to_string())?;
+        // Input collection uses long-lived subscriptions. Keep the subsequent
+        // phase-control RPCs and subscriptions on a clean WebSocket so dropping
+        // the input stream cannot head-of-line block the MPC transition.
+        let lifecycle_coord = HbOffChainCoordinator::<F>::start_rpc_client_for_execution(
+            &self.coordinator_addr.0,
+            self.coordinator_addr.1,
+            self.threshold as u64,
+            self.parties as u64,
+            0,
+            execution_id,
+            self.coordinator_cert_der.clone(),
+            self.coordinator_key_der.clone(),
+        )
+        .await
+        .map_err(|error| format!("connect to standing lifecycle coordinator: {error}"))?;
+        if self.coordinator_leader {
+            coord
+                .start_preprocessing()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         coord
             .wait_for_round(Round::Preprocessing)
             .await
@@ -5419,30 +5729,43 @@ impl StandingRunnerExecutionHandler {
 
         engine.enable_client_output_capture().await;
         let input_total = self.coordinator_registration(admission, program)?.n_inputs as usize;
-        let client_slots = admission
+        let client_roster = admission
             .clients
             .iter()
             .map(|client| client.manifest_slot)
             .collect::<Vec<_>>();
+        let client_input_slots = manifest_client_input_slots(client_input_types);
+        let input_client_ids = input_client_ids_from_output_ids(
+            &admission.expected_client_public_keys,
+            &client_roster,
+            &client_input_slots,
+            client_input_count,
+        );
         collect_hb_coordinator_inputs(
             vm,
             &engine,
             &mut coord,
             self.node_rpc.as_ref(),
             execution_id,
-            &admission.expected_client_public_keys,
+            &input_client_ids,
             Some(input_total),
             client_input_count,
-            &client_slots,
+            &client_input_slots,
             client_input_types,
             standing_preproc_pool_program_id(self.pool_id, admission.program_id),
             0,
             self.party_id,
+            self.coordinator_leader,
         )
         .await?;
 
-        coord.start_mpc().await.map_err(|error| error.to_string())?;
-        coord
+        if self.coordinator_leader {
+            lifecycle_coord
+                .start_mpc()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        lifecycle_coord
             .wait_for_round(Round::MPCExecution)
             .await
             .map_err(|error| error.to_string())?;
@@ -5451,28 +5774,42 @@ impl StandingRunnerExecutionHandler {
             .await
             .map_err(|error| format!("VM execution failed: {error}"))?;
 
-        coord
-            .send_output()
-            .await
-            .map_err(|error| error.to_string())?;
-        coord
+        if self.coordinator_leader {
+            lifecycle_coord
+                .send_output()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        lifecycle_coord
             .wait_for_round(Round::OutputDistribution)
             .await
             .map_err(|error| error.to_string())?;
-        for record in engine.drain_client_output_records().await {
-            let client_key = standing_client_key(admission, record.client_id).ok_or_else(|| {
+        let outputs_by_client = group_output_shares_by_client(
+            engine
+                .drain_client_output_records()
+                .await
+                .into_iter()
+                .map(|record| (record.client_id, record.shares)),
+        );
+        for (client_id, shares) in outputs_by_client {
+            let client_key = standing_client_key(admission, client_id).ok_or_else(|| {
                 format!(
                     "HoneyBadger output client slot {} is absent from the admission",
-                    record.client_id
+                    client_id
                 )
             })?;
-            coord
-                .send_output_shares(client_key.clone(), client_key.clone(), record.shares)
+            lifecycle_coord
+                .send_output_shares(client_key.clone(), client_key.clone(), shares)
                 .await
                 .map_err(|error| format!("send HoneyBadger output shares: {error}"))?;
         }
-        coord.finalize().await.map_err(|error| error.to_string())?;
-        coord
+        if self.coordinator_leader {
+            lifecycle_coord
+                .finalize()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        lifecycle_coord
             .wait_for_round(Round::ProgramFinished)
             .await
             .map_err(|error| error.to_string())?;
@@ -5494,6 +5831,12 @@ impl StandingRunnerExecutionHandler {
         F: SupportedMpcField,
         G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
     {
+        // Installing the MPC engine clears engine-scoped VM state, including
+        // ClientStore. Restore the admitted roster only after setup so
+        // output-only clients remain visible to the Stoffel program.
+        if !admission.clients.is_empty() {
+            vm.set_client_roster(admission.clients.iter().map(|client| client.manifest_slot));
+        }
         let execution_id = coordinator_execution_id(admission.execution_id);
         let coord = AvssOffChainCoordinator::<F, G>::start_rpc_client_for_execution(
             &self.coordinator_addr.0,
@@ -5507,10 +5850,27 @@ impl StandingRunnerExecutionHandler {
         )
         .await
         .map_err(|error| format!("connect to standing coordinator: {error}"))?;
-        coord
-            .start_preprocessing()
-            .await
-            .map_err(|error| error.to_string())?;
+        // Input collection uses long-lived subscriptions. Keep the subsequent
+        // phase-control RPCs and subscriptions on a clean WebSocket so dropping
+        // the input stream cannot head-of-line block the MPC transition.
+        let lifecycle_coord = AvssOffChainCoordinator::<F, G>::start_rpc_client_for_execution(
+            &self.coordinator_addr.0,
+            self.coordinator_addr.1,
+            self.threshold as u64,
+            self.parties as u64,
+            0,
+            execution_id,
+            self.coordinator_cert_der.clone(),
+            self.coordinator_key_der.clone(),
+        )
+        .await
+        .map_err(|error| format!("connect to standing lifecycle coordinator: {error}"))?;
+        if self.coordinator_leader {
+            coord
+                .start_preprocessing()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
         coord
             .wait_for_round(Round::Preprocessing)
             .await
@@ -5518,11 +5878,7 @@ impl StandingRunnerExecutionHandler {
 
         engine.enable_client_output_capture().await;
         let input_total = self.coordinator_registration(admission, program)?.n_inputs as usize;
-        let client_slots = admission
-            .clients
-            .iter()
-            .map(|client| client.manifest_slot)
-            .collect::<Vec<_>>();
+        let client_input_slots = manifest_client_input_slots(client_input_types);
         if input_total > 0 {
             let mask_shares = {
                 let node = engine.node_handle().lock().await;
@@ -5538,10 +5894,12 @@ impl StandingRunnerExecutionHandler {
                     })?;
                 shares
             };
-            coord
-                .reserve_input_masks()
-                .await
-                .map_err(|error| error.to_string())?;
+            if self.coordinator_leader {
+                coord
+                    .reserve_input_masks()
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
             coord
                 .wait_for_round(Round::InputMaskReservation)
                 .await
@@ -5554,7 +5912,11 @@ impl StandingRunnerExecutionHandler {
             );
             for (client, indices) in &client_to_indices {
                 self.node_rpc
-                    .add_reserved_indices_for_execution(execution_id, client.clone(), indices.clone())
+                    .add_reserved_indices_for_execution(
+                        execution_id,
+                        client.clone(),
+                        indices.clone(),
+                    )
                     .await
                     .map_err(|error| format!("add AVSS reserved indices: {error:?}"))?;
             }
@@ -5567,10 +5929,12 @@ impl StandingRunnerExecutionHandler {
                 .add_mask_shares_for_execution(execution_id, &mask_share_pairs)
                 .await
                 .map_err(|error| format!("add AVSS mask shares: {error:?}"))?;
-            coord
-                .collect_inputs()
-                .await
-                .map_err(|error| error.to_string())?;
+            if self.coordinator_leader {
+                coord
+                    .collect_inputs()
+                    .await
+                    .map_err(|error| error.to_string())?;
+            }
             coord
                 .wait_for_round(Round::InputCollection)
                 .await
@@ -5584,13 +5948,18 @@ impl StandingRunnerExecutionHandler {
                 &client_to_indices,
                 client_inputs,
                 client_input_count,
-                &client_slots,
+                &client_input_slots,
                 client_input_types,
             );
         }
 
-        coord.start_mpc().await.map_err(|error| error.to_string())?;
-        coord
+        if self.coordinator_leader {
+            lifecycle_coord
+                .start_mpc()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        lifecycle_coord
             .wait_for_round(Round::MPCExecution)
             .await
             .map_err(|error| error.to_string())?;
@@ -5598,28 +5967,42 @@ impl StandingRunnerExecutionHandler {
             .execute_async_with_metrics(&admission.entry, engine.as_ref())
             .await
             .map_err(|error| format!("VM execution failed: {error}"))?;
-        coord
-            .send_output()
-            .await
-            .map_err(|error| error.to_string())?;
-        coord
+        if self.coordinator_leader {
+            lifecycle_coord
+                .send_output()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        lifecycle_coord
             .wait_for_round(Round::OutputDistribution)
             .await
             .map_err(|error| error.to_string())?;
-        for record in engine.drain_client_output_records().await {
-            let client_key = standing_client_key(admission, record.client_id).ok_or_else(|| {
+        let outputs_by_client = group_output_shares_by_client(
+            engine
+                .drain_client_output_records()
+                .await
+                .into_iter()
+                .map(|record| (record.client_id, record.shares)),
+        );
+        for (client_id, shares) in outputs_by_client {
+            let client_key = standing_client_key(admission, client_id).ok_or_else(|| {
                 format!(
                     "AVSS output client slot {} is absent from the admission",
-                    record.client_id
+                    client_id
                 )
             })?;
-            coord
-                .send_output_shares(client_key.clone(), client_key.clone(), record.shares)
+            lifecycle_coord
+                .send_output_shares(client_key.clone(), client_key.clone(), shares)
                 .await
                 .map_err(|error| format!("send AVSS output shares: {error}"))?;
         }
-        coord.finalize().await.map_err(|error| error.to_string())?;
-        coord
+        if self.coordinator_leader {
+            lifecycle_coord
+                .finalize()
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        lifecycle_coord
             .wait_for_round(Round::ProgramFinished)
             .await
             .map_err(|error| error.to_string())?;
@@ -5642,9 +6025,6 @@ impl StandingRunnerExecutionHandler {
                 .as_ref()
                 .map(|storage| storage.with_namespace(*context.spec.execution_id.as_bytes())),
         )?;
-        if !admission.clients.is_empty() {
-            vm.set_client_roster(admission.clients.iter().map(|client| client.manifest_slot));
-        }
         let client_input_types = manifest_client_input_types(&program.client_io_manifest);
         let manifest_client_input_count =
             client_input_types.values().map(Vec::len).max().unwrap_or(0);
@@ -5653,6 +6033,7 @@ impl StandingRunnerExecutionHandler {
             stoffel_vm::net::derive_instance_id_for_execution(&context.spec.execution_id);
         let preproc_program_id =
             standing_preproc_pool_program_id(self.pool_id, admission.program_id);
+        let expected_client_bindings = self.expected_client_bindings(admission, program);
         let mut setup = Some(PartySetup {
             net: Arc::clone(&self.network),
             reply_mux: self.mux.clone(),
@@ -5664,7 +6045,7 @@ impl StandingRunnerExecutionHandler {
             t: self.threshold,
             instance_id,
             expected_client_count: None,
-            expected_client_bindings: None,
+            expected_client_bindings: Some(expected_client_bindings),
             expected_client_reservation_identities: Some(
                 self.expected_client_identities(admission),
             ),
@@ -5760,7 +6141,10 @@ impl StandingExecutionHandler for StandingRunnerExecutionHandler {
         // preprocessing material into the execution scope.
         let execution_inbox = self
             .mux
-            .register_with_client_identities(context.spec.execution_id, Vec::new())
+            .register_with_client_identities(
+                context.spec.execution_id,
+                admission.expected_client_certificate_identities.clone(),
+            )
             .map_err(|error| format!("register prepared execution transport: {error}"))?;
         let execution_registration =
             ExecutionInboxRegistrationGuard::new(self.mux.clone(), context.spec.execution_id);
@@ -5910,8 +6294,14 @@ async fn run_standing_node(raw_args: &[String]) -> Result<(), String> {
     let programs_dir = PathBuf::from(standing_required_flag(raw_args, "--program-dir")?);
     let client_cert_dir = PathBuf::from(standing_required_flag(raw_args, "--client-cert-dir")?);
     let party_cert_dir = PathBuf::from(standing_required_flag(raw_args, "--party-cert-dir")?);
-    let program_catalog =
-        Arc::new(StandingProgramCatalog::load(&programs_dir).map_err(|error| error.to_string())?);
+    let program_catalog = Arc::new(
+        if is_flag_present(raw_args, "--allow-dynamic-preprocessing") {
+            StandingProgramCatalog::load_with_dynamic_preprocessing(&programs_dir)
+        } else {
+            StandingProgramCatalog::load(&programs_dir)
+        }
+        .map_err(|error| error.to_string())?,
+    );
     let client_catalog =
         Arc::new(StandingClientCatalog::load(&client_cert_dir).map_err(|error| error.to_string())?);
     let bind = standing_required_flag(raw_args, "--bind")?
@@ -6031,6 +6421,11 @@ async fn run_standing_node(raw_args: &[String]) -> Result<(), String> {
     )
     .await
     .map_err(|error| format!("standing mesh registration failed: {error}"))?;
+    // Freeze and verify the party roster first; client identities extend the
+    // process-wide TLS allowlist only after mesh consensus is complete.
+    for client_public_key in client_catalog.transport_public_keys() {
+        network.add_allowed_certificate_public_key(client_public_key);
+    }
     let party_public_key_map = party_public_keys.into_iter().collect::<BTreeMap<_, _>>();
     let reconnect_peers = standing_session
         .parties
@@ -6069,6 +6464,7 @@ async fn run_standing_node(raw_args: &[String]) -> Result<(), String> {
         preproc_store,
         persistent_identity,
         party_id: protocol_party_id,
+        coordinator_leader: party_id == 0,
         parties,
         threshold,
         pool_id,
@@ -6180,6 +6576,52 @@ async fn main() {
         return;
     }
 
+    if let Some(index) = raw_args
+        .iter()
+        .position(|arg| arg == "--print-program-manifest")
+    {
+        #[derive(Serialize)]
+        struct ProgramManifestReport {
+            program_id: String,
+            bytecode_version: u16,
+            entries: Vec<String>,
+            manifest: ClientIoManifest,
+        }
+
+        let path = raw_args.get(index + 1).unwrap_or_else(|| {
+            eprintln!("Error: --print-program-manifest requires an artifact path");
+            exit(2);
+        });
+        let bytes = fs::read(path).unwrap_or_else(|error| {
+            eprintln!("Error: failed to read program artifact '{path}': {error}");
+            exit(2);
+        });
+        let mut entries = Vec::new();
+        let (_, bytecode_version, manifest) = CompiledBinary::try_for_each_vm_function_from_reader(
+            &mut BufReader::new(bytes.as_slice()),
+            |function| {
+                entries.push(function.name().to_owned());
+                Ok(())
+            },
+        )
+        .unwrap_or_else(|error| {
+            eprintln!("Error: failed to deserialize program artifact '{path}': {error:?}");
+            exit(2);
+        });
+        entries.sort();
+        let report = ProgramManifestReport {
+            program_id: hex::encode(program_id_from_bytes(&bytes)),
+            bytecode_version,
+            entries,
+            manifest,
+        };
+        println!(
+            "{}",
+            serde_json::to_string(&report).expect("program manifest report is serializable")
+        );
+        return;
+    }
+
     if is_flag_present(&raw_args, "--standing-node") {
         if let Err(error) = run_standing_node(&raw_args).await {
             eprintln!("Standing node failed: {error}");
@@ -6219,6 +6661,7 @@ async fn main() {
     let mut _enable_nat: bool = false;
     let mut _stun_servers: Vec<SocketAddr> = Vec::new();
     let mut server_addrs: Vec<SocketAddr> = Vec::new();
+    let mut client_transport_addrs: Vec<SocketAddr> = Vec::new();
     let mut mpc_backend: Option<String> = None;
     let mut mpc_curve: Option<String> = None;
     let mut rpc_addr: Option<(String, u16)> = None;
@@ -6271,6 +6714,7 @@ async fn main() {
         } else if let Some(_rest) = arg.strip_prefix("--client-input-total") {
         } else if let Some(_rest) = arg.strip_prefix("--stun-servers") {
         } else if let Some(_rest) = arg.strip_prefix("--servers") {
+        } else if let Some(_rest) = arg.strip_prefix("--client-transport-servers") {
         } else if let Some(_rest) = arg.strip_prefix("--mpc-backend") {
         } else if let Some(_rest) = arg.strip_prefix("--mpc-curve") {
         } else if let Some(_rest) = arg.strip_prefix("--rpc-bind") {
@@ -6388,6 +6832,23 @@ async fn main() {
                             let s = s.trim();
                             s.parse::<SocketAddr>().ok().or_else(|| {
                                 eprintln!("Warning: Invalid server address '{}', skipping", s);
+                                None
+                            })
+                        })
+                        .collect();
+                }
+            }
+            "--client-transport-servers" => {
+                if let Some(v) = args_iter.next() {
+                    client_transport_addrs = v
+                        .split(',')
+                        .filter_map(|s| {
+                            let s = s.trim();
+                            s.parse::<SocketAddr>().ok().or_else(|| {
+                                eprintln!(
+                                    "Warning: Invalid client transport address '{}', skipping",
+                                    s
+                                );
                                 None
                             })
                         })
@@ -6606,6 +7067,7 @@ async fn main() {
                 client_outputs,
                 output_format: coordinator_output_format,
                 server_addrs,
+                client_transport_addrs,
                 coord_addr: coord_addr.clone().unwrap(),
                 cert_der: cert_der.clone().expect("--cert required in client mode"),
                 key_der: key_der.clone().expect("--key required in client mode"),
@@ -6646,6 +7108,7 @@ async fn main() {
                     client_outputs,
                     coordinator_output_format,
                     server_addrs,
+                    client_transport_addrs,
                     coord_addr,
                     None,
                     cert_der.expect("--cert required in client mode"),
@@ -7367,7 +7830,9 @@ async fn main() {
                 _execution_scanner = Some(scanner);
                 // Phase 1: Coordinator preprocessing trigger
                 if let Some(ref mut coord) = coord_opt {
-                    coord.start_preprocessing().await.unwrap();
+                    if as_leader {
+                        coord.start_preprocessing().await.unwrap();
+                    }
                 }
                 // Phase 2: Create MPC engine + preprocessing + coordinator input phases
                 macro_rules! setup_hb {
@@ -7491,6 +7956,7 @@ async fn main() {
                             program_id,
                             0,
                             my_id,
+                            as_leader,
                         )
                         .await
                         {
@@ -7646,8 +8112,10 @@ async fn main() {
 
     // Coordinator: signal MPC execution phase
     if let Some(ref mut coord) = coord_opt {
-        eprintln!("[party] proposing MPCExecution");
-        coord.start_mpc().await.unwrap();
+        if as_leader {
+            eprintln!("[party] coordinator -> MPCExecution");
+            coord.start_mpc().await.unwrap();
+        }
         coord.wait_for_round(Round::MPCExecution).await.unwrap();
     }
 
@@ -7733,7 +8201,9 @@ async fn main() {
                             shares.extend(record.shares);
                         }
 
-                        coord.send_output().await.unwrap();
+                        if as_leader {
+                            coord.send_output().await.unwrap();
+                        }
                         coord
                             .wait_for_round(Round::OutputDistribution)
                             .await
@@ -7757,19 +8227,16 @@ async fn main() {
                         }
                     }
 
-                    if let Err(e) = coord.finalize().await {
-                        eprintln!(
-                            "Warning: failed to finalize off-chain coordinator round: {}",
-                            e
-                        );
+                    if as_leader {
+                        if let Err(e) = coord.finalize().await {
+                            eprintln!(
+                                "Warning: failed to finalize off-chain coordinator round: {}",
+                                e
+                            );
+                        }
                     }
-                    coord
-                        .wait_for_round(Round::ProgramFinished)
-                        .await
-                        .unwrap();
+                    coord.wait_for_round(Round::ProgramFinished).await.unwrap();
 
-                    // Coordinator shutdown is administrative rather than a protocol round, so it
-                    // stays with a single party instead of becoming a quorum proposal.
                     if as_leader && one_off {
                         if let Err(e) = coord.request_shutdown().await {
                             eprintln!(
@@ -7796,7 +8263,10 @@ async fn main() {
     #[cfg(feature = "statistics")]
     if let Some(engine) = hb_bls12381_coord_engine.as_ref() {
         let node = engine.node_handle().lock().await;
-        eprintln!("HoneyBadger MPC statistics:\n{}", node.statistics_snapshot());
+        eprintln!(
+            "HoneyBadger MPC statistics:\n{}",
+            node.statistics_snapshot()
+        );
     } else if let Some(counters) = hb_node_counters.as_ref() {
         eprintln!("HoneyBadger MPC statistics:\n{}", counters.snapshot());
     } else if let Some(counters) = avss_node_counters.as_ref() {
@@ -7821,8 +8291,12 @@ Flags:
   --reservoir-burst-capacity <n>
                           Per-program preprocessing burst capacity warmed before
                           standing readiness (default: 9)
+  --allow-dynamic-preprocessing
+                          Admit dynamic demand floors (bounded test/example use only)
   --print-program-id <path>
                           Print the domain-separated content ID and exit
+  --print-program-manifest <path>
+                          Print content ID, entries, and client/preprocessing metadata as JSON
   --trace-instr           Trace instructions before/after execution
   --trace-regs            Trace register reads/writes
   --trace-stack           Trace function calls and stack push/pop
@@ -7846,6 +8320,9 @@ Flags:
                           Decode coordinator client outputs as fixed-point values
                           with n fractional bits instead of raw field integers
   --servers <addrs>       Comma-separated server addresses (client mode)
+  --client-transport-servers <addrs>
+                          Coordinator-mode QUIC addresses used to authenticate
+                          output-only clients with each standing execution
   --wait-for-clients <n>
                           Number of client inputs to collect before starting computation
                           (HoneyBadger only; ALPN handles routing, this controls coordination)
@@ -7944,9 +8421,9 @@ mod tests {
         checked_client_input_total, client_input_completion_quorum, client_input_setup_plan,
         client_output_slot_map, client_transport_recipient, decode_preprocessing_exchange,
         direct_client_inbound_message, encode_preprocessing_exchange, field_outputs_to_hex,
-        format_coordinator_outputs, hb_input_only_completion_proven,
-        input_client_ids_from_output_ids, mpc_input_protocol_ids, plan_preprocessing,
-        preprocessing_transcript_digest, record_preprocessing_exchange_value,
+        format_coordinator_outputs, group_output_shares_by_client, hb_input_only_completion_proven,
+        input_client_ids_from_output_ids, manifest_client_input_slots, mpc_input_protocol_ids,
+        plan_preprocessing, preprocessing_transcript_digest, record_preprocessing_exchange_value,
         render_fixed_point_i64, resolve_client_protocol_bindings, standing_preproc_pool_program_id,
         standing_reservoir_plan, standing_reservoir_refill_execution_id,
         validate_preprocessing_proposals, validate_reservoir_allocation_admission,
@@ -7963,6 +8440,14 @@ mod tests {
         ClientIoManifest, ClientIoSchema, PreprocessingDemand,
     };
     use stoffel_vm_types::core_types::ShareType;
+
+    #[test]
+    fn captured_output_shares_are_batched_once_per_client_in_call_order() {
+        let grouped =
+            group_output_shares_by_client([(1, vec![10]), (0, vec![20, 21]), (1, vec![11, 12])]);
+        assert_eq!(grouped.get(&0), Some(&vec![20, 21]));
+        assert_eq!(grouped.get(&1), Some(&vec![10, 11, 12]));
+    }
 
     #[tokio::test]
     async fn execution_task_group_cancels_drops_and_joins_every_child() {
@@ -8119,12 +8604,12 @@ mod tests {
             clients: vec![
                 ClientIoSchema {
                     client_slot: 0,
-                    inputs: vec![input.clone()],
+                    inputs: vec![input],
                     outputs: Vec::new(),
                 },
                 ClientIoSchema {
                     client_slot: 1,
-                    inputs: vec![input.clone(), input.clone(), input],
+                    inputs: vec![input, input, input],
                     outputs: Vec::new(),
                 },
                 ClientIoSchema {
@@ -8482,13 +8967,13 @@ mod tests {
     }
 
     #[test]
-    fn plan_gives_dynamic_programs_an_extra_octave_of_headroom() {
+    fn plan_gives_dynamic_programs_three_extra_octaves_of_headroom() {
         let stat = plan_preprocessing(&demand(0, 16, 1, false), 1, 0);
         let dyn_ = plan_preprocessing(&demand(0, 16, 1, true), 1, 0);
-        // The dynamic flag doubles the estimate before banding, so the prandbit
-        // pool is one octave larger than the static plan's.
+        // The dynamic flag multiplies the estimate by eight before banding, so
+        // the prandbit pool is three octaves larger than the static plan's.
         assert_eq!(stat.n_prandbit, 16);
-        assert_eq!(dyn_.n_prandbit, 32);
+        assert_eq!(dyn_.n_prandbit, 128);
         assert!(dyn_.n_triples >= stat.n_triples);
     }
 
@@ -8508,6 +8993,17 @@ mod tests {
         let input_ids = input_client_ids_from_output_ids(&output_ids, &[0, 1, 2], &[], 0);
 
         assert!(input_ids.is_empty());
+    }
+
+    #[test]
+    fn manifest_input_slots_exclude_output_only_clients() {
+        let input_types = BTreeMap::from([
+            (0, Vec::new()),
+            (2, vec![ShareType::default_secret_int()]),
+            (5, Vec::new()),
+        ]);
+
+        assert_eq!(manifest_client_input_slots(&input_types), vec![2]);
     }
 
     #[test]

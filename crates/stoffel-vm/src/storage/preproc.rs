@@ -23,7 +23,9 @@ use stoffelmpc_mpc::honeybadger::{
 #[derive(Debug, thiserror::Error)]
 pub enum PreprocStoreError {
     #[error("LMDB: {0}")]
-    Lmdb(String),
+    Lmdb(#[from] heed::Error),
+    #[error("LMDB actor: {0}")]
+    LmdbActor(String),
     #[error("serialization: {0}")]
     Serialization(String),
     #[error("deserialization: {0}")]
@@ -46,12 +48,6 @@ pub enum PreprocStoreError {
     U32Overflow { field: &'static str, value: u64 },
     #[error("task join: {0}")]
     Join(String),
-}
-
-impl From<heed::Error> for PreprocStoreError {
-    fn from(e: heed::Error) -> Self {
-        Self::Lmdb(e.to_string())
-    }
 }
 
 impl From<bincode::Error> for PreprocStoreError {
@@ -713,6 +709,76 @@ fn reservoir_material_keys(
         .collect()
 }
 
+const DEFAULT_LMDB_MAP_SIZE: usize = 1024 * 1024 * 1024;
+
+fn lmdb_initial_map_size(path: &Path, requested: usize) -> Result<usize, PreprocStoreError> {
+    if requested == 0 {
+        return Err(PreprocStoreError::LmdbActor(
+            "initial map size must be nonzero".into(),
+        ));
+    }
+    let existing_len = match std::fs::metadata(path.join("data.mdb")) {
+        Ok(metadata) => usize::try_from(metadata.len()).map_err(|_| {
+            PreprocStoreError::LmdbActor(format!(
+                "existing LMDB data file is too large for this platform: {} bytes",
+                metadata.len()
+            ))
+        })?,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => 0,
+        Err(error) => return Err(error.into()),
+    };
+
+    let mut map_size = requested;
+    while map_size <= existing_len {
+        map_size = map_size.checked_mul(2).ok_or_else(|| {
+            PreprocStoreError::LmdbActor(format!(
+                "cannot size LMDB map above existing {existing_len}-byte data file"
+            ))
+        })?;
+    }
+    Ok(map_size)
+}
+
+fn is_lmdb_map_full(error: &PreprocStoreError) -> bool {
+    matches!(
+        error,
+        PreprocStoreError::Lmdb(heed::Error::Mdb(heed::MdbError::MapFull))
+    )
+}
+
+/// Retry one actor-owned write transaction after growing LMDB's virtual map.
+///
+/// Every transaction for this environment is created and completed on the
+/// actor thread, so when `operation` returns there are no live transactions
+/// owned by this store. That is the condition LMDB requires for a safe resize.
+fn with_lmdb_map_growth<T>(
+    env: &heed::Env,
+    mut operation: impl FnMut() -> Result<T, PreprocStoreError>,
+) -> Result<T, PreprocStoreError> {
+    loop {
+        match operation() {
+            Err(error) if is_lmdb_map_full(&error) => {
+                let current = env.info().map_size;
+                let grown = current.checked_mul(2).ok_or_else(|| {
+                    PreprocStoreError::LmdbActor(format!(
+                        "cannot grow full LMDB map beyond {current} bytes"
+                    ))
+                })?;
+                // SAFETY: LmdbPreprocStore serializes every transaction on this
+                // actor thread, and the failed transaction was dropped before
+                // `operation` returned.
+                unsafe { env.resize(grown) }?;
+                tracing::warn!(
+                    old_map_size = current,
+                    new_map_size = grown,
+                    "grew preprocessing LMDB map after MDB_MAP_FULL"
+                );
+            }
+            result => return result,
+        }
+    }
+}
+
 /// LMDB-backed preprocessing store using the actor pattern.
 ///
 /// A dedicated `std::thread` owns the `heed::Env` and processes all
@@ -729,12 +795,24 @@ pub struct LmdbPreprocStore {
 
 impl LmdbPreprocStore {
     pub fn open(path: impl AsRef<Path>) -> Result<Self, PreprocStoreError> {
-        std::fs::create_dir_all(path.as_ref())?;
+        Self::open_with_map_size(path, DEFAULT_LMDB_MAP_SIZE)
+    }
+
+    /// Open a preprocessing store with an explicit initial LMDB map size.
+    /// The actor automatically doubles this virtual limit when a write reaches
+    /// it; this parameter controls only the initial reservation.
+    pub fn open_with_map_size(
+        path: impl AsRef<Path>,
+        initial_map_size: usize,
+    ) -> Result<Self, PreprocStoreError> {
+        let path = path.as_ref();
+        std::fs::create_dir_all(path)?;
+        let initial_map_size = lmdb_initial_map_size(path, initial_map_size)?;
         let env = unsafe {
             heed::EnvOpenOptions::new()
-                .map_size(1024 * 1024 * 1024)
+                .map_size(initial_map_size)
                 .max_dbs(1)
-                .open(path.as_ref())
+                .open(path)
         }?;
         let mut transaction = env.write_txn()?;
         let database = env.create_database(&mut transaction, Some("store"))?;
@@ -772,10 +850,10 @@ impl LmdbPreprocStore {
             .send(Box::new(move |env, database| {
                 let _ = reply_tx.send(operation(env, database));
             }))
-            .map_err(|_| PreprocStoreError::Lmdb("actor thread gone".into()))?;
+            .map_err(|_| PreprocStoreError::LmdbActor("thread gone".into()))?;
         reply_rx
             .await
-            .map_err(|_| PreprocStoreError::Lmdb("actor reply dropped".into()))?
+            .map_err(|_| PreprocStoreError::LmdbActor("reply dropped".into()))?
     }
 
     async fn reserve_cursor(
@@ -786,34 +864,36 @@ impl LmdbPreprocStore {
     ) -> Result<u32, PreprocStoreError> {
         let meta_key = key.meta_key()?;
         self.run(move |env, database| {
-            let mut transaction = env.write_txn()?;
-            let raw = database
-                .get(&transaction, &meta_key)?
-                .ok_or(PreprocStoreError::NotFound)?;
-            let mut meta: PreprocMeta = bincode::deserialize(raw)?;
-            if meta.consumed != expected {
-                return Err(PreprocStoreError::CursorMismatch {
-                    expected,
-                    actual: meta.consumed,
-                });
-            }
-            let consumed =
-                meta.consumed
-                    .checked_add(count)
-                    .ok_or(PreprocStoreError::U32Overflow {
-                        field: "preprocessing consumed count",
-                        value: u64::from(meta.consumed) + u64::from(count),
-                    })?;
-            if consumed > meta.count {
-                return Err(PreprocStoreError::Insufficient {
-                    need: count,
-                    available: meta.available(),
-                });
-            }
-            meta.consumed = consumed;
-            database.put(&mut transaction, &meta_key, &bincode::serialize(&meta)?)?;
-            transaction.commit()?;
-            Ok(consumed)
+            with_lmdb_map_growth(env, || {
+                let mut transaction = env.write_txn()?;
+                let raw = database
+                    .get(&transaction, &meta_key)?
+                    .ok_or(PreprocStoreError::NotFound)?;
+                let mut meta: PreprocMeta = bincode::deserialize(raw)?;
+                if meta.consumed != expected {
+                    return Err(PreprocStoreError::CursorMismatch {
+                        expected,
+                        actual: meta.consumed,
+                    });
+                }
+                let consumed =
+                    meta.consumed
+                        .checked_add(count)
+                        .ok_or(PreprocStoreError::U32Overflow {
+                            field: "preprocessing consumed count",
+                            value: u64::from(meta.consumed) + u64::from(count),
+                        })?;
+                if consumed > meta.count {
+                    return Err(PreprocStoreError::Insufficient {
+                        need: count,
+                        available: meta.available(),
+                    });
+                }
+                meta.consumed = consumed;
+                database.put(&mut transaction, &meta_key, &bincode::serialize(&meta)?)?;
+                transaction.commit()?;
+                Ok(consumed)
+            })
         })
         .await
     }
@@ -826,11 +906,13 @@ impl PreprocStore for LmdbPreprocStore {
         let meta = bincode::serialize(&blob.meta)?;
         let data = blob.data.clone();
         self.run(move |env, database| {
-            let mut transaction = env.write_txn()?;
-            database.put(&mut transaction, &meta_key, &meta)?;
-            database.put(&mut transaction, &data_key, &data)?;
-            transaction.commit()?;
-            Ok(())
+            with_lmdb_map_growth(env, || {
+                let mut transaction = env.write_txn()?;
+                database.put(&mut transaction, &meta_key, &meta)?;
+                database.put(&mut transaction, &data_key, &data)?;
+                transaction.commit()?;
+                Ok(())
+            })
         })
         .await
     }
@@ -892,39 +974,41 @@ impl PreprocStore for LmdbPreprocStore {
         let data_key = key.encode()?;
         let data = data.to_vec();
         self.run(move |env, database| {
-            let mut transaction = env.write_txn()?;
-            let mut meta = match database.get(&transaction, &meta_key)? {
-                Some(raw) => {
-                    let meta: PreprocMeta = bincode::deserialize(raw)?;
-                    if meta.item_size != item_size {
-                        return Err(PreprocStoreError::ItemSizeMismatch {
-                            expected: meta.item_size,
-                            actual: item_size,
-                        });
+            with_lmdb_map_growth(env, || {
+                let mut transaction = env.write_txn()?;
+                let mut meta = match database.get(&transaction, &meta_key)? {
+                    Some(raw) => {
+                        let meta: PreprocMeta = bincode::deserialize(raw)?;
+                        if meta.item_size != item_size {
+                            return Err(PreprocStoreError::ItemSizeMismatch {
+                                expected: meta.item_size,
+                                actual: item_size,
+                            });
+                        }
+                        meta
                     }
-                    meta
-                }
-                None => PreprocMeta {
-                    count: 0,
-                    consumed: 0,
-                    item_size,
-                },
-            };
-            let mut stored = database
-                .get(&transaction, &data_key)?
-                .map_or_else(Vec::new, ToOwned::to_owned);
-            stored.extend_from_slice(&data);
-            meta.count = meta
-                .count
-                .checked_add(added)
-                .ok_or(PreprocStoreError::U32Overflow {
-                    field: "preprocessing item count",
-                    value: u64::from(meta.count) + u64::from(added),
-                })?;
-            database.put(&mut transaction, &data_key, &stored)?;
-            database.put(&mut transaction, &meta_key, &bincode::serialize(&meta)?)?;
-            transaction.commit()?;
-            Ok(meta.count)
+                    None => PreprocMeta {
+                        count: 0,
+                        consumed: 0,
+                        item_size,
+                    },
+                };
+                let mut stored = database
+                    .get(&transaction, &data_key)?
+                    .map_or_else(Vec::new, ToOwned::to_owned);
+                stored.extend_from_slice(&data);
+                meta.count =
+                    meta.count
+                        .checked_add(added)
+                        .ok_or(PreprocStoreError::U32Overflow {
+                            field: "preprocessing item count",
+                            value: u64::from(meta.count) + u64::from(added),
+                        })?;
+                database.put(&mut transaction, &data_key, &stored)?;
+                database.put(&mut transaction, &meta_key, &bincode::serialize(&meta)?)?;
+                transaction.commit()?;
+                Ok(meta.count)
+            })
         })
         .await
     }
@@ -937,116 +1021,119 @@ impl PreprocStore for LmdbPreprocStore {
         let materials = reservoir_material_keys(source)?;
 
         self.run(move |env, database| {
-            let mut transaction = env.write_txn()?;
-            let mut bundle = OwnedPreprocBundle::default();
-            for material in materials {
-                let count = requested.get(material.kind);
-                let Some(raw_meta) = database.get(&transaction, &material.meta_key)? else {
-                    if database.get(&transaction, &material.data_key)?.is_some() {
+            with_lmdb_map_growth(env, || {
+                let mut transaction = env.write_txn()?;
+                let mut bundle = OwnedPreprocBundle::default();
+                for material in &materials {
+                    let count = requested.get(material.kind);
+                    let Some(raw_meta) = database.get(&transaction, &material.meta_key)? else {
+                        if database.get(&transaction, &material.data_key)?.is_some() {
+                            return Err(PreprocStoreError::Deserialization(format!(
+                                "preprocessing reservoir {:?} has data without metadata",
+                                material.kind
+                            )));
+                        }
+                        if count > 0 {
+                            return Err(PreprocStoreError::NotFound);
+                        }
+                        continue;
+                    };
+                    let meta: PreprocMeta = bincode::deserialize(raw_meta)?;
+                    if meta.consumed > meta.count || (meta.count > 0 && meta.item_size == 0) {
                         return Err(PreprocStoreError::Deserialization(format!(
-                            "preprocessing reservoir {:?} has data without metadata",
+                            "invalid preprocessing reservoir metadata for {:?}",
                             material.kind
                         )));
                     }
-                    if count > 0 {
-                        return Err(PreprocStoreError::NotFound);
+                    if count > meta.available() {
+                        return Err(PreprocStoreError::Insufficient {
+                            need: count,
+                            available: meta.available(),
+                        });
                     }
-                    continue;
-                };
-                let meta: PreprocMeta = bincode::deserialize(raw_meta)?;
-                if meta.consumed > meta.count || (meta.count > 0 && meta.item_size == 0) {
-                    return Err(PreprocStoreError::Deserialization(format!(
-                        "invalid preprocessing reservoir metadata for {:?}",
-                        material.kind
-                    )));
-                }
-                if count > meta.available() {
-                    return Err(PreprocStoreError::Insufficient {
-                        need: count,
-                        available: meta.available(),
-                    });
-                }
-                let source_data = database
-                    .get(&transaction, &material.data_key)?
-                    .ok_or(PreprocStoreError::NotFound)?;
-                let expected_len = byte_offset(
-                    meta.count,
-                    meta.item_size,
-                    "preprocessing reservoir source size",
-                )?;
-                if source_data.len() != expected_len {
-                    return Err(PreprocStoreError::Deserialization(format!(
+                    let source_data = database
+                        .get(&transaction, &material.data_key)?
+                        .ok_or(PreprocStoreError::NotFound)?;
+                    let expected_len = byte_offset(
+                        meta.count,
+                        meta.item_size,
+                        "preprocessing reservoir source size",
+                    )?;
+                    if source_data.len() != expected_len {
+                        return Err(PreprocStoreError::Deserialization(format!(
                         "preprocessing reservoir {:?} contains {} bytes, expected {expected_len}",
                         material.kind,
                         source_data.len()
                     )));
-                }
+                    }
 
-                let start = byte_offset(
-                    meta.consumed,
-                    meta.item_size,
-                    "preprocessing reservoir bundle start",
-                )?;
-                let end_index =
-                    meta.consumed
-                        .checked_add(count)
-                        .ok_or(PreprocStoreError::U32Overflow {
-                            field: "preprocessing reservoir bundle end",
-                            value: u64::from(meta.consumed) + u64::from(count),
-                        })?;
-                let end = byte_offset(
-                    end_index,
-                    meta.item_size,
-                    "preprocessing reservoir bundle end",
-                )?;
-                let remaining = meta.count - end_index;
-                bundle.remaining.set(material.kind, remaining);
-
-                // Retain only the slices that outlive this transaction. This
-                // avoids cloning the complete reservoir blob before extracting
-                // one execution's bundle.
-                let taken_data = (count > 0).then(|| source_data[start..end].to_vec());
-                let compacted_remaining = (remaining > 0 && !(meta.consumed == 0 && count == 0))
-                    .then(|| source_data[end..].to_vec());
-
-                if let Some(data) = taken_data {
-                    bundle.set(
-                        material.kind,
-                        TakenPreproc {
-                            count,
-                            item_size: meta.item_size,
-                            data,
-                        },
-                    );
-                }
-
-                if remaining == 0 {
-                    database.delete(&mut transaction, &material.meta_key)?;
-                    database.delete(&mut transaction, &material.data_key)?;
-                } else if meta.consumed == 0 && count == 0 {
-                    // The bytes are already compact and this kind was not
-                    // requested; validating it is sufficient.
-                } else {
-                    database.put(
-                        &mut transaction,
-                        &material.meta_key,
-                        &bincode::serialize(&PreprocMeta {
-                            count: remaining,
-                            consumed: 0,
-                            item_size: meta.item_size,
-                        })?,
+                    let start = byte_offset(
+                        meta.consumed,
+                        meta.item_size,
+                        "preprocessing reservoir bundle start",
                     )?;
-                    database.put(
-                        &mut transaction,
-                        &material.data_key,
-                        compacted_remaining
-                            .as_deref()
-                            .expect("non-compact reservoir has remaining bytes"),
+                    let end_index =
+                        meta.consumed
+                            .checked_add(count)
+                            .ok_or(PreprocStoreError::U32Overflow {
+                                field: "preprocessing reservoir bundle end",
+                                value: u64::from(meta.consumed) + u64::from(count),
+                            })?;
+                    let end = byte_offset(
+                        end_index,
+                        meta.item_size,
+                        "preprocessing reservoir bundle end",
                     )?;
+                    let remaining = meta.count - end_index;
+                    bundle.remaining.set(material.kind, remaining);
+
+                    // Retain only the slices that outlive this transaction. This
+                    // avoids cloning the complete reservoir blob before extracting
+                    // one execution's bundle.
+                    let taken_data = (count > 0).then(|| source_data[start..end].to_vec());
+                    let compacted_remaining = (remaining > 0
+                        && !(meta.consumed == 0 && count == 0))
+                        .then(|| source_data[end..].to_vec());
+
+                    if let Some(data) = taken_data {
+                        bundle.set(
+                            material.kind,
+                            TakenPreproc {
+                                count,
+                                item_size: meta.item_size,
+                                data,
+                            },
+                        );
+                    }
+
+                    if remaining == 0 {
+                        database.delete(&mut transaction, &material.meta_key)?;
+                        database.delete(&mut transaction, &material.data_key)?;
+                    } else if meta.consumed == 0 && count == 0 {
+                        // The bytes are already compact and this kind was not
+                        // requested; validating it is sufficient.
+                    } else {
+                        database.put(
+                            &mut transaction,
+                            &material.meta_key,
+                            &bincode::serialize(&PreprocMeta {
+                                count: remaining,
+                                consumed: 0,
+                                item_size: meta.item_size,
+                            })?,
+                        )?;
+                        database.put(
+                            &mut transaction,
+                            &material.data_key,
+                            compacted_remaining
+                                .as_deref()
+                                .expect("non-compact reservoir has remaining bytes"),
+                        )?;
+                    }
                 }
-            }
-            transaction.commit()?;
-            Ok(bundle)
+                transaction.commit()?;
+                Ok(bundle)
+            })
         })
         .await
     }
@@ -1092,11 +1179,13 @@ impl PreprocStore for LmdbPreprocStore {
         let meta_key = key.meta_key()?;
         let data_key = key.encode()?;
         self.run(move |env, database| {
-            let mut transaction = env.write_txn()?;
-            database.delete(&mut transaction, &meta_key)?;
-            database.delete(&mut transaction, &data_key)?;
-            transaction.commit()?;
-            Ok(())
+            with_lmdb_map_growth(env, || {
+                let mut transaction = env.write_txn()?;
+                database.delete(&mut transaction, &meta_key)?;
+                database.delete(&mut transaction, &data_key)?;
+                transaction.commit()?;
+                Ok(())
+            })
         })
         .await
     }
@@ -1108,25 +1197,27 @@ impl PreprocStore for LmdbPreprocStore {
     ) -> Result<u64, PreprocStoreError> {
         let key = [namespace, key].concat();
         self.run(move |env, database| {
-            let mut transaction = env.write_txn()?;
-            let current = match database.get(&transaction, &key)? {
-                Some(raw) if raw.len() == 8 => {
-                    u64::from_le_bytes(raw.try_into().expect("length checked"))
-                }
-                Some(raw) => {
-                    return Err(PreprocStoreError::Deserialization(format!(
-                        "atomic increment value has {} bytes, expected 8",
-                        raw.len()
-                    )));
-                }
-                None => 0,
-            };
-            let next = current.checked_add(1).ok_or_else(|| {
-                PreprocStoreError::Serialization("atomic increment overflowed u64".to_owned())
-            })?;
-            database.put(&mut transaction, &key, &next.to_le_bytes())?;
-            transaction.commit()?;
-            Ok(next)
+            with_lmdb_map_growth(env, || {
+                let mut transaction = env.write_txn()?;
+                let current = match database.get(&transaction, &key)? {
+                    Some(raw) if raw.len() == 8 => {
+                        u64::from_le_bytes(raw.try_into().expect("length checked"))
+                    }
+                    Some(raw) => {
+                        return Err(PreprocStoreError::Deserialization(format!(
+                            "atomic increment value has {} bytes, expected 8",
+                            raw.len()
+                        )));
+                    }
+                    None => 0,
+                };
+                let next = current.checked_add(1).ok_or_else(|| {
+                    PreprocStoreError::Serialization("atomic increment overflowed u64".to_owned())
+                })?;
+                database.put(&mut transaction, &key, &next.to_le_bytes())?;
+                transaction.commit()?;
+                Ok(next)
+            })
         })
         .await
     }
@@ -1140,10 +1231,12 @@ impl PreprocStore for LmdbPreprocStore {
         let key = [namespace, key].concat();
         let data = data.to_vec();
         self.run(move |env, database| {
-            let mut transaction = env.write_txn()?;
-            database.put(&mut transaction, &key, &data)?;
-            transaction.commit()?;
-            Ok(())
+            with_lmdb_map_growth(env, || {
+                let mut transaction = env.write_txn()?;
+                database.put(&mut transaction, &key, &data)?;
+                transaction.commit()?;
+                Ok(())
+            })
         })
         .await
     }
@@ -1164,10 +1257,12 @@ impl PreprocStore for LmdbPreprocStore {
     async fn delete_blob(&self, namespace: &[u8], key: &[u8]) -> Result<(), PreprocStoreError> {
         let key = [namespace, key].concat();
         self.run(move |env, database| {
-            let mut transaction = env.write_txn()?;
-            database.delete(&mut transaction, &key)?;
-            transaction.commit()?;
-            Ok(())
+            with_lmdb_map_growth(env, || {
+                let mut transaction = env.write_txn()?;
+                database.delete(&mut transaction, &key)?;
+                transaction.commit()?;
+                Ok(())
+            })
         })
         .await
     }
@@ -2005,5 +2100,46 @@ mod tests {
         assert_eq!(loaded, Some(b"data1".to_vec()));
 
         assert_eq!(store.load_blob(b"rsv:", b"missing").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn lmdb_append_grows_map_and_retries_full_write() {
+        let dir = tempfile::tempdir().unwrap();
+        // 64 KiB is deliberately too small for the value below, but remains a
+        // multiple of both common 4 KiB and 16 KiB host page sizes.
+        let store = LmdbPreprocStore::open_with_map_size(dir.path(), 64 * 1024).unwrap();
+        let key = PreprocKey::new(
+            [0xA5; 32],
+            MpcFieldKind::Bn254Fr,
+            5,
+            1,
+            legacy_identity(0),
+            MaterialKind::BeaverTriple,
+        );
+        let data = vec![0xA5; 512 * 1024];
+
+        assert_eq!(
+            store
+                .append_items(&key, 1, data.len() as u32, &data)
+                .await
+                .unwrap(),
+            data.len() as u32
+        );
+
+        let loaded = store.load(&key).await.unwrap().unwrap();
+        assert_eq!(loaded.meta.count, data.len() as u32);
+        assert_eq!(loaded.data, data);
+    }
+
+    #[test]
+    fn lmdb_reopen_map_size_covers_existing_data_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = std::fs::File::create(dir.path().join("data.mdb")).unwrap();
+        file.set_len(512 * 1024).unwrap();
+
+        assert_eq!(
+            lmdb_initial_map_size(dir.path(), 64 * 1024).unwrap(),
+            1024 * 1024
+        );
     }
 }
