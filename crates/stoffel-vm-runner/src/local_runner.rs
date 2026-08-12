@@ -936,14 +936,16 @@ async fn run_honeybadger_offchain_client(
             )
             .await?;
 
-        for offset in 0..input_values.len() {
-            let index = client.reserved_index_start + offset as u64;
+        let reserved_indices = (0..input_values.len())
+            .map(|offset| client.reserved_index_start + offset as u64)
+            .collect::<Vec<_>>();
+        for index in &reserved_indices {
             eprintln!(
                 "[local-client {}] reserving mask index {}",
-                client.client_slot, index
+                client.client_slot, *index
             );
-            reserve_mask_index_when_ready(&mut coord, index, timeout).await?;
         }
+        reserve_mask_indices_when_ready(&mut coord, &reserved_indices, timeout).await?;
 
         eprintln!("[local-client {}] connecting node RPC", client.client_slot);
         let rpc_addrs = node_rpc_addrs
@@ -1049,14 +1051,16 @@ async fn run_avss_offchain_client(
             )
             .await?;
 
-        for offset in 0..input_values.len() {
-            let index = client.reserved_index_start + offset as u64;
+        let reserved_indices = (0..input_values.len())
+            .map(|offset| client.reserved_index_start + offset as u64)
+            .collect::<Vec<_>>();
+        for index in &reserved_indices {
             eprintln!(
                 "[local-client {}] reserving AVSS mask index {}",
-                client.client_slot, index
+                client.client_slot, *index
             );
-            reserve_avss_mask_index_when_ready(&mut coord, index, timeout).await?;
         }
+        reserve_avss_mask_indices_when_ready(&mut coord, &reserved_indices, timeout).await?;
 
         let rpc_addrs = node_rpc_addrs
             .iter()
@@ -1101,14 +1105,14 @@ async fn run_avss_offchain_client(
     .map_err(|_| LocalCoordinatorRunnerError::Timeout(timeout))?
 }
 
-async fn reserve_mask_index_when_ready(
+async fn reserve_mask_indices_when_ready(
     coord: &mut OffChainCoordinatorClient<Fr, RobustShare<Fr>>,
-    index: u64,
+    indices: &[u64],
     timeout: Duration,
 ) -> LocalCoordinatorRunnerResult<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        match coord.reserve_mask_index(index).await {
+        match coord.reserve_mask_indices(indices).await {
             Ok(()) => return Ok(()),
             Err(error) if coordinator_wrong_round(&error) => {
                 if tokio::time::Instant::now() >= deadline {
@@ -1121,14 +1125,14 @@ async fn reserve_mask_index_when_ready(
     }
 }
 
-async fn reserve_avss_mask_index_when_ready(
+async fn reserve_avss_mask_indices_when_ready(
     coord: &mut OffChainCoordinatorClient<Fr, FeldmanShamirShare<Fr, G1Projective>>,
-    index: u64,
+    indices: &[u64],
     timeout: Duration,
 ) -> LocalCoordinatorRunnerResult<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        match coord.reserve_mask_index(index).await {
+        match coord.reserve_mask_indices(indices).await {
             Ok(()) => return Ok(()),
             Err(error) if coordinator_wrong_round(&error) => {
                 if tokio::time::Instant::now() >= deadline {

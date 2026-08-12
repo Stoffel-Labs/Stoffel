@@ -1193,9 +1193,11 @@ where
             )));
         }
         let mut coord = coord;
-        for ordinal in 0..inputs.len() {
-            let reserved_index = config.input_start_index + ordinal as u64;
-            coord.reserve_mask_index(reserved_index).await?;
+        let reserved_indices = (0..inputs.len())
+            .map(|ordinal| config.input_start_index + ordinal as u64)
+            .collect::<Vec<_>>();
+        if !reserved_indices.is_empty() {
+            coord.reserve_mask_indices(&reserved_indices).await?;
         }
         let node_rpc = OffChainNodeRPCClient::<Fr, S>::start_rpc_client_for_execution(
             config.parties,

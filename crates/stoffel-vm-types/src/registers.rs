@@ -2,6 +2,7 @@
 
 use crate::core_types::Value;
 use smallvec::SmallVec;
+use std::cmp::Ordering;
 use std::fmt;
 
 /// Default ABI boundary between clear and secret physical registers.
@@ -90,6 +91,26 @@ pub enum ClearRegisterReadResult {
     NotClearRegister,
     RegisterOutOfBounds,
     SourcePendingReveal,
+}
+
+/// Result of attempting a local operation entirely inside the clear register bank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearRegisterOperationResult {
+    Applied,
+    NotClearRegister,
+    RegisterOutOfBounds(RegisterIndex),
+    SourcePendingReveal(RegisterIndex),
+    UnsupportedOperands,
+}
+
+/// Result of attempting a comparison entirely inside the clear register bank.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClearRegisterCompareResult {
+    Compared(Ordering),
+    NotClearRegister,
+    RegisterOutOfBounds(RegisterIndex),
+    SourcePendingReveal(RegisterIndex),
+    UnsupportedOperands,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -273,6 +294,7 @@ impl RegisterFile {
         self.layout
     }
 
+    #[inline]
     pub fn len(&self) -> usize {
         if self.secret.is_empty() {
             self.clear.len()
@@ -285,6 +307,7 @@ impl RegisterFile {
         self.clear.is_empty() && self.secret.is_empty()
     }
 
+    #[inline]
     pub fn get_slot(&self, register: RegisterIndex) -> Option<&RegisterSlot> {
         match self.layout.address(register) {
             RegisterAddress {
@@ -298,6 +321,7 @@ impl RegisterFile {
         }
     }
 
+    #[inline]
     pub fn get_slot_mut(&mut self, register: RegisterIndex) -> Option<&mut RegisterSlot> {
         match self.layout.address(register) {
             RegisterAddress {
@@ -315,10 +339,12 @@ impl RegisterFile {
         self.get_slot(register).is_some()
     }
 
+    #[inline]
     pub fn get(&self, register: RegisterIndex) -> Option<&Value> {
         self.get_slot(register).and_then(RegisterSlot::as_value)
     }
 
+    #[inline]
     pub fn get_mut(&mut self, register: RegisterIndex) -> Option<&mut Value> {
         self.get_slot_mut(register)
             .and_then(RegisterSlot::as_value_mut)
@@ -347,6 +373,86 @@ impl RegisterFile {
             ClearRegisterCopyResult::RegisterOutOfBounds
         } else {
             ClearRegisterCopyResult::NotClearRegister
+        }
+    }
+
+    /// Read two clear registers, apply a local operation, and write its result
+    /// without repeating bank translation and bounds checks at each step.
+    #[inline]
+    pub fn apply_clear_binary<E>(
+        &mut self,
+        dest: RegisterIndex,
+        lhs: RegisterIndex,
+        rhs: RegisterIndex,
+        op: impl FnOnce(&Value, &Value) -> Option<Result<Value, E>>,
+    ) -> Result<ClearRegisterOperationResult, E> {
+        let dest_index = dest.index();
+        let lhs_index = lhs.index();
+        let rhs_index = rhs.index();
+        let register_count = self.len();
+
+        for register in [dest, lhs, rhs] {
+            if register.index() >= register_count {
+                return Ok(ClearRegisterOperationResult::RegisterOutOfBounds(register));
+            }
+        }
+        if dest_index >= self.clear.len()
+            || lhs_index >= self.clear.len()
+            || rhs_index >= self.clear.len()
+        {
+            return Ok(ClearRegisterOperationResult::NotClearRegister);
+        }
+
+        let result = {
+            let Some(left) = self.clear[lhs_index].as_value() else {
+                return Ok(ClearRegisterOperationResult::SourcePendingReveal(lhs));
+            };
+            let Some(right) = self.clear[rhs_index].as_value() else {
+                return Ok(ClearRegisterOperationResult::SourcePendingReveal(rhs));
+            };
+            let Some(result) = op(left, right) else {
+                return Ok(ClearRegisterOperationResult::UnsupportedOperands);
+            };
+            result?
+        };
+
+        match &mut self.clear[dest_index] {
+            RegisterSlot::Ready(value) => *value = result,
+            slot @ RegisterSlot::PendingReveal => *slot = RegisterSlot::ready(result),
+        }
+        Ok(ClearRegisterOperationResult::Applied)
+    }
+
+    /// Compare two values in the clear bank with one bank translation/bounds pass.
+    #[inline]
+    pub fn compare_clear(
+        &self,
+        lhs: RegisterIndex,
+        rhs: RegisterIndex,
+        op: impl FnOnce(&Value, &Value) -> Option<Ordering>,
+    ) -> ClearRegisterCompareResult {
+        let lhs_index = lhs.index();
+        let rhs_index = rhs.index();
+        let register_count = self.len();
+
+        for register in [lhs, rhs] {
+            if register.index() >= register_count {
+                return ClearRegisterCompareResult::RegisterOutOfBounds(register);
+            }
+        }
+        if lhs_index >= self.clear.len() || rhs_index >= self.clear.len() {
+            return ClearRegisterCompareResult::NotClearRegister;
+        }
+
+        let Some(left) = self.clear[lhs_index].as_value() else {
+            return ClearRegisterCompareResult::SourcePendingReveal(lhs);
+        };
+        let Some(right) = self.clear[rhs_index].as_value() else {
+            return ClearRegisterCompareResult::SourcePendingReveal(rhs);
+        };
+        match op(left, right) {
+            Some(ordering) => ClearRegisterCompareResult::Compared(ordering),
+            None => ClearRegisterCompareResult::UnsupportedOperands,
         }
     }
 

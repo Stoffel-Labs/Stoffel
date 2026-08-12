@@ -3260,7 +3260,7 @@ async fn execute_async_with_metrics_distinguishes_online_effect_from_explicit_yi
 
 #[tokio::test(flavor = "current_thread")]
 async fn execute_async_with_metrics_reports_local_instruction_budget_yields() {
-    const LOCAL_INSTRUCTIONS: usize = 2048;
+    const LOCAL_INSTRUCTIONS: usize = super::effect_scheduler::DEFAULT_LOCAL_INSTRUCTION_BUDGET * 2;
 
     let mut instructions = (0..LOCAL_INSTRUCTIONS)
         .map(|value| Instruction::LDI(0, Value::I64(value as i64)))

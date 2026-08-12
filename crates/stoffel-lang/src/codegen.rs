@@ -1396,12 +1396,16 @@ impl CodeGenerator {
         let Some(AstNode::Identifier(list_name, _)) = arguments.first() else {
             return;
         };
-        let Some(share_type) = arguments
+        let share_type = arguments
             .get(1)
             .and_then(|argument| self.share_type_for_node(argument))
-        else {
-            return;
-        };
+            // A user helper declared as returning the generic `Share` object
+            // does not carry a concrete bit layout through semantic typing.
+            // The VM treats such shares as the default secret integer unless a
+            // more precise annotation is available, so mirror that fallback in
+            // the client-IO manifest instead of leaving an appended output list
+            // empty (which would omit the client from output coordination).
+            .unwrap_or_else(ShareType::default_secret_int);
         let repeat = self.active_loop_iteration_count();
         self.variable_share_lists
             .entry(list_name.clone())
@@ -1482,7 +1486,15 @@ impl CodeGenerator {
                     _ => None,
                 }
             }
-            _ => None,
+            // Index and field access nodes carry their element type through the
+            // semantic symbol table even when no scalar value has been assigned
+            // to a named variable yet. Preserve that type for client-output
+            // manifests instead of degrading, for example, `secret bool` list
+            // elements to the default 64-bit secret integer.
+            _ => self
+                .type_hint_for_node(node)
+                .as_ref()
+                .and_then(share_type_for_secret_scalar_symbol_type),
         }
     }
 
@@ -3524,6 +3536,10 @@ pub fn generate_bytecode_with_opt_level_and_backend(
     collect_reassigned_vars(node, &mut generator.reassigned_vars);
     let (_result_vr, _result_is_secret) = generator.compile_node(node)?;
     let mut program = generator.finalize_program()?;
+    // Codegen records direct ClientStore calls inside each function. Augment
+    // that data by following literal clear-integer arguments through helper
+    // calls so client slots and ordinals hidden behind helpers are not omitted.
+    crate::client_io_planner::merge_inferred_client_inputs(node, &mut program.client_io_manifest);
     // Compute the program's MPC preprocessing demand interprocedurally over the
     // whole AST (call-multiplicity- and list-length-aware) and stamp it into the
     // client-IO manifest, replacing the placeholder set during finalisation.

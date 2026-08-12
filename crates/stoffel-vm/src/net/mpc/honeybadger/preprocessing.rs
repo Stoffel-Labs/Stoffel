@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 use stoffel_vm_types::core_types::{ShareData, ShareType};
 use stoffelmpc_mpc::common::PreprocessingMPCProtocol;
 use stoffelmpc_mpc::honeybadger::fpmul::f256::Gf256;
+use stoffelmpc_mpc::honeybadger::preprocessing::HoneyBadgerMPCNodePreprocMaterial;
 use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustShare;
 use stoffelmpc_mpc::honeybadger::triple_gen::ShamirBeaverTriple;
 use stoffelmpc_mpc::honeybadger::HoneyBadgerError;
@@ -46,12 +47,12 @@ fn preprocessing_progress_interval() -> Option<Duration> {
 // HoneyBadger turns each requested Beaver triple into two temporary random
 // shares before constructing the triple.  Letting a large standing-reservoir
 // deficit flow through one `run_preprocessing` call pipelines every RanSha
-// batch at once.  At the AES reservoir watermark (131,072 triples) that is 43
-// simultaneous RanSha sessions and is large enough to starve the execution
-// transport before any session can finish.  Keep each call at the largest
-// workload exercised reliably by the regular 65,536-triple preprocessing path.
-const STANDING_TOP_UP_RANDOM_WORK_LIMIT: u64 = 132 * 1024;
-const STANDING_TOP_UP_DERIVED_SHARE_LIMIT: u64 = 65_536;
+// batch at once. Keep each call small enough that TripleGen's serialized batch
+// messages remain comfortably below the transport's 10 MiB decode limit.
+const STANDING_TOP_UP_RANDOM_WORK_LIMIT: u64 = 32 * 1024;
+// Keep derived-share top-ups bounded independently of the much larger RanSha
+// workload. The MPC dependency performs finer-grained internal mask batches.
+const STANDING_TOP_UP_DERIVED_SHARE_LIMIT: u64 = 256;
 
 fn div_ceil_u64(value: u64, divisor: u64) -> u64 {
     if value == 0 {
@@ -65,6 +66,17 @@ fn split_u32(total: u32, parts: u64, index: u64) -> u32 {
     let total = u64::from(total);
     let value = total / parts + u64::from(index < total % parts);
     u32::try_from(value).expect("a partition of a u32 count always fits in u32")
+}
+
+fn split_u32_aligned(total: u32, parts: u64, index: u64, alignment: u64) -> u32 {
+    let alignment = alignment.max(1);
+    let total = u64::from(total);
+    let full_units = total / alignment;
+    let remainder = total % alignment;
+    let value = full_units / parts + u64::from(index < full_units % parts);
+    let value =
+        value.saturating_mul(alignment) + u64::from(index + 1 == parts).saturating_mul(remainder);
+    u32::try_from(value).expect("an aligned partition of a u32 count always fits in u32")
 }
 
 fn standing_top_up_random_work(chunk: PoolAvailability, threshold: usize) -> u64 {
@@ -92,6 +104,9 @@ fn standing_top_up_chunks(needed: PoolAvailability, threshold: usize) -> Vec<Poo
         .unwrap_or(u64::MAX)
         .saturating_mul(2)
         .saturating_add(1);
+    let mask_group_size = u64::try_from(threshold)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1);
     let random_work_limit = STANDING_TOP_UP_RANDOM_WORK_LIMIT.max(group_size.saturating_mul(2));
     let total_random_work = standing_top_up_random_work(needed, threshold);
     let mut part_count = div_ceil_u64(total_random_work, random_work_limit)
@@ -107,11 +122,36 @@ fn standing_top_up_chunks(needed: PoolAvailability, threshold: usize) -> Vec<Poo
 
     loop {
         let chunks = (0..part_count)
-            .map(|index| PoolAvailability {
-                beaver: split_u32(needed.beaver, part_count, index),
-                random: split_u32(needed.random, part_count, index),
-                prand_bit: split_u32(needed.prand_bit, part_count, index),
-                prand_int: split_u32(needed.prand_int, part_count, index),
+            .map(|index| {
+                // RandBit/PRandBit consume masks in threshold+1 groups. Keep
+                // every partition aligned when the total is aligned so a
+                // chunk never needs an unaccounted extra triple/random share.
+                let prand_bit =
+                    split_u32_aligned(needed.prand_bit, part_count, index, mask_group_size);
+                let beaver = if needed.beaver >= needed.prand_bit {
+                    prand_bit.saturating_add(split_u32(
+                        needed.beaver - needed.prand_bit,
+                        part_count,
+                        index,
+                    ))
+                } else {
+                    split_u32(needed.beaver, part_count, index)
+                };
+                let random = if needed.random >= needed.prand_bit {
+                    prand_bit.saturating_add(split_u32(
+                        needed.random - needed.prand_bit,
+                        part_count,
+                        index,
+                    ))
+                } else {
+                    split_u32(needed.random, part_count, index)
+                };
+                PoolAvailability {
+                    beaver,
+                    random,
+                    prand_bit,
+                    prand_int: split_u32(needed.prand_int, part_count, index),
+                }
             })
             .filter(|chunk| *chunk != PoolAvailability::default())
             .collect::<Vec<_>>();
@@ -402,8 +442,17 @@ where
         let mut node = self.clone_node().await;
         let chunks = standing_top_up_chunks(needed, self.topology.threshold());
         for (chunk_index, chunk) in chunks.iter().copied().enumerate() {
-            node.params.n_triples = chunk.beaver as usize;
-            node.params.n_random_shares = chunk.random as usize;
+            let mask_group_size = self.topology.threshold().saturating_add(1);
+            let mask_cost = usize::try_from(
+                div_ceil_u64(u64::from(chunk.prand_bit), mask_group_size as u64)
+                    .saturating_mul(mask_group_size as u64),
+            )
+            .map_err(|_| "PRandBit top-up cost does not fit usize".to_owned())?;
+            // Big-field RandBit consumes one ordinary triple and random share
+            // per mask. These are generation costs, not part of the program's
+            // declared final reservoir, so provision them in addition.
+            node.params.n_triples = (chunk.beaver as usize).saturating_add(mask_cost);
+            node.params.n_random_shares = (chunk.random as usize).saturating_add(mask_cost);
             node.params.n_prandbit = chunk.prand_bit as usize;
             node.params.n_prandint = chunk.prand_int as usize;
 
@@ -433,39 +482,42 @@ where
             let mut to_append = Vec::new();
             {
                 let mut prep = node.preprocessing_material.lock().await;
-                let lengths = prep.length();
-                if lengths.beaver_triples > 0 {
+                if chunk.beaver > 0 {
                     let items = prep
-                        .take_beaver_triples(lengths.beaver_triples)
+                        .take_beaver_triples(chunk.beaver as usize)
                         .map_err(|e| format!("{e:?}"))?;
                     let (data, item_size) = preproc::serialize_beaver_triples::<F>(&items)?;
                     let added = preproc::u32_index(items.len() as u64, "generated beaver")?;
                     to_append.push((scope.beaver_triple(), item_size, added, data));
                 }
-                if lengths.random_shr > 0 {
+                if chunk.random > 0 {
                     let items = prep
-                        .take_random_shares(lengths.random_shr)
+                        .take_random_shares(chunk.random as usize)
                         .map_err(|e| format!("{e:?}"))?;
                     let (data, item_size) = preproc::serialize_robust_shares::<F>(&items)?;
                     let added = preproc::u32_index(items.len() as u64, "generated random")?;
                     to_append.push((scope.random_share(), item_size, added, data));
                 }
-                if lengths.prandbit > 0 {
+                if chunk.prand_bit > 0 {
                     let items = prep
-                        .take_prandbit_shares(lengths.prandbit)
+                        .take_prandbit_shares(chunk.prand_bit as usize)
                         .map_err(|e| format!("{e:?}"))?;
                     let (data, item_size) = preproc::serialize_prandbit_shares::<F>(&items)?;
                     let added = preproc::u32_index(items.len() as u64, "generated prandbit")?;
                     to_append.push((scope.prand_bit(), item_size, added, data));
                 }
-                if lengths.prandint > 0 {
+                if chunk.prand_int > 0 {
                     let items = prep
-                        .take_prandint_shares(lengths.prandint)
+                        .take_prandint_shares(chunk.prand_int as usize)
                         .map_err(|e| format!("{e:?}"))?;
                     let (data, item_size) = preproc::serialize_robust_shares::<F>(&items)?;
                     let added = preproc::u32_index(items.len() as u64, "generated prandint")?;
                     to_append.push((scope.prand_int(), item_size, added, data));
                 }
+                // Protocol batch sizes can overproduce a few items. The
+                // persistent agreement is exact, so do not carry those extras
+                // into the next chunk or commit them to the reservoir.
+                *prep = HoneyBadgerMPCNodePreprocMaterial::empty();
             }
 
             for (key, item_size, added, data) in to_append {
@@ -890,10 +942,10 @@ mod standing_agreement_tests {
             prand_int: 0,
         };
         let chunks = standing_top_up_chunks(needed, 1);
-        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks.len(), 9);
         assert_eq!(sum_chunks(&chunks), needed);
-        assert_eq!(chunks[0].beaver, 65_536);
-        assert_eq!(chunks[0].random, 576);
+        assert_eq!(chunks[0].beaver, 14_564);
+        assert_eq!(chunks[0].random, 128);
         assert!(chunks.iter().all(|chunk| {
             standing_top_up_random_work(*chunk, 1) <= STANDING_TOP_UP_RANDOM_WORK_LIMIT
         }));
@@ -913,6 +965,26 @@ mod standing_agreement_tests {
             standing_top_up_random_work(*chunk, 2) <= STANDING_TOP_UP_RANDOM_WORK_LIMIT
                 && u64::from(chunk.prand_bit) <= STANDING_TOP_UP_DERIVED_SHARE_LIMIT
                 && u64::from(chunk.prand_int) <= STANDING_TOP_UP_DERIVED_SHARE_LIMIT
+        }));
+    }
+
+    #[test]
+    fn fixed_division_stress_top_up_splits_single_shot_prandbit_work() {
+        let needed = PoolAvailability {
+            beaver: 1_664,
+            random: 1_792,
+            prand_bit: 1_664,
+            prand_int: 104,
+        };
+        let chunks = standing_top_up_chunks(needed, 1);
+        assert_eq!(chunks.len(), 7);
+        assert_eq!(sum_chunks(&chunks), needed);
+        assert!(chunks.iter().all(|chunk| {
+            chunk.prand_bit <= STANDING_TOP_UP_DERIVED_SHARE_LIMIT as u32
+                && chunk.prand_int <= STANDING_TOP_UP_DERIVED_SHARE_LIMIT as u32
+                && chunk.prand_bit % 2 == 0
+                && chunk.beaver >= chunk.prand_bit
+                && chunk.random >= chunk.prand_bit
         }));
     }
 

@@ -22,6 +22,7 @@ use stoffel_vm_types::compiled_binary::{
     ClientIoManifest, CompiledBinary, PreprocessingDemand,
     PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION,
 };
+use stoffelnet::network_utils::{CertificateIdentity, NodePublicKey};
 use tokio_util::sync::CancellationToken;
 use x509_parser::prelude::FromDer;
 use x509_parser::prelude::X509Certificate;
@@ -89,6 +90,9 @@ pub struct ResolvedStandingExecutionAdmissionV1 {
     /// Public-key identities used by the coordinator's mutual-TLS authorization.
     /// Vector position is the execution-local client ordinal.
     pub expected_client_public_keys: Vec<Vec<u8>>,
+    /// Certificate-exact identities used to authorize execution transport routes.
+    /// Vector position is the same execution-local client ordinal.
+    pub expected_client_certificate_identities: Vec<CertificateIdentity>,
     pub config_digest: [u8; 32],
 }
 
@@ -115,6 +119,22 @@ pub struct StandingProgramCatalog(BTreeMap<[u8; 32], Arc<StandingProgram>>);
 
 impl StandingProgramCatalog {
     pub fn load(directory: &Path) -> Result<Self, StandingControlError> {
+        Self::load_with_policy(directory, false)
+    }
+
+    /// Load a frozen standing catalog while admitting artifacts whose compiler
+    /// manifest contains a conservative dynamic preprocessing floor.
+    ///
+    /// This is intentionally separate from [`Self::load`] for bounded example
+    /// and test campaigns. Normal standing deployments remain fail-closed.
+    pub fn load_with_dynamic_preprocessing(directory: &Path) -> Result<Self, StandingControlError> {
+        Self::load_with_policy(directory, true)
+    }
+
+    fn load_with_policy(
+        directory: &Path,
+        allow_dynamic_preprocessing: bool,
+    ) -> Result<Self, StandingControlError> {
         fs::create_dir_all(directory).map_err(|source| io_error(directory, source))?;
         let mut paths = fs::read_dir(directory)
             .map_err(|source| io_error(directory, source))?
@@ -138,7 +158,8 @@ impl StandingProgramCatalog {
                     path.display()
                 )));
             }
-            let (client_io_manifest, backend, curve, entries) = inspect_standing_program(&bytes)?;
+            let (client_io_manifest, backend, curve, entries) =
+                inspect_standing_program_with_policy(&bytes, allow_dynamic_preprocessing)?;
             programs.insert(
                 program_id,
                 Arc::new(StandingProgram {
@@ -164,8 +185,15 @@ impl StandingProgramCatalog {
 }
 
 /// Client certificate identities frozen alongside the program catalog at startup.
+#[derive(Debug, Clone)]
+struct StandingClientIdentity {
+    coordinator_public_key: Vec<u8>,
+    transport_public_key: NodePublicKey,
+    certificate_identity: CertificateIdentity,
+}
+
 #[derive(Debug)]
-pub struct StandingClientCatalog(BTreeMap<String, Vec<u8>>);
+pub struct StandingClientCatalog(BTreeMap<String, StandingClientIdentity>);
 
 impl StandingClientCatalog {
     pub fn load(directory: &Path) -> Result<Self, StandingControlError> {
@@ -204,21 +232,34 @@ impl StandingClientCatalog {
                     path.display()
                 )));
             }
+            let coordinator_public_key = parsed
+                .public_key()
+                .subject_public_key
+                .data
+                .as_ref()
+                .to_vec();
+            let transport_public_key = NodePublicKey(parsed.public_key().raw.to_vec());
+            let certificate_identity = transport_public_key.certificate_identity();
             identities.insert(
                 name.to_owned(),
-                parsed
-                    .public_key()
-                    .subject_public_key
-                    .data
-                    .as_ref()
-                    .to_vec(),
+                StandingClientIdentity {
+                    coordinator_public_key,
+                    transport_public_key,
+                    certificate_identity,
+                },
             );
         }
         Ok(Self(identities))
     }
 
-    fn get(&self, filename: &str) -> Option<Vec<u8>> {
+    fn get(&self, filename: &str) -> Option<StandingClientIdentity> {
         self.0.get(filename).cloned()
+    }
+
+    pub fn transport_public_keys(&self) -> impl Iterator<Item = NodePublicKey> + '_ {
+        self.0
+            .values()
+            .map(|identity| identity.transport_public_key.clone())
     }
 }
 
@@ -454,21 +495,24 @@ impl StandingNodeControl {
         validate_client_io_admission(&admission.clients, &program.client_io_manifest)?;
 
         let mut expected_client_public_keys = Vec::with_capacity(admission.clients.len());
+        let mut expected_client_certificate_identities =
+            Vec::with_capacity(admission.clients.len());
         let mut unique_client_identities = HashSet::with_capacity(admission.clients.len());
         for client in &admission.clients {
-            let public_key = self.clients.get(&client.certificate).ok_or_else(|| {
+            let identity = self.clients.get(&client.certificate).ok_or_else(|| {
                 StandingControlError::InvalidCommand(format!(
                     "client certificate {:?} is not in the standing startup catalog",
                     client.certificate
                 ))
             })?;
-            if !unique_client_identities.insert(public_key.clone()) {
+            if !unique_client_identities.insert(identity.certificate_identity) {
                 return Err(StandingControlError::InvalidCommand(format!(
                     "standing client roster contains duplicate SPKI identity at {:?}",
                     client.certificate
                 )));
             }
-            expected_client_public_keys.push(public_key);
+            expected_client_public_keys.push(identity.coordinator_public_key);
+            expected_client_certificate_identities.push(identity.certificate_identity);
         }
 
         let canonical = serde_json::to_vec(&admission)
@@ -481,6 +525,9 @@ impl StandingNodeControl {
             hasher.update(&(identity.len() as u64).to_le_bytes());
             hasher.update(identity);
         }
+        for identity in &expected_client_certificate_identities {
+            hasher.update(identity.as_bytes());
+        }
         let config_digest = *hasher.finalize().as_bytes();
 
         Ok(ResolvedStandingExecutionAdmissionV1 {
@@ -489,6 +536,7 @@ impl StandingNodeControl {
             entry: admission.entry,
             clients: admission.clients,
             expected_client_public_keys,
+            expected_client_certificate_identities,
             config_digest,
         })
     }
@@ -518,8 +566,24 @@ impl StandingNodeControl {
     }
 }
 
+#[cfg(test)]
 fn inspect_standing_program(
     bytes: &[u8],
+) -> Result<
+    (
+        ClientIoManifest,
+        MpcBackendKind,
+        MpcCurveConfig,
+        HashSet<String>,
+    ),
+    StandingControlError,
+> {
+    inspect_standing_program_with_policy(bytes, false)
+}
+
+fn inspect_standing_program_with_policy(
+    bytes: &[u8],
+    allow_dynamic_preprocessing: bool,
 ) -> Result<
     (
         ClientIoManifest,
@@ -544,8 +608,12 @@ fn inspect_standing_program(
             "compiled program contains no functions".to_owned(),
         ));
     }
-    validate_standing_preprocessing_manifest(version, &manifest.preprocessing_demand)
-        .map_err(StandingControlError::InvalidCommand)?;
+    validate_standing_preprocessing_manifest(
+        version,
+        &manifest.preprocessing_demand,
+        allow_dynamic_preprocessing,
+    )
+    .map_err(StandingControlError::InvalidCommand)?;
     let backend = MpcBackendKind::from(manifest.mpc_backend);
     let curve = MpcCurveConfig::from(manifest.mpc_curve);
     curve
@@ -557,13 +625,14 @@ fn inspect_standing_program(
 fn validate_standing_preprocessing_manifest(
     artifact_version: u16,
     demand: &PreprocessingDemand,
+    allow_dynamic_preprocessing: bool,
 ) -> Result<(), String> {
     if artifact_version < PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION {
         return Err(format!(
             "standing execution requires artifact format version {PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION} or newer; version {artifact_version} has no complete preprocessing manifest"
         ));
     }
-    if demand.dynamic {
+    if demand.dynamic && !allow_dynamic_preprocessing {
         return Err(
             "standing execution requires statically bounded preprocessing demand".to_owned(),
         );
@@ -842,6 +911,7 @@ mod tests {
         let old_version = validate_standing_preprocessing_manifest(
             PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION - 1,
             &fixed,
+            false,
         )
         .unwrap_err();
         assert!(old_version.contains("no complete preprocessing manifest"));
@@ -853,9 +923,33 @@ mod tests {
         let unbounded = validate_standing_preprocessing_manifest(
             PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION,
             &dynamic,
+            false,
         )
         .unwrap_err();
         assert!(unbounded.contains("statically bounded"));
+
+        validate_standing_preprocessing_manifest(
+            PREPROCESSING_DEMAND_MANIFEST_FORMAT_VERSION,
+            &dynamic,
+            true,
+        )
+        .expect("explicit example/test policy admits a dynamic demand floor");
+    }
+
+    #[test]
+    fn checked_in_client_mul_is_standing_safe() {
+        let fixture = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../stoffel-vm/src/tests/binaries/client_mul.stflb");
+        let bytes = std::fs::read(&fixture).expect("read client_mul fixture");
+        let (manifest, backend, curve, entries) =
+            inspect_standing_program(&bytes).expect("client_mul must be standing-safe");
+
+        assert_eq!(backend, MpcBackendKind::HoneyBadger);
+        assert_eq!(curve, MpcCurveConfig::Bls12_381);
+        assert!(entries.contains("main"));
+        assert_eq!(manifest.clients.len(), 2);
+        assert_eq!(manifest.preprocessing_demand.triples, 1);
+        assert!(!manifest.preprocessing_demand.dynamic);
     }
 
     #[test]

@@ -54,8 +54,27 @@ pub const MAX_EXECUTION_PAYLOAD_LEN: usize = 10_000_000;
 /// stalled execution from retaining an unbounded collection of large frames.
 pub const DEFAULT_EXECUTION_INBOX_BYTE_CAPACITY: usize = 2 * MAX_EXECUTION_PAYLOAD_LEN;
 /// Maximum queued payload bytes retained by all execution inboxes by default.
-pub const DEFAULT_EXECUTION_MUX_BYTE_CAPACITY: usize = 8 * MAX_EXECUTION_PAYLOAD_LEN;
+///
+/// Standing nodes intentionally multiplex hundreds of executions over one
+/// physical mesh.  The former eight-frame budget could be exhausted by a
+/// short cross-execution burst even though every individual inbox was healthy;
+/// the demultiplexer then had to retire an arbitrary execution and its MPC
+/// peers eventually timed out waiting for a contribution that had already
+/// reached the physical connection.  Keep a process-wide bound, but allow 32
+/// independently busy inboxes to reach their per-execution bound at once.
+pub const DEFAULT_EXECUTION_MUX_BYTE_CAPACITY: usize = 32 * DEFAULT_EXECUTION_INBOX_BYTE_CAPACITY;
 const CONNECTION_SCAN_INTERVAL: Duration = Duration::from_millis(50);
+/// How long a physical reader may apply bounded backpressure for a busy
+/// execution before concluding that its consumer has stopped draining.
+///
+/// A short queue-full condition is normal when hundreds of executions share
+/// one transport and Tokio schedules a burst of protocol frames before their
+/// VM tasks. Dropping the already-consumed frame would permanently corrupt the
+/// affected transcript, so preserve ordering and let the physical stream
+/// backpressure briefly. A genuinely abandoned inbox is still retired after a
+/// bounded interval rather than blocking sibling executions forever.
+const EXECUTION_INGRESS_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(30);
+const EXECUTION_INGRESS_RETRY_INTERVAL: Duration = Duration::from_millis(2);
 
 /// A physical client is not useful to the standing node until it proves an
 /// authorized execution route. Keep this short so certificate-valid but idle
@@ -783,6 +802,31 @@ impl ExecutionTransportMux {
             }
         }
     }
+
+    async fn route_envelope_with_backpressure(
+        &self,
+        authenticated_source: ExecutionTransportSource,
+        source: ExecutionTransportSource,
+        envelope: ExecutionEnvelopeV1<'_>,
+        cancel: &CancellationToken,
+    ) -> Result<(), ExecutionTransportError> {
+        let deadline = Instant::now() + EXECUTION_INGRESS_BACKPRESSURE_TIMEOUT;
+        loop {
+            match self.route_envelope(authenticated_source, source, envelope) {
+                Err(error @ ExecutionTransportError::InboxFull { .. })
+                | Err(error @ ExecutionTransportError::InboxByteCapacityExceeded { .. }) => {
+                    if Instant::now() >= deadline {
+                        return Err(error);
+                    }
+                    tokio::select! {
+                        _ = cancel.cancelled() => return Ok(()),
+                        _ = tokio::time::sleep(EXECUTION_INGRESS_RETRY_INTERVAL) => {}
+                    }
+                }
+                result => return result,
+            }
+        }
+    }
 }
 
 struct ReceiveTask {
@@ -1004,16 +1048,29 @@ async fn run_connection_receive_loop_with_owner(
                         }
                     }
 
-                    match mux.route_envelope(authenticated_source, logical_source, envelope) {
+                    match mux
+                        .route_envelope_with_backpressure(
+                            authenticated_source,
+                            logical_source,
+                            envelope,
+                            &cancel,
+                        )
+                        .await
+                    {
                         Ok(_) => {}
-                        Err(ExecutionTransportError::InboxFull { execution_id, .. })
-                        | Err(ExecutionTransportError::InboxByteCapacityExceeded {
+                        Err(error @ ExecutionTransportError::InboxFull { execution_id, .. })
+                        | Err(error @ ExecutionTransportError::InboxByteCapacityExceeded {
                             execution_id,
                             ..
                         }) => {
-                            // The physical frame was consumed but cannot enter
-                            // this execution's transcript. Closing its inbox
-                            // makes that lane fail while siblings keep moving.
+                            // A full inbox is transient under a concurrent
+                            // burst, so only retire the lane after bounded
+                            // backpressure failed to let its consumer catch up.
+                            tracing::warn!(
+                                %execution_id,
+                                %error,
+                                "execution transport ingress remained saturated; retiring lane"
+                            );
                             mux.unregister(execution_id);
                         }
                         Err(_) => {}
@@ -1247,53 +1304,65 @@ mod tests {
         mux.route_party_frame(1, &message).unwrap();
     }
 
+    #[test]
+    fn production_ingress_budget_supports_concurrent_execution_bursts() {
+        let limits = ExecutionIngressLimits::production(4096);
+        assert_eq!(
+            limits.execution_byte_capacity,
+            2 * MAX_EXECUTION_PAYLOAD_LEN
+        );
+        assert!(
+            limits.global_byte_capacity >= 32 * limits.execution_byte_capacity,
+            "the shared standing-node mux must not retire a healthy execution during a modest cross-execution burst"
+        );
+    }
+
     #[tokio::test]
-    async fn scanner_unregisters_only_the_overflowed_execution() {
-        let mux = ExecutionTransportMux::new(1).unwrap();
-        let mut overflowed = mux.register(execution(5)).unwrap();
-        let healthy = mux.register(execution(6)).unwrap();
-        let connection = Arc::new(LoopbackPeerConnection::new(
-            "127.0.0.1:1".parse().unwrap(),
-            Some(1),
-        ));
-        let peer = Arc::clone(&connection) as Arc<dyn PeerConnection>;
+    async fn transient_ingress_pressure_backpressures_without_retiring_the_execution() {
+        let limits = ExecutionIngressLimits {
+            inbox_capacity: 1,
+            execution_byte_capacity: 16,
+            global_byte_capacity: 32,
+        };
+        let mux = ExecutionTransportMux::new_with_limits(limits).unwrap();
+        let mut bursty = mux.register(execution(5)).unwrap();
+        let mut healthy = mux.register(execution(6)).unwrap();
+        mux.route_party_frame(1, &frame(execution(5), ExecutionMessageKind::Mpc, b"first"))
+            .unwrap();
+
+        let retry_mux = mux.clone();
         let cancel = CancellationToken::new();
-        let loop_cancel = cancel.clone();
-        let loop_mux = mux.clone();
-        let loop_task = tokio::spawn(async move {
-            run_connection_receive_loop_with_owner(
-                peer,
-                ExecutionTransportSource::Party(1),
-                loop_mux,
-                loop_cancel,
-                None,
-            )
-            .await;
+        let retry_cancel = cancel.clone();
+        let retry = tokio::spawn(async move {
+            let encoded = frame(execution(5), ExecutionMessageKind::Mpc, b"second");
+            let envelope = ExecutionEnvelopeV1::decode(&encoded).unwrap();
+            retry_mux
+                .route_envelope_with_backpressure(
+                    ExecutionTransportSource::Party(1),
+                    ExecutionTransportSource::Party(1),
+                    envelope,
+                    &retry_cancel,
+                )
+                .await
         });
 
-        connection
-            .send(&frame(execution(5), ExecutionMessageKind::Mpc, b"first"))
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        assert!(!retry.is_finished());
+        assert_eq!(bursty.party.recv().await.unwrap().payload, b"first");
+        tokio::time::timeout(Duration::from_secs(1), retry)
             .await
+            .unwrap()
+            .unwrap()
             .unwrap();
-        connection
-            .send(&frame(execution(5), ExecutionMessageKind::Mpc, b"overflow"))
-            .await
-            .unwrap();
+        assert_eq!(bursty.party.recv().await.unwrap().payload, b"second");
+        assert!(mux.entries.read().contains_key(&execution(5)));
 
-        tokio::time::timeout(Duration::from_secs(1), async {
-            while mux.entries.read().contains_key(&execution(5)) {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
+        mux.route_party_frame(
+            1,
+            &frame(execution(6), ExecutionMessageKind::Mpc, b"sibling"),
+        )
         .unwrap();
-        assert!(mux.entries.read().contains_key(&execution(6)));
-        assert_eq!(overflowed.party.recv().await.unwrap().payload, b"first");
-        assert!(overflowed.party.recv().await.is_none());
-
-        cancel.cancel();
-        loop_task.await.unwrap();
-        drop(healthy);
+        assert_eq!(healthy.party.recv().await.unwrap().payload, b"sibling");
     }
 
     #[test]

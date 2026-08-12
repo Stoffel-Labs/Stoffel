@@ -633,7 +633,7 @@ fn parse_runner_return_value(value: &str) -> Result<Value> {
 }
 
 fn hex_decode(encoded: &str) -> Result<Vec<u8>> {
-    if encoded.len() % 2 != 0 {
+    if !encoded.len().is_multiple_of(2) {
         return Err(Error::Computation(
             "runner byte-array result contains odd-length hex".to_owned(),
         ));

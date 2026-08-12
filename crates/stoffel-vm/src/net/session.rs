@@ -52,6 +52,12 @@ impl ExecutionId {
     }
 }
 
+impl Default for ExecutionId {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl From<[u8; 32]> for ExecutionId {
     fn from(value: [u8; 32]) -> Self {
         Self::from_bytes(value)

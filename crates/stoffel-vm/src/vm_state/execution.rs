@@ -107,13 +107,31 @@ struct RuntimeFunctionCache {
 }
 
 impl RuntimeFunctionCache {
+    #[inline]
     fn current<'cache>(&'cache mut self, state: &mut VMState) -> VmResult<&'cache RuntimeFunction> {
-        let frame_depth = state.current_frame_depth()?.depth();
-        if self.frame_depth != Some(frame_depth) {
-            self.runtime_function = Some(state.current_runtime_function()?);
-            self.frame_depth = Some(frame_depth);
+        let frame_depth = state
+            .call_stack_depth()
+            .checked_sub(1)
+            .ok_or(VmError::NoActiveActivationRecord)?;
+        if self.frame_depth == Some(frame_depth) {
+            return self
+                .runtime_function
+                .as_deref()
+                .ok_or(VmError::NoActiveActivationRecord);
         }
 
+        self.refresh(state, frame_depth)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn refresh<'cache>(
+        &'cache mut self,
+        state: &mut VMState,
+        frame_depth: usize,
+    ) -> VmResult<&'cache RuntimeFunction> {
+        self.runtime_function = Some(state.current_runtime_function()?);
+        self.frame_depth = Some(frame_depth);
         self.runtime_function
             .as_deref()
             .ok_or(VmError::NoActiveActivationRecord)
@@ -277,7 +295,9 @@ impl VMState {
             let runtime_function = runtime_cache.current(self)?;
             match self.execute_async_step(context, runtime_function)? {
                 StepResult::Continue => {
-                    executed_instructions = executed_instructions.saturating_add(1);
+                    // The pre-step budget check guarantees this cannot overflow,
+                    // even when the configured maximum is `usize::MAX`.
+                    executed_instructions += 1;
                 }
                 StepResult::Return(value) => return Ok(VmRunSlice::Complete(value)),
                 StepResult::NeedsMpc {
@@ -347,7 +367,7 @@ impl VMState {
             // ---- execute (plan an async MPC effect, otherwise run locally) ----
             match self.execute_effect_fetched_instruction_without_hooks(instruction, checkpoint)? {
                 InstructionEffect::Completed(InstructionOutcome::Continue) => {
-                    executed_instructions = executed_instructions.saturating_add(1);
+                    executed_instructions += 1;
                 }
                 InstructionEffect::Completed(InstructionOutcome::Return(value)) => {
                     return Ok(VmRunSlice::Complete(value));

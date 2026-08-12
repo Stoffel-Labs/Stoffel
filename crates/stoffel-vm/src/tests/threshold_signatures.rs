@@ -762,11 +762,8 @@ where
                 },
                 move |event, _| {
                     let mut marks = hook_marks.lock().expect("timing marks lock");
-                    match event {
-                        HookEvent::BeforeInstructionExecute(Instruction::CALL(_)) => {
-                            marks.call_started = Some(Instant::now());
-                        }
-                        _ => {}
+                    if let HookEvent::BeforeInstructionExecute(Instruction::CALL(_)) = event {
+                        marks.call_started = Some(Instant::now());
                     }
                     match event {
                         HookEvent::BeforeInstructionExecute(Instruction::CALL(name))
@@ -1223,7 +1220,7 @@ async fn benchmark_optimized_threshold_ecdsa_secp256k1() {
     point_x.sort_unstable();
     let median = |samples: &[Duration]| {
         let middle = samples.len() / 2;
-        if samples.len() % 2 == 0 {
+        if samples.len().is_multiple_of(2) {
             (samples[middle - 1] + samples[middle]) / 2
         } else {
             samples[middle]

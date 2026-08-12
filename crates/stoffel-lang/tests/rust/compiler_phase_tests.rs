@@ -2905,6 +2905,28 @@ def main() -> int64:
 }
 
 #[test]
+fn test_dce_preserves_literal_closure_targets() {
+    let source = r#"
+def callback() -> int64:
+  return 7
+
+def dead() -> int64:
+  return 9
+
+def main() -> int64:
+  var closure = create_closure("callback")
+  return call_closure(closure)
+"#;
+    let program = compile(source, "test.stfl", &default_options()).expect("program compiles");
+
+    assert!(
+        program.function_chunks.contains_key("callback"),
+        "string-literal closure targets are executable call-graph roots"
+    );
+    assert!(!program.function_chunks.contains_key("dead"));
+}
+
+#[test]
 fn test_no_entry_library_style_compile_keeps_function_chunks() {
     let source = r#"
 def first() -> int64:
@@ -3079,6 +3101,48 @@ def main() -> int64:
                 ShareType::default_secret_fixed_point(),
                 ShareType::default_secret_int(),
             ],
+        )],
+    );
+}
+
+#[test]
+fn test_compile_client_io_manifest_preserves_nested_boolean_element_outputs() {
+    let source = r#"
+def send_block(block: list[list[secret bool]]) -> int64:
+  var outputs: list[secret bool] = []
+  for byte_index in 0..2:
+    for bit_index in 0..8:
+      outputs.append(block[byte_index][bit_index])
+  MpcOutput.send_to_client(0, outputs)
+  return 16
+
+def main(block: list[list[secret bool]]) -> int64:
+  return send_block(block)
+"#;
+
+    assert_client_io_manifest(source, &[(0, vec![], vec![ShareType::boolean(); 16])]);
+}
+
+#[test]
+fn test_compile_client_io_manifest_tracks_generic_helper_share_output() {
+    let source = r#"
+def normalize(value: Share) -> Share:
+  return value.add_constant(1)
+
+def main() -> int64:
+  var input = ClientStore.take_share(0, 0)
+  var output = normalize(input)
+  var outputs: list[Share] = []
+  outputs.append(output)
+  MpcOutput.send_to_client(0, outputs)
+  return 0
+"#;
+    assert_client_io_manifest(
+        source,
+        &[(
+            0,
+            vec![ShareType::default_secret_int()],
+            vec![ShareType::default_secret_int()],
         )],
     );
 }

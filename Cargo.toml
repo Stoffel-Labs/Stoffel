@@ -15,4 +15,6 @@ exclude = [
 ]
 
 [patch.crates-io]
-stoffelnet = { git = "https://github.com/Stoffel-Labs/stoffel-networking.git", branch = "codex/concurrent-execution-transport" }
+stoffelcrypto = { git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "fixes-concurrent-execution-protocols" }
+stoffelmpc-network = { git = "https://github.com/Stoffel-Labs/mpc-protocols.git", branch = "fixes-concurrent-execution-protocols" }
+stoffelnet = { git = "https://github.com/Stoffel-Labs/stoffel-networking.git", branch = "fixes/concurrent-execution-transport" }

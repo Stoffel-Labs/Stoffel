@@ -92,7 +92,8 @@ pub fn honeybadger_node_opts_with_truncation(
 ) -> Result<HoneyBadgerMPCNodeOpts, String> {
     validate_honeybadger_topology(n_parties, threshold)?;
 
-    let l = DEFAULT_FIXED_POINT_TOTAL_BITS;
+    // Fixed-point division requires l >= 2 * total_bits - fractional_bits.
+    let l = 2 * DEFAULT_FIXED_POINT_TOTAL_BITS - DEFAULT_FIXED_POINT_FRACTIONAL_BITS;
     let k = DEFAULT_SECURITY_PARAMETER_K;
 
     HoneyBadgerMPCNodeOpts::new(
