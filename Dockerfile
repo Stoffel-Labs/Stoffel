@@ -150,6 +150,7 @@ FROM debian:bookworm-slim AS runtime-base
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
     ca-certificates \
+    iproute2 \
     libssl3 \
     netcat-openbsd \
     net-tools \
@@ -182,9 +183,10 @@ COPY --from=builder /build/docker/standing-concurrency/target/output-only-client
 COPY --from=builder /build/docker/standing-concurrency/target/single-client-io-avss.stflb /app/standing-fixtures/single-client-io-avss.stflb
 COPY --from=builder /build/docker/standing-concurrency/target/multi-client-io-avss.stflb /app/standing-fixtures/multi-client-io-avss.stflb
 
-# Copy the entrypoint script
+# Copy the entrypoint and peer-network shaping scripts
 COPY docker/entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+COPY docker/configure-peer-netem.sh /app/configure-peer-netem.sh
+RUN chmod +x /app/entrypoint.sh /app/configure-peer-netem.sh
 
 # Default environment variables (can be overridden in docker-compose)
 ENV STOFFEL_BIND_ADDR="0.0.0.0:9000"
