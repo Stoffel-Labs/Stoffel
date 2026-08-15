@@ -28,6 +28,8 @@ use stoffel_vm::net::program_id_from_bytes;
 use stoffel_vm::net::session::ExecutionId;
 use stoffel_vm::net::{MpcBackendKind, MpcCurveConfig};
 
+use crate::returned_share::{ReturnedShare, ReturnedShareParseError, RETURNED_SHARE_PREFIX_V1};
+
 const DEFAULT_TIMEOUT: Duration = Duration::from_secs(180);
 const DEFAULT_AUTH_TOKEN: &str = "stoffel-local-coordinator-runner";
 
@@ -824,6 +826,15 @@ impl LocalCoordinatorRunOutput {
         returned_values_from(&self.combined_output)
     }
 
+    /// Decode every party-local secret share returned by the run.
+    ///
+    /// Unlike [`Self::consistent_returned_values`], this intentionally does
+    /// not compare payloads: distinct parties normally hold distinct bytes for
+    /// the same logical secret.
+    pub fn returned_shares(&self) -> Result<Vec<ReturnedShare>, ReturnedShareParseError> {
+        returned_shares_from(&self.combined_output)
+    }
+
     pub fn consistent_returned_values(&self) -> Result<Vec<String>, String> {
         let mut parties = self.party_outputs.iter();
         let Some(first_party) = parties.next() else {
@@ -839,6 +850,15 @@ impl LocalCoordinatorRunOutput {
                 "local party {} did not report a VM return value",
                 first_party.name
             ));
+        }
+        if first_values
+            .iter()
+            .any(|value| value.starts_with(RETURNED_SHARE_PREFIX_V1))
+        {
+            return Err(
+                "secret VM returns are party-local and must be read with returned_shares()"
+                    .to_owned(),
+            );
         }
 
         for party in parties {
@@ -866,6 +886,14 @@ fn returned_values_from(output: &str) -> Vec<&str> {
         .collect()
 }
 
+fn returned_shares_from(output: &str) -> Result<Vec<ReturnedShare>, ReturnedShareParseError> {
+    returned_values_from(output)
+        .into_iter()
+        .filter(|value| value.starts_with(RETURNED_SHARE_PREFIX_V1))
+        .map(str::parse)
+        .collect()
+}
+
 #[derive(Debug, Clone)]
 pub struct LocalPartyOutput {
     pub name: String,
@@ -877,6 +905,14 @@ pub struct LocalPartyOutput {
 impl LocalPartyOutput {
     pub fn returned_values(&self) -> Vec<&str> {
         returned_values_from(&self.combined)
+    }
+
+    /// Decode this party's unrevealed VM return shares.
+    ///
+    /// The returned bytes are the local backend serialization and can be fed
+    /// directly into a party-local hashing or sealing operation.
+    pub fn returned_shares(&self) -> Result<Vec<ReturnedShare>, ReturnedShareParseError> {
+        returned_shares_from(&self.combined)
     }
 }
 
