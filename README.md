@@ -448,6 +448,7 @@ Notes:
 - The CLI accepts any file path; this repository conventionally stores compiled fixtures as `.stflb`
 - `--mpc-backend` supports `honeybadger` and `avss` for client mode; `.stflb` party runs use the backend recorded in the program manifest and reject conflicting CLI overrides
 - `--mpc-curve` supports `bls12-381`, `bn254`, `curve25519`, `ed25519`, `secp256k1`, and `p-256` (`secp256r1`) for AVSS
+- Returning a secret share does not open or reconstruct it. Each party emits its exact local backend bytes as `Program returned: share:v1[<type>;<format>;<byte-length>] 0x<hex>`. Party outputs are expected to differ; `LocalPartyOutput::returned_shares()` decodes the record for hashing or sealing. Treat this stdout as secret material. Programs that intentionally need a clear return must call `open()` or `reveal()` explicitly.
 
 ## Docker Flows
 
