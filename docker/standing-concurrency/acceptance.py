@@ -89,10 +89,11 @@ class Harness:
             "STOFFEL_STANDING_NODE_IMAGE", "stoffel-standing-node:local"
         )
         self.env = os.environ.copy()
-        self.env.setdefault(
-            "STOFFEL_COORDINATOR_CONTEXT",
-            str((self.root / "vendor" / "stoffel-mpc-coordinator").resolve()),
-        )
+        self.manages_client_certificates = "STOFFEL_STANDING_CLIENT_CERTS_DIR" not in self.env
+        if self.manages_client_certificates:
+            self.env["STOFFEL_STANDING_CLIENT_CERTS_DIR"] = str(
+                (self.state / "client-certificates").resolve()
+            )
         self.env.update(
             {
                 "STOFFEL_STANDING_STATE_DIR": str(self.state),
@@ -182,7 +183,7 @@ class Harness:
         coordinator = self.require_source(
             "STOFFEL_COORDINATOR_CONTEXT",
             "crates/off-chain/Cargo.toml",
-            require_git=False,
+            require_git=True,
         )
         networking = self.require_source(
             "STOFFEL_NETWORK_CONTEXT", "Cargo.toml", require_git=True
@@ -194,6 +195,11 @@ class Harness:
             "--profile", "tools", "down", "--remove-orphans", "--volumes", check=False
         )
         self.reset_control()
+        if self.manages_client_certificates:
+            client_certificates = Path(self.env["STOFFEL_STANDING_CLIENT_CERTS_DIR"])
+            client_certificates.mkdir(parents=True, exist_ok=True)
+            for certificate in sorted((self.root / "ids" / "clients").glob("*.crt")):
+                shutil.copy2(certificate, client_certificates / certificate.name)
         (self.state / "programs").mkdir(parents=True, exist_ok=True)
         (self.state / "logs").mkdir(parents=True, exist_ok=True)
         print(
@@ -716,6 +722,8 @@ test -z "$(find /app /run/secrets -type f \( -name '*.der' -o -name '*.key' \) !
                 str(client["outputs"]),
                 "--servers",
                 NODE_RPC_SERVERS,
+                "--client-transport-servers",
+                NODE_CLIENT_TRANSPORT_SERVERS,
                 "--off-chain-coord",
                 COORDINATOR,
                 "--n-parties",
@@ -807,7 +815,10 @@ test -z "$(find /app /run/secrets -type f \( -name '*.der' -o -name '*.key' \) !
         events = {}
         for party in parties:
             event = self.terminal(
-                execution["execution_id"], party, {"Completed"}, timeout
+                execution["execution_id"],
+                party,
+                {"Completed", "Failed", "Cancelled"},
+                timeout,
             )
             if (
                 event.get("outcome") != "event"

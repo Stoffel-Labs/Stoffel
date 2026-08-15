@@ -69,6 +69,8 @@ RUN mkdir -p /build/.cargo && \
 RUN --mount=type=cache,id=stoffel-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=stoffel-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=stoffel-coordinator-target,target=/build/coordinator-wrapper/target,sharing=locked \
+    find /build/coordinator/crates/off-chain /build/coordinator/crates/coord-shared \
+      -type f -exec touch {} + && \
     cargo build --release && \
     mkdir -p /build/artifacts && \
     cp target/release/stoffel-coordinator-docker /build/artifacts/stoffel-coordinator-docker
