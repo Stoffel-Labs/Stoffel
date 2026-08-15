@@ -49,8 +49,8 @@ use stoffel_vm::storage::preproc::{
 };
 use stoffel_vm::storage::{LocalStorage, RedbLocalStorage};
 use stoffel_vm_runner::{
-    ResolvedStandingExecutionAdmissionV1, StandingClientCatalog, StandingExecutionHandler,
-    StandingNodeControl, StandingProgram, StandingProgramCatalog,
+    ResolvedStandingExecutionAdmissionV1, ReturnedShare, StandingClientCatalog,
+    StandingExecutionHandler, StandingNodeControl, StandingProgram, StandingProgramCatalog,
 };
 use stoffel_vm_types::compiled_binary::{
     BinaryError, ClientIoManifest, CompiledBinary, MPC_BACKEND_MANIFEST_FORMAT_VERSION,
@@ -1655,20 +1655,21 @@ fn is_flag_present(raw_args: &[String], flag: &str) -> bool {
 }
 
 fn print_vm_result(vm: &mut VirtualMachine, result: Value) {
-    let result = if matches!(result, Value::Share(_, _)) && vm.mpc_runtime_info().is_some() {
-        eprintln!("Program returned a secret share, revealing...");
-        match vm.open_share_value(&result) {
-            Ok(revealed) => revealed,
-            Err(e) => {
-                eprintln!("Failed to reveal returned share: {}", e);
-                result
-            }
-        }
-    } else {
-        result
-    };
+    println!("Program returned: {}", format_vm_result(vm, &result));
+}
 
-    match &result {
+fn format_vm_result(vm: &mut VirtualMachine, result: &Value) -> String {
+    let returned_share = ReturnedShare::from_vm_value(result).or_else(|| {
+        matches!(result, Value::Object(_))
+            .then(|| vm.read_share_object(result).ok())
+            .flatten()
+            .map(|(share_type, share_data)| ReturnedShare::from_share_data(share_type, &share_data))
+    });
+    if let Some(share) = returned_share {
+        return share.to_string();
+    }
+
+    match result {
         Value::Array(arr_ref) => {
             if let Some(bytes) = vm
                 .read_byte_array(&Value::from(*arr_ref))
@@ -1676,12 +1677,12 @@ fn print_vm_result(vm: &mut VirtualMachine, result: Value) {
                 .filter(|bytes| !bytes.is_empty())
             {
                 let hex: String = bytes.iter().map(|b| format!("{:02x}", b)).collect();
-                println!("Program returned: byte[{}] 0x{}", bytes.len(), hex);
+                format!("byte[{}] 0x{}", bytes.len(), hex)
             } else {
-                println!("Program returned: {}", format_vm_value(vm, &result, 4));
+                format_vm_value(vm, result, 4)
             }
         }
-        _ => println!("Program returned: {}", format_vm_value(vm, &result, 4)),
+        _ => format_vm_value(vm, result, 4),
     }
 }
 
