@@ -5,21 +5,20 @@ mesh. Each process remains ready until Compose sends SIGTERM; execution IDs are
 multiplexed over that mesh rather than creating a mesh or node per program.
 
 ```bash
+STOFFEL_COORDINATOR_CONTEXT=/absolute/path/to/stoffel-mpc-coordinator \
 STOFFEL_NETWORK_CONTEXT=/absolute/path/to/stoffel-networking \
 docker/test-standing-concurrency.sh
 
+STOFFEL_COORDINATOR_CONTEXT=/absolute/path/to/stoffel-mpc-coordinator \
 STOFFEL_NETWORK_CONTEXT=/absolute/path/to/stoffel-networking \
 docker/test-standing-adversarial.sh
 
+STOFFEL_COORDINATOR_CONTEXT=/absolute/path/to/stoffel-mpc-coordinator \
 STOFFEL_NETWORK_CONTEXT=/absolute/path/to/stoffel-networking \
 docker/test-standing-all-examples.sh
 ```
 
-The acceptance harness uses the bundled coordinator source in
-`vendor/stoffel-mpc-coordinator` by default. Set `STOFFEL_COORDINATOR_CONTEXT`
-only to test a different absolute source tree.
-
-Both source paths must be local Git checkouts. The tests always rebuild the
+Both source paths must be explicit local Git checkouts. The tests always rebuild the
 standing image from the current VM, coordinator, and networking worktrees and
 record their revisions and dirty state under the temporary state directory.
 The host needs Docker Compose, Git, and Python 3; the driver has no third-party
