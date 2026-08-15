@@ -38,6 +38,10 @@ validate_env() {
 
 validate_env
 
+if [ "${STOFFEL_ROLE}" = "leader" ] || [ "${STOFFEL_ROLE}" = "party" ]; then
+    /app/configure-peer-netem.sh
+fi
+
 # Resolve the IP address peers should use to connect to this node.
 # STOFFEL_ADVERTISE_IP can be set explicitly; otherwise auto-detect from
 # the primary network interface (works for ECS Fargate and docker-compose, but not for EC2!).

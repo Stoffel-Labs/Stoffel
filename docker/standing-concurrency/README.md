@@ -28,6 +28,13 @@ Set `STOFFEL_KEEP_STANDING_STATE=1` to retain that directory. Useful timeout
 overrides are `WAIT_TIMEOUT_SECS`, `COORDINATION_TIMEOUT_SECS`, and
 `PROTOCOL_TIMEOUT_SECS`.
 
+The Compose stack also supports peer-only latency emulation. For example,
+`NET_RTT_MS=100 PARTY3_EXTRA_RTT_MS=250` gives ordinary party pairs about
+100 ms RTT and every pair involving party 3 about 350 ms RTT. Extras from two
+slow parties are both added: pairwise RTT is `NET_RTT_MS` plus the source and
+destination `PARTY<n>_EXTRA_RTT_MS` values. Coordinator and client traffic is
+not shaped. Increase the acceptance timeouts above when testing large RTTs.
+
 ## Concurrency campaign
 
 One wave admits and starts six executions together:

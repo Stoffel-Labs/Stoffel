@@ -470,6 +470,38 @@ docker compose -f docker-compose.avss.yml up --build
 
 `docker-compose.avss.yml` mounts a per-party local data volume and forwards `STOFFEL_LOCAL_STORE` to `stoffel-run`.
 
+### Peer RTT emulation
+
+The normal, benchmark, and standing-concurrency Compose stacks can emulate a
+global peer-network RTT plus extra latency on selected parties. Values are
+non-negative integer milliseconds:
+
+```bash
+NET_RTT_MS=80 \
+PARTY3_EXTRA_RTT_MS=220 \
+docker compose up --build
+```
+
+Every party-to-party pair receives `NET_RTT_MS`. A party's extra RTT is added
+to every pair containing that party, so the resulting pairwise RTT is
+approximately:
+
+```text
+global RTT + source party extra RTT + destination party extra RTT
+```
+
+In the example above, party 0 to party 1 is approximately 80 ms while party 0
+to party 3 is approximately 300 ms. Multiple slow parties compose naturally;
+with `PARTY2_EXTRA_RTT_MS=40` and `PARTY4_EXTRA_RTT_MS=160`, party 2 to party 4
+receives the global RTT plus another 200 ms. `PARTY0_EXTRA_RTT_MS` through
+`PARTY4_EXTRA_RTT_MS` are available in each stack.
+
+The shaper selects only the five fixed party IPs. Coordinator, client, and
+other container traffic remains unshaped, which keeps a slow-party experiment
+focused on the MPC peer mesh. The existing `NET_LOSS` (percent) and
+`NET_BANDWIDTH` (Mbit/s) controls remain whole-network egress controls. The
+defaults are zero RTT and no loss or bandwidth limit.
+
 The AVSS threshold ECDSA examples mirror the threshold signature fixtures:
 
 ```bash

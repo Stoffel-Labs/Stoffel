@@ -138,7 +138,8 @@ WORKDIR /app
 COPY --from=builder /build/artifacts/stoffel-run /app/stoffel-run
 COPY --from=builder /build/programs /app/programs
 COPY docker/entrypoint.sh /app/entrypoint.sh
-RUN chmod +x /app/entrypoint.sh
+COPY docker/configure-peer-netem.sh /app/configure-peer-netem.sh
+RUN chmod +x /app/entrypoint.sh /app/configure-peer-netem.sh
 
 ENV STOFFEL_PROGRAM="/app/programs/mpc_aes128_circuit.stflb"
 ENV STOFFEL_ENTRY="main"

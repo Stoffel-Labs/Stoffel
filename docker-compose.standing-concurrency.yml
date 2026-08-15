@@ -24,8 +24,13 @@ x-node-environment: &node-environment
   RUST_LOG: ${RUST_LOG:-info}
   RUST_BACKTRACE: "1"
   RUST_MIN_STACK: ${RUST_MIN_STACK:-67108864}
+  NET_RTT_MS: "${NET_RTT_MS:-0}"
+  NET_PEER_IPS: "172.33.0.10,172.33.0.11,172.33.0.12,172.33.0.13,172.33.0.14"
+  NET_LOSS: "${NET_LOSS:-}"
+  NET_BANDWIDTH: "${NET_BANDWIDTH:-}"
 
 x-node-command: &node-command |
+  /app/configure-peer-netem.sh
   exec /app/stoffel-run \
     --standing-node \
     --control-dir /var/run/stoffel/control \
@@ -54,6 +59,7 @@ x-node: &node
   entrypoint: ["/bin/sh", "-ec"]
   command: [*node-command]
   environment: *node-environment
+  cap_add: [NET_ADMIN]
   stop_grace_period: 45s
   init: true
   depends_on:
@@ -115,6 +121,7 @@ services:
       ADVERTISE_ADDR: 172.33.0.10:10000
       LEADER_ARGS: --leader
       BOOTSTRAP_ARGS: ""
+      NET_EXTRA_RTT_MS: "${PARTY0_EXTRA_RTT_MS:-0}"
     volumes:
       - ${STOFFEL_STANDING_STATE_DIR:?Set state directory}/programs:/var/lib/stoffel/programs:ro
       - ${STOFFEL_STANDING_CLIENT_CERTS_DIR:-./ids/clients}:/var/lib/stoffel/client-certs:ro
@@ -136,6 +143,7 @@ services:
       ADVERTISE_ADDR: 172.33.0.11:9001
       LEADER_ARGS: ""
       BOOTSTRAP_ARGS: --bootstrap 172.33.0.10:9000
+      NET_EXTRA_RTT_MS: "${PARTY1_EXTRA_RTT_MS:-0}"
     volumes:
       - ${STOFFEL_STANDING_STATE_DIR:?Set state directory}/programs:/var/lib/stoffel/programs:ro
       - ${STOFFEL_STANDING_CLIENT_CERTS_DIR:-./ids/clients}:/var/lib/stoffel/client-certs:ro
@@ -157,6 +165,7 @@ services:
       ADVERTISE_ADDR: 172.33.0.12:9002
       LEADER_ARGS: ""
       BOOTSTRAP_ARGS: --bootstrap 172.33.0.10:9000
+      NET_EXTRA_RTT_MS: "${PARTY2_EXTRA_RTT_MS:-0}"
     volumes:
       - ${STOFFEL_STANDING_STATE_DIR:?Set state directory}/programs:/var/lib/stoffel/programs:ro
       - ${STOFFEL_STANDING_CLIENT_CERTS_DIR:-./ids/clients}:/var/lib/stoffel/client-certs:ro
@@ -178,6 +187,7 @@ services:
       ADVERTISE_ADDR: 172.33.0.13:9003
       LEADER_ARGS: ""
       BOOTSTRAP_ARGS: --bootstrap 172.33.0.10:9000
+      NET_EXTRA_RTT_MS: "${PARTY3_EXTRA_RTT_MS:-0}"
     volumes:
       - ${STOFFEL_STANDING_STATE_DIR:?Set state directory}/programs:/var/lib/stoffel/programs:ro
       - ${STOFFEL_STANDING_CLIENT_CERTS_DIR:-./ids/clients}:/var/lib/stoffel/client-certs:ro
@@ -199,6 +209,7 @@ services:
       ADVERTISE_ADDR: 172.33.0.14:9004
       LEADER_ARGS: ""
       BOOTSTRAP_ARGS: --bootstrap 172.33.0.10:9000
+      NET_EXTRA_RTT_MS: "${PARTY4_EXTRA_RTT_MS:-0}"
     volumes:
       - ${STOFFEL_STANDING_STATE_DIR:?Set state directory}/programs:/var/lib/stoffel/programs:ro
       - ${STOFFEL_STANDING_CLIENT_CERTS_DIR:-./ids/clients}:/var/lib/stoffel/client-certs:ro

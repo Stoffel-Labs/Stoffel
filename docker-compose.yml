@@ -22,6 +22,7 @@ x-party-common: &party-common
     stoffel-net:
   volumes:
     - stoffel-local-store:/app/local-store
+  cap_add: [NET_ADMIN]
   environment: &party-env
     STOFFEL_AUTH_TOKEN: ${STOFFEL_AUTH_TOKEN:-stoffel-compose-honeybadger-token}
     STOFFEL_N_PARTIES: ${STOFFEL_N_PARTIES:-5}
@@ -34,6 +35,10 @@ x-party-common: &party-common
     RUST_MIN_STACK: ${RUST_MIN_STACK:-67108864}
     RUST_LOG: ${RUST_LOG:-info}
     RUST_BACKTRACE: "1"
+    NET_RTT_MS: "${NET_RTT_MS:-0}"
+    NET_PEER_IPS: "172.28.0.10,172.28.0.11,172.28.0.12,172.28.0.13,172.28.0.14"
+    NET_LOSS: "${NET_LOSS:-}"
+    NET_BANDWIDTH: "${NET_BANDWIDTH:-}"
 
 services:
   coordinator:
@@ -102,6 +107,7 @@ services:
       STOFFEL_LOCAL_STORE: /app/local-store/party-0.redb
       STOFFEL_CERT: /app/ids/nodes/cert0.crt
       STOFFEL_KEY: /app/ids/nodes/key0.der
+      NET_EXTRA_RTT_MS: "${PARTY0_EXTRA_RTT_MS:-0}"
     networks:
       stoffel-net:
         ipv4_address: 172.28.0.10
@@ -139,6 +145,7 @@ services:
       STOFFEL_LOCAL_STORE: /app/local-store/party-1.redb
       STOFFEL_CERT: /app/ids/nodes/cert1.crt
       STOFFEL_KEY: /app/ids/nodes/key1.der
+      NET_EXTRA_RTT_MS: "${PARTY1_EXTRA_RTT_MS:-0}"
     networks:
       stoffel-net:
         ipv4_address: 172.28.0.11
@@ -168,6 +175,7 @@ services:
       STOFFEL_LOCAL_STORE: /app/local-store/party-2.redb
       STOFFEL_CERT: /app/ids/nodes/cert2.crt
       STOFFEL_KEY: /app/ids/nodes/key2.der
+      NET_EXTRA_RTT_MS: "${PARTY2_EXTRA_RTT_MS:-0}"
     networks:
       stoffel-net:
         ipv4_address: 172.28.0.12
@@ -197,6 +205,7 @@ services:
       STOFFEL_LOCAL_STORE: /app/local-store/party-3.redb
       STOFFEL_CERT: /app/ids/nodes/cert3.crt
       STOFFEL_KEY: /app/ids/nodes/key3.der
+      NET_EXTRA_RTT_MS: "${PARTY3_EXTRA_RTT_MS:-0}"
     networks:
       stoffel-net:
         ipv4_address: 172.28.0.13
@@ -226,6 +235,7 @@ services:
       STOFFEL_LOCAL_STORE: /app/local-store/party-4.redb
       STOFFEL_CERT: /app/ids/nodes/cert4.crt
       STOFFEL_KEY: /app/ids/nodes/key4.der
+      NET_EXTRA_RTT_MS: "${PARTY4_EXTRA_RTT_MS:-0}"
     networks:
       stoffel-net:
         ipv4_address: 172.28.0.14
