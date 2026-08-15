@@ -6,9 +6,20 @@ use stoffel_vm_runner::{
     LocalClientInput, LocalCoordinatorRunOutput, LocalCoordinatorRunner, LocalPartyOutput,
 };
 use stoffel_vm_types::compiled_binary::{ClientIoManifest, ClientIoSchema, CompiledBinary};
-use stoffel_vm_types::core_types::{ShareType, Value};
+use stoffel_vm_types::core_types::{ShareDataFormat, ShareType, Value};
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::Instruction;
+
+fn assert_all_parties_proposed(output: &LocalCoordinatorRunOutput, round: &str) {
+    let needle = format!("proposing {round}");
+    let proposals = output.combined_output.matches(&needle).count();
+    let expected = output.party_outputs.len();
+    assert!(
+        proposals >= expected,
+        "expected all {expected} parties to propose {round}, saw {proposals}; output:\n{}",
+        output.combined_output
+    );
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts a real localhost coordinator and MPC party mesh"]
@@ -36,13 +47,10 @@ async fn local_offchain_coordinator_runs_networked_vm_without_docker_compose() {
 
     assert_eq!(output.returned_values(), vec!["7", "7", "7", "7", "7"]);
     assert_eq!(output.consistent_returned_values().unwrap(), vec!["7"]);
-    assert!(
-        output
-            .combined_output
-            .contains("coordinator -> MPCExecution"),
-        "expected leader to drive the off-chain coordinator into MPCExecution; output:\n{}",
-        output.combined_output
-    );
+    assert_all_parties_proposed(&output, "Preprocessing");
+    assert_all_parties_proposed(&output, "MPCExecution");
+    assert_all_parties_proposed(&output, "OutputDistribution");
+    assert_all_parties_proposed(&output, "ProgramFinished");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -74,6 +82,10 @@ async fn local_offchain_coordinator_runs_avss_networked_vm_without_docker_compos
 
     assert_eq!(output.returned_values(), vec!["7", "7", "7", "7", "7"]);
     assert_eq!(output.consistent_returned_values().unwrap(), vec!["7"]);
+    assert_all_parties_proposed(&output, "Preprocessing");
+    assert_all_parties_proposed(&output, "MPCExecution");
+    assert_all_parties_proposed(&output, "OutputDistribution");
+    assert_all_parties_proposed(&output, "ProgramFinished");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -145,6 +157,8 @@ def main() -> int64:
 
     assert_eq!(output.returned_values(), vec!["60", "60", "60", "60", "60"]);
     assert_eq!(output.consistent_returned_values().unwrap(), vec!["60"]);
+    assert_all_parties_proposed(&output, "InputMaskReservation");
+    assert_all_parties_proposed(&output, "InputCollection");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -177,13 +191,11 @@ def main() -> int64:
 
     assert_eq!(output.returned_values(), vec!["47", "47", "47", "47", "47"]);
     assert_eq!(output.consistent_returned_values().unwrap(), vec!["47"]);
-    assert!(
-        output
-            .combined_output
-            .contains("coordinator -> MPCExecution"),
-        "expected leader to drive the off-chain coordinator into MPCExecution; output:\n{}",
-        output.combined_output
-    );
+    assert_all_parties_proposed(&output, "InputMaskReservation");
+    assert_all_parties_proposed(&output, "InputCollection");
+    assert_all_parties_proposed(&output, "MPCExecution");
+    assert_all_parties_proposed(&output, "OutputDistribution");
+    assert_all_parties_proposed(&output, "ProgramFinished");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -289,6 +301,34 @@ fn local_run_output_rejects_inconsistent_party_return_values() {
         err.contains("returned"),
         "expected consistency error, got: {err}"
     );
+}
+
+#[test]
+fn local_run_output_exposes_each_party_share_without_requiring_consistency() {
+    let party0 = "Program returned: share:v1[secret-int:64;opaque;3] 0x000102\n";
+    let party1 = "Program returned: share:v1[secret-int:64;opaque;3] 0x030405\n";
+    let output = LocalCoordinatorRunOutput {
+        combined_output: format!("{party0}{party1}"),
+        party_outputs: vec![
+            party_output("party0", party0),
+            party_output("party1", party1),
+        ],
+        client_outputs: Vec::new(),
+    };
+
+    let shares = output.returned_shares().unwrap();
+    assert_eq!(shares.len(), 2);
+    assert_eq!(shares[0].share_type, ShareType::secret_int(64));
+    assert_eq!(shares[0].format, ShareDataFormat::Opaque);
+    assert_eq!(shares[0].as_bytes(), &[0x00, 0x01, 0x02]);
+    assert_eq!(shares[1].as_bytes(), &[0x03, 0x04, 0x05]);
+
+    assert_eq!(
+        output.party_outputs[0].returned_shares().unwrap()[0].as_bytes(),
+        &[0x00, 0x01, 0x02]
+    );
+    let error = output.consistent_returned_values().unwrap_err();
+    assert!(error.contains("party-local"), "unexpected error: {error}");
 }
 
 fn party_output(name: &str, combined: &str) -> LocalPartyOutput {

@@ -98,6 +98,54 @@ fn read_trimmed_u64(path: &str) -> Option<u64> {
         .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
+fn coordinator_execution_already_retired(error: &str) -> bool {
+    error.contains(" is not registered")
+}
+
+async fn finish_hb_standing_execution<F: PrimeField>(
+    coordinator: &HbOffChainCoordinator<F>,
+) -> Result<(), String> {
+    if let Err(error) = coordinator.finalize().await {
+        let error = error.to_string();
+        if coordinator_execution_already_retired(&error) {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    if let Err(error) = coordinator.wait_for_round(Round::ProgramFinished).await {
+        let error = error.to_string();
+        if coordinator_execution_already_retired(&error) {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
+async fn finish_avss_standing_execution<F, G>(
+    coordinator: &AvssOffChainCoordinator<F, G>,
+) -> Result<(), String>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
+{
+    if let Err(error) = coordinator.finalize().await {
+        let error = error.to_string();
+        if coordinator_execution_already_retired(&error) {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    if let Err(error) = coordinator.wait_for_round(Round::ProgramFinished).await {
+        let error = error.to_string();
+        if coordinator_execution_already_retired(&error) {
+            return Ok(());
+        }
+        return Err(error);
+    }
+    Ok(())
+}
+
 fn current_cgroup_memory_bytes() -> Option<u64> {
     read_trimmed_u64("/sys/fs/cgroup/memory.current")
         .or_else(|| read_trimmed_u64("/sys/fs/cgroup/memory/memory.usage_in_bytes"))
@@ -992,7 +1040,7 @@ fn store_reserved_client_inputs<F, I>(
     client_to_indices: &std::collections::HashMap<I, Vec<u64>>,
     client_inputs: std::collections::HashMap<I, Vec<RobustShare<F>>>,
     client_input_count: usize,
-    client_input_slots: &[usize],
+    client_input_slots: &std::collections::HashMap<I, usize>,
     client_input_types: &std::collections::BTreeMap<usize, Vec<ShareType>>,
 ) where
     F: ark_ff::FftField,
@@ -1005,10 +1053,11 @@ fn store_reserved_client_inputs<F, I>(
 
     let mut seen_reserved_indices = std::collections::HashSet::new();
     // Group each client's shares independently — clients may provide DIFFERENT
-    // numbers of inputs. The runner reserves a contiguous index block per client
-    // in slot order, so ordering clients by their lowest reserved index recovers
-    // the client-store ordinal (matching `client_input_slots` / the roster).
-    let mut per_client: Vec<(u64, Vec<RobustShare<F>>)> = Vec::new();
+    // numbers of inputs. Reservation indices are assigned in request-arrival
+    // order, so they cannot be used to infer a manifest slot. Bind the
+    // coordinator's authenticated client identity directly to its admitted
+    // manifest slot instead.
+    let mut per_client: Vec<(usize, Vec<RobustShare<F>>)> = Vec::new();
 
     for (client_id, shares) in client_inputs {
         if shares.is_empty() {
@@ -1042,10 +1091,16 @@ fn store_reserved_client_inputs<F, I>(
             reserved_indices.iter().copied().zip(shares).collect();
         indexed_shares.sort_by_key(|(reserved_index, _)| *reserved_index);
 
-        let min_reserved_index = indexed_shares
-            .first()
-            .map(|(reserved_index, _)| *reserved_index)
-            .unwrap_or(0);
+        let client_slot = match client_input_slots.get(&client_id) {
+            Some(slot) => *slot,
+            None => {
+                eprintln!(
+                    "Coordinator returned input for client {:?} without an admitted manifest slot",
+                    client_id
+                );
+                exit(13);
+            }
+        };
         let mut ordered_shares = Vec::with_capacity(indexed_shares.len());
         for (reserved_index, share) in indexed_shares {
             if reserved_index > usize::MAX as u64 {
@@ -1064,17 +1119,12 @@ fn store_reserved_client_inputs<F, I>(
             }
             ordered_shares.push(share);
         }
-        per_client.push((min_reserved_index, ordered_shares));
+        per_client.push((client_slot, ordered_shares));
     }
 
-    // Slot order == reservation order == ascending min reserved index.
-    per_client.sort_by_key(|(min_reserved_index, _)| *min_reserved_index);
+    per_client.sort_by_key(|(client_slot, _)| *client_slot);
 
-    for (client_store_index, (_min_reserved_index, shares)) in per_client.into_iter().enumerate() {
-        let client_slot = client_input_slots
-            .get(client_store_index)
-            .copied()
-            .unwrap_or(client_store_index);
+    for (client_slot, shares) in per_client {
         let result = if let Some(share_types) = client_input_types.get(&client_slot) {
             vm.try_store_client_input_with_types(client_slot, shares, share_types)
         } else {
@@ -1094,7 +1144,7 @@ fn store_reserved_client_inputs_feldman<F, G, I>(
     client_to_indices: &std::collections::HashMap<I, Vec<u64>>,
     client_inputs: std::collections::HashMap<I, Vec<FeldmanShamirShare<F, G>>>,
     client_input_count: usize,
-    client_input_slots: &[usize],
+    client_input_slots: &std::collections::HashMap<I, usize>,
     client_input_types: &std::collections::BTreeMap<usize, Vec<ShareType>>,
 ) where
     F: SupportedMpcField,
@@ -1107,11 +1157,9 @@ fn store_reserved_client_inputs_feldman<F, G, I>(
     }
 
     let mut seen_reserved_indices = std::collections::HashSet::new();
-    // Group each client's shares independently — clients may provide DIFFERENT
-    // numbers of inputs. The runner reserves a contiguous index block per client
-    // in slot order, so ordering clients by their lowest reserved index recovers
-    // the client-store ordinal (matching `client_input_slots` / the roster).
-    let mut per_client: Vec<(u64, Vec<FeldmanShamirShare<F, G>>)> = Vec::new();
+    // As in the HoneyBadger path, reservation order is nondeterministic under
+    // concurrent clients. Use the authenticated identity-to-slot admission map.
+    let mut per_client: Vec<(usize, Vec<FeldmanShamirShare<F, G>>)> = Vec::new();
 
     for (client_id, shares) in client_inputs {
         if shares.is_empty() {
@@ -1145,10 +1193,16 @@ fn store_reserved_client_inputs_feldman<F, G, I>(
             reserved_indices.iter().copied().zip(shares).collect();
         indexed_shares.sort_by_key(|(reserved_index, _)| *reserved_index);
 
-        let min_reserved_index = indexed_shares
-            .first()
-            .map(|(reserved_index, _)| *reserved_index)
-            .unwrap_or(0);
+        let client_slot = match client_input_slots.get(&client_id) {
+            Some(slot) => *slot,
+            None => {
+                eprintln!(
+                    "Coordinator returned AVSS input for client {:?} without an admitted manifest slot",
+                    client_id
+                );
+                exit(13);
+            }
+        };
         let mut ordered_shares = Vec::with_capacity(indexed_shares.len());
         for (reserved_index, share) in indexed_shares {
             if reserved_index > usize::MAX as u64 {
@@ -1167,17 +1221,12 @@ fn store_reserved_client_inputs_feldman<F, G, I>(
             }
             ordered_shares.push(share);
         }
-        per_client.push((min_reserved_index, ordered_shares));
+        per_client.push((client_slot, ordered_shares));
     }
 
-    // Slot order == reservation order == ascending min reserved index.
-    per_client.sort_by_key(|(min_reserved_index, _)| *min_reserved_index);
+    per_client.sort_by_key(|(client_slot, _)| *client_slot);
 
-    for (client_store_index, (_min_reserved_index, shares)) in per_client.into_iter().enumerate() {
-        let client_slot = client_input_slots
-            .get(client_store_index)
-            .copied()
-            .unwrap_or(client_store_index);
+    for (client_slot, shares) in per_client {
         let result = if let Some(share_types) = client_input_types.get(&client_slot) {
             vm.try_store_client_input_feldman_with_types(client_slot, shares, share_types)
         } else {
@@ -1267,14 +1316,13 @@ async fn collect_hb_coordinator_inputs<F, G>(
     node_rpc: &OffChainNodeRPCServer,
     execution_id: CoordinatorExecutionId,
     input_ids: &[Vec<u8>],
+    client_input_slots_by_id: &std::collections::HashMap<Vec<u8>, usize>,
     client_input_total: Option<usize>,
     client_input_count: usize,
-    client_input_slots: &[usize],
     client_input_types: &std::collections::BTreeMap<usize, Vec<ShareType>>,
     program_id: [u8; 32],
     run_id: u64,
     my_id: usize,
-    as_leader: bool,
 ) -> Result<(), String>
 where
     F: SupportedMpcField,
@@ -1317,13 +1365,11 @@ where
         )
     };
 
-    if as_leader {
-        eprintln!("[party {my_id}] coordinator -> InputMaskReservation");
-        coord
-            .reserve_input_masks()
-            .await
-            .map_err(|e| e.to_string())?;
-    }
+    eprintln!("[party {my_id}] proposing InputMaskReservation");
+    coord
+        .reserve_input_masks()
+        .await
+        .map_err(|e| e.to_string())?;
     coord
         .wait_for_round(Round::InputMaskReservation)
         .await
@@ -1421,10 +1467,8 @@ where
         .await
         .map_err(|error| format!("add mask shares: {error:?}"))?;
 
-    if as_leader {
-        eprintln!("[party {my_id}] coordinator -> InputCollection");
-        coord.collect_inputs().await.map_err(|e| e.to_string())?;
-    }
+    eprintln!("[party {my_id}] proposing InputCollection");
+    coord.collect_inputs().await.map_err(|e| e.to_string())?;
     coord
         .wait_for_round(Round::InputCollection)
         .await
@@ -1449,7 +1493,7 @@ where
         &client_to_indices,
         client_inputs,
         client_input_count,
-        client_input_slots,
+        client_input_slots_by_id,
         client_input_types,
     );
 
@@ -2259,17 +2303,26 @@ fn standing_client_key(
         .find_map(|(client, key)| (client.manifest_slot == manifest_slot).then_some(key))
 }
 
-fn input_client_ids_from_output_ids(
+fn input_client_bindings_from_output_ids(
     output_ids: &[Vec<u8>],
     client_roster: &[usize],
     client_input_slots: &[usize],
     client_input_count: usize,
-) -> Vec<Vec<u8>> {
+) -> Vec<(Vec<u8>, usize)> {
     if client_input_count == 0 {
         return Vec::new();
     }
     if client_input_slots.is_empty() {
-        return output_ids.to_vec();
+        return output_ids
+            .iter()
+            .enumerate()
+            .map(|(ordinal, client_id)| {
+                (
+                    client_id.clone(),
+                    client_roster.get(ordinal).copied().unwrap_or(ordinal),
+                )
+            })
+            .collect();
     }
 
     let input_slots = client_input_slots.iter().copied().collect::<HashSet<_>>();
@@ -2278,9 +2331,55 @@ fn input_client_ids_from_output_ids(
         .enumerate()
         .filter_map(|(ordinal, client_id)| {
             let slot = client_roster.get(ordinal).copied().unwrap_or(ordinal);
-            input_slots.contains(&slot).then(|| client_id.clone())
+            input_slots
+                .contains(&slot)
+                .then(|| (client_id.clone(), slot))
         })
         .collect()
+}
+
+fn input_client_ids_from_output_ids(
+    output_ids: &[Vec<u8>],
+    client_roster: &[usize],
+    client_input_slots: &[usize],
+    client_input_count: usize,
+) -> Vec<Vec<u8>> {
+    input_client_bindings_from_output_ids(
+        output_ids,
+        client_roster,
+        client_input_slots,
+        client_input_count,
+    )
+    .into_iter()
+    .map(|(client_id, _)| client_id)
+    .collect()
+}
+
+fn input_client_slot_map_from_output_ids(
+    output_ids: &[Vec<u8>],
+    client_roster: &[usize],
+    client_input_slots: &[usize],
+    client_input_count: usize,
+) -> Result<std::collections::HashMap<Vec<u8>, usize>, String> {
+    let bindings = input_client_bindings_from_output_ids(
+        output_ids,
+        client_roster,
+        client_input_slots,
+        client_input_count,
+    );
+    let mut slots = std::collections::HashMap::with_capacity(bindings.len());
+    let mut seen_slots = HashSet::with_capacity(bindings.len());
+    for (client_id, slot) in bindings {
+        if slots.insert(client_id, slot).is_some() {
+            return Err("duplicate authenticated client identity in input admission".to_owned());
+        }
+        if !seen_slots.insert(slot) {
+            return Err(format!(
+                "multiple authenticated input clients were assigned manifest slot {slot}"
+            ));
+        }
+    }
+    Ok(slots)
 }
 
 struct ClientProtocolConfig {
@@ -4580,6 +4679,7 @@ async fn run_avss_coordinated_party_for_curve<F, G>(
     expected_clients: &[String],
     client_input_total: Option<usize>,
     client_input_count: usize,
+    client_roster: &[usize],
     client_input_slots: &[usize],
     client_input_types: &std::collections::BTreeMap<usize, Vec<ShareType>>,
     preprocessing_demand: stoffel_vm_types::compiled_binary::PreprocessingDemand,
@@ -4598,6 +4698,12 @@ where
         .iter()
         .map(|path| extract_pubkey_from_cert(&fs::read(path).expect("read client cert")))
         .collect();
+    let client_input_slots_by_id = input_client_slot_map_from_output_ids(
+        &input_ids,
+        client_roster,
+        client_input_slots,
+        client_input_count,
+    )?;
     let client_input_total =
         client_input_total.unwrap_or_else(|| input_ids.len().saturating_mul(client_input_count));
     let (mux, execution_inbox, _execution_registration, _execution_scanner) =
@@ -4627,12 +4733,11 @@ where
     .await
     .map_err(|error| format!("Failed to start AVSS node RPC server: {error}"))?;
 
-    if as_leader {
-        coord
-            .start_preprocessing()
-            .await
-            .map_err(|e| e.to_string())?;
-    }
+    eprintln!("[party {my_id}] proposing Preprocessing");
+    coord
+        .start_preprocessing()
+        .await
+        .map_err(|e| e.to_string())?;
 
     let engine = setup_avss_party_for_curve::<F, G>(
         vm,
@@ -4702,12 +4807,11 @@ where
             .await
             .map_err(|e| format!("add_mask_shares: {:?}", e))?;
 
-        if as_leader {
-            coord
-                .reserve_input_masks()
-                .await
-                .map_err(|e| e.to_string())?;
-        }
+        eprintln!("[party {my_id}] proposing InputMaskReservation");
+        coord
+            .reserve_input_masks()
+            .await
+            .map_err(|e| e.to_string())?;
         coord
             .wait_for_round(Round::InputMaskReservation)
             .await
@@ -4736,9 +4840,8 @@ where
                 })?;
         }
 
-        if as_leader {
-            coord.collect_inputs().await.map_err(|e| e.to_string())?;
-        }
+        eprintln!("[party {my_id}] proposing InputCollection");
+        coord.collect_inputs().await.map_err(|e| e.to_string())?;
         coord
             .wait_for_round(Round::InputCollection)
             .await
@@ -4753,14 +4856,13 @@ where
             &client_to_indices,
             client_inputs,
             client_input_count,
-            client_input_slots,
+            &client_input_slots_by_id,
             client_input_types,
         );
     }
 
-    if as_leader {
-        coord.start_mpc().await.map_err(|e| e.to_string())?;
-    }
+    eprintln!("[party {my_id}] proposing MPCExecution");
+    coord.start_mpc().await.map_err(|e| e.to_string())?;
     coord
         .wait_for_round(Round::MPCExecution)
         .await
@@ -4777,15 +4879,14 @@ where
     );
 
     let captured_outputs = engine.drain_client_output_records().await;
-    if !captured_outputs.is_empty() {
-        if as_leader {
-            coord.send_output().await.map_err(|e| e.to_string())?;
-        }
-        coord
-            .wait_for_round(Round::OutputDistribution)
-            .await
-            .map_err(|e| e.to_string())?;
+    eprintln!("[party {my_id}] proposing OutputDistribution");
+    coord.send_output().await.map_err(|e| e.to_string())?;
+    coord
+        .wait_for_round(Round::OutputDistribution)
+        .await
+        .map_err(|e| e.to_string())?;
 
+    if !captured_outputs.is_empty() {
         let outputs_by_client = group_output_shares_by_client(
             captured_outputs
                 .into_iter()
@@ -4805,9 +4906,8 @@ where
         }
     }
 
-    if as_leader {
-        coord.finalize().await.map_err(|e| e.to_string())?;
-    }
+    eprintln!("[party {my_id}] proposing ProgramFinished");
+    coord.finalize().await.map_err(|e| e.to_string())?;
     coord
         .wait_for_round(Round::ProgramFinished)
         .await
@@ -4857,6 +4957,7 @@ async fn run_avss_coordinated_party(
     expected_clients: &[String],
     client_input_total: Option<usize>,
     client_input_count: usize,
+    client_roster: &[usize],
     client_input_slots: &[usize],
     client_input_types: &std::collections::BTreeMap<usize, Vec<ShareType>>,
     preprocessing_demand: stoffel_vm_types::compiled_binary::PreprocessingDemand,
@@ -4883,6 +4984,7 @@ async fn run_avss_coordinated_party(
                 expected_clients,
                 client_input_total,
                 client_input_count,
+                client_roster,
                 client_input_slots,
                 client_input_types,
                 preprocessing_demand,
@@ -5026,7 +5128,6 @@ struct StandingRunnerExecutionHandler {
     preproc_store: Arc<dyn PreprocStore>,
     persistent_identity: DurableIdentityDigest,
     party_id: usize,
-    coordinator_leader: bool,
     parties: usize,
     threshold: usize,
     pool_id: ExecutionId,
@@ -5657,7 +5758,12 @@ impl StandingRunnerExecutionHandler {
                 Ok(coordinator) => coordinator
                     .retire_execution()
                     .await
-                    .map_err(|error| format!("retire coordinator execution: {error}")),
+                    .map_err(|error| error.to_string())
+                    .or_else(|error| {
+                        coordinator_execution_already_retired(&error)
+                            .then_some(())
+                            .ok_or_else(|| format!("retire coordinator execution: {error}"))
+                    }),
                 Err(error) => Err(format!("connect for coordinator cleanup: {error}")),
             };
 
@@ -5726,12 +5832,11 @@ impl StandingRunnerExecutionHandler {
         )
         .await
         .map_err(|error| format!("connect to standing lifecycle coordinator: {error}"))?;
-        if self.coordinator_leader {
-            coord
-                .start_preprocessing()
-                .await
-                .map_err(|error| error.to_string())?;
-        }
+        eprintln!("[party {}] proposing Preprocessing", self.party_id);
+        coord
+            .start_preprocessing()
+            .await
+            .map_err(|error| error.to_string())?;
         coord
             .wait_for_round(Round::Preprocessing)
             .await
@@ -5751,6 +5856,12 @@ impl StandingRunnerExecutionHandler {
             &client_input_slots,
             client_input_count,
         );
+        let client_input_slots_by_id = input_client_slot_map_from_output_ids(
+            &admission.expected_client_public_keys,
+            &client_roster,
+            &client_input_slots,
+            client_input_count,
+        )?;
         collect_hb_coordinator_inputs(
             vm,
             &engine,
@@ -5758,23 +5869,21 @@ impl StandingRunnerExecutionHandler {
             self.node_rpc.as_ref(),
             execution_id,
             &input_client_ids,
+            &client_input_slots_by_id,
             Some(input_total),
             client_input_count,
-            &client_input_slots,
             client_input_types,
             standing_preproc_pool_program_id(self.pool_id, admission.program_id),
             0,
             self.party_id,
-            self.coordinator_leader,
         )
         .await?;
 
-        if self.coordinator_leader {
-            lifecycle_coord
-                .start_mpc()
-                .await
-                .map_err(|error| error.to_string())?;
-        }
+        eprintln!("[party {}] proposing MPCExecution", self.party_id);
+        lifecycle_coord
+            .start_mpc()
+            .await
+            .map_err(|error| error.to_string())?;
         lifecycle_coord
             .wait_for_round(Round::MPCExecution)
             .await
@@ -5784,12 +5893,11 @@ impl StandingRunnerExecutionHandler {
             .await
             .map_err(|error| format!("VM execution failed: {error}"))?;
 
-        if self.coordinator_leader {
-            lifecycle_coord
-                .send_output()
-                .await
-                .map_err(|error| error.to_string())?;
-        }
+        eprintln!("[party {}] proposing OutputDistribution", self.party_id);
+        lifecycle_coord
+            .send_output()
+            .await
+            .map_err(|error| error.to_string())?;
         lifecycle_coord
             .wait_for_round(Round::OutputDistribution)
             .await
@@ -5813,16 +5921,8 @@ impl StandingRunnerExecutionHandler {
                 .await
                 .map_err(|error| format!("send HoneyBadger output shares: {error}"))?;
         }
-        if self.coordinator_leader {
-            lifecycle_coord
-                .finalize()
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-        lifecycle_coord
-            .wait_for_round(Round::ProgramFinished)
-            .await
-            .map_err(|error| error.to_string())?;
+        eprintln!("[party {}] proposing ProgramFinished", self.party_id);
+        finish_hb_standing_execution(&lifecycle_coord).await?;
         print_vm_result(vm, result);
         Ok(metrics)
     }
@@ -5875,12 +5975,11 @@ impl StandingRunnerExecutionHandler {
         )
         .await
         .map_err(|error| format!("connect to standing lifecycle coordinator: {error}"))?;
-        if self.coordinator_leader {
-            coord
-                .start_preprocessing()
-                .await
-                .map_err(|error| error.to_string())?;
-        }
+        eprintln!("[party {}] proposing Preprocessing", self.party_id);
+        coord
+            .start_preprocessing()
+            .await
+            .map_err(|error| error.to_string())?;
         coord
             .wait_for_round(Round::Preprocessing)
             .await
@@ -5889,6 +5988,17 @@ impl StandingRunnerExecutionHandler {
         engine.enable_client_output_capture().await;
         let input_total = self.coordinator_registration(admission, program)?.n_inputs as usize;
         let client_input_slots = manifest_client_input_slots(client_input_types);
+        let client_roster = admission
+            .clients
+            .iter()
+            .map(|client| client.manifest_slot)
+            .collect::<Vec<_>>();
+        let client_input_slots_by_id = input_client_slot_map_from_output_ids(
+            &admission.expected_client_public_keys,
+            &client_roster,
+            &client_input_slots,
+            client_input_count,
+        )?;
         if input_total > 0 {
             let mask_shares = {
                 let node = engine.node_handle().lock().await;
@@ -5904,12 +6014,11 @@ impl StandingRunnerExecutionHandler {
                     })?;
                 shares
             };
-            if self.coordinator_leader {
-                coord
-                    .reserve_input_masks()
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
+            eprintln!("[party {}] proposing InputMaskReservation", self.party_id);
+            coord
+                .reserve_input_masks()
+                .await
+                .map_err(|error| error.to_string())?;
             coord
                 .wait_for_round(Round::InputMaskReservation)
                 .await
@@ -5939,12 +6048,11 @@ impl StandingRunnerExecutionHandler {
                 .add_mask_shares_for_execution(execution_id, &mask_share_pairs)
                 .await
                 .map_err(|error| format!("add AVSS mask shares: {error:?}"))?;
-            if self.coordinator_leader {
-                coord
-                    .collect_inputs()
-                    .await
-                    .map_err(|error| error.to_string())?;
-            }
+            eprintln!("[party {}] proposing InputCollection", self.party_id);
+            coord
+                .collect_inputs()
+                .await
+                .map_err(|error| error.to_string())?;
             coord
                 .wait_for_round(Round::InputCollection)
                 .await
@@ -5958,17 +6066,16 @@ impl StandingRunnerExecutionHandler {
                 &client_to_indices,
                 client_inputs,
                 client_input_count,
-                &client_input_slots,
+                &client_input_slots_by_id,
                 client_input_types,
             );
         }
 
-        if self.coordinator_leader {
-            lifecycle_coord
-                .start_mpc()
-                .await
-                .map_err(|error| error.to_string())?;
-        }
+        eprintln!("[party {}] proposing MPCExecution", self.party_id);
+        lifecycle_coord
+            .start_mpc()
+            .await
+            .map_err(|error| error.to_string())?;
         lifecycle_coord
             .wait_for_round(Round::MPCExecution)
             .await
@@ -5977,12 +6084,11 @@ impl StandingRunnerExecutionHandler {
             .execute_async_with_metrics(&admission.entry, engine.as_ref())
             .await
             .map_err(|error| format!("VM execution failed: {error}"))?;
-        if self.coordinator_leader {
-            lifecycle_coord
-                .send_output()
-                .await
-                .map_err(|error| error.to_string())?;
-        }
+        eprintln!("[party {}] proposing OutputDistribution", self.party_id);
+        lifecycle_coord
+            .send_output()
+            .await
+            .map_err(|error| error.to_string())?;
         lifecycle_coord
             .wait_for_round(Round::OutputDistribution)
             .await
@@ -6006,16 +6112,8 @@ impl StandingRunnerExecutionHandler {
                 .await
                 .map_err(|error| format!("send AVSS output shares: {error}"))?;
         }
-        if self.coordinator_leader {
-            lifecycle_coord
-                .finalize()
-                .await
-                .map_err(|error| error.to_string())?;
-        }
-        lifecycle_coord
-            .wait_for_round(Round::ProgramFinished)
-            .await
-            .map_err(|error| error.to_string())?;
+        eprintln!("[party {}] proposing ProgramFinished", self.party_id);
+        finish_avss_standing_execution(&lifecycle_coord).await?;
         print_vm_result(vm, result);
         Ok(metrics)
     }
@@ -6474,7 +6572,6 @@ async fn run_standing_node(raw_args: &[String]) -> Result<(), String> {
         preproc_store,
         persistent_identity,
         party_id: protocol_party_id,
-        coordinator_leader: party_id == 0,
         parties,
         threshold,
         pool_id,
@@ -7736,6 +7833,7 @@ async fn main() {
     let mut coord_opt: Option<HbOffChainCoordinator<ark_bls12_381::Fr>> = None;
     let mut node_rpc_opt: Option<OffChainNodeRPCServer> = None;
     let mut input_ids: Vec<Vec<u8>> = Vec::new();
+    let mut client_input_slots_by_id = std::collections::HashMap::new();
     let mut output_ids: Vec<Vec<u8>> = Vec::new();
     let mut hb_bls12381_coord_engine: Option<
         Arc<HoneyBadgerMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projective>>,
@@ -7780,6 +7878,16 @@ async fn main() {
                 &client_input_slots,
                 client_input_count,
             );
+            client_input_slots_by_id = input_client_slot_map_from_output_ids(
+                &output_ids,
+                &client_roster,
+                &client_input_slots,
+                client_input_count,
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("Invalid coordinator client input admission: {error}");
+                exit(13);
+            });
 
             if let Some(ref rpc) = rpc_addr {
                 let node_cert_der = cert_der.clone().unwrap();
@@ -7840,9 +7948,8 @@ async fn main() {
                 _execution_scanner = Some(scanner);
                 // Phase 1: Coordinator preprocessing trigger
                 if let Some(ref mut coord) = coord_opt {
-                    if as_leader {
-                        coord.start_preprocessing().await.unwrap();
-                    }
+                    eprintln!("[party {my_id}] proposing Preprocessing");
+                    coord.start_preprocessing().await.unwrap();
                 }
                 // Phase 2: Create MPC engine + preprocessing + coordinator input phases
                 macro_rules! setup_hb {
@@ -7959,14 +8066,13 @@ async fn main() {
                             node_rpc,
                             coordinator_execution_id(execution_id),
                             &input_ids,
+                            &client_input_slots_by_id,
                             client_input_total,
                             client_input_count,
-                            &client_input_slots,
                             &client_input_types,
                             program_id,
                             0,
                             my_id,
-                            as_leader,
                         )
                         .await
                         {
@@ -8030,6 +8136,7 @@ async fn main() {
                         &expected_clients,
                         client_input_total,
                         client_input_count,
+                        &client_roster,
                         &client_input_slots,
                         &client_input_types,
                         preprocessing_demand,
@@ -8122,12 +8229,10 @@ async fn main() {
 
     // Coordinator: signal MPC execution phase
     if let Some(ref mut coord) = coord_opt {
-        if as_leader {
-            eprintln!("[party] coordinator -> MPCExecution");
-            if let Err(error) = coord.start_mpc().await {
-                eprintln!("Failed to propose coordinator MPCExecution round: {error}");
-                exit(13);
-            }
+        eprintln!("[party] proposing MPCExecution");
+        if let Err(error) = coord.start_mpc().await {
+            eprintln!("Failed to propose coordinator MPCExecution round: {error}");
+            exit(13);
         }
         if let Err(error) = coord.wait_for_round(Round::MPCExecution).await {
             eprintln!("Failed waiting for coordinator MPCExecution round: {error}");
@@ -8189,6 +8294,20 @@ async fn main() {
                         Vec::new()
                     };
 
+                    eprintln!("[party] proposing OutputDistribution");
+                    if let Err(error) = coord.send_output().await {
+                        eprintln!(
+                            "Failed to propose coordinator OutputDistribution round: {error}"
+                        );
+                        exit(13);
+                    }
+                    if let Err(error) = coord.wait_for_round(Round::OutputDistribution).await {
+                        eprintln!(
+                            "Failed waiting for coordinator OutputDistribution round: {error}"
+                        );
+                        exit(13);
+                    }
+
                     if output_share.is_some() || !captured_outputs.is_empty() {
                         let mut output_shares_by_client: Vec<
                             Vec<HbCoordinatorShare<ark_bls12_381::Fr>>,
@@ -8217,21 +8336,6 @@ async fn main() {
                             shares.extend(record.shares);
                         }
 
-                        if as_leader {
-                            if let Err(error) = coord.send_output().await {
-                                eprintln!(
-                                    "Failed to propose coordinator OutputDistribution round: {error}"
-                                );
-                                exit(13);
-                            }
-                        }
-                        if let Err(error) = coord.wait_for_round(Round::OutputDistribution).await {
-                            eprintln!(
-                                "Failed waiting for coordinator OutputDistribution round: {error}"
-                            );
-                            exit(13);
-                        }
-
                         for (cid, output_shares) in
                             output_ids.iter().zip(output_shares_by_client.into_iter())
                         {
@@ -8250,13 +8354,12 @@ async fn main() {
                         }
                     }
 
-                    if as_leader {
-                        if let Err(e) = coord.finalize().await {
-                            eprintln!(
-                                "Warning: failed to finalize off-chain coordinator round: {}",
-                                e
-                            );
-                        }
+                    eprintln!("[party] proposing ProgramFinished");
+                    if let Err(e) = coord.finalize().await {
+                        eprintln!(
+                            "Warning: failed to finalize off-chain coordinator round: {}",
+                            e
+                        );
                     }
                     if let Err(error) = coord.wait_for_round(Round::ProgramFinished).await {
                         eprintln!("Failed waiting for coordinator ProgramFinished round: {error}");
@@ -8454,11 +8557,13 @@ mod tests {
     use super::{
         band_pow2, bind_admitted_client_slots, canonical_mask_reservation_runs,
         checked_client_input_total, client_input_completion_quorum, client_input_setup_plan,
-        client_output_slot_map, client_transport_recipient, decode_preprocessing_exchange,
-        direct_client_inbound_message, encode_preprocessing_exchange, field_outputs_to_hex,
-        format_coordinator_outputs, group_output_shares_by_client, hb_input_only_completion_proven,
-        input_client_ids_from_output_ids, manifest_client_input_slots, mpc_input_protocol_ids,
-        plan_preprocessing, preprocessing_transcript_digest, record_preprocessing_exchange_value,
+        client_output_slot_map, client_transport_recipient, coordinator_execution_already_retired,
+        decode_preprocessing_exchange, direct_client_inbound_message,
+        encode_preprocessing_exchange, field_outputs_to_hex, format_coordinator_outputs,
+        format_vm_result, group_output_shares_by_client, hb_input_only_completion_proven,
+        input_client_ids_from_output_ids, input_client_slot_map_from_output_ids,
+        manifest_client_input_slots, mpc_input_protocol_ids, plan_preprocessing,
+        preprocessing_transcript_digest, record_preprocessing_exchange_value,
         render_fixed_point_i64, resolve_client_protocol_bindings, standing_preproc_pool_program_id,
         standing_reservoir_plan, standing_reservoir_refill_execution_id,
         validate_preprocessing_proposals, validate_reservoir_allocation_admission,
@@ -8467,6 +8572,12 @@ mod tests {
         StandingPreprocessingProposal,
     };
     use std::collections::{BTreeMap, HashSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use stoffel_vm::core_vm::VirtualMachine;
+    use stoffel_vm::net::mpc_engine::{
+        MpcEngine, MpcEngineError, MpcEngineResult, MpcSessionTopology,
+    };
     use stoffel_vm::net::session::ExecutionId;
     use stoffel_vm::net::MpcCurveConfig;
     use stoffel_vm::storage::preproc::PreprocMeta;
@@ -8474,7 +8585,88 @@ mod tests {
     use stoffel_vm_types::compiled_binary::{
         ClientIoManifest, ClientIoSchema, PreprocessingDemand,
     };
-    use stoffel_vm_types::core_types::ShareType;
+    use stoffel_vm_types::core_types::{
+        ClearShareInput, ClearShareValue, ShareData, ShareType, Value,
+    };
+
+    struct OpenCountingEngine {
+        opens: Arc<AtomicUsize>,
+    }
+
+    impl MpcEngine for OpenCountingEngine {
+        fn protocol_name(&self) -> &'static str {
+            "open-counting-test"
+        }
+
+        fn topology(&self) -> MpcSessionTopology {
+            MpcSessionTopology::try_new(7, 0, 3, 1).expect("test topology")
+        }
+
+        fn is_ready(&self) -> bool {
+            true
+        }
+
+        fn start(&self) -> MpcEngineResult<()> {
+            Ok(())
+        }
+
+        fn input_share(&self, _clear: ClearShareInput) -> MpcEngineResult<ShareData> {
+            Err(MpcEngineError::operation_failed(
+                "input_share",
+                "not used by returned-share formatting test",
+            ))
+        }
+
+        fn open_share(
+            &self,
+            _share_type: ShareType,
+            _share_bytes: &[u8],
+        ) -> MpcEngineResult<ClearShareValue> {
+            self.opens.fetch_add(1, Ordering::SeqCst);
+            Ok(ClearShareValue::Integer(0))
+        }
+    }
+
+    #[test]
+    fn vm_result_preserves_returned_share_bytes_without_a_runtime_open() {
+        let opens = Arc::new(AtomicUsize::new(0));
+        let mut vm = VirtualMachine::builder()
+            .with_mpc_engine(Arc::new(OpenCountingEngine {
+                opens: Arc::clone(&opens),
+            }))
+            .build();
+        let returned = Value::Share(
+            ShareType::secret_int(64),
+            ShareData::Opaque(vec![0x00, 0x01, 0xfe, 0xff].into()),
+        );
+        let returned_object = vm
+            .create_share_object(
+                ShareType::secret_int(64),
+                ShareData::Opaque(vec![0x00, 0x01, 0xfe, 0xff].into()),
+                2,
+            )
+            .expect("share object");
+
+        assert_eq!(
+            format_vm_result(&mut vm, &returned),
+            "share:v1[secret-int:64;opaque;4] 0x0001feff"
+        );
+        assert_eq!(
+            format_vm_result(&mut vm, &returned_object),
+            "share:v1[secret-int:64;opaque;4] 0x0001feff"
+        );
+        assert_eq!(
+            opens.load(Ordering::SeqCst),
+            0,
+            "formatting a return value must never call the MPC open protocol"
+        );
+    }
+
+    #[test]
+    fn vm_result_keeps_clear_returns_unchanged() {
+        let mut vm = VirtualMachine::try_new().expect("VM");
+        assert_eq!(format_vm_result(&mut vm, &Value::I64(42)), "42");
+    }
 
     #[test]
     fn captured_output_shares_are_batched_once_per_client_in_call_order() {
@@ -9198,6 +9390,27 @@ mod tests {
         let input_ids = input_client_ids_from_output_ids(&output_ids, &[0, 2, 5], &[2], 1);
 
         assert_eq!(input_ids, vec![vec![21]]);
+    }
+
+    #[test]
+    fn coordinator_input_identity_preserves_permuted_manifest_slots() {
+        let output_ids = vec![vec![41], vec![40]];
+
+        let slots =
+            input_client_slot_map_from_output_ids(&output_ids, &[1, 0], &[0, 1], 2).unwrap();
+
+        assert_eq!(slots.get(&vec![41]), Some(&1));
+        assert_eq!(slots.get(&vec![40]), Some(&0));
+    }
+
+    #[test]
+    fn terminal_cleanup_recognizes_only_an_already_retired_execution() {
+        assert!(coordinator_execution_already_retired(
+            "Execution abc is not registered"
+        ));
+        assert!(!coordinator_execution_already_retired(
+            "coordinator transport disconnected"
+        ));
     }
 
     #[test]
