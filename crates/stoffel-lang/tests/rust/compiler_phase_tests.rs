@@ -3226,7 +3226,7 @@ fn test_compile_client_io_manifest_tracks_static_loop_fixed_client_io() {
     .expect("program compiles");
     let binary = convert_to_binary(&program);
 
-    assert_eq!(binary.client_io_manifest.clients.len(), 1);
+    assert_eq!(binary.client_io_manifest.clients.len(), 2);
     let schema = &binary.client_io_manifest.clients[0];
     assert_eq!(schema.client_slot, 0);
     assert_eq!(
@@ -3237,6 +3237,13 @@ fn test_compile_client_io_manifest_tracks_static_loop_fixed_client_io() {
         schema.outputs,
         vec![ShareType::default_secret_fixed_point(); 6]
     );
+    let schema = &binary.client_io_manifest.clients[1];
+    assert_eq!(schema.client_slot, 1);
+    assert_eq!(
+        schema.inputs,
+        vec![ShareType::default_secret_fixed_point(); 6]
+    );
+    assert!(schema.outputs.is_empty());
 }
 
 #[test]
