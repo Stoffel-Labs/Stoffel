@@ -36,6 +36,9 @@ fn public_sdk_types_are_send_and_sync_where_expected() {
     assert_send_sync::<Stoffel>();
     assert_send_sync::<StoffelRuntime>();
     assert_send_sync::<stoffel::LocalNetworkBuilder<'static>>();
+    assert_send_sync::<LocalShareExecutionOutput>();
+    assert_send_sync::<LocalPartyShareOutput>();
+    assert_send_sync::<OpaqueShare>();
     assert_send_sync::<Program>();
     assert_send_sync::<ProgramSummary>();
     assert_send_sync::<BytecodeSummary>();
@@ -1855,10 +1858,9 @@ async fn local_network_builder_rejects_zero_timeout_before_runner_lookup() -> st
     Ok(())
 }
 
-#[tokio::test]
-async fn local_execution_rejects_non_bls_avss_client_inputs_before_runner_lookup(
-) -> stoffel::Result<()> {
-    let err = Stoffel::compile(
+#[test]
+fn local_execution_preserves_non_bls_avss_client_input_configuration() -> stoffel::Result<()> {
+    let runtime = Stoffel::compile(
         r#"
 def main() -> int64:
   var share = ClientStore.take_share(0, 0)
@@ -1871,15 +1873,15 @@ def main() -> int64:
         curve: Curve::Ed25519,
     })
     .with_client_input(0, &[42_i64])
-    .execute_local()
-    .await
-    .unwrap_err();
+    .build()?;
 
-    assert!(matches!(
-        err,
-        stoffel::Error::Unsupported(message)
-            if message.contains("AVSS local client inputs only for bls12_381")
-    ));
+    assert_eq!(
+        runtime.mpc_config().unwrap().backend,
+        MpcBackend::Avss {
+            curve: Curve::Ed25519
+        }
+    );
+    runtime.validate_client_inputs()?;
     Ok(())
 }
 
@@ -2554,15 +2556,20 @@ fn offchain_client_config_reports_actionable_validation_errors() {
         stoffel::Error::Configuration(message) if message.contains("host")
     ));
 
-    let unsupported_curve = offchain_config_builder()
+    let non_bls_curve = offchain_config_builder()
         .coordinator("127.0.0.1", 19000)
         .timestamp(1)
         .avss(Curve::Bn254)
         .node_rpc_address("127.0.0.1:19100")
         .identity_der(vec![1], vec![2])
         .build()
-        .unwrap_err();
-    assert!(matches!(unsupported_curve, stoffel::Error::Unsupported(_)));
+        .expect("BN254 AVSS client config");
+    assert_eq!(
+        non_bls_curve.backend,
+        MpcBackend::Avss {
+            curve: Curve::Bn254
+        }
+    );
 
     let invalid_threshold = offchain_config_builder()
         .coordinator("127.0.0.1", 19000)
@@ -2608,6 +2615,30 @@ fn offchain_client_config_reports_actionable_validation_errors() {
         zero_timeout,
         stoffel::Error::Configuration(message) if message.contains("timeout")
     ));
+}
+
+#[test]
+fn offchain_client_config_accepts_every_avss_curve() {
+    let curves = [
+        Curve::Bls12_381,
+        Curve::Bn254,
+        Curve::Curve25519,
+        Curve::Ed25519,
+        Curve::Secp256k1,
+        Curve::Secp256r1,
+    ];
+
+    for curve in curves {
+        let config = offchain_config_builder()
+            .coordinator("127.0.0.1", 19000)
+            .timestamp(1)
+            .avss(curve)
+            .node_rpc_address("127.0.0.1:19100")
+            .identity_der(vec![1], vec![2])
+            .build()
+            .unwrap_or_else(|error| panic!("{curve:?} AVSS client config failed: {error}"));
+        assert_eq!(config.backend, MpcBackend::Avss { curve });
+    }
 }
 
 #[test]
@@ -3351,6 +3382,35 @@ async fn execute_local_uses_real_local_avss_coordinator_runner_for_no_input_prog
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts a real localhost coordinator and AVSS MPC party mesh; requires target/debug/stoffel-run"]
+async fn execute_local_preserves_party_local_opaque_return_shares() -> stoffel::Result<()> {
+    let result = Stoffel::compile(
+        "def main() -> secret int64:\n  var share: secret int64 = Share.random()\n  return share",
+    )?
+    .parties(5)
+    .threshold(1)
+    .avss(Curve::Bls12_381)
+    .local_runner_path("target/debug/stoffel-run")
+    .execute_local_returning_party_shares()
+    .await?;
+
+    assert!(result.client_outputs.is_empty());
+    assert_eq!(result.shares().len(), 5);
+    assert_eq!(result.party_outputs.len(), 5);
+
+    let mut payloads = std::collections::HashSet::new();
+    for party in &result.party_outputs {
+        let share = &party.returned_share;
+        assert_eq!(share.share_type, ShareType::secret_int(64));
+        assert_eq!(share.backend_format, ShareDataFormat::Feldman);
+        assert!(!share.as_bytes().is_empty());
+        payloads.insert(share.as_bytes().to_vec());
+    }
+    assert_eq!(payloads.len(), 5, "each party must retain its own share");
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts a real localhost coordinator, AVSS MPC party mesh, and coordinator client"]
 async fn execute_local_submits_avss_clientstore_inputs_through_coordinator() -> stoffel::Result<()>
 {
@@ -3365,6 +3425,30 @@ def main() -> int64:
     .parties(5)
     .threshold(1)
     .avss(Curve::Bls12_381)
+    .with_client_input(0, &[42_i64])
+    .local_runner_path("target/debug/stoffel-run")
+    .execute_local()
+    .await?;
+
+    assert_eq!(result, vec![Value::I64(47)]);
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts a real localhost coordinator, BN254 AVSS party mesh, and coordinator client"]
+async fn execute_local_submits_bn254_avss_clientstore_inputs_through_coordinator(
+) -> stoffel::Result<()> {
+    let result = Stoffel::compile(
+        r#"
+def main() -> int64:
+  var share = ClientStore.take_share(0, 0)
+  var opened: int64 = share.open()
+  return opened + 5
+"#,
+    )?
+    .parties(5)
+    .threshold(1)
+    .avss(Curve::Bn254)
     .with_client_input(0, &[42_i64])
     .local_runner_path("target/debug/stoffel-run")
     .execute_local()

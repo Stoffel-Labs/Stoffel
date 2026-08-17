@@ -227,6 +227,41 @@ pub trait SupportedMpcField: ark_ff::FftField + ark_ff::PrimeField + Send + Sync
     }
 }
 
+/// Implemented by every field/group pair supported by the generic AVSS engine.
+///
+/// Unlike [`SupportedMpcField`], this marker preserves the configured curve
+/// identity when two curves share a scalar field (notably Curve25519 and
+/// Ed25519). Generic SDK and runner boundaries use it to infer the curve from
+/// `AvssMpcEngine<F, G>` without accepting a separate, potentially mismatched
+/// runtime curve argument.
+pub trait SupportedMpcCurvePair {
+    const CURVE_CONFIG: MpcCurveConfig;
+}
+
+impl SupportedMpcCurvePair for (ark_bls12_381::Fr, ark_bls12_381::G1Projective) {
+    const CURVE_CONFIG: MpcCurveConfig = MpcCurveConfig::Bls12_381;
+}
+
+impl SupportedMpcCurvePair for (ark_bn254::Fr, ark_bn254::G1Projective) {
+    const CURVE_CONFIG: MpcCurveConfig = MpcCurveConfig::Bn254;
+}
+
+impl SupportedMpcCurvePair for (ark_curve25519::Fr, ark_curve25519::EdwardsProjective) {
+    const CURVE_CONFIG: MpcCurveConfig = MpcCurveConfig::Curve25519;
+}
+
+impl SupportedMpcCurvePair for (ark_ed25519::Fr, ark_ed25519::EdwardsProjective) {
+    const CURVE_CONFIG: MpcCurveConfig = MpcCurveConfig::Ed25519;
+}
+
+impl SupportedMpcCurvePair for (ark_secp256k1::Fr, ark_secp256k1::Projective) {
+    const CURVE_CONFIG: MpcCurveConfig = MpcCurveConfig::Secp256k1;
+}
+
+impl SupportedMpcCurvePair for (ark_secp256r1::Fr, ark_secp256r1::Projective) {
+    const CURVE_CONFIG: MpcCurveConfig = MpcCurveConfig::Secp256r1;
+}
+
 impl SupportedMpcField for ark_bls12_381::Fr {
     const CURVE_CONFIG: MpcCurveConfig = MpcCurveConfig::Bls12_381;
 }

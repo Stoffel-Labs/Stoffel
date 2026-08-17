@@ -215,7 +215,7 @@ use stoffel::prelude::*;
 
 # async fn example() -> stoffel::Result<()> {
 let result = Stoffel::compile(
-    "def main(a: secret int64, b: secret int64) -> secret int64:\n  return a + b",
+    "def main(a: secret int64, b: secret int64) -> int64:\n  var sum: secret int64 = a + b\n  return sum.open()",
 )?
 .parties(5)
 .threshold(1)
@@ -224,6 +224,36 @@ let result = Stoffel::compile(
 # Ok(())
 # }
 ```
+
+When the VM return itself must remain secret, use the opaque-share result API.
+It preserves the exact backend serialization held by each compute party and
+never compares or reconstructs those payload bytes:
+
+```rust
+use stoffel::prelude::*;
+
+# async fn example() -> stoffel::Result<()> {
+let result = Stoffel::compile(
+    "def main() -> secret int64:\n  var share: secret int64 = Share.random()\n  return share",
+)?
+.parties(5)
+.threshold(1)
+.avss(Curve::Bls12_381)
+.execute_local_returning_party_shares()
+.await?;
+
+assert_eq!(result.party_outputs.len(), 5);
+assert_eq!(result.shares().len(), 5);
+# Ok(())
+# }
+```
+
+The two execution APIs are intentionally disjoint: `execute_local()` accepts a
+public VM return, while `execute_local_returning_party_shares()` requires
+exactly one secret return share per compute party. A public return passed to the
+share API—or a secret return passed to the public API—is reported as an error.
+`client_outputs` remains reserved for values explicitly reconstructed with
+`send_to_client`; it never contains the party-local VM return shares.
 
 `crates/stoffel-bindgen` complements the SDK by generating typed Rust bindings
 for a Stoffel program at build time, so host code can call into compiled

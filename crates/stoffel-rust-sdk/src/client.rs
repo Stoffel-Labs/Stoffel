@@ -12,8 +12,8 @@ use std::str::FromStr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use ark_bls12_381::{Fr, G1Projective};
-use ark_ff::{PrimeField, Zero};
+use ark_bls12_381::Fr;
+use ark_ff::PrimeField;
 use serde::{Deserialize, Serialize};
 use stoffel_mpc_coordinator_off_chain::{
     node_rpc::NodeRPCClient as OffChainNodeRPCClient, OffChainCoordinatorClient,
@@ -374,13 +374,6 @@ impl OffChainClientConfig {
             return Err(Error::Configuration(
                 "off-chain client parties must be at least 5".to_owned(),
             ));
-        }
-        if let MpcBackend::Avss { curve } = self.backend {
-            if curve != Curve::Bls12_381 {
-                return Err(Error::Unsupported(
-                    "off-chain client IO currently supports AVSS over bls12_381".to_owned(),
-                ));
-            }
         }
         if self.parties < 4 * self.threshold + 1 {
             return Err(Error::Unsupported(
@@ -1155,25 +1148,66 @@ async fn run_offchain_inputs_with_config(
     inputs: &[Value],
 ) -> Result<Vec<Value>> {
     match config.backend {
-        MpcBackend::HoneyBadger => run_offchain_with_share::<RobustShare<Fr>>(config, inputs).await,
-        MpcBackend::Avss {
-            curve: Curve::Bls12_381,
-        } => run_offchain_with_share::<FeldmanShamirShare<Fr, G1Projective>>(config, inputs).await,
-        MpcBackend::Avss { curve } => Err(Error::Unsupported(format!(
-            "off-chain client IO does not support AVSS curve {curve}"
-        ))),
+        MpcBackend::HoneyBadger => {
+            run_offchain_with_share::<Fr, RobustShare<Fr>>(config, inputs).await
+        }
+        MpcBackend::Avss { curve } => match curve {
+            Curve::Bls12_381 => {
+                run_offchain_with_share::<
+                    ark_bls12_381::Fr,
+                    FeldmanShamirShare<ark_bls12_381::Fr, ark_bls12_381::G1Projective>,
+                >(config, inputs)
+                .await
+            }
+            Curve::Bn254 => {
+                run_offchain_with_share::<
+                    ark_bn254::Fr,
+                    FeldmanShamirShare<ark_bn254::Fr, ark_bn254::G1Projective>,
+                >(config, inputs)
+                .await
+            }
+            Curve::Curve25519 => {
+                run_offchain_with_share::<
+                    ark_curve25519::Fr,
+                    FeldmanShamirShare<ark_curve25519::Fr, ark_curve25519::EdwardsProjective>,
+                >(config, inputs)
+                .await
+            }
+            Curve::Ed25519 => {
+                run_offchain_with_share::<
+                    ark_ed25519::Fr,
+                    FeldmanShamirShare<ark_ed25519::Fr, ark_ed25519::EdwardsProjective>,
+                >(config, inputs)
+                .await
+            }
+            Curve::Secp256k1 => {
+                run_offchain_with_share::<
+                    ark_secp256k1::Fr,
+                    FeldmanShamirShare<ark_secp256k1::Fr, ark_secp256k1::Projective>,
+                >(config, inputs)
+                .await
+            }
+            Curve::Secp256r1 => {
+                run_offchain_with_share::<
+                    ark_secp256r1::Fr,
+                    FeldmanShamirShare<ark_secp256r1::Fr, ark_secp256r1::Projective>,
+                >(config, inputs)
+                .await
+            }
+        },
     }
 }
 
-async fn run_offchain_with_share<S>(
+async fn run_offchain_with_share<F, S>(
     config: &OffChainClientConfig,
     inputs: &[Value],
 ) -> Result<Vec<Value>>
 where
-    S: stoffel_mpc_coordinator_shared::ShareBound<Fr, ValueType = Fr>,
+    F: stoffel_vm::net::curve::SupportedMpcField,
+    S: stoffel_mpc_coordinator_shared::ShareBound<F, ValueType = F>,
 {
     tokio::time::timeout(config.timeout, async {
-        let coord = OffChainCoordinatorClient::<Fr, S>::start_rpc_client_for_execution(
+        let coord = OffChainCoordinatorClient::<F, S>::start_rpc_client_for_execution(
             &config.coordinator_host,
             config.coordinator_port,
             config.threshold as u64,
@@ -1199,7 +1233,7 @@ where
         if !reserved_indices.is_empty() {
             coord.reserve_mask_indices(&reserved_indices).await?;
         }
-        let node_rpc = OffChainNodeRPCClient::<Fr, S>::start_rpc_client_for_execution(
+        let node_rpc = OffChainNodeRPCClient::<F, S>::start_rpc_client_for_execution(
             config.parties,
             config.threshold,
             config.node_rpc_endpoints()?,
@@ -1220,7 +1254,8 @@ where
                     format!("missing assigned mask for input ordinal {ordinal}"),
                 ))
             })?;
-            let field_input = value_to_field(input, *share_type)?;
+            let curve = config.backend.curve().unwrap_or(Curve::Bls12_381);
+            let field_input = value_to_field::<F>(input, *share_type, curve)?;
             coord
                 .send_masked_input(field_input + mask, reserved_index)
                 .await?;
@@ -1236,31 +1271,31 @@ where
     })?
 }
 
-fn value_to_field(value: &Value, share_type: ShareType) -> Result<Fr> {
+fn value_to_field<F: PrimeField>(value: &Value, share_type: ShareType, curve: Curve) -> Result<F> {
     match (share_type, value) {
-        (ShareType::SecretInt { bit_length: 1 }, Value::Bool(value)) => Ok(Fr::from(*value as u64)),
+        (ShareType::SecretInt { bit_length: 1 }, Value::Bool(value)) => Ok(F::from(*value as u64)),
         (ShareType::SecretInt { bit_length: 1 }, Value::I64(value)) => {
-            Ok(Fr::from((*value != 0) as u64))
+            Ok(F::from((*value != 0) as u64))
         }
-        (ShareType::SecretInt { .. }, Value::I64(value)) => Ok(i64_to_field(*value)),
+        (ShareType::SecretInt { .. }, Value::I64(value)) => Ok(i64_to_field::<F>(*value)),
         (ShareType::SecretInt { .. }, Value::U64(value)) => {
             let value = i64::try_from(*value).map_err(|_| {
                 Error::InvalidInput("u64 secret integer input exceeds i64 range".to_owned())
             })?;
-            Ok(i64_to_field(value))
+            Ok(i64_to_field::<F>(value))
         }
         // `Value::Bytes` is the full-width field input path used by protocols
         // such as blinded OPRFs. Integer SDK values remain intentionally
         // bounded, while canonical field scalars can use the entire Fr domain.
         (ShareType::SecretInt { bit_length }, Value::Bytes(value)) if bit_length > 1 => {
-            canonical_bls12381_field_from_be_bytes(value)
+            canonical_field_from_be_bytes::<F>(value, curve)
         }
         (ShareType::SecretUInt { .. }, Value::Bytes(value)) => {
-            canonical_bls12381_field_from_be_bytes(value)
+            canonical_field_from_be_bytes::<F>(value, curve)
         }
         (ShareType::SecretUInt { bit_length }, Value::U64(value)) => {
             validate_secret_uint_range(*value, bit_length)?;
-            Ok(Fr::from(*value))
+            Ok(F::from(*value))
         }
         (ShareType::SecretUInt { bit_length }, Value::I64(value)) => {
             let value = u64::try_from(*value).map_err(|_| {
@@ -1269,19 +1304,19 @@ fn value_to_field(value: &Value, share_type: ShareType) -> Result<Fr> {
                 )
             })?;
             validate_secret_uint_range(value, bit_length)?;
-            Ok(Fr::from(value))
+            Ok(F::from(value))
         }
         (ShareType::SecretFixedPoint { .. }, Value::Float(value)) => {
-            encode_fixed_point(*value, share_type)
+            encode_fixed_point::<F>(*value, share_type)
         }
         (ShareType::SecretFixedPoint { .. }, Value::I64(value)) => {
-            encode_fixed_point(*value as f64, share_type)
+            encode_fixed_point::<F>(*value as f64, share_type)
         }
         (ShareType::SecretFixedPoint { .. }, Value::U64(value)) => {
             let value = i64::try_from(*value).map_err(|_| {
                 Error::InvalidInput("u64 fixed-point input exceeds i64 range".to_owned())
             })?;
-            encode_fixed_point(value as f64, share_type)
+            encode_fixed_point::<F>(value as f64, share_type)
         }
         _ => Err(Error::InvalidInput(format!(
             "value kind '{}' is not compatible with share type {share_type:?}",
@@ -1290,28 +1325,28 @@ fn value_to_field(value: &Value, share_type: ShareType) -> Result<Fr> {
     }
 }
 
-fn canonical_bls12381_field_from_be_bytes(bytes: &[u8]) -> Result<Fr> {
-    use ark_ff::{BigInteger, PrimeField};
+fn canonical_field_from_be_bytes<F: PrimeField>(bytes: &[u8], curve: Curve) -> Result<F> {
+    use ark_ff::BigInteger;
 
-    const FIELD_BYTES: usize = 32;
-    if bytes.len() != FIELD_BYTES {
+    let field_bytes = F::MODULUS_BIT_SIZE.div_ceil(8) as usize;
+    if bytes.len() != field_bytes {
         return Err(Error::InvalidInput(format!(
-            "BLS12-381 field input must be exactly {FIELD_BYTES} canonical big-endian bytes, got {}",
+            "{curve} field input must be exactly {field_bytes} canonical big-endian bytes, got {}",
             bytes.len()
         )));
     }
 
-    let value = Fr::from_be_bytes_mod_order(bytes);
+    let value = F::from_be_bytes_mod_order(bytes);
     let encoded = value.into_bigint().to_bytes_be();
-    let mut canonical = [0u8; FIELD_BYTES];
-    let start = FIELD_BYTES
+    let mut canonical = vec![0u8; field_bytes];
+    let start = field_bytes
         .checked_sub(encoded.len())
-        .ok_or_else(|| Error::InvalidInput("BLS12-381 field input is not canonical".to_owned()))?;
+        .ok_or_else(|| Error::InvalidInput(format!("{curve} field input is not canonical")))?;
     canonical[start..].copy_from_slice(&encoded);
     if canonical.as_slice() != bytes {
-        return Err(Error::InvalidInput(
-            "BLS12-381 field input must be less than the scalar-field modulus".to_owned(),
-        ));
+        return Err(Error::InvalidInput(format!(
+            "{curve} field input must be less than the scalar-field modulus"
+        )));
     }
     Ok(value)
 }
@@ -1330,25 +1365,21 @@ fn validate_secret_uint_range(value: u64, bit_length: usize) -> Result<()> {
     }
 }
 
-fn encode_fixed_point(value: f64, share_type: ShareType) -> Result<Fr> {
+fn encode_fixed_point<F: PrimeField>(value: f64, share_type: ShareType) -> Result<F> {
     let ShareType::SecretFixedPoint { precision } = share_type else {
         return Err(Error::InvalidInput(format!(
             "cannot encode fixed-point value with share type {share_type:?}"
         )));
     };
     let scale = 2f64.powi(precision.fractional_bits() as i32);
-    Ok(i64_to_field((value * scale).round() as i64))
+    Ok(i64_to_field::<F>((value * scale).round() as i64))
 }
 
-fn i64_to_field(value: i64) -> Fr {
-    if value >= 0 {
-        Fr::from(value as u64)
-    } else {
-        -Fr::from(value.unsigned_abs())
-    }
+fn i64_to_field<F: PrimeField>(value: i64) -> F {
+    stoffel_vm::net::curve::field_from_i64(value)
 }
 
-fn field_to_i64(value: Fr) -> Result<i64> {
+fn field_to_i64<F: PrimeField>(value: F) -> Result<i64> {
     let positive = value.into_bigint();
     if positive.as_ref()[1..].iter().all(|limb| *limb == 0)
         && positive.as_ref()[0] <= i64::MAX as u64
@@ -1373,7 +1404,7 @@ fn field_to_i64(value: Fr) -> Result<i64> {
     ))
 }
 
-fn field_to_u64(value: Fr, bit_length: usize) -> Result<u64> {
+fn field_to_u64<F: PrimeField>(value: F, bit_length: usize) -> Result<u64> {
     let positive = value.into_bigint();
     if positive.as_ref()[1..].iter().all(|limb| *limb == 0) {
         let value = positive.as_ref()[0];
@@ -1386,7 +1417,7 @@ fn field_to_u64(value: Fr, bit_length: usize) -> Result<u64> {
     ))
 }
 
-fn field_to_value(value: Fr, share_type: ShareType) -> Result<Value> {
+fn field_to_value<F: PrimeField>(value: F, share_type: ShareType) -> Result<Value> {
     match share_type {
         ShareType::SecretInt { bit_length: 1 } => Ok(Value::Bool(!value.is_zero())),
         ShareType::SecretInt { .. } => Ok(Value::I64(field_to_i64(value)?)),
@@ -1399,7 +1430,10 @@ fn field_to_value(value: Fr, share_type: ShareType) -> Result<Value> {
     }
 }
 
-fn outputs_to_values(outputs: Vec<Fr>, output_types: &[ShareType]) -> Result<Vec<Value>> {
+fn outputs_to_values<F: PrimeField>(
+    outputs: Vec<F>,
+    output_types: &[ShareType],
+) -> Result<Vec<Value>> {
     if outputs.len() != output_types.len() {
         return Err(Error::InvalidInput(format!(
             "expected {} outputs, got {}",
@@ -1415,8 +1449,8 @@ fn outputs_to_values(outputs: Vec<Fr>, output_types: &[ShareType]) -> Result<Vec
 }
 
 #[allow(dead_code)]
-fn bound_outputs_to_values(
-    outputs: Vec<(u64, Fr)>,
+fn bound_outputs_to_values<F: PrimeField>(
+    outputs: Vec<(u64, F)>,
     output_types: &[ShareType],
 ) -> Result<Vec<Value>> {
     if outputs.len() != output_types.len() {
@@ -1648,7 +1682,7 @@ mod tests {
     #[test]
     fn secret_uint_values_encode_and_decode_as_unsigned() -> Result<()> {
         let share_type = ShareType::secret_uint(8);
-        let field = value_to_field(&Value::U64(255), share_type)?;
+        let field = value_to_field::<Fr>(&Value::U64(255), share_type, Curve::Bls12_381)?;
         assert_eq!(field_to_value(field, share_type)?, Value::U64(255));
         Ok(())
     }
@@ -1657,8 +1691,8 @@ mod tests {
     fn secret_uint_encoding_rejects_negative_or_out_of_range_values() {
         let share_type = ShareType::secret_uint(8);
 
-        assert!(value_to_field(&Value::I64(-1), share_type).is_err());
-        assert!(value_to_field(&Value::U64(256), share_type).is_err());
+        assert!(value_to_field::<Fr>(&Value::I64(-1), share_type, Curve::Bls12_381).is_err());
+        assert!(value_to_field::<Fr>(&Value::U64(256), share_type, Curve::Bls12_381).is_err());
     }
 
     #[test]
@@ -1671,7 +1705,11 @@ mod tests {
         canonical[32 - encoded.len()..].copy_from_slice(&encoded);
 
         assert_eq!(
-            value_to_field(&Value::Bytes(canonical), ShareType::default_secret_int())?,
+            value_to_field::<Fr>(
+                &Value::Bytes(canonical),
+                ShareType::default_secret_int(),
+                Curve::Bls12_381,
+            )?,
             expected
         );
         Ok(())
@@ -1685,6 +1723,41 @@ mod tests {
         let mut encoded = vec![0u8; 32];
         encoded[32 - modulus.len()..].copy_from_slice(&modulus);
 
-        assert!(value_to_field(&Value::Bytes(encoded), ShareType::default_secret_int()).is_err());
+        assert!(value_to_field::<Fr>(
+            &Value::Bytes(encoded),
+            ShareType::default_secret_int(),
+            Curve::Bls12_381,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn full_width_field_bytes_are_curve_generic() -> Result<()> {
+        fn check<F: PrimeField>(curve: Curve) -> Result<()> {
+            use ark_ff::BigInteger;
+
+            let expected = F::from(42u64);
+            let encoded = expected.into_bigint().to_bytes_be();
+            let field_bytes = F::MODULUS_BIT_SIZE.div_ceil(8) as usize;
+            let mut canonical = vec![0u8; field_bytes];
+            canonical[field_bytes - encoded.len()..].copy_from_slice(&encoded);
+            assert_eq!(
+                value_to_field::<F>(
+                    &Value::Bytes(canonical),
+                    ShareType::default_secret_int(),
+                    curve,
+                )?,
+                expected
+            );
+            Ok(())
+        }
+
+        check::<ark_bls12_381::Fr>(Curve::Bls12_381)?;
+        check::<ark_bn254::Fr>(Curve::Bn254)?;
+        check::<ark_curve25519::Fr>(Curve::Curve25519)?;
+        check::<ark_ed25519::Fr>(Curve::Ed25519)?;
+        check::<ark_secp256k1::Fr>(Curve::Secp256k1)?;
+        check::<ark_secp256r1::Fr>(Curve::Secp256r1)?;
+        Ok(())
     }
 }

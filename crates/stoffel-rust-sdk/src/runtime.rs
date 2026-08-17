@@ -398,6 +398,23 @@ impl StoffelRuntime {
     pub async fn execute_local_function(&self, name: &str) -> Result<Vec<Value>> {
         vm::execute_local(self, name).await
     }
+
+    /// Execute `main` when its VM return must remain secret-shared.
+    pub async fn execute_local_returning_party_shares(
+        &self,
+    ) -> Result<vm::LocalShareExecutionOutput> {
+        self.execute_local_function_returning_party_shares("main")
+            .await
+    }
+
+    /// Execute a named entrypoint that returns exactly one secret share per
+    /// party. Use [`Self::execute_local_function`] for public VM returns.
+    pub async fn execute_local_function_returning_party_shares(
+        &self,
+        name: &str,
+    ) -> Result<vm::LocalShareExecutionOutput> {
+        vm::execute_local_returning_party_shares(self, name).await
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -456,6 +473,25 @@ impl<'a> LocalNetworkBuilder<'a> {
             ));
         }
         vm::execute_local_with_options(
+            self.runtime,
+            &self.entry,
+            vm::LocalExecutionOptions {
+                runner_path: self.runner_path,
+                timeout: self.timeout,
+            },
+        )
+        .await
+    }
+
+    /// Execute the configured local MPC run when its VM return must remain
+    /// secret-shared. This requires exactly one return share per party.
+    pub async fn run_returning_party_shares(self) -> Result<vm::LocalShareExecutionOutput> {
+        if matches!(self.timeout, Some(timeout) if timeout.is_zero()) {
+            return Err(Error::Configuration(
+                "local network timeout must be greater than zero".to_owned(),
+            ));
+        }
+        vm::execute_local_returning_party_shares_options(
             self.runtime,
             &self.entry,
             vm::LocalExecutionOptions {

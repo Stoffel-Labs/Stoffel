@@ -15,7 +15,13 @@ name = "stoffel"
 
 [dependencies]
 ark-bls12-381 = "0.5.0"
+ark-bn254 = "0.5.0"
+ark-curve25519 = "0.5.0"
+ark-ec = "0.5.0"
+ark-ed25519 = "0.5.0"
 ark-ff = "0.5.0"
+ark-secp256k1 = "0.5.0"
+ark-secp256r1 = "0.5.0"
 ark-serialize = { version = "0.5.0", features = ["ark-serialize-derive"] }
 futures-core = "0.3"
 csv = "1.3"
@@ -44,7 +50,6 @@ stoffelmpc-mpc = { package = "stoffelcrypto", version = "0.1.0" }
 
 [dev-dependencies]
 aes = "0.8"
-ark-ec = "0.5.0"
 rand = "0.8"
 sha2 = "0.10"
 stoffel-bindgen = { path = "../stoffel-bindgen" }

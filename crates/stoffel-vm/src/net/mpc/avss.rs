@@ -63,14 +63,20 @@ pub type Bls12381AvssShare = FeldmanShamirShare<Bls12381AvssField, Bls12381AvssG
 use session_ids::{field_from_usize, protocol_instance_id_u32, usize_seed, AvssSessionIds};
 const DEFAULT_RESET_DRAIN_TIMEOUT_MS: u64 = 30_000;
 
-pub fn decode_bls12381_avss_field(bytes: &[u8]) -> Result<Bls12381AvssField, String> {
-    use ark_ff::PrimeField;
-    use ark_serialize::CanonicalDeserialize;
-
-    match Bls12381AvssField::deserialize_compressed(bytes) {
+/// Decode a canonical AVSS scalar, falling back to reducing arbitrary
+/// big-endian bytes into the selected scalar field.
+pub fn decode_avss_field<F>(bytes: &[u8]) -> Result<F, String>
+where
+    F: ark_ff::PrimeField + ark_serialize::CanonicalDeserialize,
+{
+    match F::deserialize_compressed(bytes) {
         Ok(value) => Ok(value),
-        Err(_) => Ok(Bls12381AvssField::from_be_bytes_mod_order(bytes)),
+        Err(_) => Ok(F::from_be_bytes_mod_order(bytes)),
     }
+}
+
+pub fn decode_bls12381_avss_field(bytes: &[u8]) -> Result<Bls12381AvssField, String> {
+    decode_avss_field(bytes)
 }
 
 // ============================================================================
