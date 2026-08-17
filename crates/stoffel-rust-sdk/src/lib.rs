@@ -101,13 +101,13 @@ pub use server::{
     StoffelServer,
 };
 pub use stoffel_vm_types::compiled_binary::FunctionType;
-pub use stoffel_vm_types::core_types::ShareType;
+pub use stoffel_vm_types::core_types::{ShareDataFormat, ShareType};
 pub use types::{
     ClientId, ClientInputValue, ClientOutputValue, ClientValueType, FieldElement,
     GeneratedProgramManifest, GroupElement, MaskIndex, PartyId, ProgramArgs, PublicKey, Round,
     Share, TypedClientInputs, TypedClientOutputs, Value, ValueSummary,
 };
-pub use vm::LocalClientOutput;
+pub use vm::{LocalClientOutput, LocalPartyShareOutput, LocalShareExecutionOutput, OpaqueShare};
 
 #[derive(Debug, Clone)]
 enum ProgramSource {
@@ -529,6 +529,27 @@ impl Stoffel {
     pub async fn execute_local_function(self, name: &str) -> Result<Vec<Value>> {
         let (runtime, entry) = self.build_for_local_execution(name)?;
         vm::execute_local(&runtime, &entry).await
+    }
+
+    /// Execute `main` locally when its VM return must remain secret-shared.
+    ///
+    /// Unlike [`Self::execute_local`], this method requires exactly one secret
+    /// VM return share per party. It never compares or reconstructs payload
+    /// bytes. Each share and that party's printed output are paired in a
+    /// [`LocalPartyShareOutput`].
+    pub async fn execute_local_returning_party_shares(self) -> Result<LocalShareExecutionOutput> {
+        self.execute_local_function_returning_party_shares("main")
+            .await
+    }
+
+    /// Named-function variant of [`Self::execute_local_returning_party_shares`].
+    #[tracing::instrument(skip_all, fields(function = name))]
+    pub async fn execute_local_function_returning_party_shares(
+        self,
+        name: &str,
+    ) -> Result<LocalShareExecutionOutput> {
+        let (runtime, entry) = self.build_for_local_execution(name)?;
+        vm::execute_local_returning_party_shares(&runtime, &entry).await
     }
 
     /// Execute `main` locally and also return the program's printed output.

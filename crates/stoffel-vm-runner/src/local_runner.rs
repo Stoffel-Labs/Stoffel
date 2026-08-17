@@ -6,7 +6,8 @@ use std::sync::atomic::{AtomicU16, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-use ark_bls12_381::{Fr, G1Projective};
+use ark_bls12_381::Fr;
+use ark_ec::CurveGroup;
 use ark_ff::{BigInteger, PrimeField};
 use stoffel_mpc_coordinator_off_chain::tests::fake_coord::{
     HoneyBadgerCoordinatorConnection, HoneyBadgerCoordinatorRPCServerSharedBase,
@@ -24,6 +25,7 @@ use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};
 use tokio::process::{Child, Command};
 use x509_parser::prelude::{FromDer, X509Certificate};
 
+use stoffel_vm::net::curve::SupportedMpcField;
 use stoffel_vm::net::program_id_from_bytes;
 use stoffel_vm::net::session::ExecutionId;
 use stoffel_vm::net::{MpcBackendKind, MpcCurveConfig};
@@ -227,13 +229,15 @@ impl LocalCoordinatorRunner {
                     .await
                 }
                 MpcBackendKind::Avss => {
+                    let curve_config = self.curve_config;
                     futures::future::join_all(
                         local_clients
                             .iter()
                             .filter(|client| client.input.has_input())
                             .cloned()
                             .map(|client| {
-                                run_avss_offchain_client(
+                                run_avss_offchain_client_for_curve(
+                                    curve_config,
                                     client,
                                     execution_id,
                                     node_rpc_addrs.clone(),
@@ -338,15 +342,6 @@ impl LocalCoordinatorRunner {
         self.curve_config
             .validate_for_backend(self.backend)
             .map_err(|error| LocalCoordinatorRunnerError::Configuration(error.to_string()))?;
-        if matches!(self.backend, MpcBackendKind::Avss)
-            && !self.client_inputs.is_empty()
-            && !matches!(self.curve_config, MpcCurveConfig::Bls12_381)
-        {
-            return Err(LocalCoordinatorRunnerError::Configuration(
-                "local coordinator runner AVSS client inputs currently support the bls12-381 curve"
-                    .to_owned(),
-            ));
-        }
         if self.timeout.is_zero() {
             return Err(LocalCoordinatorRunnerError::Configuration(
                 "timeout must be greater than zero".to_owned(),
@@ -953,7 +948,7 @@ async fn run_honeybadger_offchain_client(
             .input
             .values
             .iter()
-            .map(|value| parse_input_as_field(value))
+            .map(|value| parse_input_as_field::<Fr>(value))
             .collect::<LocalCoordinatorRunnerResult<Vec<_>>>()?;
         eprintln!(
             "[local-client {}] connecting coordinator",
@@ -1034,7 +1029,7 @@ async fn run_honeybadger_offchain_client(
             client.client_slot,
             output_values.len()
         );
-        let values = output_values.iter().map(fr_to_u64).collect::<Vec<_>>();
+        let values = output_values.iter().map(field_to_u64).collect::<Vec<_>>();
         Ok(Some(ClientOutputRecord {
             client_slot: client.client_slot,
             values,
@@ -1046,7 +1041,7 @@ async fn run_honeybadger_offchain_client(
 
 /// Reduce a field element to its low 64 bits (exact for the small values —
 /// bits, bytes — that client outputs carry in these examples).
-fn fr_to_u64(value: &Fr) -> u64 {
+fn field_to_u64<F: PrimeField>(value: &F) -> u64 {
     let bytes = value.into_bigint().to_bytes_le();
     let mut buf = [0u8; 8];
     let n = bytes.len().min(8);
@@ -1054,7 +1049,7 @@ fn fr_to_u64(value: &Fr) -> u64 {
     u64::from_le_bytes(buf)
 }
 
-async fn run_avss_offchain_client(
+async fn run_avss_offchain_client<F, G>(
     client: LocalClientIdentity,
     execution_id: ExecutionId,
     node_rpc_addrs: Vec<SocketAddr>,
@@ -1062,7 +1057,11 @@ async fn run_avss_offchain_client(
     parties: usize,
     threshold: usize,
     timeout: Duration,
-) -> LocalCoordinatorRunnerResult<Option<ClientOutputRecord>> {
+) -> LocalCoordinatorRunnerResult<Option<ClientOutputRecord>>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + Send + Sync + 'static,
+{
     tokio::time::timeout(timeout, async move {
         eprintln!(
             "[local-client {}] starting AVSS off-chain coordinator input submission",
@@ -1072,9 +1071,9 @@ async fn run_avss_offchain_client(
             .input
             .values
             .iter()
-            .map(|value| parse_input_as_field(value))
+            .map(|value| parse_input_as_field::<F>(value))
             .collect::<LocalCoordinatorRunnerResult<Vec<_>>>()?;
-        let mut coord: OffChainCoordinatorClient<Fr, FeldmanShamirShare<Fr, G1Projective>> =
+        let mut coord: OffChainCoordinatorClient<F, FeldmanShamirShare<F, G>> =
             OffChainCoordinatorClient::start_rpc_client_for_execution(
                 "127.0.0.1",
                 coord_port,
@@ -1102,7 +1101,7 @@ async fn run_avss_offchain_client(
             .iter()
             .map(|addr| (addr.ip().to_string(), addr.port()))
             .collect::<Vec<_>>();
-        let node_rpc: OffChainNodeRPCClient<Fr, FeldmanShamirShare<Fr, G1Projective>> =
+        let node_rpc: OffChainNodeRPCClient<F, FeldmanShamirShare<F, G>> =
             OffChainNodeRPCClient::start_rpc_client_for_execution(
                 parties,
                 threshold,
@@ -1141,6 +1140,44 @@ async fn run_avss_offchain_client(
     .map_err(|_| LocalCoordinatorRunnerError::Timeout(timeout))?
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn run_avss_offchain_client_for_curve(
+    curve_config: MpcCurveConfig,
+    client: LocalClientIdentity,
+    execution_id: ExecutionId,
+    node_rpc_addrs: Vec<SocketAddr>,
+    coord_port: u16,
+    parties: usize,
+    threshold: usize,
+    timeout: Duration,
+) -> LocalCoordinatorRunnerResult<Option<ClientOutputRecord>> {
+    macro_rules! run {
+        ($field:ty, $group:ty) => {
+            run_avss_offchain_client::<$field, $group>(
+                client,
+                execution_id,
+                node_rpc_addrs,
+                coord_port,
+                parties,
+                threshold,
+                timeout,
+            )
+            .await
+        };
+    }
+
+    match curve_config {
+        MpcCurveConfig::Bls12_381 => run!(ark_bls12_381::Fr, ark_bls12_381::G1Projective),
+        MpcCurveConfig::Bn254 => run!(ark_bn254::Fr, ark_bn254::G1Projective),
+        MpcCurveConfig::Curve25519 => {
+            run!(ark_curve25519::Fr, ark_curve25519::EdwardsProjective)
+        }
+        MpcCurveConfig::Ed25519 => run!(ark_ed25519::Fr, ark_ed25519::EdwardsProjective),
+        MpcCurveConfig::Secp256k1 => run!(ark_secp256k1::Fr, ark_secp256k1::Projective),
+        MpcCurveConfig::Secp256r1 => run!(ark_secp256r1::Fr, ark_secp256r1::Projective),
+    }
+}
+
 async fn reserve_mask_indices_when_ready(
     coord: &mut OffChainCoordinatorClient<Fr, RobustShare<Fr>>,
     indices: &[u64],
@@ -1161,11 +1198,15 @@ async fn reserve_mask_indices_when_ready(
     }
 }
 
-async fn reserve_avss_mask_indices_when_ready(
-    coord: &mut OffChainCoordinatorClient<Fr, FeldmanShamirShare<Fr, G1Projective>>,
+async fn reserve_avss_mask_indices_when_ready<F, G>(
+    coord: &mut OffChainCoordinatorClient<F, FeldmanShamirShare<F, G>>,
     indices: &[u64],
     timeout: Duration,
-) -> LocalCoordinatorRunnerResult<()> {
+) -> LocalCoordinatorRunnerResult<()>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + Send + Sync + 'static,
+{
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         match coord.reserve_mask_indices(indices).await {
@@ -1202,12 +1243,16 @@ async fn send_masked_input_when_ready(
     }
 }
 
-async fn send_avss_masked_input_when_ready(
-    coord: &OffChainCoordinatorClient<Fr, FeldmanShamirShare<Fr, G1Projective>>,
-    masked_input: Fr,
+async fn send_avss_masked_input_when_ready<F, G>(
+    coord: &OffChainCoordinatorClient<F, FeldmanShamirShare<F, G>>,
+    masked_input: F,
     index: u64,
     timeout: Duration,
-) -> LocalCoordinatorRunnerResult<()> {
+) -> LocalCoordinatorRunnerResult<()>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + Send + Sync + 'static,
+{
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         match coord.send_masked_input(masked_input, index).await {
@@ -1230,15 +1275,15 @@ fn coordinator_wrong_round(error: &stoffel_mpc_coordinator_shared::CoordinatorEr
         || message.contains("current round is")
 }
 
-fn parse_input_as_field(value: &str) -> LocalCoordinatorRunnerResult<Fr> {
+fn parse_input_as_field<F: PrimeField>(value: &str) -> LocalCoordinatorRunnerResult<F> {
     let value = value.trim();
     // Booleans are advertised by the CLI as valid client inputs; share them
     // as the field bits 1/0 so secret-bool gates work on them.
     if value.eq_ignore_ascii_case("true") {
-        return Ok(Fr::from(1u64));
+        return Ok(F::from(1u64));
     }
     if value.eq_ignore_ascii_case("false") {
-        return Ok(Fr::from(0u64));
+        return Ok(F::from(0u64));
     }
     if let Some(hex) = value
         .strip_prefix("0x")
@@ -1253,14 +1298,14 @@ fn parse_input_as_field(value: &str) -> LocalCoordinatorRunnerResult<Fr> {
                 "invalid hex client input '{value}': {error}"
             ))
         })?;
-        return Ok(Fr::from_be_bytes_mod_order(&bytes));
+        return Ok(F::from_be_bytes_mod_order(&bytes));
     }
     let value = value.parse::<i64>().map_err(|error| {
         LocalCoordinatorRunnerError::Configuration(format!(
             "invalid integer client input '{value}': {error}"
         ))
     })?;
-    Ok(stoffel_vm::net::field_from_i64::<Fr>(value))
+    Ok(stoffel_vm::net::field_from_i64::<F>(value))
 }
 
 enum PartyRole {
@@ -1592,6 +1637,33 @@ mod tests {
             .parties(5)
             .build()
             .expect("HoneyBadger should accept five parties");
+    }
+
+    #[test]
+    fn avss_client_inputs_accept_every_supported_curve() {
+        let curves = [
+            MpcCurveConfig::Bls12_381,
+            MpcCurveConfig::Bn254,
+            MpcCurveConfig::Curve25519,
+            MpcCurveConfig::Ed25519,
+            MpcCurveConfig::Secp256k1,
+            MpcCurveConfig::Secp256r1,
+        ];
+
+        for curve in curves {
+            let mut binary = CompiledBinary::new();
+            binary.client_io_manifest.clients = vec![ClientIoSchema {
+                client_slot: 0,
+                inputs: vec![ShareType::default_secret_int()],
+                outputs: Vec::new(),
+            }];
+            test_runner(binary)
+                .backend(MpcBackendKind::Avss)
+                .curve(curve)
+                .client_input(0, [42])
+                .build()
+                .unwrap_or_else(|error| panic!("{curve:?} must accept AVSS client input: {error}"));
+        }
     }
 
     #[test]
