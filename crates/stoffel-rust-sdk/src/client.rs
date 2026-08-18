@@ -25,6 +25,7 @@ use stoffelmpc_mpc::honeybadger::robust_interpolate::robust_interpolate::RobustS
 use stoffelnet::network_utils::Network as _;
 use stoffelnet::transports::quic::QuicNetworkManager;
 
+use crate::client_value_codec::{decode_fixed_point_value, encode_fixed_point_value};
 use crate::config::{validate_socket_address, Curve, MpcBackend, NetworkConfig, NetworkDeployment};
 use crate::consensus::VerifiedOrdering;
 use crate::error::{Error, Result};
@@ -1306,18 +1307,9 @@ fn value_to_field<F: PrimeField>(value: &Value, share_type: ShareType, curve: Cu
             validate_secret_uint_range(value, bit_length)?;
             Ok(F::from(value))
         }
-        (ShareType::SecretFixedPoint { .. }, Value::Float(value)) => {
-            encode_fixed_point::<F>(*value, share_type)
-        }
-        (ShareType::SecretFixedPoint { .. }, Value::I64(value)) => {
-            encode_fixed_point::<F>(*value as f64, share_type)
-        }
-        (ShareType::SecretFixedPoint { .. }, Value::U64(value)) => {
-            let value = i64::try_from(*value).map_err(|_| {
-                Error::InvalidInput("u64 fixed-point input exceeds i64 range".to_owned())
-            })?;
-            encode_fixed_point::<F>(value as f64, share_type)
-        }
+        (ShareType::SecretFixedPoint { precision }, value) => Ok(i64_to_field::<F>(
+            encode_fixed_point_value(value, precision)?,
+        )),
         _ => Err(Error::InvalidInput(format!(
             "value kind '{}' is not compatible with share type {share_type:?}",
             value.kind()
@@ -1363,16 +1355,6 @@ fn validate_secret_uint_range(value: u64, bit_length: usize) -> Result<()> {
             "secret unsigned integer input {value} does not fit in {bit_length} bit(s)"
         )))
     }
-}
-
-fn encode_fixed_point<F: PrimeField>(value: f64, share_type: ShareType) -> Result<F> {
-    let ShareType::SecretFixedPoint { precision } = share_type else {
-        return Err(Error::InvalidInput(format!(
-            "cannot encode fixed-point value with share type {share_type:?}"
-        )));
-    };
-    let scale = 2f64.powi(precision.fractional_bits() as i32);
-    Ok(i64_to_field::<F>((value * scale).round() as i64))
 }
 
 fn i64_to_field<F: PrimeField>(value: i64) -> F {
@@ -1424,8 +1406,7 @@ fn field_to_value<F: PrimeField>(value: F, share_type: ShareType) -> Result<Valu
         ShareType::SecretUInt { bit_length } => Ok(Value::U64(field_to_u64(value, bit_length)?)),
         ShareType::SecretFixedPoint { precision } => {
             let scaled = field_to_i64(value)?;
-            let scale = 2f64.powi(precision.fractional_bits() as i32);
-            Ok(Value::Float(scaled as f64 / scale))
+            Ok(Value::Float(decode_fixed_point_value(scaled, precision)?))
         }
     }
 }
@@ -1693,6 +1674,19 @@ mod tests {
 
         assert!(value_to_field::<Fr>(&Value::I64(-1), share_type, Curve::Bls12_381).is_err());
         assert!(value_to_field::<Fr>(&Value::U64(256), share_type, Curve::Bls12_381).is_err());
+    }
+
+    #[test]
+    fn fixed_point_values_use_semantic_manifest_encoding() -> Result<()> {
+        let share_type = ShareType::default_secret_fixed_point();
+
+        let integer = value_to_field::<Fr>(&Value::I64(1), share_type, Curve::Bls12_381)?;
+        let fractional = value_to_field::<Fr>(&Value::Float(1.5), share_type, Curve::Bls12_381)?;
+
+        assert_eq!(integer, Fr::from(65_536u64));
+        assert_eq!(fractional, Fr::from(98_304u64));
+        assert_eq!(field_to_value(fractional, share_type)?, Value::Float(1.5));
+        Ok(())
     }
 
     #[test]

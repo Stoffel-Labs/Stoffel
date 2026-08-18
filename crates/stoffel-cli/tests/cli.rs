@@ -908,6 +908,9 @@ fn run_help_exposes_mpc_network_flags() {
         .stdout(predicate::str::contains("--network"))
         .stdout(predicate::str::contains("--local"))
         .stdout(predicate::str::contains("--client-input"))
+        .stdout(predicate::str::contains(
+            "Fixed-point values are scaled automatically",
+        ))
         .stdout(predicate::str::contains("--expected-output-clients"))
         .stdout(predicate::str::contains("--expected-clients").not())
         .stdout(predicate::str::contains("--connect-timeout-ms"))

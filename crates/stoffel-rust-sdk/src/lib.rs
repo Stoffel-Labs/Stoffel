@@ -46,6 +46,7 @@
 
 pub mod backend;
 pub mod client;
+mod client_value_codec;
 pub mod compiler;
 pub mod config;
 pub mod consensus;
@@ -353,7 +354,9 @@ impl Stoffel {
     /// Attach one coordinator client input set for local networked execution.
     ///
     /// This is distinct from named function parameters. It feeds programs that
-    /// read secret client values through `ClientStore.take_share(client_slot, i)`.
+    /// read secret client values through `ClientStore`. Values are semantic:
+    /// fixed-point positions declared by the program manifest are scaled
+    /// automatically before secret sharing.
     pub fn with_client_input<V>(mut self, client_slot: u64, values: &[V]) -> Self
     where
         V: Clone + Into<Value>,

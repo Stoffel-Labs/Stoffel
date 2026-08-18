@@ -278,7 +278,9 @@ impl StoffelRuntime {
         Ok(self)
     }
 
-    /// Add one coordinator client input set for local networked execution.
+    /// Add one semantic coordinator client input set for local networked execution.
+    /// Fixed-point positions declared by the program manifest are scaled
+    /// automatically before secret sharing.
     pub fn with_client_input<V>(mut self, client_slot: u64, values: &[V]) -> Self
     where
         V: Clone + Into<Value>,

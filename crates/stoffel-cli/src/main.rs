@@ -290,7 +290,8 @@ struct RunArgs {
     /// Load named function inputs from a .json, .csv, or .txt file.
     #[arg(long = "input-file", value_name = "FILE")]
     input_files: Vec<PathBuf>,
-    /// Local simulation input for a numeric client slot, written as SLOT=VALUE.
+    /// Semantic input for a numeric client slot, written as SLOT=VALUE.
+    /// Fixed-point values are scaled automatically from ordinary integers or decimals.
     #[arg(
         long = "client-input",
         visible_alias = "client-inputs",
@@ -430,7 +431,8 @@ struct DevArgs {
     /// Load named function inputs from a .json, .csv, or .txt file.
     #[arg(long = "input-file", value_name = "FILE")]
     input_files: Vec<PathBuf>,
-    /// Local simulation input for a numeric client slot, written as SLOT=VALUE.
+    /// Semantic input for a numeric client slot, written as SLOT=VALUE.
+    /// Fixed-point values are scaled automatically from ordinary integers or decimals.
     #[arg(
         long = "client-input",
         visible_alias = "client-inputs",
@@ -631,7 +633,7 @@ impl std::str::FromStr for ClientInputArg {
         }
         if value.contains('=') {
             anyhow::bail!(
-                "client input '{raw}' has more than one '='. Write one client input per flag as --client-input {client_slot}=<value>; values must be integers, booleans, or 0x-prefixed hex bytes."
+                "client input '{raw}' has more than one '='. Write one client input per flag as --client-input {client_slot}=<value>; values may be integers, fixed-point decimals, booleans, or 0x-prefixed hex bytes."
             );
         }
         Ok(Self {
