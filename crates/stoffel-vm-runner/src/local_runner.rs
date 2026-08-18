@@ -8,7 +8,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use ark_bls12_381::Fr;
 use ark_ec::CurveGroup;
-use ark_ff::{BigInteger, PrimeField};
+use ark_ff::PrimeField;
 use stoffel_mpc_coordinator_off_chain::tests::fake_coord::{
     HoneyBadgerCoordinatorConnection, HoneyBadgerCoordinatorRPCServerSharedBase,
 };
@@ -1039,14 +1039,32 @@ async fn run_honeybadger_offchain_client(
     .map_err(|_| LocalCoordinatorRunnerError::Timeout(timeout))?
 }
 
-/// Reduce a field element to its low 64 bits (exact for the small values —
-/// bits, bytes — that client outputs carry in these examples).
+/// Preserve small signed field values in a `u64` wire slot.
+///
+/// Positive values retain their ordinary `u64` representation. Negative field
+/// values use the corresponding two's-complement `i64` bits so the manifest-
+/// aware SDK can decode signed integer and fixed-point client outputs without
+/// losing the sign at this lower-level runner boundary.
 fn field_to_u64<F: PrimeField>(value: &F) -> u64 {
-    let bytes = value.into_bigint().to_bytes_le();
-    let mut buf = [0u8; 8];
-    let n = bytes.len().min(8);
-    buf[..n].copy_from_slice(&bytes[..n]);
-    u64::from_le_bytes(buf)
+    let positive = value.into_bigint();
+    if positive.as_ref()[1..].iter().all(|limb| *limb == 0) {
+        return positive.as_ref()[0];
+    }
+
+    let negative = (-*value).into_bigint();
+    if negative.as_ref()[1..].iter().all(|limb| *limb == 0)
+        && negative.as_ref()[0] <= i64::MAX as u64 + 1
+    {
+        let magnitude = negative.as_ref()[0];
+        let signed = if magnitude == i64::MAX as u64 + 1 {
+            i64::MIN
+        } else {
+            -(magnitude as i64)
+        };
+        return signed as u64;
+    }
+
+    positive.as_ref()[0]
 }
 
 async fn run_avss_offchain_client<F, G>(
@@ -1574,6 +1592,14 @@ mod tests {
             instructions: Vec::new(),
         });
         LocalCoordinatorRunner::builder("/bin/sh", binary)
+    }
+
+    #[test]
+    fn client_output_wire_value_preserves_small_signed_field_values() {
+        type Fr = ark_bls12_381::Fr;
+
+        assert_eq!(field_to_u64(&Fr::from(98_304u64)), 98_304);
+        assert_eq!(field_to_u64(&-Fr::from(32_768u64)) as i64, -32_768);
     }
 
     #[test]

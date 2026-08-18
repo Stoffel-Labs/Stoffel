@@ -8,8 +8,10 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use crate::client_value_codec::{decode_fixed_point_value, encode_fixed_point_value};
 use crate::config::MpcBackend;
 use crate::error::{Error, Result};
+use crate::program::Program;
 use crate::runtime::StoffelRuntime;
 use crate::types::Value;
 use stoffel_vm_types::core_types::{ShareDataFormat, ShareType, TableRef, Value as VmValue};
@@ -271,16 +273,15 @@ fn value_is_set(value: &Value) -> bool {
 
 /// Decode one reconstructed field value into a typed SDK [`Value`] using the
 /// share type the manifest declared for that output position.
-fn decode_client_output_value(raw: u64, share_type: ShareType) -> Value {
-    match share_type {
+fn decode_client_output_value(raw: u64, share_type: ShareType) -> Result<Value> {
+    Ok(match share_type {
         ShareType::SecretInt { bit_length: 1 } => Value::Bool(raw != 0),
         ShareType::SecretInt { .. } => Value::I64(raw as i64),
         ShareType::SecretUInt { .. } => Value::U64(raw),
         ShareType::SecretFixedPoint { precision } => {
-            let scale = (1u128 << precision.fractional_bits()) as f64;
-            Value::Float((raw as i64) as f64 / scale)
+            Value::Float(decode_fixed_point_value(raw as i64, precision)?)
         }
-    }
+    })
 }
 
 pub(crate) async fn execute_local_with_options(
@@ -374,18 +375,8 @@ async fn execute_local_details_with_options(
         .ok_or_else(|| Error::Configuration("MPC configuration is required".to_owned()))?;
     let flattened_client_inputs = flatten_local_client_inputs(runtime.client_inputs())?;
     validate_flattened_local_client_inputs(runtime, &flattened_client_inputs)?;
-    let local_client_inputs = flattened_client_inputs
-        .iter()
-        .map(|(client_slot, values)| {
-            Ok(stoffel_vm_runner::LocalClientInput::raw(
-                *client_slot,
-                values
-                    .iter()
-                    .map(local_client_input_value)
-                    .collect::<Result<Vec<_>>>()?,
-            ))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let local_client_inputs =
+        local_client_inputs_for_runner(runtime.program(), &flattened_client_inputs)?;
     let runner_path = resolve_stoffel_run_binary(
         options
             .runner_path
@@ -487,16 +478,16 @@ async fn execute_local_details_with_options(
                 .enumerate()
                 .map(|(index, &raw)| match output_types.get(index) {
                     Some(share_type) => decode_client_output_value(raw, *share_type),
-                    None => Value::U64(raw),
+                    None => Ok(Value::U64(raw)),
                 })
-                .collect();
-            LocalClientOutput {
+                .collect::<Result<Vec<_>>>()?;
+            Ok(LocalClientOutput {
                 client_slot: record.client_slot,
                 values: typed,
                 raw: record.values.clone(),
-            }
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>>>()?;
     Ok(LocalExecutionDetails {
         values,
         program_output,
@@ -619,19 +610,54 @@ fn flatten_local_client_input_value(value: &Value, out: &mut Vec<Value>) -> Resu
     }
 }
 
-fn local_client_input_value(value: &Value) -> Result<String> {
-    match value {
-        Value::I64(value) => Ok(value.to_string()),
-        Value::U64(value) if i64::try_from(*value).is_ok() => Ok(value.to_string()),
-        Value::U64(value) => Ok(format!("0x{value:x}")),
-        Value::Bool(value) => Ok(if *value { "1" } else { "0" }.to_owned()),
-        Value::Bytes(value) => Ok(format!("0x{}", hex_encode(value))),
-        Value::Float(_) | Value::String(_) | Value::List(_) | Value::Object(_) | Value::Unit => {
-            Err(Error::InvalidInput(
-                "local coordinator client inputs support integers, booleans, 0x-prefixed hex bytes, and lists of those values"
-                    .to_owned(),
+fn local_client_inputs_for_runner(
+    program: &Program,
+    inputs: &[(u64, Vec<Value>)],
+) -> Result<Vec<stoffel_vm_runner::LocalClientInput>> {
+    inputs
+        .iter()
+        .map(|(client_slot, values)| {
+            let input_types = program
+                .client(*client_slot)
+                .map(|client| client.inputs())
+                .unwrap_or(&[]);
+            let encoded = values
+                .iter()
+                .enumerate()
+                .map(|(index, value)| {
+                    local_client_input_value(value, input_types.get(index).copied())
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(stoffel_vm_runner::LocalClientInput::raw(
+                *client_slot,
+                encoded,
             ))
+        })
+        .collect()
+}
+
+fn local_client_input_value(value: &Value, share_type: Option<ShareType>) -> Result<String> {
+    match (share_type, value) {
+        (Some(ShareType::SecretFixedPoint { precision }), value) => {
+            Ok(encode_fixed_point_value(value, precision)?.to_string())
         }
+        (_, Value::I64(value)) => Ok(value.to_string()),
+        (_, Value::U64(value)) if i64::try_from(*value).is_ok() => Ok(value.to_string()),
+        (_, Value::U64(value)) => Ok(format!("0x{value:x}")),
+        (_, Value::Bool(value)) => Ok(if *value { "1" } else { "0" }.to_owned()),
+        (_, Value::Bytes(value)) => Ok(format!("0x{}", hex_encode(value))),
+        (Some(share_type), value) => Err(Error::InvalidInput(format!(
+            "local client input kind '{}' is not compatible with manifest share type {share_type:?}",
+            value.kind()
+        ))),
+        (None, Value::Float(_))
+        | (None, Value::String(_))
+        | (None, Value::List(_))
+        | (None, Value::Object(_))
+        | (None, Value::Unit) => Err(Error::InvalidInput(
+            "local coordinator client inputs without manifest types support integers, booleans, 0x-prefixed hex bytes, and lists of those values"
+                .to_owned(),
+        )),
     }
 }
 
@@ -1021,9 +1047,10 @@ fn sdk_value_from_vm_value(
 #[cfg(test)]
 mod tests {
     use super::{
-        find_binary_in_path, local_program_output_without_return_markers,
-        parse_runner_return_value, path_is_under, target_profile_dir_from_exe,
-        validate_party_share_returns, LocalPartyExecutionDetails, OpaqueShare,
+        decode_client_output_value, find_binary_in_path, local_client_inputs_for_runner,
+        local_program_output_without_return_markers, parse_runner_return_value, path_is_under,
+        target_profile_dir_from_exe, validate_party_share_returns, LocalPartyExecutionDetails,
+        OpaqueShare,
     };
     use crate::types::Value;
     use std::path::PathBuf;
@@ -1051,6 +1078,53 @@ mod tests {
                 returned_shares: vec![share],
             },
         )
+    }
+
+    #[test]
+    fn local_client_inputs_use_manifest_fixed_point_precision() -> crate::Result<()> {
+        let runtime = crate::Stoffel::compile(
+            r#"
+def main() -> int64:
+  var num_elements: int64 = 2
+  var num_clients: int64 = 2
+  var element_index: int64 = 0
+  while element_index < num_elements:
+    discard ClientStore.take_share_fixed(0, element_index)
+    var client_index: int64 = 1
+    while client_index < num_clients:
+      discard ClientStore.take_share_fixed(client_index, element_index)
+      client_index += 1
+    element_index += 1
+  return 0
+"#,
+        )?
+        .build()?;
+        let inputs = vec![
+            (0, vec![Value::I64(0), Value::I64(0)]),
+            (1, vec![Value::I64(1), Value::I64(1)]),
+        ];
+
+        let encoded = local_client_inputs_for_runner(runtime.program(), &inputs)?;
+
+        assert_eq!(encoded.len(), 2);
+        assert_eq!(encoded[0].values, vec!["0", "0"]);
+        assert_eq!(encoded[1].values, vec!["65536", "65536"]);
+        Ok(())
+    }
+
+    #[test]
+    fn local_fixed_point_client_outputs_decode_semantically() -> crate::Result<()> {
+        let share_type = ShareType::default_secret_fixed_point();
+
+        assert_eq!(
+            decode_client_output_value(98_304, share_type)?,
+            Value::Float(1.5)
+        );
+        assert_eq!(
+            decode_client_output_value((-32_768_i64) as u64, share_type)?,
+            Value::Float(-0.5)
+        );
+        Ok(())
     }
 
     #[test]
