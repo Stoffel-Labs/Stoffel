@@ -23,7 +23,9 @@ use stoffel_mpc_coordinator_shared::{
     Coordinator, ExecutionId as CoordinatorExecutionId, NodeRPCError, Round,
 };
 use stoffel_vm::core_vm::{VirtualMachine, VmCooperativeExecutionMetrics};
-use stoffel_vm::net::curve::{field_from_i64, field_to_i64, SupportedMpcField};
+use stoffel_vm::net::curve::{
+    field_from_i64, field_to_clear_share_value, field_to_i64, SupportedMpcField,
+};
 use stoffel_vm::net::engine_config::DeploymentMode;
 use stoffel_vm::net::hb_engine::{HoneyBadgerMpcEngine, StandingPreprocAction};
 use stoffel_vm::net::mpc_engine::{
@@ -53,10 +55,11 @@ use stoffel_vm_runner::{
     StandingExecutionHandler, StandingNodeControl, StandingProgram, StandingProgramCatalog,
 };
 use stoffel_vm_types::compiled_binary::{
-    BinaryError, ClientIoManifest, CompiledBinary, MPC_BACKEND_MANIFEST_FORMAT_VERSION,
-    MPC_CURVE_MANIFEST_FORMAT_VERSION,
+    BinaryError, ClientIoManifest, ClientIoSchema, CompiledBinary,
+    MPC_BACKEND_MANIFEST_FORMAT_VERSION, MPC_CURVE_MANIFEST_FORMAT_VERSION,
 };
-use stoffel_vm_types::core_types::{ShareType, TableRef, Value};
+use stoffel_vm_types::core_types::{ClearShareValue, ShareType, TableRef, Value};
+use stoffel_vm_types::fixed_point_codec::{encode_fixed_point_float, encode_fixed_point_integer};
 use stoffelmpc_mpc::avss_mpc::input::AvssInputError;
 #[cfg(feature = "statistics")]
 use stoffelmpc_mpc::avss_mpc::statistics::NodeStatisticsCounters as AvssNodeStatisticsCounters;
@@ -944,10 +947,242 @@ fn spawn_standing_mesh_reconnect_loop(
         }
     })
 }
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 enum CoordinatorOutputFormat {
     FieldInteger,
     FixedPoint { fractional_bits: usize },
+    Manifest(Vec<ShareType>),
+}
+
+#[derive(Debug, Clone)]
+struct ClientManifestSemantics {
+    client_slot: u64,
+    inputs: Vec<ShareType>,
+    outputs: Vec<ShareType>,
+}
+
+fn load_client_manifest_semantics(
+    program_path: &Path,
+    requested_slot: Option<u64>,
+    reserved_input_index: Option<u64>,
+    input_count: usize,
+    requested_output_count: Option<usize>,
+) -> Result<ClientManifestSemantics, String> {
+    let file = File::open(program_path).map_err(|error| {
+        format!(
+            "failed to open client program '{}': {error}",
+            program_path.display()
+        )
+    })?;
+    let binary = CompiledBinary::deserialize(&mut BufReader::new(file)).map_err(|error| {
+        format!(
+            "failed to load client program manifest '{}': {error:?}",
+            program_path.display()
+        )
+    })?;
+    let clients = &binary.client_io_manifest.clients;
+    if clients.is_empty() {
+        return Err(format!(
+            "program '{}' has no client-I/O manifest",
+            program_path.display()
+        ));
+    }
+
+    let schema = match requested_slot {
+        Some(slot) => clients
+            .iter()
+            .find(|schema| schema.client_slot == slot)
+            .ok_or_else(|| {
+                let available = manifest_client_slots(clients);
+                format!(
+                    "client slot {slot} is absent from program '{}'; available slots: {available}",
+                    program_path.display()
+                )
+            })?,
+        None if reserved_input_index.is_some() && input_count > 0 => {
+            let reserved_input_index = reserved_input_index.expect("checked above");
+            client_schema_for_reserved_index(clients, reserved_input_index).ok_or_else(|| {
+                format!(
+                    "coordinator input index {reserved_input_index} is not the start of a client input range in '{}'; pass --client-slot <slot>",
+                    program_path.display()
+                )
+            })?
+        }
+        None => {
+            let candidates = clients
+                .iter()
+                .filter(|schema| {
+                    schema.inputs.len() == input_count
+                        && requested_output_count.is_none_or(|count| schema.outputs.len() == count)
+                })
+                .collect::<Vec<_>>();
+            match candidates.as_slice() {
+                [schema] => *schema,
+                [] if clients.len() == 1 => &clients[0],
+                [] => {
+                    return Err(format!(
+                        "no client schema in '{}' matches {input_count} input(s){}; pass --client-slot <slot>",
+                        program_path.display(),
+                        requested_output_count
+                            .map(|count| format!(" and {count} output(s)"))
+                            .unwrap_or_default()
+                    ));
+                }
+                _ => {
+                    let slots = candidates
+                        .iter()
+                        .map(|schema| schema.client_slot.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ");
+                    return Err(format!(
+                        "client schema is ambiguous in '{}'; matching slots are {slots}. Pass --client-slot <slot>",
+                        program_path.display()
+                    ));
+                }
+            }
+        }
+    };
+
+    if schema.inputs.len() != input_count {
+        return Err(format!(
+            "client slot {} expects {} input value(s) from the program manifest, got {input_count}",
+            schema.client_slot,
+            schema.inputs.len()
+        ));
+    }
+    if let Some(output_count) = requested_output_count {
+        if schema.outputs.len() != output_count {
+            return Err(format!(
+                "client slot {} expects {} output value(s) from the program manifest, but --outputs requested {output_count}",
+                schema.client_slot,
+                schema.outputs.len()
+            ));
+        }
+    }
+
+    Ok(ClientManifestSemantics {
+        client_slot: schema.client_slot,
+        inputs: schema.inputs.clone(),
+        outputs: schema.outputs.clone(),
+    })
+}
+
+fn client_schema_for_reserved_index(
+    clients: &[ClientIoSchema],
+    reserved_input_index: u64,
+) -> Option<&ClientIoSchema> {
+    let mut ordered = clients.iter().collect::<Vec<_>>();
+    ordered.sort_unstable_by_key(|schema| schema.client_slot);
+    let mut next_index = 0_u64;
+    for schema in ordered {
+        if !schema.inputs.is_empty() && next_index == reserved_input_index {
+            return Some(schema);
+        }
+        next_index = next_index.checked_add(u64::try_from(schema.inputs.len()).ok()?)?;
+    }
+    None
+}
+
+fn manifest_client_slots(clients: &[ClientIoSchema]) -> String {
+    clients
+        .iter()
+        .map(|schema| schema.client_slot.to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn semantic_client_input_count(inputs: Option<&str>) -> usize {
+    inputs
+        .filter(|inputs| !inputs.trim().is_empty())
+        .map(|inputs| inputs.split(',').count())
+        .unwrap_or(0)
+}
+
+fn encode_manifest_client_inputs(
+    inputs: Option<&str>,
+    share_types: &[ShareType],
+) -> Result<Option<String>, String> {
+    let values = inputs
+        .filter(|inputs| !inputs.trim().is_empty())
+        .map(|inputs| inputs.split(',').map(str::trim).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if values.len() != share_types.len() {
+        return Err(format!(
+            "program manifest expects {} client input value(s), got {}",
+            share_types.len(),
+            values.len()
+        ));
+    }
+    if values.is_empty() {
+        return Ok(None);
+    }
+
+    values
+        .into_iter()
+        .zip(share_types)
+        .enumerate()
+        .map(|(index, (value, share_type))| {
+            encode_manifest_client_input(value, *share_type)
+                .map_err(|error| format!("client input {index}: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()
+        .map(|values| Some(values.join(",")))
+}
+
+fn encode_manifest_client_input(value: &str, share_type: ShareType) -> Result<String, String> {
+    match share_type {
+        ShareType::SecretFixedPoint { precision } => {
+            if value.starts_with("0x") || value.starts_with("0X") {
+                return Err(
+                    "fixed-point inputs must be ordinary integers or decimals; use --raw-client-io for an encoded field value"
+                        .to_owned(),
+                );
+            }
+            let encoded = match value.parse::<i128>() {
+                Ok(integer) => encode_fixed_point_integer(integer, precision),
+                Err(_) => {
+                    let value = value
+                        .parse::<f64>()
+                        .map_err(|_| format!("invalid fixed-point value '{value}'"))?;
+                    encode_fixed_point_float(value, precision)
+                }
+            };
+            encoded
+                .map_err(|error| error.to_string())
+                .map(|encoded| encoded.to_string())
+        }
+        ShareType::SecretInt { bit_length: 1 } => match value {
+            "true" => Ok("1".to_owned()),
+            "false" => Ok("0".to_owned()),
+            value => value
+                .parse::<i64>()
+                .map(|value| i64::from(value != 0).to_string())
+                .map_err(|_| format!("invalid boolean value '{value}'")),
+        },
+        ShareType::SecretInt { .. } => {
+            if value.starts_with("0x") || value.starts_with("0X") {
+                return Ok(value.to_owned());
+            }
+            value
+                .parse::<i64>()
+                .map(|value| value.to_string())
+                .map_err(|_| format!("invalid signed integer value '{value}'"))
+        }
+        ShareType::SecretUInt { bit_length } => {
+            if value.starts_with("0x") || value.starts_with("0X") {
+                return Ok(value.to_owned());
+            }
+            let value = value
+                .parse::<u64>()
+                .map_err(|_| format!("invalid unsigned integer value '{value}'"))?;
+            if bit_length < u64::BITS as usize && value >= (1_u64 << bit_length) {
+                return Err(format!(
+                    "unsigned value {value} does not fit the declared {bit_length}-bit range"
+                ));
+            }
+            Ok(value.to_string())
+        }
+    }
 }
 fn render_fixed_point_i64(scaled: i64, fractional_bits: usize) -> Option<String> {
     let scale = 1_i128.checked_shl(u32::try_from(fractional_bits).ok()?)?;
@@ -983,31 +1218,53 @@ fn render_fixed_point_i64(scaled: i64, fractional_bits: usize) -> Option<String>
         format!("{whole}.{fractional}")
     })
 }
-fn format_coordinator_outputs<F>(outputs: &[F], output_format: CoordinatorOutputFormat) -> String
+fn format_coordinator_outputs<F>(outputs: &[F], output_format: &CoordinatorOutputFormat) -> String
 where
     F: PrimeField + Copy + PartialEq + std::fmt::Debug,
 {
     let rendered = outputs
         .iter()
         .copied()
-        .map(|output| match (field_to_i64(output), output_format) {
-            (Ok(signed), CoordinatorOutputFormat::FieldInteger)
-                if field_from_i64::<F>(signed) == output =>
-            {
-                signed.to_string()
-            }
-            (Ok(signed), CoordinatorOutputFormat::FixedPoint { fractional_bits })
-                if field_from_i64::<F>(signed) == output =>
-            {
-                render_fixed_point_i64(signed, fractional_bits)
-                    .unwrap_or_else(|| format!("{output:?}"))
-            }
-            _ => format!("{output:?}"),
-        })
+        .enumerate()
+        .map(
+            |(index, output)| match (field_to_i64(output), output_format) {
+                (Ok(signed), CoordinatorOutputFormat::FieldInteger)
+                    if field_from_i64::<F>(signed) == output =>
+                {
+                    signed.to_string()
+                }
+                (Ok(signed), CoordinatorOutputFormat::FixedPoint { fractional_bits })
+                    if field_from_i64::<F>(signed) == output =>
+                {
+                    render_fixed_point_i64(signed, *fractional_bits)
+                        .unwrap_or_else(|| format!("{output:?}"))
+                }
+                (_, CoordinatorOutputFormat::Manifest(output_types)) => output_types
+                    .get(index)
+                    .and_then(|share_type| format_manifest_client_output(output, *share_type))
+                    .unwrap_or_else(|| format!("{output:?}")),
+                _ => format!("{output:?}"),
+            },
+        )
         .collect::<Vec<_>>()
         .join(", ");
 
     format!("[{}]", rendered)
+}
+
+fn format_manifest_client_output<F>(output: F, share_type: ShareType) -> Option<String>
+where
+    F: PrimeField + Copy,
+{
+    match field_to_clear_share_value(share_type, output).ok()? {
+        ClearShareValue::Integer(value) => Some(value.to_string()),
+        ClearShareValue::UnsignedInteger(value) => Some(value.to_string()),
+        ClearShareValue::Boolean(value) => Some(value.to_string()),
+        ClearShareValue::FixedPoint(_) => {
+            let precision = share_type.precision()?;
+            render_fixed_point_i64(field_to_i64(output).ok()?, precision.fractional_bits())
+        }
+    }
 }
 trait ReservedMaskIndices {
     fn into_reserved_indices(self) -> Vec<u64>;
@@ -2395,6 +2652,7 @@ struct ClientProtocolConfig {
     client_index: u8,
     local_position: usize,
     curve_config: MpcCurveConfig,
+    output_format: CoordinatorOutputFormat,
 }
 /// Number of distinct, successfully processed mask-share senders that proves
 /// an input client has initiated its masked-input broadcast.
@@ -2537,13 +2795,18 @@ async fn run_hb_client_protocol_for_curve<F: PrimeField>(
                 if expects_output {
                     if let Some(outputs) = mpc_client.output.get_output() {
                         let output_hex = field_outputs_to_hex(&outputs, config.curve_config);
-                        println!("Client output: field[{}] 0x{}", outputs.len(), output_hex);
+                        if matches!(&config.output_format, CoordinatorOutputFormat::Manifest(_)) {
+                            eprintln!(
+                                "[client {mpc_cid}] raw output: field[{}] 0x{}",
+                                outputs.len(),
+                                output_hex
+                            );
+                        } else {
+                            println!("Client output: field[{}] 0x{}", outputs.len(), output_hex);
+                        }
                         println!(
                             "outputs: {}",
-                            format_coordinator_outputs(
-                                &outputs,
-                                CoordinatorOutputFormat::FieldInteger,
-                            )
+                            format_coordinator_outputs(&outputs, &config.output_format,)
                         );
                         eprintln!(
                             "[client {}] Reconstructed {} output value(s)",
@@ -2672,13 +2935,18 @@ where
                 if expects_output {
                     if let Some(outputs) = mpc_client.output.get_output() {
                         let output_hex = field_outputs_to_hex(&outputs, config.curve_config);
-                        println!("Client output: field[{}] 0x{}", outputs.len(), output_hex);
+                        if matches!(&config.output_format, CoordinatorOutputFormat::Manifest(_)) {
+                            eprintln!(
+                                "[client {mpc_cid}] raw output: field[{}] 0x{}",
+                                outputs.len(),
+                                output_hex
+                            );
+                        } else {
+                            println!("Client output: field[{}] 0x{}", outputs.len(), output_hex);
+                        }
                         println!(
                             "outputs: {}",
-                            format_coordinator_outputs(
-                                &outputs,
-                                CoordinatorOutputFormat::FieldInteger,
-                            )
+                            format_coordinator_outputs(&outputs, &config.output_format,)
                         );
                         return Ok(());
                     }
@@ -2767,6 +3035,7 @@ async fn run_as_client(
     mpc_curve: Option<&str>,
     client_inputs: Option<String>,
     client_outputs: Option<usize>,
+    output_format: CoordinatorOutputFormat,
     server_addrs: Vec<SocketAddr>,
     cert_der: Option<Vec<u8>>,
     key_der: Option<Vec<u8>>,
@@ -3057,6 +3326,7 @@ async fn run_as_client(
                 client_index,
                 local_position,
                 curve_config,
+                output_format: output_format.clone(),
             };
             tokio::spawn(async move {
                 run_hb_client_for_curve(
@@ -3080,6 +3350,7 @@ async fn run_as_client(
                 client_index,
                 local_position,
                 curve_config,
+                output_format,
             };
             tokio::spawn(async move {
                 run_avss_client_for_curve(
@@ -3238,7 +3509,7 @@ async fn run_avss_offchain_coordinator_client_for_curve<F, G>(
         let (outputs, _output_client_routes) = tokio::join!(output_wait, route_wait);
         println!(
             "outputs: {}",
-            format_coordinator_outputs(&outputs, output_format)
+            format_coordinator_outputs(&outputs, &output_format)
         );
         return;
     }
@@ -3341,7 +3612,7 @@ async fn run_avss_offchain_coordinator_client_for_curve<F, G>(
     };
     println!(
         "outputs: {}",
-        format_coordinator_outputs(&outputs, output_format)
+        format_coordinator_outputs(&outputs, &output_format)
     );
 }
 async fn run_avss_offchain_coordinator_client(args: AvssOffchainCoordinatorClientArgs) {
@@ -3467,7 +3738,7 @@ async fn run_hb_coordinator_client_for_field<F>(
         let (outputs, _output_client_routes) = tokio::join!(output_wait, route_wait);
         println!(
             "outputs: {}",
-            format_coordinator_outputs(&outputs, output_format)
+            format_coordinator_outputs(&outputs, &output_format)
         );
         return;
     }
@@ -3571,7 +3842,7 @@ async fn run_hb_coordinator_client_for_field<F>(
     };
     println!(
         "outputs: {}",
-        format_coordinator_outputs(&outputs, output_format)
+        format_coordinator_outputs(&outputs, &output_format)
     );
 }
 #[allow(clippy::too_many_arguments)]
@@ -6669,6 +6940,10 @@ async fn main() {
     }
 
     let raw_args = env::args().skip(1).collect::<Vec<_>>();
+    let leading_program_path = raw_args
+        .first()
+        .filter(|argument| !argument.starts_with("--"))
+        .map(PathBuf::from);
 
     if let Some(index) = raw_args.iter().position(|arg| arg == "--print-program-id") {
         let path = raw_args.get(index + 1).unwrap_or_else(|| {
@@ -6758,6 +7033,9 @@ async fn main() {
     let mut threshold: Option<usize> = None;
     let mut client_inputs: Option<String> = None;
     let mut client_outputs: Option<usize> = None;
+    let mut client_program = leading_program_path;
+    let mut client_manifest_slot: Option<u64> = None;
+    let mut raw_client_io = false;
     let mut output_fixed_point_fractional_bits: Option<usize> = None;
     let mut expected_client_count: Option<usize> = None;
     let mut client_input_count: usize = 1;
@@ -6802,6 +7080,8 @@ async fn main() {
             as_leader = true;
         } else if arg == "--client" {
             as_client = true;
+        } else if arg == "--raw-client-io" {
+            raw_client_io = true;
         } else if arg == "--one-off" {
             one_off = true;
         } else if arg == "--nat" {
@@ -6815,6 +7095,8 @@ async fn main() {
         } else if let Some(_rest) = arg.strip_prefix("--threshold") {
         } else if let Some(_rest) = arg.strip_prefix("--inputs") {
         } else if let Some(_rest) = arg.strip_prefix("--outputs") {
+        } else if let Some(_rest) = arg.strip_prefix("--program") {
+        } else if let Some(_rest) = arg.strip_prefix("--client-slot") {
         } else if let Some(_rest) = arg.strip_prefix("--output-fixed-point-fractional-bits") {
         } else if let Some(_rest) = arg.strip_prefix("--wait-for-clients") {
         } else if let Some(_rest) = arg.strip_prefix("--client-input-count") {
@@ -6892,6 +7174,16 @@ async fn main() {
             "--outputs" => {
                 if let Some(v) = args_iter.next() {
                     client_outputs = Some(v.parse().expect("Invalid --outputs"));
+                }
+            }
+            "--program" => {
+                if let Some(v) = args_iter.next() {
+                    client_program = Some(PathBuf::from(v));
+                }
+            }
+            "--client-slot" => {
+                if let Some(v) = args_iter.next() {
+                    client_manifest_slot = Some(v.parse().expect("Invalid --client-slot"));
                 }
             }
             "--output-fixed-point-fractional-bits" => {
@@ -7073,7 +7365,7 @@ async fn main() {
         }
     }
 
-    let coordinator_output_format = match output_fixed_point_fractional_bits {
+    let mut coordinator_output_format = match output_fixed_point_fractional_bits {
         Some(bits) => {
             if bits > 62 {
                 eprintln!("Error: --output-fixed-point-fractional-bits must be <= 62");
@@ -7141,6 +7433,37 @@ async fn main() {
 
     // Client mode: connect to MPC servers and provide inputs
     if as_client {
+        if client_manifest_slot.is_some() && client_program.is_none() {
+            eprintln!("Error: --client-slot requires --program <compiled.stflb>");
+            exit(2);
+        }
+        if let Some(program_path) = client_program.as_deref().filter(|_| !raw_client_io) {
+            let semantics = load_client_manifest_semantics(
+                program_path,
+                client_manifest_slot,
+                coordinator_client_index,
+                semantic_client_input_count(client_inputs.as_deref()),
+                client_outputs,
+            )
+            .unwrap_or_else(|error| {
+                eprintln!("Error: {error}");
+                exit(2);
+            });
+            client_inputs =
+                encode_manifest_client_inputs(client_inputs.as_deref(), &semantics.inputs)
+                    .unwrap_or_else(|error| {
+                        eprintln!("Error: {error}");
+                        exit(2);
+                    });
+            client_outputs = Some(semantics.outputs.len());
+            coordinator_output_format = CoordinatorOutputFormat::Manifest(semantics.outputs);
+            eprintln!(
+                "[client] using semantic client I/O from {} for manifest slot {}",
+                program_path.display(),
+                semantics.client_slot
+            );
+        }
+
         if coord_addr.is_some()
             && contract_addr.is_none()
             && mpc_backend.as_deref().is_some_and(|backend| {
@@ -7240,6 +7563,7 @@ async fn main() {
                 mpc_curve.as_deref(),
                 client_inputs,
                 client_outputs,
+                coordinator_output_format,
                 server_addrs,
                 cert_der,
                 key_der,
@@ -8453,6 +8777,12 @@ Flags:
   --mpc-curve <name>      MPC curve: bls12-381 (default), bn254, curve25519, ed25519;
                           AVSS also supports secp256k1 and p-256
   --inputs <values>       Comma-separated input values (client mode)
+  --program <path>        Compiled program used to translate client inputs and outputs
+                          according to its client-I/O manifest (client mode)
+  --client-slot <u64>     Manifest client slot. Usually inferred from --client-index
+                          and the manifest's per-client input ranges
+  --raw-client-io         Treat --inputs and reconstructed outputs as raw field values,
+                          bypassing --program semantics
   --outputs <n>           Number of output field elements to reconstruct (client mode)
   --output-fixed-point-fractional-bits <n>
                           Decode coordinator client outputs as fixed-point values
@@ -8539,14 +8869,14 @@ Examples:
 
   # Client mode: provide inputs to the MPC network
   # Note: clients connect directly to party servers, not the bootnode
-  stoffel-run --client --inputs 10,20 --servers 127.0.0.1:10000,127.0.0.1:9002,127.0.0.1:9003,127.0.0.1:9004,127.0.0.1:9005 --n-parties 5
-  stoffel-run --client --inputs 30,40 --servers 127.0.0.1:10000,127.0.0.1:9002,127.0.0.1:9003,127.0.0.1:9004,127.0.0.1:9005 --n-parties 5
+  stoffel-run --client --program program.stflb --client-slot 0 --inputs 10,20 --servers 127.0.0.1:10000,127.0.0.1:9002,127.0.0.1:9003,127.0.0.1:9004,127.0.0.1:9005 --n-parties 5
+  stoffel-run --client --program program.stflb --client-slot 1 --inputs 30,40 --servers 127.0.0.1:10000,127.0.0.1:9002,127.0.0.1:9003,127.0.0.1:9004,127.0.0.1:9005 --n-parties 5
 
   # Docker example with client inputs:
   # Start parties with expected-client-count:
   # docker run ... -e STOFFEL_EXPECTED_CLIENT_COUNT=2 stoffelvm:latest
   # Then run clients connecting to the party servers:
-  stoffel-run --client --inputs 42 --servers 172.18.0.2:9000,172.18.0.3:9000,172.18.0.4:9000,172.18.0.5:9000,172.18.0.6:9000 --n-parties 5
+  stoffel-run --client --program /app/programs/program.stflb --client-slot 0 --inputs 42 --servers 172.18.0.2:9000,172.18.0.3:9000,172.18.0.4:9000,172.18.0.5:9000,172.18.0.6:9000 --n-parties 5
 "#
     );
     exit(1);
@@ -8557,13 +8887,14 @@ mod tests {
     use super::{
         band_pow2, bind_admitted_client_slots, canonical_mask_reservation_runs,
         checked_client_input_total, client_input_completion_quorum, client_input_setup_plan,
-        client_output_slot_map, client_transport_recipient, coordinator_execution_already_retired,
-        decode_preprocessing_exchange, direct_client_inbound_message,
+        client_output_slot_map, client_schema_for_reserved_index, client_transport_recipient,
+        coordinator_execution_already_retired, decode_preprocessing_exchange,
+        direct_client_inbound_message, encode_manifest_client_inputs,
         encode_preprocessing_exchange, field_outputs_to_hex, format_coordinator_outputs,
         format_vm_result, group_output_shares_by_client, hb_input_only_completion_proven,
         input_client_ids_from_output_ids, input_client_slot_map_from_output_ids,
-        manifest_client_input_slots, mpc_input_protocol_ids, plan_preprocessing,
-        preprocessing_transcript_digest, record_preprocessing_exchange_value,
+        load_client_manifest_semantics, manifest_client_input_slots, mpc_input_protocol_ids,
+        plan_preprocessing, preprocessing_transcript_digest, record_preprocessing_exchange_value,
         render_fixed_point_i64, resolve_client_protocol_bindings, standing_preproc_pool_program_id,
         standing_reservoir_plan, standing_reservoir_refill_execution_id,
         validate_preprocessing_proposals, validate_reservoir_allocation_admission,
@@ -8583,7 +8914,7 @@ mod tests {
     use stoffel_vm::storage::preproc::PreprocMeta;
     use stoffel_vm::storage::preproc::{PoolAvailability, StandingPreprocSnapshot};
     use stoffel_vm_types::compiled_binary::{
-        ClientIoManifest, ClientIoSchema, PreprocessingDemand,
+        ClientIoManifest, ClientIoSchema, CompiledBinary, PreprocessingDemand,
     };
     use stoffel_vm_types::core_types::{
         ClearShareInput, ClearShareValue, ShareData, ShareType, Value,
@@ -9208,7 +9539,7 @@ mod tests {
     fn formats_negative_field_outputs_as_signed_i64s() {
         let outputs = vec![-ark_bls12_381::Fr::from(10u64)];
         assert_eq!(
-            format_coordinator_outputs(&outputs, CoordinatorOutputFormat::FieldInteger),
+            format_coordinator_outputs(&outputs, &CoordinatorOutputFormat::FieldInteger),
             "[-10]"
         );
     }
@@ -9426,7 +9757,7 @@ mod tests {
     fn formats_positive_field_outputs_as_signed_i64s() {
         let outputs = vec![ark_bls12_381::Fr::from(10u64)];
         assert_eq!(
-            format_coordinator_outputs(&outputs, CoordinatorOutputFormat::FieldInteger),
+            format_coordinator_outputs(&outputs, &CoordinatorOutputFormat::FieldInteger),
             "[10]"
         );
     }
@@ -9441,11 +9772,101 @@ mod tests {
         assert_eq!(
             format_coordinator_outputs(
                 &outputs,
-                CoordinatorOutputFormat::FixedPoint {
+                &CoordinatorOutputFormat::FixedPoint {
                     fractional_bits: 16
                 }
             ),
             "[8, 2.5]"
+        );
+    }
+
+    #[test]
+    fn manifest_client_inputs_are_encoded_from_semantic_values() {
+        let inputs = encode_manifest_client_inputs(
+            Some("0,1.5,true,255"),
+            &[
+                ShareType::default_secret_fixed_point(),
+                ShareType::default_secret_fixed_point(),
+                ShareType::boolean(),
+                ShareType::secret_uint(8),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(inputs.as_deref(), Some("0,98304,1,255"));
+    }
+
+    #[test]
+    fn coordinator_reserved_ranges_identify_manifest_client_slots() {
+        let clients = vec![
+            ClientIoSchema {
+                client_slot: 0,
+                inputs: vec![ShareType::default_secret_int(); 2],
+                outputs: Vec::new(),
+            },
+            ClientIoSchema {
+                client_slot: 7,
+                inputs: vec![ShareType::default_secret_fixed_point(); 3],
+                outputs: Vec::new(),
+            },
+        ];
+
+        assert_eq!(
+            client_schema_for_reserved_index(&clients, 0).map(|schema| schema.client_slot),
+            Some(0)
+        );
+        assert_eq!(
+            client_schema_for_reserved_index(&clients, 2).map(|schema| schema.client_slot),
+            Some(7)
+        );
+        assert!(client_schema_for_reserved_index(&clients, 1).is_none());
+    }
+
+    #[test]
+    fn compiled_manifest_maps_large_reserved_client_ranges() {
+        let mut binary = CompiledBinary::new();
+        binary.client_io_manifest.clients = vec![
+            ClientIoSchema {
+                client_slot: 0,
+                inputs: vec![ShareType::default_secret_fixed_point(); 4_096],
+                outputs: vec![ShareType::default_secret_fixed_point(); 2],
+            },
+            ClientIoSchema {
+                client_slot: 1,
+                inputs: vec![ShareType::default_secret_fixed_point(); 4_096],
+                outputs: vec![ShareType::default_secret_fixed_point(); 2],
+            },
+        ];
+        let mut artifact = tempfile::NamedTempFile::new().unwrap();
+        binary.serialize(artifact.as_file_mut()).unwrap();
+
+        let semantics =
+            load_client_manifest_semantics(artifact.path(), None, Some(4_096), 4_096, Some(2))
+                .unwrap();
+
+        assert_eq!(semantics.client_slot, 1);
+        assert_eq!(semantics.inputs.len(), 4_096);
+        assert_eq!(semantics.outputs.len(), 2);
+    }
+
+    #[test]
+    fn manifest_client_outputs_are_decoded_by_position() {
+        let outputs = vec![
+            ark_bls12_381::Fr::from(98_304u64),
+            -ark_bls12_381::Fr::from(32_768u64),
+            ark_bls12_381::Fr::from(1u64),
+            ark_bls12_381::Fr::from(255u64),
+        ];
+        let format = CoordinatorOutputFormat::Manifest(vec![
+            ShareType::default_secret_fixed_point(),
+            ShareType::default_secret_fixed_point(),
+            ShareType::boolean(),
+            ShareType::secret_uint(8),
+        ]);
+
+        assert_eq!(
+            format_coordinator_outputs(&outputs, &format),
+            "[1.5, -0.5, true, 255]"
         );
     }
 
