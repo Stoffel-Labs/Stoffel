@@ -706,6 +706,10 @@ test -z "$(find /app /run/secrets -type f \( -name '*.der' -o -name '*.key' \) !
             "--client",
             "--execution-id",
             execution["execution_id"],
+            "--program",
+            f"/var/lib/stoffel/programs/{execution['program_id']}.stflb",
+            "--client-slot",
+            str(manifest_slot),
         )
         inputs = client.get("inputs", [])
         if inputs:

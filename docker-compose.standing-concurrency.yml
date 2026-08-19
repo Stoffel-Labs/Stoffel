@@ -76,6 +76,8 @@ x-client: &client
     STOFFEL_MPC_PROTOCOL_TIMEOUT_SECONDS: ${STOFFEL_MPC_PROTOCOL_TIMEOUT_SECONDS:-600}
     RUST_LOG: ${RUST_LOG:-info}
     RUST_BACKTRACE: "1"
+  volumes:
+    - ${STOFFEL_STANDING_STATE_DIR:?Set state directory}/programs:/var/lib/stoffel/programs:ro
   networks: [standing-net]
 
 services:

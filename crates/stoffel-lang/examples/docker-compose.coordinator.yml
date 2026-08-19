@@ -37,8 +37,11 @@ x-party-common: &party-common
 
 x-client-common: &client-common
   build: *stoffel-build
+  volumes:
+    - ${STOFFEL_EXAMPLES_OUT:-./dist}:/app/examples:ro
   environment: &client-env
     STOFFEL_ROLE: client
+    STOFFEL_PROGRAM: /app/examples/${STOFFEL_PROGRAM_NAME:-mpc_share_arithmetic.stflb}
     STOFFEL_SERVERS: ${STOFFEL_COORD_NET_PREFIX:-172.32.0}.10:16180,${STOFFEL_COORD_NET_PREFIX:-172.32.0}.11:16181,${STOFFEL_COORD_NET_PREFIX:-172.32.0}.12:16182,${STOFFEL_COORD_NET_PREFIX:-172.32.0}.13:16183,${STOFFEL_COORD_NET_PREFIX:-172.32.0}.14:16184
     STOFFEL_N_PARTIES: "5"
     STOFFEL_THRESHOLD: "1"

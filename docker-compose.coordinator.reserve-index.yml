@@ -50,6 +50,7 @@ x-client-common: &client-common
   build: *stoffel-build
   environment: &client-env
     STOFFEL_ROLE: client
+    STOFFEL_PROGRAM: /app/programs/client_sub_order.stflb
     STOFFEL_SERVERS: 172.29.0.10:16180,172.29.0.11:16181,172.29.0.12:16182,172.29.0.13:16183,172.29.0.14:16184
     STOFFEL_N_PARTIES: "5"
     STOFFEL_THRESHOLD: "1"

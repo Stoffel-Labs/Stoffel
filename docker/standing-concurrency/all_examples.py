@@ -71,11 +71,11 @@ DEFAULT_ALL_EXAMPLES_WAVE_SIZE = 16
 # fixture is more useful.
 SPECIAL_CLIENT_INPUTS: dict[str, dict[int, list[str]]] = {
     "mpc_client_federated_average": {
-        0: ["65536", "131072", "196608", "262144", "327680", "393216"],
-        1: ["458752", "524288", "589824", "655360", "720896", "786432"],
+        0: ["1", "2", "3", "4", "5", "6"],
+        1: ["7", "8", "9", "10", "11", "12"],
     },
     "mpc_client_private_score": {0: ["100"], 1: ["20"]},
-    "mpc_fixed_div_stress": {0: ["65536"]},
+    "mpc_fixed_div_stress": {0: ["1"]},
     "mpc_protocol_coordination": {0: ["1"]},
     "mpc_share_arithmetic": {0: ["2"]},
 }
@@ -228,6 +228,8 @@ class AllExamplesHarness(Harness):
                 f"{self.client_certificates}:/run/client-certs:ro",
                 "--volume",
                 f"{self.client_identities}:/run/client-identities:ro",
+                "--volume",
+                f"{self.state / 'programs'}:/run/programs:ro",
                 "--env",
                 f"STOFFEL_AUTH_TOKEN={self.env.get('STOFFEL_AUTH_TOKEN', 'stoffel-standing-compose-token')}",
                 "--env",
@@ -549,6 +551,10 @@ class AllExamplesHarness(Harness):
             "--client",
             "--execution-id",
             execution["execution_id"],
+            "--program",
+            f"/run/programs/{execution['program_id']}.stflb",
+            "--client-slot",
+            str(manifest_slot),
         ]
         inputs = client.get("inputs", [])
         if inputs:

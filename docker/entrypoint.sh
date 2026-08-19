@@ -56,6 +56,7 @@ echo "Role: ${STOFFEL_ROLE}"
     if [ "${STOFFEL_ROLE}" = "client" ]; then
         echo "Inputs: ${STOFFEL_INPUTS}"
         echo "Client Index: ${STOFFEL_CLIENT_INDEX:-unset}"
+        echo "Manifest Slot: ${STOFFEL_CLIENT_SLOT:-auto}"
         echo "Servers: ${STOFFEL_SERVERS}"
 else
     echo "Party ID: ${STOFFEL_PARTY_ID}"
@@ -143,6 +144,15 @@ build_command() {
         cmd="${cmd} --servers ${STOFFEL_SERVERS}"
         cmd="${cmd} --n-parties ${STOFFEL_N_PARTIES}"
         cmd="${cmd} --threshold ${STOFFEL_THRESHOLD:-1}"
+        if [ -n "${STOFFEL_PROGRAM:-}" ]; then
+            cmd="${cmd} --program ${STOFFEL_PROGRAM}"
+        fi
+        if [ -n "${STOFFEL_CLIENT_SLOT:-}" ]; then
+            cmd="${cmd} --client-slot ${STOFFEL_CLIENT_SLOT}"
+        fi
+        if [ "${STOFFEL_RAW_CLIENT_IO:-}" = "true" ]; then
+            cmd="${cmd} --raw-client-io"
+        fi
         if [ -n "${STOFFEL_OUTPUTS:-}" ]; then
             cmd="${cmd} --outputs ${STOFFEL_OUTPUTS}"
         fi
