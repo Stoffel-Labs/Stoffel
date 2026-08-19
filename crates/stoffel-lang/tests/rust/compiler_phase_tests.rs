@@ -2161,8 +2161,8 @@ fn test_compile_matrix_average_fixed_point_uses_nested_generic_bytecode() {
     assert!(
         average_calls
             .iter()
-            .any(|name| name == "ClientStore.take_share_fixed"),
-        "average bytecode should load each flat matrix element directly, got {average_calls:?}"
+            .any(|name| name == "ClientStore.sum_shares_fixed"),
+        "average bytecode should use the semantic fixed-point client reduction, got {average_calls:?}"
     );
     assert!(
         average_calls.iter().any(|name| name == "Share.batch_open"),
@@ -4901,4 +4901,185 @@ def main(a: list[secret int64], b: list[secret int64]) -> int64:
 "#,
     );
     assert!(demand.dynamic);
+}
+
+#[test]
+fn optimized_fixed_client_reduction_uses_semantic_bulk_builtin() {
+    let source = r#"
+def main() -> list[fix64]:
+  var num_elements: int64 = 2
+  var num_clients: int64 = ClientStore.get_number_clients()
+  var sums: list[Share] = []
+  var element_index: int64 = 0
+  while element_index < num_elements:
+    var element_sum: Share = ClientStore.take_share_fixed(0, element_index)
+    var client_index: int64 = 1
+    while client_index < num_clients:
+      var share: Share = ClientStore.take_share_fixed(client_index, element_index)
+      element_sum = element_sum.add(share)
+      client_index = client_index + 1
+    sums.append(element_sum)
+    element_index = element_index + 1
+  return Share.batch_open_fixed(sums)
+"#;
+    let options = default_options();
+    let program = compile(source, "test.stfl", &options).expect("program compiles");
+    let calls = collect_call_names(&program.main_chunk.instructions);
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|name| name.as_str() == "ClientStore.sum_shares_fixed")
+            .count(),
+        1
+    );
+    assert!(!calls
+        .iter()
+        .any(|name| name == "ClientStore.take_share_fixed"));
+    assert!(!calls.iter().any(|name| name == "add"));
+
+    let dynamic = &program.client_io_manifest.dynamic_client_inputs;
+    assert_eq!(dynamic.len(), 1);
+    assert_eq!(dynamic[0].first_client_slot, 0);
+    assert_eq!(
+        dynamic[0].inputs,
+        vec![
+            ShareType::default_secret_fixed_point(),
+            ShareType::default_secret_fixed_point(),
+        ]
+    );
+}
+
+#[test]
+fn semantic_client_reduction_uses_bulk_builtin_for_integer_and_boolean_shares() {
+    for (read_builtin, sum_builtin, expected_type) in [
+        (
+            "ClientStore.take_share",
+            "ClientStore.sum_shares",
+            ShareType::default_secret_int(),
+        ),
+        (
+            "ClientStore.take_share_bool",
+            "ClientStore.sum_shares_bool",
+            ShareType::boolean(),
+        ),
+    ] {
+        let source = format!(
+            r#"
+def main() -> Share:
+  var num_clients: int64 = ClientStore.get_number_clients()
+  var total: Share = {read_builtin}(0, 0)
+  var client_index: int64 = 1
+  while client_index < num_clients:
+    var share: Share = {read_builtin}(client_index, 0)
+    total = total.add(share)
+    client_index = client_index + 1
+  return total
+"#
+        );
+        let program = compile(&source, "test.stfl", &default_options()).expect("program compiles");
+        let calls = collect_call_names(&program.main_chunk.instructions);
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|name| name.as_str() == sum_builtin)
+                .count(),
+            1,
+            "expected {sum_builtin}, got {calls:?}"
+        );
+        assert!(
+            !calls.iter().any(|name| name == read_builtin),
+            "lowered reduction retained {read_builtin}: {calls:?}"
+        );
+        assert_eq!(
+            program.client_io_manifest.dynamic_client_inputs[0].inputs,
+            vec![expected_type]
+        );
+
+        let static_source = source.replace("ClientStore.get_number_clients()", "2");
+        let static_program =
+            compile(&static_source, "test.stfl", &default_options()).expect("program compiles");
+        assert_eq!(static_program.client_io_manifest.clients.len(), 2);
+        assert!(static_program
+            .client_io_manifest
+            .clients
+            .iter()
+            .all(|schema| schema.inputs == vec![expected_type]));
+    }
+}
+
+#[test]
+fn semantic_client_reduction_preserves_nondefault_share_metadata() {
+    for (type_name, read_builtin, sum_builtin, expected_type) in [
+        (
+            "uint32",
+            "ClientStore.take_share",
+            "ClientStore.sum_shares",
+            ShareType::secret_uint(32),
+        ),
+        (
+            "fix32",
+            "ClientStore.take_share_fixed",
+            "ClientStore.sum_shares_fixed",
+            ShareType::secret_fixed_point_from_bits(32, 16),
+        ),
+    ] {
+        let source = format!(
+            r#"
+def main() -> secret {type_name}:
+  var num_clients: int64 = ClientStore.get_number_clients()
+  var total: secret {type_name} = {read_builtin}(0, 0)
+  var client_index: int64 = 1
+  while client_index < num_clients:
+    var share: secret {type_name} = {read_builtin}(client_index, 0)
+    total = total.add(share)
+    client_index = client_index + 1
+  return total
+"#
+        );
+        let program = compile(&source, "test.stfl", &default_options()).expect("program compiles");
+        let calls = collect_call_names(&program.main_chunk.instructions);
+        assert!(calls.iter().any(|name| name == sum_builtin));
+        assert_eq!(
+            program.client_io_manifest.dynamic_client_inputs[0].inputs,
+            vec![expected_type]
+        );
+
+        let static_source = source.replace("ClientStore.get_number_clients()", "2");
+        let static_program =
+            compile(&static_source, "test.stfl", &default_options()).expect("program compiles");
+        assert_eq!(static_program.client_io_manifest.clients.len(), 2);
+        assert!(static_program
+            .client_io_manifest
+            .clients
+            .iter()
+            .all(|schema| schema.inputs == vec![expected_type]));
+    }
+}
+
+#[test]
+fn noncanonical_client_reduction_is_not_fused() {
+    let source = r#"
+def main() -> fix64:
+  var num_clients: int64 = ClientStore.get_number_clients()
+  var element_sum: Share = ClientStore.take_share_fixed(0, 0)
+  var client_index: int64 = 1
+  while client_index < num_clients:
+    var share: Share = ClientStore.take_share_fixed(client_index, 0)
+    element_sum = element_sum.add(share)
+    client_index = client_index + 2
+  return element_sum.open_fixed()
+"#;
+    let options = CompilerOptions {
+        optimize: true,
+        optimization_level: 2,
+        ..default_options()
+    };
+    let program = compile(source, "test.stfl", &options).expect("program compiles");
+    let calls = collect_call_names(&program.main_chunk.instructions);
+    assert!(!calls
+        .iter()
+        .any(|name| name == "ClientStore.sum_shares_fixed"));
+    assert!(calls
+        .iter()
+        .any(|name| name == "ClientStore.take_share_fixed"));
 }

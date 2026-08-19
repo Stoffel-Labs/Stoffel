@@ -865,7 +865,7 @@ where
                     self.topology.party_id(),
                     type_key,
                     Some(seq),
-                    shares.to_vec(),
+                    shares,
                     required,
                     |collected, pos| {
                         let expected_share = shares.get(pos).ok_or_else(|| {

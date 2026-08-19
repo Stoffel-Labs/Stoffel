@@ -223,6 +223,8 @@ impl MultiFileCompiler {
             return Err(error_reporter.get_all().into_iter().cloned().collect());
         }
 
+        let analyzed_ast = optimizations::lower_semantic_client_reductions(analyzed_ast);
+
         // Apply optimizations
         let optimized_ast = if self.options.optimize {
             optimizations::optimize_all_with_budgets(

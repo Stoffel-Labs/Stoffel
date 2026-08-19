@@ -56,6 +56,13 @@ impl MpcShareRuntime<'_> {
         self.preserve_share_data_format(lhs_data, result)
     }
 
+    pub(crate) fn sum_data(&self, ty: ShareType, shares: &[ShareData]) -> VmResult<ShareData> {
+        ensure_homogeneous_share_data_format("sum_shares_local", shares)?;
+        self.engine
+            .sum_share_data_local(ty, shares)
+            .map_mpc_backend_err("sum_share_data_local")
+    }
+
     pub(crate) fn sub_data(
         &self,
         ty: ShareType,

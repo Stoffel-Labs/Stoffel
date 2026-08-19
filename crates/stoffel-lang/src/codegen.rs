@@ -33,6 +33,18 @@ fn infer_single_share_type(node: &AstNode) -> Option<ShareType> {
             AstNode::Identifier(name, _) if name == "ClientStore.take_share_fixed" => {
                 Some(ShareType::default_secret_fixed_point())
             }
+            AstNode::Identifier(name, _) if name == "ClientStore.take_share_bool" => {
+                Some(ShareType::boolean())
+            }
+            AstNode::Identifier(name, _) if name == "ClientStore.sum_shares_fixed" => {
+                Some(ShareType::default_secret_fixed_point())
+            }
+            AstNode::Identifier(name, _) if name == "ClientStore.sum_shares_bool" => {
+                Some(ShareType::boolean())
+            }
+            AstNode::Identifier(name, _) if name == "ClientStore.sum_shares" => {
+                Some(ShareType::default_secret_int())
+            }
             AstNode::Identifier(name, _) if name == "ClientStore.take_share" => {
                 Some(ShareType::default_secret_int())
             }
@@ -59,7 +71,7 @@ fn fixed_share_type(bits: u8) -> ShareType {
     )
 }
 
-fn share_type_for_secret_scalar_symbol_type(ty: &SymbolType) -> Option<ShareType> {
+pub(crate) fn share_type_for_secret_scalar_symbol_type(ty: &SymbolType) -> Option<ShareType> {
     if !ty.is_secret() {
         return None;
     }
@@ -1307,6 +1319,33 @@ impl CodeGenerator {
                     }
                 }
             }
+            "ClientStore.sum_shares"
+            | "ClientStore.sum_shares_bool"
+            | "ClientStore.sum_shares_fixed" => {
+                let Some(input_ordinals) = self.input_ordinals_for_node(arguments.first()) else {
+                    return;
+                };
+                let Some(client_counts) = self.input_ordinals_for_node(arguments.get(1)) else {
+                    return;
+                };
+                let share_type = match function_name {
+                    "ClientStore.sum_shares_bool" => ShareType::boolean(),
+                    "ClientStore.sum_shares_fixed" => ShareType::default_secret_fixed_point(),
+                    _ => ShareType::default_secret_int(),
+                };
+                for client_count in client_counts {
+                    for client_slot in 0..client_count.max(1) {
+                        let inputs = self.client_inputs.entry(client_slot).or_default();
+                        for input_ordinal in &input_ordinals {
+                            let ordinal = *input_ordinal as usize;
+                            if inputs.len() <= ordinal {
+                                inputs.resize(ordinal + 1, None);
+                            }
+                            inputs[ordinal] = Some(share_type);
+                        }
+                    }
+                }
+            }
             "MpcOutput.send_to_client" => {
                 let Some(client_slots) = self.input_ordinals_for_node(arguments.first()) else {
                     Self::warn_unrecorded_client_io(function_name, "output");
@@ -1365,13 +1404,44 @@ impl CodeGenerator {
         // builtin's default: `secret bool`/`secret uintN` for take_share,
         // a concrete fixed-point layout for take_share_fixed.
         let annotation_applies = match function_name.as_str() {
-            "ClientStore.take_share" => !matches!(share_type, ShareType::SecretFixedPoint { .. }),
-            "ClientStore.take_share_fixed" => {
+            "ClientStore.take_share" | "ClientStore.sum_shares" => {
+                !matches!(share_type, ShareType::SecretFixedPoint { .. })
+            }
+            "ClientStore.take_share_bool" | "ClientStore.sum_shares_bool" => {
+                share_type.is_boolean()
+            }
+            "ClientStore.take_share_fixed" | "ClientStore.sum_shares_fixed" => {
                 matches!(share_type, ShareType::SecretFixedPoint { .. })
             }
             _ => false,
         };
         if !annotation_applies {
+            return;
+        }
+        if matches!(
+            function_name.as_str(),
+            "ClientStore.sum_shares"
+                | "ClientStore.sum_shares_bool"
+                | "ClientStore.sum_shares_fixed"
+        ) {
+            let Some(input_ordinals) = self.input_ordinals_for_node(arguments.first()) else {
+                return;
+            };
+            let Some(client_counts) = self.input_ordinals_for_node(arguments.get(1)) else {
+                return;
+            };
+            for client_count in client_counts {
+                for client_slot in 0..client_count.max(1) {
+                    let inputs = self.client_inputs.entry(client_slot).or_default();
+                    for input_ordinal in &input_ordinals {
+                        let ordinal = *input_ordinal as usize;
+                        if inputs.len() <= ordinal {
+                            inputs.resize(ordinal + 1, None);
+                        }
+                        inputs[ordinal] = Some(share_type);
+                    }
+                }
+            }
             return;
         }
         let Some(client_slot) = int_literal_u64(arguments.first()) else {

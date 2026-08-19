@@ -30,14 +30,24 @@ impl<'a> ForeignFunctionContext<'a> {
         self.services.load_client_share(client_id, share_index)
     }
 
-    pub(crate) fn load_client_share_as(
+    pub(crate) fn load_client_share_at_as(
         &self,
-        client_id: ClientId,
+        client_index: ClientInputIndex,
         share_index: ClientShareIndex,
         share_type: ShareType,
     ) -> VmResult<Value> {
         self.services
-            .load_client_share_as(client_id, share_index, share_type)
+            .load_client_share_at_as(client_index, share_index, share_type)
+    }
+
+    pub(crate) fn sum_client_shares_at(
+        &self,
+        share_index: ClientShareIndex,
+        client_count: usize,
+        fallback_type: ShareType,
+    ) -> VmResult<Value> {
+        self.services
+            .sum_client_shares_at(share_index, client_count, fallback_type)
     }
 
     pub(crate) fn send_output_to_client(
