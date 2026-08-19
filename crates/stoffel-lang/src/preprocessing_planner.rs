@@ -1133,7 +1133,10 @@ impl<'a> Planner<'a> {
             // --- Client input: a secret scalar share -------------------------
             "ClientStore.take_share"
             | "ClientStore.take_share_bool"
-            | "ClientStore.take_share_fixed" => AbstractValue::secret(),
+            | "ClientStore.take_share_fixed"
+            | "ClientStore.sum_shares"
+            | "ClientStore.sum_shares_bool"
+            | "ClientStore.sum_shares_fixed" => AbstractValue::secret(),
 
             // --- Operations that consume random preprocessing material -------
             // random_field always uses the random-share pool. A typed

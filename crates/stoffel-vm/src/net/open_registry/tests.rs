@@ -617,11 +617,12 @@ async fn local_batch_insert_wakes_waiters() {
 
     let reg2 = reg.clone();
     let waiter = tokio::spawn(async move {
+        let shares = vec![b"a0".to_vec(), b"b0".to_vec()];
         reg2.batch_open_at_async(
             0,
             "batch-notify".to_string(),
             Some(0),
-            vec![b"a0".to_vec(), b"b0".to_vec()],
+            &shares,
             2,
             |shares, _pos| Ok(ClearShareValue::Integer(shares.len() as i64)),
         )
@@ -646,11 +647,12 @@ async fn local_batch_insert_wakes_waiters() {
 
     let reg3 = reg.clone();
     let finalizer = tokio::spawn(async move {
+        let shares = vec![b"a1".to_vec(), b"b1".to_vec()];
         reg3.batch_open_at_async(
             1,
             "batch-notify".to_string(),
             Some(0),
-            vec![b"a1".to_vec(), b"b1".to_vec()],
+            &shares,
             2,
             |shares, _pos| Ok(ClearShareValue::Integer(shares.len() as i64)),
         )

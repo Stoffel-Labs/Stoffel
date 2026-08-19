@@ -179,6 +179,14 @@ impl VMState {
         self.mpc_runtime.try_replace_client_input(inputs)
     }
 
+    pub(crate) fn try_replace_client_input_with_types<F, I>(&self, inputs: I) -> VmResult<usize>
+    where
+        F: ark_ff::FftField,
+        I: IntoIterator<Item = (ClientId, Vec<RobustShare<F>>, Option<Vec<ShareType>>)>,
+    {
+        self.mpc_runtime.try_replace_client_input_with_types(inputs)
+    }
+
     /// Retrieve a robust share for a client input.
     pub(crate) fn client_share<F>(
         &self,
@@ -202,6 +210,7 @@ impl VMState {
     }
 
     /// Load a client's input share with an explicit VM share type.
+    #[cfg(test)]
     pub(crate) fn load_client_share_as(
         &self,
         client_id: ClientId,
@@ -210,6 +219,32 @@ impl VMState {
     ) -> VmResult<Value> {
         self.mpc_runtime
             .client_share_as(client_id, index, ClientShareRequest::new(share_type))
+    }
+
+    /// Load a client share directly by the VM-visible client slot.
+    pub(crate) fn load_client_share_at_as(
+        &self,
+        client_index: ClientInputIndex,
+        share_index: ClientShareIndex,
+        share_type: ShareType,
+    ) -> VmResult<Value> {
+        self.mpc_runtime.client_share_at_as(
+            client_index,
+            share_index,
+            ClientShareRequest::new(share_type),
+        )
+    }
+
+    /// Sum one client-input column locally across the requested prefix of the
+    /// deterministic client roster.
+    pub(crate) fn sum_client_shares_at(
+        &self,
+        share_index: ClientShareIndex,
+        client_count: usize,
+        fallback_type: ShareType,
+    ) -> VmResult<Value> {
+        self.mpc_runtime
+            .sum_client_shares_at(share_index, client_count, fallback_type)
     }
 
     /// Send output share(s) to a specific client for private reconstruction.

@@ -47,6 +47,34 @@ pub(super) enum OpenRegistryWireMessage {
     },
 }
 
+/// Serialization-only borrowed mirror of `OpenRegistryWireMessage`.
+///
+/// Variant order and fields intentionally match the owned wire enum, so bincode
+/// produces the same payload without cloning an entire batch first.
+#[derive(Serialize)]
+enum BorrowedOpenRegistryWireMessage<'a> {
+    Single {
+        instance_id: u64,
+        seq: u64,
+        type_key: &'a str,
+        sender_party_id: usize,
+        share: &'a [u8],
+    },
+    Batch {
+        instance_id: u64,
+        seq: u64,
+        type_key: &'a str,
+        sender_party_id: usize,
+        shares: &'a [Vec<u8>],
+    },
+    Rbc {
+        instance_id: u64,
+        session_id: u64,
+        sender_party_id: usize,
+        message: &'a [u8],
+    },
+}
+
 pub fn encode_single_share_wire_message(
     instance_id: u64,
     seq: usize,
@@ -54,12 +82,12 @@ pub fn encode_single_share_wire_message(
     sender_party_id: usize,
     share_bytes: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let payload = OpenRegistryWireMessage::Single {
+    let payload = BorrowedOpenRegistryWireMessage::Single {
         instance_id,
         seq: seq as u64,
-        type_key: type_key.to_string(),
+        type_key,
         sender_party_id,
-        share: share_bytes.to_vec(),
+        share: share_bytes,
     };
     let encoded =
         bincode::serialize(&payload).map_err(|e| format!("serialize open wire payload: {}", e))?;
@@ -76,12 +104,12 @@ pub fn encode_batch_share_wire_message(
     sender_party_id: usize,
     shares: &[Vec<u8>],
 ) -> Result<Vec<u8>, String> {
-    let payload = OpenRegistryWireMessage::Batch {
+    let payload = BorrowedOpenRegistryWireMessage::Batch {
         instance_id,
         seq: seq as u64,
-        type_key: type_key.to_string(),
+        type_key,
         sender_party_id,
-        shares: shares.to_vec(),
+        shares,
     };
     let encoded =
         bincode::serialize(&payload).map_err(|e| format!("serialize open wire payload: {}", e))?;
@@ -97,11 +125,11 @@ pub fn encode_rbc_wire_message(
     sender_party_id: usize,
     message: &[u8],
 ) -> Result<Vec<u8>, String> {
-    let payload = OpenRegistryWireMessage::Rbc {
+    let payload = BorrowedOpenRegistryWireMessage::Rbc {
         instance_id,
         session_id,
         sender_party_id,
-        message: message.to_vec(),
+        message,
     };
     let encoded =
         bincode::serialize(&payload).map_err(|e| format!("serialize RBC payload: {}", e))?;

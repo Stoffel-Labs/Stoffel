@@ -154,6 +154,51 @@ fn current_cgroup_memory_bytes() -> Option<u64> {
         .or_else(|| read_trimmed_u64("/sys/fs/cgroup/memory/memory.usage_in_bytes"))
 }
 
+/// Stable eBPF boundary identifiers for the HoneyBadger client-input path.
+///
+/// Keep the numeric values synchronized with `scripts/stoffel-input-path.bt`.
+/// Each marker denotes entry into the named phase; `Complete` closes the final
+/// interval.
+#[repr(u64)]
+#[derive(Clone, Copy)]
+enum InputPathPhase {
+    ReservationRegistryInit = 1,
+    MaskPoolPrepare = 2,
+    ReservationProposeRpc = 3,
+    ReservationRoundWait = 4,
+    ReservedIndicesWait = 5,
+    ReservationMirror = 6,
+    MaskSharesMaterialize = 7,
+    ReservedIndicesPublish = 8,
+    MaskShareBatchBuild = 9,
+    MaskSharesPublish = 10,
+    InputCollectionProposeRpc = 11,
+    InputCollectionRoundWait = 12,
+    MaskedInputsWaitReconstruct = 13,
+    MaskRetire = 14,
+    VmInputHydration = 15,
+    Complete = 16,
+}
+
+/// No-op uprobe target used by the eBPF input-path profiler.
+///
+/// Exporting one stable C symbol avoids relying on unstable Rust async symbol
+/// names. With no tracer attached, this is only one non-inlined function call
+/// at each coarse phase boundary and does not perform timing or logging.
+#[no_mangle]
+#[inline(never)]
+pub extern "C" fn stoffel_input_path_probe(phase: u64, clients: u64, inputs: u64) {
+    std::hint::black_box((phase, clients, inputs));
+}
+
+fn mark_input_path_phase(phase: InputPathPhase, clients: usize, inputs: usize) {
+    stoffel_input_path_probe(
+        phase as u64,
+        u64::try_from(clients).unwrap_or(u64::MAX),
+        u64::try_from(inputs).unwrap_or(u64::MAX),
+    );
+}
+
 /// Owns the detached routing work for one standing execution.
 ///
 /// Tasks spawned through this group observe the execution's cancellation token.
@@ -603,6 +648,52 @@ fn record_preprocessing_exchange_value<T: PartialEq>(
     }
 }
 
+struct CompletedPreprocessingTranscript {
+    digest: [u8; 32],
+    acknowledgement: Vec<u8>,
+}
+
+fn preprocessing_transcript_ack_if_complete(
+    phase: PreprocessingExchangePhase,
+    execution_id: ExecutionId,
+    values: &[Option<Vec<u8>>],
+    local_digest: Option<[u8; 32]>,
+) -> Result<Option<CompletedPreprocessingTranscript>, String> {
+    if local_digest.is_some() || values.iter().any(Option::is_none) {
+        return Ok(None);
+    }
+
+    let digest = preprocessing_transcript_digest(phase, execution_id, values)?;
+    let acknowledgement = encode_preprocessing_exchange(&PreprocessingExchangeFrame {
+        phase,
+        message: PreprocessingExchangeMessage::Ack(digest),
+    })?;
+    Ok(Some(CompletedPreprocessingTranscript {
+        digest,
+        acknowledgement,
+    }))
+}
+
+async fn advertise_preprocessing_ack(
+    network: &ExecutionScopedNetwork,
+    party_id: usize,
+    acknowledgement: &[u8],
+    advertised: &mut [bool],
+) {
+    for (peer_id, peer_advertised) in advertised.iter_mut().enumerate() {
+        if peer_id == party_id || *peer_advertised {
+            continue;
+        }
+        match network.send(peer_id, acknowledgement).await {
+            Ok(_) => *peer_advertised = true,
+            Err(error) => eprintln!(
+                "party {} failed to acknowledge preprocessing transcript to party {peer_id}: {error}",
+                party_id
+            ),
+        }
+    }
+}
+
 /// Route preprocessing coordination without creating a second inbox reader.
 #[allow(clippy::too_many_arguments)]
 async fn preprocessing_transcript_exchange<T>(
@@ -641,14 +732,29 @@ where
         let mut retry = tokio::time::interval(STANDING_PREPROC_CONTROL_RETRY_INTERVAL);
         retry.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut local_digest = None;
+        let mut acknowledgement = None;
         while local_digest.is_none()
             || acknowledgements.iter().any(Option::is_none)
             || ack_advertised.iter().any(|advertised| !advertised)
         {
-            if local_digest.is_none() && values.iter().all(Option::is_some) {
-                let digest = preprocessing_transcript_digest(phase, execution_id, &values)?;
-                local_digest = Some(digest);
-                acknowledgements[party_id] = Some(digest);
+            if let Some(completed) = preprocessing_transcript_ack_if_complete(
+                phase,
+                execution_id,
+                &values,
+                local_digest,
+            )? {
+                local_digest = Some(completed.digest);
+                acknowledgements[party_id] = Some(completed.digest);
+                // This is the latency-sensitive first advertisement. The interval below is only
+                // for retrying failed sends; a healthy exchange must not wait for its next tick.
+                advertise_preprocessing_ack(
+                    network,
+                    party_id,
+                    &completed.acknowledgement,
+                    &mut ack_advertised,
+                )
+                .await;
+                acknowledgement = Some(completed.acknowledgement);
             }
 
             tokio::select! {
@@ -663,19 +769,14 @@ where
                             }
                         }
                     }
-                    if let Some(digest) = local_digest {
-                        let ack = encode_preprocessing_exchange(&PreprocessingExchangeFrame {
-                            phase,
-                            message: PreprocessingExchangeMessage::Ack(digest),
-                        })?;
-                        for (peer_id, advertised) in ack_advertised.iter_mut().enumerate() {
-                            if peer_id != party_id && !*advertised {
-                                match network.send(peer_id, &ack).await {
-                                    Ok(_) => *advertised = true,
-                                    Err(error) => eprintln!("party {} failed to acknowledge preprocessing transcript to party {peer_id}: {error}", party_id),
-                                }
-                            }
-                        }
+                    if let Some(ack) = acknowledgement.as_deref() {
+                        advertise_preprocessing_ack(
+                            network,
+                            party_id,
+                            ack,
+                            &mut ack_advertised,
+                        )
+                        .await;
                     }
                 }
                 inbound = receiver.recv() => {
@@ -1477,19 +1578,16 @@ fn store_reserved_client_inputs<F, I>(
 
     per_client.sort_by_key(|(client_slot, _)| *client_slot);
 
-    for (client_slot, shares) in per_client {
-        let result = if let Some(share_types) = client_input_types.get(&client_slot) {
-            vm.try_store_client_input_with_types(client_slot, shares, share_types)
-        } else {
-            vm.try_store_client_input(client_slot, shares)
-        };
-        if let Err(error) = result {
-            eprintln!(
-                "Failed to store input shares for client slot {}: {}",
-                client_slot, error
-            );
-            exit(13);
-        }
+    let inputs = per_client.into_iter().map(|(client_slot, shares)| {
+        let share_types = client_input_types.get(&client_slot).cloned();
+        (client_slot, shares, share_types)
+    });
+    if let Err(error) = vm.try_replace_client_inputs_with_types(inputs) {
+        eprintln!(
+            "Failed to atomically hydrate client input shares: {}",
+            error
+        );
+        exit(13);
     }
 }
 fn store_reserved_client_inputs_feldman<F, G, I>(
@@ -1607,19 +1705,6 @@ fn configure_preproc_store(
         .set_preproc_store(store, program_hash)?;
     Ok(())
 }
-async fn load_reserved_mask_share<F, G>(
-    engine: &Arc<HoneyBadgerMpcEngine<F, G>>,
-    reserved_index: u64,
-) -> Result<RobustShare<F>, String>
-where
-    F: SupportedMpcField,
-    G: CurveGroup<ScalarField = F> + PrimeGroup + Send + Sync + 'static,
-{
-    let reservation = engine.reservation_ops()?;
-    let share_bytes = reservation.get_mask_share(reserved_index).await?;
-    ark_serialize::CanonicalDeserialize::deserialize_compressed(share_bytes.as_slice())
-        .map_err(|e| format!("deserialize reserved mask share {reserved_index}: {:?}", e))
-}
 async fn load_reserved_mask_shares<F, G>(
     engine: &Arc<HoneyBadgerMpcEngine<F, G>>,
     capacity: usize,
@@ -1636,7 +1721,19 @@ where
     let mut slots: Vec<Option<RobustShare<F>>> = vec![None; capacity];
     let mut reserved_indices: Vec<u64> = reserved_indices.into_iter().collect();
     reserved_indices.sort_unstable();
-    for reserved_index in reserved_indices {
+    if reserved_indices.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err("duplicate reserved mask share request".to_owned());
+    }
+    let reservation = engine.reservation_ops()?;
+    let share_bytes = reservation.get_mask_shares(&reserved_indices).await?;
+    if share_bytes.len() != reserved_indices.len() {
+        return Err(format!(
+            "mask share batch returned {} shares for {} requested indices",
+            share_bytes.len(),
+            reserved_indices.len()
+        ));
+    }
+    for (reserved_index, share_bytes) in reserved_indices.into_iter().zip(share_bytes) {
         let slot = usize::try_from(reserved_index)
             .map_err(|_| format!("reserved index {reserved_index} exceeds usize range"))?;
         if slot >= capacity {
@@ -1644,12 +1741,10 @@ where
                 "reserved index {reserved_index} exceeds expected input capacity {capacity}"
             ));
         }
-        if slots[slot].is_some() {
-            return Err(format!(
-                "duplicate reserved mask share request for slot {reserved_index}"
-            ));
-        }
-        slots[slot] = Some(load_reserved_mask_share(engine, reserved_index).await?);
+        let share =
+            ark_serialize::CanonicalDeserialize::deserialize_compressed(share_bytes.as_slice())
+                .map_err(|e| format!("deserialize reserved mask share {reserved_index}: {e:?}"))?;
+        slots[slot] = Some(share);
     }
 
     slots
@@ -1687,6 +1782,12 @@ where
 
     let total_input_count =
         client_input_total.unwrap_or_else(|| input_ids.len().saturating_mul(client_input_count));
+    let profile_clients = input_ids.len();
+    mark_input_path_phase(
+        InputPathPhase::ReservationRegistryInit,
+        profile_clients,
+        total_input_count,
+    );
 
     if engine.is_standing() {
         engine
@@ -1701,6 +1802,11 @@ where
             .await
             .map_err(|e| e.to_string())?;
     }
+    mark_input_path_phase(
+        InputPathPhase::MaskPoolPrepare,
+        profile_clients,
+        total_input_count,
+    );
 
     let precomputed_mask_shares = if engine.is_standing() {
         None
@@ -1717,16 +1823,31 @@ where
                 .map_err(|e| format!("take_random_shares: {e}"))?,
         )
     };
+    mark_input_path_phase(
+        InputPathPhase::ReservationProposeRpc,
+        profile_clients,
+        total_input_count,
+    );
 
     eprintln!("[party {my_id}] proposing InputMaskReservation");
     coord
         .reserve_input_masks()
         .await
         .map_err(|e| e.to_string())?;
+    mark_input_path_phase(
+        InputPathPhase::ReservationRoundWait,
+        profile_clients,
+        total_input_count,
+    );
     coord
         .wait_for_round(Round::InputMaskReservation)
         .await
         .map_err(|e| e.to_string())?;
+    mark_input_path_phase(
+        InputPathPhase::ReservedIndicesWait,
+        profile_clients,
+        total_input_count,
+    );
 
     eprintln!("[party {my_id}] waiting for reserved input indices");
     let client_to_indices = normalize_client_to_indices(
@@ -1736,6 +1857,11 @@ where
             .map_err(|e| e.to_string())?,
     );
     eprintln!("[party {my_id}] reserved input indices received");
+    mark_input_path_phase(
+        InputPathPhase::ReservationMirror,
+        profile_clients,
+        total_input_count,
+    );
 
     // Mirror the coordinator's logical allocation in deterministic index order.
     // Standing engines destructively remove each corresponding mask from LMDB
@@ -1776,6 +1902,11 @@ where
             }
         }
     }
+    mark_input_path_phase(
+        InputPathPhase::MaskSharesMaterialize,
+        profile_clients,
+        total_input_count,
+    );
 
     let mask_shares = if let Some(mask_shares) = precomputed_mask_shares {
         mask_shares
@@ -1789,6 +1920,11 @@ where
 
         mask_shares
     };
+    mark_input_path_phase(
+        InputPathPhase::ReservedIndicesPublish,
+        profile_clients,
+        total_input_count,
+    );
 
     for (cid, indices) in &client_to_indices {
         node_rpc
@@ -1804,6 +1940,11 @@ where
                 other => Err(format!("add_reserved_indices: {:?}", other)),
             })?;
     }
+    mark_input_path_phase(
+        InputPathPhase::MaskShareBatchBuild,
+        profile_clients,
+        total_input_count,
+    );
     let mask_share_pairs = reserved_mask_indices
         .iter()
         .map(|index| {
@@ -1815,17 +1956,37 @@ where
             Ok((*index, share))
         })
         .collect::<Result<Vec<_>, String>>()?;
+    mark_input_path_phase(
+        InputPathPhase::MaskSharesPublish,
+        profile_clients,
+        total_input_count,
+    );
     node_rpc
         .add_mask_shares_for_execution(execution_id, &mask_share_pairs)
         .await
         .map_err(|error| format!("add mask shares: {error:?}"))?;
+    mark_input_path_phase(
+        InputPathPhase::InputCollectionProposeRpc,
+        profile_clients,
+        total_input_count,
+    );
 
     eprintln!("[party {my_id}] proposing InputCollection");
     coord.collect_inputs().await.map_err(|e| e.to_string())?;
+    mark_input_path_phase(
+        InputPathPhase::InputCollectionRoundWait,
+        profile_clients,
+        total_input_count,
+    );
     coord
         .wait_for_round(Round::InputCollection)
         .await
         .map_err(|e| e.to_string())?;
+    mark_input_path_phase(
+        InputPathPhase::MaskedInputsWaitReconstruct,
+        profile_clients,
+        total_input_count,
+    );
 
     eprintln!("[party {my_id}] waiting for masked client inputs");
     let client_inputs = coord
@@ -1833,6 +1994,11 @@ where
         .await
         .map_err(|e| e.to_string())?;
     eprintln!("[party {my_id}] masked client inputs received");
+    mark_input_path_phase(
+        InputPathPhase::MaskRetire,
+        profile_clients,
+        total_input_count,
+    );
     if engine.is_standing() {
         engine
             .reservation_ops()
@@ -1841,6 +2007,11 @@ where
             .await
             .map_err(|e| e.to_string())?;
     }
+    mark_input_path_phase(
+        InputPathPhase::VmInputHydration,
+        profile_clients,
+        total_input_count,
+    );
     store_reserved_client_inputs(
         vm,
         &client_to_indices,
@@ -1849,6 +2020,7 @@ where
         client_input_slots_by_id,
         client_input_types,
     );
+    mark_input_path_phase(InputPathPhase::Complete, profile_clients, total_input_count);
 
     Ok(())
 }
@@ -8996,9 +9168,9 @@ mod tests {
         format_vm_result, group_output_shares_by_client, hb_input_only_completion_proven,
         input_client_ids_from_output_ids, input_client_slot_map_from_output_ids,
         load_client_manifest_semantics, manifest_client_input_slots, manifest_client_input_types,
-        mpc_input_protocol_ids, plan_preprocessing, preprocessing_transcript_digest,
-        record_preprocessing_exchange_value, render_fixed_point_i64,
-        resolve_client_protocol_bindings, standing_preproc_pool_program_id,
+        mpc_input_protocol_ids, plan_preprocessing, preprocessing_transcript_ack_if_complete,
+        preprocessing_transcript_digest, record_preprocessing_exchange_value,
+        render_fixed_point_i64, resolve_client_protocol_bindings, standing_preproc_pool_program_id,
         standing_reservoir_plan, standing_reservoir_refill_execution_id,
         validate_preprocessing_proposals, validate_reservoir_allocation_admission,
         CoordinatorOutputFormat, ExecutionTaskGroup, PreprocessingExchangeFrame,
@@ -9454,6 +9626,44 @@ mod tests {
                 .unwrap_err();
         assert!(error.contains("equivocated"));
         assert_eq!(values[1], Some(vec![7]));
+    }
+
+    #[test]
+    fn preprocessing_ack_is_ready_when_the_last_value_arrives() {
+        let execution_id = ExecutionId::from_bytes([0x74; 32]);
+        let phase = PreprocessingExchangePhase::HoneyBadgerReady;
+        let mut values = vec![Some(vec![1]), None];
+
+        assert!(
+            preprocessing_transcript_ack_if_complete(phase, execution_id, &values, None)
+                .unwrap()
+                .is_none(),
+            "an incomplete transcript must not be acknowledged"
+        );
+
+        values[1] = Some(vec![2]);
+        let completed =
+            preprocessing_transcript_ack_if_complete(phase, execution_id, &values, None)
+                .unwrap()
+                .expect("the final value makes the acknowledgement immediately available");
+        assert_eq!(
+            decode_preprocessing_exchange(&completed.acknowledgement).unwrap(),
+            PreprocessingExchangeFrame {
+                phase,
+                message: PreprocessingExchangeMessage::Ack(completed.digest),
+            }
+        );
+        assert!(
+            preprocessing_transcript_ack_if_complete(
+                phase,
+                execution_id,
+                &values,
+                Some(completed.digest),
+            )
+            .unwrap()
+            .is_none(),
+            "the same transcript must not trigger another first advertisement"
+        );
     }
 
     #[test]

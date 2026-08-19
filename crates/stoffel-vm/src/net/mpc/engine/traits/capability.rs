@@ -278,6 +278,18 @@ pub trait MpcEngineReservation: MpcEngine {
     /// Get this node's mask share at a given index as serialized bytes.
     async fn get_mask_share(&self, index: u64) -> MpcEngineResult<Vec<u8>>;
 
+    /// Get several mask shares in caller-specified order.
+    ///
+    /// Engines with persistent preprocessing should override this to amortize
+    /// store reads and cursor updates. The default preserves compatibility.
+    async fn get_mask_shares(&self, indices: &[u64]) -> MpcEngineResult<Vec<Vec<u8>>> {
+        let mut shares = Vec::with_capacity(indices.len());
+        for &index in indices {
+            shares.push(self.get_mask_share(index).await?);
+        }
+        Ok(shares)
+    }
+
     /// Accept a masked input at a reserved index.
     async fn submit_masked_input(
         &self,

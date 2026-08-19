@@ -3304,6 +3304,274 @@ fn timed_pass(name: &str, f: impl FnOnce() -> AstNode) -> AstNode {
     out
 }
 
+// Fuse the canonical client-column reduction emitted by federated aggregation
+// programs into the VM's semantic bulk primitive. This matcher is deliberately
+// exact and fail-closed: it only removes the loop when the initialization,
+// bound, client read, accumulator update, and increment all prove the expected
+// reduction, and when the loop counter is dead afterwards.
+pub(crate) fn lower_semantic_client_reductions(node: AstNode) -> AstNode {
+    fn identifier(node: &AstNode) -> Option<&str> {
+        match node {
+            AstNode::Identifier(name, _) => Some(name),
+            _ => None,
+        }
+    }
+
+    fn int_literal(node: &AstNode, expected: u128) -> bool {
+        matches!(
+            node,
+            AstNode::Literal {
+                value: crate::ast::Value::Int { value, .. },
+                ..
+            } if *value == expected
+        )
+    }
+
+    fn call<'a>(node: &'a AstNode, expected: &str) -> Option<&'a [AstNode]> {
+        let AstNode::FunctionCall {
+            function,
+            arguments,
+            ..
+        } = node
+        else {
+            return None;
+        };
+        (identifier(function)? == expected).then_some(arguments)
+    }
+
+    fn client_share_sum_builtin(read_builtin: &str) -> Option<&'static str> {
+        match read_builtin {
+            "ClientStore.take_share" => Some("ClientStore.sum_shares"),
+            "ClientStore.take_share_bool" => Some("ClientStore.sum_shares_bool"),
+            "ClientStore.take_share_fixed" => Some("ClientStore.sum_shares_fixed"),
+            _ => None,
+        }
+    }
+
+    fn simple_same(left: &AstNode, right: &AstNode) -> bool {
+        match (left, right) {
+            (AstNode::Identifier(a, _), AstNode::Identifier(b, _)) => a == b,
+            (AstNode::Literal { value: a, .. }, AstNode::Literal { value: b, .. }) => a == b,
+            _ => false,
+        }
+    }
+
+    fn fused_declaration(
+        init: &AstNode,
+        counter_decl: &AstNode,
+        loop_node: &AstNode,
+        following: &[AstNode],
+    ) -> Option<AstNode> {
+        let AstNode::VariableDeclaration {
+            name: accumulator,
+            type_annotation,
+            value: Some(initial_value),
+            is_mutable,
+            is_secret,
+            location,
+        } = init
+        else {
+            return None;
+        };
+        let AstNode::FunctionCall {
+            function,
+            arguments: initial_arguments,
+            ..
+        } = initial_value.as_ref()
+        else {
+            return None;
+        };
+        let read_builtin = identifier(function)?;
+        let sum_builtin = client_share_sum_builtin(read_builtin)?;
+        if initial_arguments.len() != 2 || !int_literal(&initial_arguments[0], 0) {
+            return None;
+        }
+        let share_index = &initial_arguments[1];
+        if !matches!(
+            share_index,
+            AstNode::Identifier(_, _) | AstNode::Literal { .. }
+        ) {
+            return None;
+        }
+
+        let AstNode::VariableDeclaration {
+            name: counter,
+            value: Some(counter_initial),
+            ..
+        } = counter_decl
+        else {
+            return None;
+        };
+        if !int_literal(counter_initial, 1)
+            || following
+                .iter()
+                .any(|statement| references_var(statement, counter))
+        {
+            return None;
+        }
+
+        let AstNode::WhileLoop {
+            condition, body, ..
+        } = loop_node
+        else {
+            return None;
+        };
+        let AstNode::BinaryOperation {
+            op,
+            left,
+            right: client_count,
+            ..
+        } = condition.as_ref()
+        else {
+            return None;
+        };
+        if op != "<"
+            || identifier(left)? != counter
+            || !matches!(
+                client_count.as_ref(),
+                AstNode::Identifier(_, _) | AstNode::Literal { .. }
+            )
+        {
+            return None;
+        }
+
+        let AstNode::Block(body) = body.as_ref() else {
+            return None;
+        };
+        if body.len() != 3 {
+            return None;
+        }
+        let AstNode::VariableDeclaration {
+            name: next_share,
+            value: Some(next_value),
+            ..
+        } = &body[0]
+        else {
+            return None;
+        };
+        let next_arguments = call(next_value, read_builtin)?;
+        if next_arguments.len() != 2
+            || identifier(&next_arguments[0])? != counter
+            || !simple_same(&next_arguments[1], share_index)
+        {
+            return None;
+        }
+
+        let AstNode::Assignment {
+            target,
+            value: add_value,
+            ..
+        } = &body[1]
+        else {
+            return None;
+        };
+        let add_arguments = call(add_value, "Share.add").or_else(|| call(add_value, "add"))?;
+        if identifier(target)? != accumulator
+            || add_arguments.len() != 2
+            || identifier(&add_arguments[0])? != accumulator
+            || identifier(&add_arguments[1])? != next_share
+        {
+            return None;
+        }
+
+        let AstNode::Assignment {
+            target,
+            value: increment,
+            ..
+        } = &body[2]
+        else {
+            return None;
+        };
+        let AstNode::BinaryOperation {
+            op, left, right, ..
+        } = increment.as_ref()
+        else {
+            return None;
+        };
+        if identifier(target)? != counter
+            || op != "+"
+            || identifier(left)? != counter
+            || !int_literal(right, 1)
+        {
+            return None;
+        }
+
+        let resolved_return_type = match initial_value.as_ref() {
+            AstNode::FunctionCall {
+                resolved_return_type,
+                ..
+            } => resolved_return_type.clone(),
+            _ => None,
+        };
+        Some(AstNode::VariableDeclaration {
+            name: accumulator.clone(),
+            type_annotation: type_annotation.clone(),
+            value: Some(Box::new(AstNode::FunctionCall {
+                function: Box::new(AstNode::Identifier(
+                    sum_builtin.to_string(),
+                    location.clone(),
+                )),
+                arguments: vec![share_index.clone(), client_count.as_ref().clone()],
+                location: location.clone(),
+                resolved_return_type,
+            })),
+            is_mutable: *is_mutable,
+            is_secret: *is_secret,
+            location: location.clone(),
+        })
+    }
+
+    match node {
+        AstNode::FunctionDefinition {
+            name,
+            type_params,
+            parameters,
+            return_type,
+            body,
+            is_secret,
+            pragmas,
+            location,
+            node_id,
+        } => AstNode::FunctionDefinition {
+            name,
+            type_params,
+            parameters,
+            return_type,
+            body: Box::new(lower_semantic_client_reductions(*body)),
+            is_secret,
+            pragmas,
+            location,
+            node_id,
+        },
+        AstNode::Block(statements) => {
+            let statements = statements
+                .into_iter()
+                .map(lower_semantic_client_reductions)
+                .collect::<Vec<_>>();
+            let mut result = Vec::with_capacity(statements.len());
+            let mut index = 0;
+            while index < statements.len() {
+                if index + 2 < statements.len() {
+                    if let Some(fused) = fused_declaration(
+                        &statements[index],
+                        &statements[index + 1],
+                        &statements[index + 2],
+                        &statements[index + 3..],
+                    ) {
+                        result.push(fused);
+                        index += 3;
+                        continue;
+                    }
+                }
+                result.push(statements[index].clone());
+                index += 1;
+            }
+            AstNode::Block(result)
+        }
+        node => map_children(node, &mut lower_semantic_client_reductions),
+    }
+}
+
 fn optimize_all_inner(node: AstNode, optimization_level: u8) -> AstNode {
     // Passes compose forward: each one runs on the previous pass's output, so the
     // pipeline refines the program incrementally rather than each pass re-reading

@@ -127,6 +127,11 @@ pub fn compile(
         println!("-------------------------------------");
     }
 
+    // Lower semantically proven VM-native reductions even when general
+    // optimization is disabled. This is a backend-aware lowering, not an
+    // optional source-level performance tweak developers must remember.
+    let analyzed_ast = optimizations::lower_semantic_client_reductions(analyzed_ast);
+
     // 5. Optimization Passes
     let optimized_ast = if options.optimize {
         let ast = optimizations::optimize_all_with_budgets(

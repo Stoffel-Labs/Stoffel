@@ -4,10 +4,10 @@ use crate::vm_state::{CallStackCheckpoint, VMState, VmEffectKind, VmExecutionBud
 use std::time::{Duration, Instant};
 use stoffel_vm_types::core_types::Value;
 
-// At current interpreter speeds 8K instructions is still a sub-millisecond
-// cooperative slice, while avoiding thousands of executor wakeups for ordinary
-// local bytecode between online effects.
-pub(super) const DEFAULT_LOCAL_INSTRUCTION_BUDGET: usize = 8192;
+// A 32K slice remains short compared with online MPC effects while reducing
+// executor wakeups for local loop-heavy bytecode. Deployments that need tighter
+// cooperative latency can override it with STOFFEL_VM_LOCAL_INSTRUCTION_BUDGET.
+pub(super) const DEFAULT_LOCAL_INSTRUCTION_BUDGET: usize = 32_768;
 pub(super) const DEFAULT_COMPLETED_EFFECT_BUDGET: usize = 64;
 
 /// Observable evidence that one VM invocation used the cooperative async
@@ -30,7 +30,12 @@ pub(crate) struct AsyncEffectScheduler {
 
 impl Default for AsyncEffectScheduler {
     fn default() -> Self {
-        Self::new(DEFAULT_LOCAL_INSTRUCTION_BUDGET)
+        let local_instruction_budget = std::env::var("STOFFEL_VM_LOCAL_INSTRUCTION_BUDGET")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(DEFAULT_LOCAL_INSTRUCTION_BUDGET);
+        Self::new(local_instruction_budget)
     }
 }
 

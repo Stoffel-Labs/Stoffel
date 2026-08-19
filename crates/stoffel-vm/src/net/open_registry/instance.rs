@@ -1016,7 +1016,7 @@ impl InstanceRegistry {
                         party_id,
                         type_key.to_owned(),
                         Some(sequence),
-                        shares.to_vec(),
+                        shares,
                         required,
                         reconstruct_one,
                     ))
@@ -1044,7 +1044,7 @@ impl InstanceRegistry {
     where
         R: Fn(&[Vec<u8>], usize) -> Result<ClearShareValue, String>,
     {
-        self.batch_open_at_async(party_id, type_key, None, shares, required, reconstruct_one)
+        self.batch_open_at_async(party_id, type_key, None, &shares, required, reconstruct_one)
             .await
     }
 
@@ -1053,7 +1053,7 @@ impl InstanceRegistry {
         party_id: usize,
         type_key: String,
         sequence: Option<usize>,
-        shares: Vec<Vec<u8>>,
+        shares: &[Vec<u8>],
         required: usize,
         reconstruct_one: R,
     ) -> Result<Vec<ClearShareValue>, String>
@@ -1093,12 +1093,11 @@ impl InstanceRegistry {
                         .entry((seq, type_key.clone(), batch_size))
                         .or_insert_with(|| BatchOpenAccumulator::new(batch_size));
                     if let Some(pos) = entry.party_ids.iter().position(|id| *id == party_id) {
-                        let existing: Vec<_> = entry
-                            .shares_per_position
-                            .iter()
-                            .filter_map(|shares_at_pos| shares_at_pos.get(pos).cloned())
-                            .collect();
-                        if existing != shares {
+                        let existing_matches =
+                            entry.shares_per_position.iter().zip(shares).all(
+                                |(shares_at_pos, share)| shares_at_pos.get(pos) == Some(share),
+                            );
+                        if !existing_matches || entry.shares_per_position.len() != shares.len() {
                             return Err(format!(
                                 "conflicting local batch_open_shares payload for sequence {}, type '{}'",
                                 seq, type_key

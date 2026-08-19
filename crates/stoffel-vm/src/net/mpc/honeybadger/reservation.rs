@@ -179,6 +179,76 @@ where
         .map_mpc_engine_operation("get_mask_share")
     }
 
+    async fn get_mask_shares(&self, indices: &[u64]) -> MpcEngineResult<Vec<Vec<u8>>> {
+        async {
+            if indices.is_empty() {
+                return Ok(Vec::new());
+            }
+            if self.is_standing() {
+                let cache = self.reserved_mask_shares.lock().await;
+                return indices
+                    .iter()
+                    .map(|index| {
+                        cache.get(index).cloned().ok_or_else(|| {
+                            format!("standing mask index {index} was not reserved before retrieval")
+                        })
+                    })
+                    .collect();
+            }
+
+            // A reservation grant is consecutive, and the runner requests all
+            // grants in sorted order. Consume that complete range with one LMDB
+            // cursor update and one blob load. Retain the scalar fallback for
+            // compatibility with sparse/custom callers.
+            let consecutive = indices
+                .windows(2)
+                .all(|window| window[0].checked_add(1) == Some(window[1]));
+            if !consecutive {
+                let mut shares = Vec::with_capacity(indices.len());
+                for &index in indices {
+                    shares.push(self.get_mask_share(index).await?);
+                }
+                return Ok(shares);
+            }
+
+            let (store, _hash, scope) = self.preproc_scope().await?;
+            let key = scope.random_share();
+            let blob = store.load(&key).await?.ok_or("no random shares stored")?;
+            let preproc_offset = {
+                let guard = self.reservation.read().await;
+                guard
+                    .as_ref()
+                    .ok_or("reservations not initialized")?
+                    .preproc_offset()
+                    .await
+            };
+            let physical_start = indices[0]
+                .checked_add(u64::from(preproc_offset.random))
+                .ok_or_else(|| "preprocessing random share physical index overflow".to_owned())?;
+            let physical_start =
+                preproc::u32_index(physical_start, "preprocessing random share index")?;
+            let count = u32::try_from(indices.len())
+                .map_err(|_| "mask share batch length exceeds u32 range".to_owned())?;
+            store.reserve_at(&key, physical_start, count).await?;
+
+            let mut shares = Vec::with_capacity(indices.len());
+            for offset in 0..count {
+                let index = physical_start
+                    .checked_add(offset)
+                    .ok_or_else(|| "preprocessing random share batch index overflow".to_owned())?;
+                let share = preproc::deserialize_one_robust_share::<F>(
+                    &blob.data,
+                    blob.meta.item_size,
+                    index,
+                )?;
+                shares.push(Self::encode_share(&share)?);
+            }
+            Ok::<Vec<Vec<u8>>, String>(shares)
+        }
+        .await
+        .map_mpc_engine_operation("get_mask_shares")
+    }
+
     async fn submit_masked_input(
         &self,
         client_id: ClientId,

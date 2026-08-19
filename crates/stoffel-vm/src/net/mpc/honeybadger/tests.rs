@@ -393,6 +393,75 @@ async fn get_mask_share_reserves_requested_persistent_index_once() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn get_mask_shares_reserves_a_contiguous_persistent_batch_once() {
+    let dir = tempfile::tempdir().unwrap();
+    let store = Arc::new(LmdbPreprocStore::open(dir.path()).unwrap());
+    let program_hash = [0x6B; 32];
+    let party_id = 0;
+    let n = 5;
+    let t = 1;
+    let scope = PreprocKeyScope::new(
+        program_hash,
+        crate::net::curve::MpcFieldKind::Bls12_381Fr,
+        n,
+        t,
+        DurableIdentityDigest::from_legacy_party_id(party_id),
+    );
+    let key = scope.random_share();
+
+    let mut rng = ark_std::rand::rngs::StdRng::seed_from_u64(17);
+    let shares: Vec<_> = (0..3)
+        .map(|_| RobustShare::new(ark_bls12_381::Fr::rand(&mut rng), 1, t))
+        .collect();
+    let (data, item_size) = preproc::serialize_robust_shares(&shares).unwrap();
+    store
+        .store(
+            &key,
+            &PreprocBlob::try_new(data, item_size, shares.len()).unwrap(),
+        )
+        .await
+        .unwrap();
+
+    let engine = test_engine(
+        Arc::new(crate::net::open_registry::OpenMessageRouter::new()),
+        next_instance_id(),
+        party_id,
+        n,
+        t,
+    );
+    engine
+        .preproc_persistence_ops()
+        .unwrap()
+        .set_preproc_store(store.clone(), program_hash)
+        .unwrap();
+    let reservation = engine.reservation_ops().unwrap();
+    reservation
+        .init_reservations(program_hash, shares.len() as u64)
+        .await
+        .unwrap();
+
+    let encoded = reservation.get_mask_shares(&[0, 1, 2]).await.unwrap();
+    assert_eq!(encoded.len(), shares.len());
+    for (actual, expected) in encoded.iter().zip(&shares) {
+        assert_eq!(
+            HoneyBadgerMpcEngine::<ark_bls12_381::Fr, ark_bls12_381::G1Projective>::decode_share(
+                actual
+            )
+            .unwrap(),
+            *expected
+        );
+    }
+    assert_eq!(store.available(&key).await.unwrap(), 0);
+
+    let error = reservation.get_mask_shares(&[0, 1, 2]).await.unwrap_err();
+    assert!(
+        error.to_string().contains("preprocessing cursor mismatch"),
+        "unexpected error: {error}"
+    );
+    assert_eq!(store.available(&key).await.unwrap(), 0);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn standing_mask_reservation_reads_owned_preprocessing_bundle() {
     type Engine = HoneyBadgerMpcEngine<ark_bls12_381::Fr, ark_bls12_381::G1Projective>;
 

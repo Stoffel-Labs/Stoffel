@@ -13,6 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{AstNode, Parameter, Pragma, Value};
+use crate::symbol_table::SymbolType;
 use stoffel_vm_types::compiled_binary::{
     ClientIoManifest, ClientIoSchema, DynamicClientInputSchema,
 };
@@ -370,13 +371,14 @@ impl Planner<'_> {
             AstNode::FunctionCall {
                 function,
                 arguments,
+                resolved_return_type,
                 ..
-            }
-            | AstNode::CommandCall {
+            } => self.visit_call(function, arguments, resolved_return_type.as_ref(), env),
+            AstNode::CommandCall {
                 command: function,
                 arguments,
                 ..
-            } => self.visit_call(function, arguments, env),
+            } => self.visit_call(function, arguments, None, env),
             AstNode::NamedArgument { value, .. } => self.visit(value, env),
             AstNode::ForLoop {
                 variables,
@@ -490,6 +492,7 @@ impl Planner<'_> {
         &mut self,
         function: &AstNode,
         arguments: &[AstNode],
+        resolved_return_type: Option<&SymbolType>,
         env: &mut Env,
     ) -> AbstractValue {
         let argument_values = arguments
@@ -506,8 +509,10 @@ impl Planner<'_> {
                 runtime_client_count: true,
                 ..AbstractValue::default()
             };
+        } else if is_client_input_sum_call(name) {
+            self.record_client_input_sum(name, &argument_values, resolved_return_type);
         } else if is_client_input_call(name) {
-            self.record_client_input(name, &argument_values);
+            self.record_client_input(name, &argument_values, resolved_return_type);
         } else if is_client_output_call(name) {
             self.record_client_output(name, &argument_values);
         } else if matches!(name.as_str(), "len" | "array_length") {
@@ -570,7 +575,12 @@ impl Planner<'_> {
         value
     }
 
-    fn record_client_input(&mut self, name: &str, arguments: &[AbstractValue]) {
+    fn record_client_input(
+        &mut self,
+        name: &str,
+        arguments: &[AbstractValue],
+        resolved_return_type: Option<&SymbolType>,
+    ) {
         let Some(ordinal) = arguments
             .get(1)
             .and_then(|value| value.int)
@@ -578,11 +588,13 @@ impl Planner<'_> {
         else {
             return;
         };
-        let share_type = match name {
-            "ClientStore.take_share_fixed" => ShareType::default_secret_fixed_point(),
-            "ClientStore.take_share_bool" => ShareType::boolean(),
-            _ => ShareType::default_secret_int(),
-        };
+        let share_type = resolved_return_type
+            .and_then(crate::codegen::share_type_for_secret_scalar_symbol_type)
+            .unwrap_or_else(|| match name {
+                "ClientStore.take_share_fixed" => ShareType::default_secret_fixed_point(),
+                "ClientStore.take_share_bool" => ShareType::boolean(),
+                _ => ShareType::default_secret_int(),
+            });
         let Some(client) = arguments.first() else {
             return;
         };
@@ -598,6 +610,54 @@ impl Planner<'_> {
             inputs.resize(ordinal + 1, None);
         }
         inputs[ordinal] = Some(share_type);
+    }
+
+    fn record_client_input_sum(
+        &mut self,
+        name: &str,
+        arguments: &[AbstractValue],
+        resolved_return_type: Option<&SymbolType>,
+    ) {
+        let Some(ordinal) = arguments
+            .first()
+            .and_then(|value| value.int)
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            return;
+        };
+        let Some(client_count) = arguments.get(1) else {
+            return;
+        };
+        let share_type = resolved_return_type
+            .and_then(crate::codegen::share_type_for_secret_scalar_symbol_type)
+            .unwrap_or_else(|| match name {
+                "ClientStore.sum_shares_bool" => ShareType::boolean(),
+                "ClientStore.sum_shares_fixed" => ShareType::default_secret_fixed_point(),
+                _ => ShareType::default_secret_int(),
+            });
+
+        if client_count.runtime_client_count {
+            let inputs = self.dynamic_inputs.entry(0).or_default();
+            if inputs.len() <= ordinal {
+                inputs.resize(ordinal + 1, None);
+            }
+            inputs[ordinal] = Some(share_type);
+            return;
+        }
+
+        let Some(client_count) = client_count
+            .int
+            .and_then(|value| usize::try_from(value).ok())
+        else {
+            return;
+        };
+        for client_slot in 0..client_count.max(1) {
+            let inputs = self.inputs.entry(client_slot as u64).or_default();
+            if inputs.len() <= ordinal {
+                inputs.resize(ordinal + 1, None);
+            }
+            inputs[ordinal] = Some(share_type);
+        }
     }
 
     fn record_client_output(&mut self, name: &str, arguments: &[AbstractValue]) {
@@ -741,7 +801,19 @@ fn is_list_return_type(node: &AstNode) -> bool {
 fn is_client_input_call(name: &str) -> bool {
     matches!(
         name,
-        "ClientStore.take_share" | "ClientStore.take_share_fixed" | "ClientStore.take_share_bool"
+        "ClientStore.take_share"
+            | "ClientStore.take_share_fixed"
+            | "ClientStore.take_share_bool"
+            | "ClientStore.sum_shares"
+            | "ClientStore.sum_shares_bool"
+            | "ClientStore.sum_shares_fixed"
+    )
+}
+
+fn is_client_input_sum_call(name: &str) -> bool {
+    matches!(
+        name,
+        "ClientStore.sum_shares" | "ClientStore.sum_shares_bool" | "ClientStore.sum_shares_fixed"
     )
 }
 

@@ -291,11 +291,18 @@ pub(crate) trait ForeignMpcServices {
         share_index: ClientShareIndex,
     ) -> VmResult<Value>;
 
-    fn load_client_share_as(
+    fn load_client_share_at_as(
         &self,
-        client_id: ClientId,
+        client_index: ClientInputIndex,
         share_index: ClientShareIndex,
         share_type: ShareType,
+    ) -> VmResult<Value>;
+
+    fn sum_client_shares_at(
+        &self,
+        share_index: ClientShareIndex,
+        client_count: usize,
+        fallback_type: ShareType,
     ) -> VmResult<Value>;
 
     fn send_output_to_client(
@@ -456,13 +463,22 @@ impl ForeignMpcServices for VMState {
         VMState::load_client_share(self, client_id, share_index)
     }
 
-    fn load_client_share_as(
+    fn load_client_share_at_as(
         &self,
-        client_id: ClientId,
+        client_index: ClientInputIndex,
         share_index: ClientShareIndex,
         share_type: ShareType,
     ) -> VmResult<Value> {
-        VMState::load_client_share_as(self, client_id, share_index, share_type)
+        VMState::load_client_share_at_as(self, client_index, share_index, share_type)
+    }
+
+    fn sum_client_shares_at(
+        &self,
+        share_index: ClientShareIndex,
+        client_count: usize,
+        fallback_type: ShareType,
+    ) -> VmResult<Value> {
+        VMState::sum_client_shares_at(self, share_index, client_count, fallback_type)
     }
 
     fn send_output_to_client(
