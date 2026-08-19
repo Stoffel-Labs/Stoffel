@@ -13,13 +13,17 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::ast::{AstNode, Parameter, Pragma, Value};
-use stoffel_vm_types::compiled_binary::{ClientIoManifest, ClientIoSchema};
+use stoffel_vm_types::compiled_binary::{
+    ClientIoManifest, ClientIoSchema, DynamicClientInputSchema,
+};
 use stoffel_vm_types::core_types::ShareType;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 struct AbstractValue {
     int: Option<i128>,
     list_len: Option<usize>,
+    runtime_client_count: bool,
+    dynamic_client_slot_start: Option<u64>,
 }
 
 impl AbstractValue {
@@ -27,6 +31,8 @@ impl AbstractValue {
         Self {
             int: Some(value),
             list_len: None,
+            runtime_client_count: false,
+            dynamic_client_slot_start: None,
         }
     }
 
@@ -34,12 +40,15 @@ impl AbstractValue {
         Self {
             int: None,
             list_len: Some(len),
+            runtime_client_count: false,
+            dynamic_client_slot_start: None,
         }
     }
 }
 
 type Env = HashMap<String, AbstractValue>;
 type InferredInputs = HashMap<u64, Vec<Option<ShareType>>>;
+type InferredDynamicInputs = HashMap<u64, Vec<Option<ShareType>>>;
 type InferredOutputCounts = HashMap<u64, usize>;
 
 struct FunctionInfo<'a> {
@@ -53,6 +62,7 @@ struct Planner<'a> {
     functions: HashMap<String, FunctionInfo<'a>>,
     relevant: HashSet<String>,
     inputs: InferredInputs,
+    dynamic_inputs: InferredDynamicInputs,
     output_counts: InferredOutputCounts,
     call_stack: Vec<String>,
 }
@@ -63,7 +73,7 @@ const MAX_STATIC_LOOP_ITERATIONS: usize = 1_000_000;
 /// manifest. Existing output schemas and directly inferred input types remain
 /// intact.
 pub(crate) fn merge_inferred_client_inputs(program: &AstNode, manifest: &mut ClientIoManifest) {
-    let (inputs, output_counts) = infer_client_io(program);
+    let (inputs, dynamic_inputs, output_counts) = infer_client_io(program);
     for (client_slot, inferred) in inputs {
         let schema = match manifest
             .clients
@@ -105,6 +115,41 @@ pub(crate) fn merge_inferred_client_inputs(program: &AstNode, manifest: &mut Cli
     manifest
         .clients
         .sort_unstable_by_key(|schema| schema.client_slot);
+
+    for (first_client_slot, inferred) in dynamic_inputs {
+        let schema = match manifest
+            .dynamic_client_inputs
+            .iter_mut()
+            .find(|schema| schema.first_client_slot == first_client_slot)
+        {
+            Some(schema) => schema,
+            None => {
+                manifest
+                    .dynamic_client_inputs
+                    .push(DynamicClientInputSchema {
+                        first_client_slot,
+                        inputs: Vec::new(),
+                    });
+                manifest
+                    .dynamic_client_inputs
+                    .last_mut()
+                    .expect("dynamic client input schema was pushed")
+            }
+        };
+        if schema.inputs.len() < inferred.len() {
+            schema
+                .inputs
+                .resize_with(inferred.len(), ShareType::default_secret_int);
+        }
+        for (ordinal, share_type) in inferred.into_iter().enumerate() {
+            if let Some(share_type) = share_type {
+                schema.inputs[ordinal] = share_type;
+            }
+        }
+    }
+    manifest
+        .dynamic_client_inputs
+        .sort_unstable_by_key(|schema| schema.first_client_slot);
 
     // Codegen visits a loop body once, so a `send_to_client` inside a bounded
     // loop contributes only one schema output even though the VM captures one
@@ -148,7 +193,9 @@ pub(crate) fn merge_inferred_client_inputs(program: &AstNode, manifest: &mut Cli
         .sort_unstable_by_key(|schema| schema.client_slot);
 }
 
-fn infer_client_io(program: &AstNode) -> (InferredInputs, InferredOutputCounts) {
+fn infer_client_io(
+    program: &AstNode,
+) -> (InferredInputs, InferredDynamicInputs, InferredOutputCounts) {
     let mut functions = HashMap::new();
     collect_functions(program, &mut functions);
 
@@ -189,6 +236,7 @@ fn infer_client_io(program: &AstNode) -> (InferredInputs, InferredOutputCounts) 
         functions,
         relevant,
         inputs: HashMap::new(),
+        dynamic_inputs: HashMap::new(),
         output_counts: HashMap::new(),
         call_stack: Vec::new(),
     };
@@ -199,7 +247,11 @@ fn infer_client_io(program: &AstNode) -> (InferredInputs, InferredOutputCounts) 
     for entry in entries {
         planner.visit_user_call(&entry, &[], &Env::new());
     }
-    (planner.inputs, planner.output_counts)
+    (
+        planner.inputs,
+        planner.dynamic_inputs,
+        planner.output_counts,
+    )
 }
 
 fn collect_functions<'a>(node: &'a AstNode, out: &mut HashMap<String, FunctionInfo<'a>>) {
@@ -287,6 +339,7 @@ impl Planner<'_> {
                 AbstractValue {
                     int: eval_binary(op, left.int, right.int),
                     list_len: None,
+                    ..AbstractValue::default()
                 }
             }
             AstNode::UnaryOperation { op, operand, .. } => {
@@ -301,6 +354,7 @@ impl Planner<'_> {
                 AbstractValue {
                     int,
                     list_len: None,
+                    ..AbstractValue::default()
                 }
             }
             AstNode::Block(nodes) => {
@@ -447,7 +501,12 @@ impl Planner<'_> {
             return AbstractValue::default();
         };
 
-        if is_client_input_call(name) {
+        if name == "ClientStore.get_number_clients" {
+            return AbstractValue {
+                runtime_client_count: true,
+                ..AbstractValue::default()
+            };
+        } else if is_client_input_call(name) {
             self.record_client_input(name, &argument_values);
         } else if is_client_output_call(name) {
             self.record_client_output(name, &argument_values);
@@ -458,6 +517,7 @@ impl Planner<'_> {
                     .and_then(|value| value.list_len)
                     .and_then(|len| i128::try_from(len).ok()),
                 list_len: None,
+                ..AbstractValue::default()
             };
         } else if matches!(name.as_str(), "append" | "array_push" | "insert") {
             if let Some(AstNode::Identifier(receiver, _)) = arguments.first() {
@@ -511,13 +571,6 @@ impl Planner<'_> {
     }
 
     fn record_client_input(&mut self, name: &str, arguments: &[AbstractValue]) {
-        let Some(client_slot) = arguments
-            .first()
-            .and_then(|value| value.int)
-            .and_then(|value| u64::try_from(value).ok())
-        else {
-            return;
-        };
         let Some(ordinal) = arguments
             .get(1)
             .and_then(|value| value.int)
@@ -530,7 +583,17 @@ impl Planner<'_> {
             "ClientStore.take_share_bool" => ShareType::boolean(),
             _ => ShareType::default_secret_int(),
         };
-        let inputs = self.inputs.entry(client_slot).or_default();
+        let Some(client) = arguments.first() else {
+            return;
+        };
+        let inputs =
+            if let Some(client_slot) = client.int.and_then(|value| u64::try_from(value).ok()) {
+                self.inputs.entry(client_slot).or_default()
+            } else if let Some(first_client_slot) = client.dynamic_client_slot_start {
+                self.dynamic_inputs.entry(first_client_slot).or_default()
+            } else {
+                return;
+            };
         if inputs.len() <= ordinal {
             inputs.resize(ordinal + 1, None);
         }
@@ -602,6 +665,7 @@ impl Planner<'_> {
 
     fn visit_while(&mut self, condition: &AstNode, body: &AstNode, env: &mut Env) {
         for _ in 0..MAX_STATIC_LOOP_ITERATIONS {
+            let dynamic_client_counter = dynamic_client_loop_counter(condition, env);
             match self.visit(condition, env).int {
                 Some(0) => return,
                 Some(_) => {
@@ -613,7 +677,15 @@ impl Planner<'_> {
                     // counter in the condition is not a literal, though: its
                     // current value represents an unknown runtime range and
                     // must not invent a client schema for the first iteration.
-                    if let AstNode::BinaryOperation { left, right, .. } = condition {
+                    if let Some((counter, first_client_slot)) = dynamic_client_counter {
+                        env.insert(
+                            counter,
+                            AbstractValue {
+                                dynamic_client_slot_start: Some(first_client_slot),
+                                ..AbstractValue::default()
+                            },
+                        );
+                    } else if let AstNode::BinaryOperation { left, right, .. } = condition {
                         if let AstNode::Identifier(name, _) = left.as_ref() {
                             env.insert(name.clone(), AbstractValue::default());
                         }
@@ -627,6 +699,35 @@ impl Planner<'_> {
             }
         }
     }
+}
+
+fn dynamic_client_loop_counter(condition: &AstNode, env: &Env) -> Option<(String, u64)> {
+    let AstNode::BinaryOperation {
+        op, left, right, ..
+    } = condition
+    else {
+        return None;
+    };
+    if op != "<" {
+        return None;
+    }
+    let AstNode::Identifier(counter, _) = left.as_ref() else {
+        return None;
+    };
+    let AstNode::Identifier(client_count, _) = right.as_ref() else {
+        return None;
+    };
+    if !env
+        .get(client_count)
+        .is_some_and(|value| value.runtime_client_count)
+    {
+        return None;
+    }
+    let first_client_slot = env
+        .get(counter)
+        .and_then(|value| value.int)
+        .and_then(|value| u64::try_from(value).ok())?;
+    Some((counter.clone(), first_client_slot))
 }
 
 fn is_list_return_type(node: &AstNode) -> bool {
@@ -806,7 +907,7 @@ def main() -> int64:
     }
 
     #[test]
-    fn dynamic_client_loop_does_not_invent_the_first_runtime_slot() {
+    fn dynamic_client_loop_records_a_runtime_input_template_without_inventing_a_slot() {
         let source = r#"
 def main() -> int64:
   var clients = ClientStore.get_number_clients()
@@ -821,6 +922,45 @@ def main() -> int64:
             .expect("program should compile");
         assert_eq!(program.client_io_manifest.clients.len(), 1);
         assert_eq!(program.client_io_manifest.clients[0].client_slot, 0);
+        assert_eq!(program.client_io_manifest.dynamic_client_inputs.len(), 1);
+        assert_eq!(
+            program.client_io_manifest.dynamic_client_inputs[0].first_client_slot,
+            1
+        );
+        assert_eq!(
+            program.client_io_manifest.dynamic_client_inputs[0].inputs,
+            vec![ShareType::default_secret_fixed_point()]
+        );
+    }
+
+    #[test]
+    fn dynamic_client_template_collects_each_statically_bounded_input_ordinal() {
+        let source = r#"
+def main() -> int64:
+  var clients = ClientStore.get_number_clients()
+  var ordinal = 0
+  while ordinal < 4:
+    var client = 0
+    while client < clients:
+      discard ClientStore.take_share_fixed(client, ordinal)
+      client += 1
+    ordinal += 1
+  return 0
+"#;
+        let program = compile(
+            source,
+            "dynamic_client_inputs.stfl",
+            &CompilerOptions::default(),
+        )
+        .expect("program should compile");
+        assert!(program.client_io_manifest.clients.is_empty());
+        assert_eq!(program.client_io_manifest.dynamic_client_inputs.len(), 1);
+        let schema = &program.client_io_manifest.dynamic_client_inputs[0];
+        assert_eq!(schema.first_client_slot, 0);
+        assert_eq!(
+            schema.inputs,
+            vec![ShareType::default_secret_fixed_point(); 4]
+        );
     }
 
     #[test]

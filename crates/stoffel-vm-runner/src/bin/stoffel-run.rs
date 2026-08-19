@@ -225,8 +225,9 @@ where
 
 fn manifest_client_input_types(
     manifest: &ClientIoManifest,
+    runtime_client_count: Option<usize>,
 ) -> std::collections::BTreeMap<usize, Vec<ShareType>> {
-    manifest
+    let mut input_types = manifest
         .clients
         .iter()
         .filter_map(|schema| {
@@ -234,7 +235,15 @@ fn manifest_client_input_types(
                 .ok()
                 .map(|slot| (slot, schema.inputs.clone()))
         })
-        .collect()
+        .collect::<std::collections::BTreeMap<_, _>>();
+    if let Some(runtime_client_count) = runtime_client_count {
+        for client_slot in 0..runtime_client_count {
+            if let Some(resolved) = manifest.input_types_for_client_slot(client_slot as u64) {
+                input_types.insert(client_slot, resolved.to_vec());
+            }
+        }
+    }
+    input_types
 }
 
 fn manifest_client_input_slots(
@@ -980,45 +989,78 @@ fn load_client_manifest_semantics(
             program_path.display()
         )
     })?;
-    let clients = &binary.client_io_manifest.clients;
-    if clients.is_empty() {
+    let manifest = &binary.client_io_manifest;
+    let clients = &manifest.clients;
+    if clients.is_empty() && manifest.dynamic_client_inputs.is_empty() {
         return Err(format!(
             "program '{}' has no client-I/O manifest",
             program_path.display()
         ));
     }
 
-    let schema = match requested_slot {
-        Some(slot) => clients
-            .iter()
-            .find(|schema| schema.client_slot == slot)
-            .ok_or_else(|| {
-                let available = manifest_client_slots(clients);
-                format!(
-                    "client slot {slot} is absent from program '{}'; available slots: {available}",
-                    program_path.display()
-                )
-            })?,
+    let (client_slot, inputs, outputs) = match requested_slot {
+        Some(slot) => client_manifest_semantics_for_slot(manifest, slot).ok_or_else(|| {
+            let available = manifest_client_slots(manifest);
+            format!(
+                "client slot {slot} is absent from program '{}'; available slots: {available}",
+                program_path.display()
+            )
+        })?,
         None if reserved_input_index.is_some() && input_count > 0 => {
             let reserved_input_index = reserved_input_index.expect("checked above");
-            client_schema_for_reserved_index(clients, reserved_input_index).ok_or_else(|| {
-                format!(
-                    "coordinator input index {reserved_input_index} is not the start of a client input range in '{}'; pass --client-slot <slot>",
-                    program_path.display()
-                )
-            })?
+            let slot = client_slot_for_reserved_index(manifest, reserved_input_index).ok_or_else(
+                || {
+                    format!(
+                        "coordinator input index {reserved_input_index} is not the start of a client input range in '{}'; pass --client-slot <slot>",
+                        program_path.display()
+                    )
+                },
+            )?;
+            client_manifest_semantics_for_slot(manifest, slot)
+                .expect("reserved input slot came from this manifest")
         }
         None => {
-            let candidates = clients
+            let mut candidates = clients
                 .iter()
                 .filter(|schema| {
                     schema.inputs.len() == input_count
                         && requested_output_count.is_none_or(|count| schema.outputs.len() == count)
                 })
+                .map(|schema| {
+                    (
+                        schema.client_slot,
+                        schema.inputs.as_slice(),
+                        schema.outputs.as_slice(),
+                    )
+                })
                 .collect::<Vec<_>>();
+            candidates.extend(
+                manifest
+                    .dynamic_client_inputs
+                    .iter()
+                    .filter(|schema| {
+                        schema.inputs.len() == input_count
+                            && requested_output_count.is_none_or(|count| count == 0)
+                    })
+                    .map(|schema| {
+                        (
+                            schema.first_client_slot,
+                            schema.inputs.as_slice(),
+                            &[] as &[ShareType],
+                        )
+                    }),
+            );
+            candidates.dedup_by(|left, right| left.1 == right.1 && left.2 == right.2);
             match candidates.as_slice() {
                 [schema] => *schema,
-                [] if clients.len() == 1 => &clients[0],
+                [] if clients.len() == 1 => {
+                    let schema = &clients[0];
+                    (
+                        schema.client_slot,
+                        schema.inputs.as_slice(),
+                        schema.outputs.as_slice(),
+                    )
+                }
                 [] => {
                     return Err(format!(
                         "no client schema in '{}' matches {input_count} input(s){}; pass --client-slot <slot>",
@@ -1031,7 +1073,7 @@ fn load_client_manifest_semantics(
                 _ => {
                     let slots = candidates
                         .iter()
-                        .map(|schema| schema.client_slot.to_string())
+                        .map(|(slot, _, _)| slot.to_string())
                         .collect::<Vec<_>>()
                         .join(", ");
                     return Err(format!(
@@ -1043,28 +1085,43 @@ fn load_client_manifest_semantics(
         }
     };
 
-    if schema.inputs.len() != input_count {
+    if inputs.len() != input_count {
         return Err(format!(
             "client slot {} expects {} input value(s) from the program manifest, got {input_count}",
-            schema.client_slot,
-            schema.inputs.len()
+            client_slot,
+            inputs.len()
         ));
     }
     if let Some(output_count) = requested_output_count {
-        if schema.outputs.len() != output_count {
+        if outputs.len() != output_count {
             return Err(format!(
                 "client slot {} expects {} output value(s) from the program manifest, but --outputs requested {output_count}",
-                schema.client_slot,
-                schema.outputs.len()
+                client_slot,
+                outputs.len()
             ));
         }
     }
 
     Ok(ClientManifestSemantics {
-        client_slot: schema.client_slot,
-        inputs: schema.inputs.clone(),
-        outputs: schema.outputs.clone(),
+        client_slot,
+        inputs: inputs.to_vec(),
+        outputs: outputs.to_vec(),
     })
+}
+
+fn client_manifest_semantics_for_slot(
+    manifest: &ClientIoManifest,
+    client_slot: u64,
+) -> Option<(u64, &[ShareType], &[ShareType])> {
+    let concrete = manifest
+        .clients
+        .iter()
+        .find(|schema| schema.client_slot == client_slot);
+    let inputs = manifest.input_types_for_client_slot(client_slot)?;
+    let outputs = concrete
+        .map(|schema| schema.outputs.as_slice())
+        .unwrap_or(&[]);
+    Some((client_slot, inputs, outputs))
 }
 
 fn client_schema_for_reserved_index(
@@ -1083,12 +1140,51 @@ fn client_schema_for_reserved_index(
     None
 }
 
-fn manifest_client_slots(clients: &[ClientIoSchema]) -> String {
-    clients
+fn client_slot_for_reserved_index(
+    manifest: &ClientIoManifest,
+    reserved_input_index: u64,
+) -> Option<u64> {
+    if manifest.dynamic_client_inputs.is_empty() {
+        return client_schema_for_reserved_index(&manifest.clients, reserved_input_index)
+            .map(|schema| schema.client_slot);
+    }
+
+    let max_static_slot = manifest
+        .clients
+        .iter()
+        .map(|schema| schema.client_slot)
+        .max()
+        .unwrap_or(0);
+    let max_slot = max_static_slot.max(u64::from(u8::MAX));
+    let mut next_index = 0_u64;
+    for client_slot in 0..=max_slot {
+        let inputs = manifest
+            .input_types_for_client_slot(client_slot)
+            .unwrap_or(&[]);
+        if !inputs.is_empty() && next_index == reserved_input_index {
+            return Some(client_slot);
+        }
+        next_index = next_index.checked_add(u64::try_from(inputs.len()).ok()?)?;
+        if next_index > reserved_input_index {
+            return None;
+        }
+    }
+    None
+}
+
+fn manifest_client_slots(manifest: &ClientIoManifest) -> String {
+    let mut slots = manifest
+        .clients
         .iter()
         .map(|schema| schema.client_slot.to_string())
-        .collect::<Vec<_>>()
-        .join(", ")
+        .collect::<Vec<_>>();
+    slots.extend(
+        manifest
+            .dynamic_client_inputs
+            .iter()
+            .map(|schema| format!("{}+ (runtime)", schema.first_client_slot)),
+    );
+    slots.join(", ")
 }
 
 fn semantic_client_input_count(inputs: Option<&str>) -> usize {
@@ -5931,7 +6027,7 @@ impl StandingRunnerExecutionHandler {
             .map_err(|error| format!("register reservoir transport: {error}"))?;
         let registration = ExecutionInboxRegistrationGuard::new(self.mux.clone(), execution_id);
         let mut vm = VirtualMachine::builder().build();
-        let client_input_types = manifest_client_input_types(&program.client_io_manifest);
+        let client_input_types = manifest_client_input_types(&program.client_io_manifest, None);
         let execution_tasks = ExecutionTaskGroup::child_of(&self.reservoir_cancellation);
         let mut setup = Some(PartySetup {
             net: Arc::clone(&self.network),
@@ -6404,7 +6500,8 @@ impl StandingRunnerExecutionHandler {
                 .as_ref()
                 .map(|storage| storage.with_namespace(*context.spec.execution_id.as_bytes())),
         )?;
-        let client_input_types = manifest_client_input_types(&program.client_io_manifest);
+        let client_input_types =
+            manifest_client_input_types(&program.client_io_manifest, Some(admission.clients.len()));
         let manifest_client_input_count =
             client_input_types.values().map(Vec::len).max().unwrap_or(0);
         let execution_id = context.spec.execution_id;
@@ -7986,7 +8083,12 @@ async fn main() {
             }
         }
     };
-    let client_input_types = manifest_client_input_types(&client_io_manifest);
+    let runtime_client_count = if expected_clients.is_empty() {
+        expected_client_count
+    } else {
+        Some(expected_clients.len())
+    };
+    let client_input_types = manifest_client_input_types(&client_io_manifest, runtime_client_count);
     let preprocessing_demand = client_io_manifest.preprocessing_demand;
     if function_count == 0 {
         eprintln!("Error: compiled program contains no functions");
@@ -8893,9 +8995,10 @@ mod tests {
         encode_preprocessing_exchange, field_outputs_to_hex, format_coordinator_outputs,
         format_vm_result, group_output_shares_by_client, hb_input_only_completion_proven,
         input_client_ids_from_output_ids, input_client_slot_map_from_output_ids,
-        load_client_manifest_semantics, manifest_client_input_slots, mpc_input_protocol_ids,
-        plan_preprocessing, preprocessing_transcript_digest, record_preprocessing_exchange_value,
-        render_fixed_point_i64, resolve_client_protocol_bindings, standing_preproc_pool_program_id,
+        load_client_manifest_semantics, manifest_client_input_slots, manifest_client_input_types,
+        mpc_input_protocol_ids, plan_preprocessing, preprocessing_transcript_digest,
+        record_preprocessing_exchange_value, render_fixed_point_i64,
+        resolve_client_protocol_bindings, standing_preproc_pool_program_id,
         standing_reservoir_plan, standing_reservoir_refill_execution_id,
         validate_preprocessing_proposals, validate_reservoir_allocation_admission,
         CoordinatorOutputFormat, ExecutionTaskGroup, PreprocessingExchangeFrame,
@@ -8914,7 +9017,8 @@ mod tests {
     use stoffel_vm::storage::preproc::PreprocMeta;
     use stoffel_vm::storage::preproc::{PoolAvailability, StandingPreprocSnapshot};
     use stoffel_vm_types::compiled_binary::{
-        ClientIoManifest, ClientIoSchema, CompiledBinary, PreprocessingDemand,
+        ClientIoManifest, ClientIoSchema, CompiledBinary, DynamicClientInputSchema,
+        PreprocessingDemand,
     };
     use stoffel_vm_types::core_types::{
         ClearShareInput, ClearShareValue, ShareData, ShareType, Value,
@@ -9847,6 +9951,37 @@ mod tests {
         assert_eq!(semantics.client_slot, 1);
         assert_eq!(semantics.inputs.len(), 4_096);
         assert_eq!(semantics.outputs.len(), 2);
+    }
+
+    #[test]
+    fn dynamic_manifest_maps_the_hundredth_client_range() {
+        let mut binary = CompiledBinary::new();
+        binary.client_io_manifest.clients = vec![ClientIoSchema {
+            client_slot: 0,
+            inputs: vec![ShareType::default_secret_fixed_point(); 4_096],
+            outputs: Vec::new(),
+        }];
+        binary.client_io_manifest.dynamic_client_inputs = vec![DynamicClientInputSchema {
+            first_client_slot: 1,
+            inputs: vec![ShareType::default_secret_fixed_point(); 4_096],
+        }];
+        let mut artifact = tempfile::NamedTempFile::new().unwrap();
+        binary.serialize(artifact.as_file_mut()).unwrap();
+
+        let semantics =
+            load_client_manifest_semantics(artifact.path(), None, Some(99 * 4_096), 4_096, None)
+                .unwrap();
+
+        assert_eq!(semantics.client_slot, 99);
+        assert_eq!(semantics.inputs.len(), 4_096);
+        assert!(semantics
+            .inputs
+            .iter()
+            .all(|share_type| *share_type == ShareType::default_secret_fixed_point()));
+
+        let expanded = manifest_client_input_types(&binary.client_io_manifest, Some(100));
+        assert_eq!(expanded.len(), 100);
+        assert_eq!(expanded[&99].len(), 4_096);
     }
 
     #[test]
