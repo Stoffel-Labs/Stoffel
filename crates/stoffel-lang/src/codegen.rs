@@ -1279,9 +1279,10 @@ impl CodeGenerator {
             | "ClientStore.take_share_fixed"
             | "ClientStore.take_share_bool" => {
                 // The client slot may be a literal, a loop variable (records every
-                // client in the loop range), or a clear-int constant.
+                // client in the loop range), or a clear-int constant. Runtime
+                // client-count loops are recorded later by client_io_planner as
+                // dynamic input templates, so they are intentionally silent here.
                 let Some(client_slots) = self.input_ordinals_for_node(arguments.first()) else {
-                    Self::warn_unrecorded_client_io(function_name, "input");
                     return;
                 };
                 let Some(input_ordinals) = self.input_ordinals_for_node(arguments.get(1)) else {
@@ -1639,6 +1640,7 @@ impl CodeGenerator {
             // program AST by `preprocessing_planner` and stamped into the
             // manifest in `generate_bytecode`; leave it at the default here.
             preprocessing_demand: PreprocessingDemand::default(),
+            dynamic_client_inputs: Vec::new(),
         }
     }
 
