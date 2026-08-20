@@ -2223,7 +2223,7 @@ fn is_flag_present(raw_args: &[String], flag: &str) -> bool {
         .any(|arg| arg == flag || arg.starts_with(&format!("{flag}=")))
 }
 
-fn client_option_takes_value(argument: &str) -> bool {
+fn cli_option_takes_value(argument: &str) -> bool {
     matches!(
         argument,
         "--advertise"
@@ -2252,6 +2252,8 @@ fn client_option_takes_value(argument: &str) -> bool {
             | "--outputs"
             | "--party-id"
             | "--preproc-store"
+            | "--print-program-id"
+            | "--print-program-manifest"
             | "--program"
             | "--rpc-bind"
             | "--servers"
@@ -2263,6 +2265,150 @@ fn client_option_takes_value(argument: &str) -> bool {
     )
 }
 
+fn validate_cli_option_values(raw_args: &[String]) -> Result<(), String> {
+    let mut index = 0;
+    while let Some(argument) = raw_args.get(index) {
+        if let Some((option, value)) = argument.split_once('=') {
+            if cli_option_takes_value(option) && value.is_empty() {
+                return Err(format!("{option} requires a value"));
+            }
+            index += 1;
+            continue;
+        }
+
+        if cli_option_takes_value(argument) {
+            let value = raw_args
+                .get(index + 1)
+                .filter(|value| !value.starts_with("--"))
+                .ok_or_else(|| format!("{argument} requires a value"))?;
+            if value.is_empty() {
+                return Err(format!("{argument} requires a value"));
+            }
+            index += 2;
+            continue;
+        }
+
+        index += 1;
+    }
+    Ok(())
+}
+
+fn normalized_cli_arguments(raw_args: &[String]) -> Vec<String> {
+    let mut normalized = Vec::with_capacity(raw_args.len());
+    for argument in raw_args {
+        if let Some((option, value)) = argument.split_once('=') {
+            if cli_option_takes_value(option) {
+                normalized.push(option.to_owned());
+                normalized.push(value.to_owned());
+                continue;
+            }
+        }
+        normalized.push(argument.clone());
+    }
+    normalized
+}
+
+fn cli_positional_arguments(raw_args: &[String]) -> Vec<String> {
+    let mut positional = Vec::new();
+    let mut index = 0;
+    while let Some(argument) = raw_args.get(index) {
+        if argument
+            .split_once('=')
+            .is_some_and(|(option, _)| cli_option_takes_value(option))
+        {
+            index += 1;
+            continue;
+        }
+        if cli_option_takes_value(argument) {
+            index += 2;
+            continue;
+        }
+        if !argument.starts_with('-') {
+            positional.push(argument.clone());
+        }
+        index += 1;
+    }
+    positional
+}
+
+fn validate_required_cli_parameters(
+    mode: &str,
+    requirements: &[(&str, bool)],
+) -> Result<(), String> {
+    let missing = requirements
+        .iter()
+        .filter_map(|(parameter, present)| (!present).then_some(*parameter))
+        .collect::<Vec<_>>();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(format!("{mode} requires {}", missing.join(", ")))
+    }
+}
+
+fn validate_forbidden_cli_parameters(
+    mode: &str,
+    parameters: &[(&str, bool)],
+) -> Result<(), String> {
+    let present = parameters
+        .iter()
+        .filter_map(|(parameter, present)| (*present).then_some(*parameter))
+        .collect::<Vec<_>>();
+    if present.is_empty() {
+        Ok(())
+    } else {
+        Err(format!(
+            "{mode} does not accept mode-specific parameter(s): {}",
+            present.join(", ")
+        ))
+    }
+}
+
+fn validate_cli_mode_flags(
+    as_client: bool,
+    as_bootnode: bool,
+    as_leader: bool,
+    has_party_id: bool,
+    has_bootstrap: bool,
+) -> Result<(), String> {
+    let has_party_marker = has_party_id || has_bootstrap;
+    if as_client && (as_bootnode || as_leader || has_party_marker) {
+        return Err(
+            "--client cannot be combined with --bootnode, --leader, --party-id, or --bootstrap"
+                .to_owned(),
+        );
+    }
+    if as_bootnode && (as_leader || has_party_marker) {
+        return Err(
+            "--bootnode cannot be combined with --leader, --party-id, or --bootstrap".to_owned(),
+        );
+    }
+    if as_leader && has_party_marker {
+        return Err("--leader cannot be combined with --party-id or --bootstrap".to_owned());
+    }
+    if has_party_id != has_bootstrap {
+        return Err("party mode requires both --party-id and --bootstrap".to_owned());
+    }
+    Ok(())
+}
+
+fn validate_client_server_count(n_parties: usize, server_count: usize) -> Result<(), String> {
+    if server_count == n_parties {
+        Ok(())
+    } else {
+        Err(format!(
+            "client mode requires exactly one --servers address per party (got {server_count}, expected {n_parties})"
+        ))
+    }
+}
+
+fn exit_on_cli_configuration_error(result: Result<(), String>) {
+    if let Err(error) = result {
+        eprintln!("Error: {error}");
+        exit(2);
+    }
+}
+
 /// Resolve the compiled artifact used for semantic client I/O.
 ///
 /// Client mode historically accepted options before the positional program
@@ -2270,7 +2416,10 @@ fn client_option_takes_value(argument: &str) -> bool {
 /// inspected argv[1]. Walk the arguments with their arity so option values are
 /// not mistaken for the program. An explicit `--program` remains authoritative.
 fn client_program_from_arguments(raw_args: &[String]) -> Option<PathBuf> {
-    let mut positional_program = None;
+    let positional_program = cli_positional_arguments(raw_args)
+        .into_iter()
+        .next()
+        .map(PathBuf::from);
     let mut explicit_program = None;
     let mut index = 0;
 
@@ -2287,12 +2436,9 @@ fn client_program_from_arguments(raw_args: &[String]) -> Option<PathBuf> {
             index += 1;
             continue;
         }
-        if client_option_takes_value(argument) {
+        if cli_option_takes_value(argument) {
             index += 2;
             continue;
-        }
-        if !argument.starts_with("--") && positional_program.is_none() {
-            positional_program = Some(PathBuf::from(argument));
         }
         index += 1;
     }
@@ -3432,10 +3578,11 @@ async fn run_as_client(
 
     if server_addrs.len() != n {
         eprintln!(
-            "Warning: number of servers ({}) doesn't match n_parties ({})",
+            "Error: number of servers ({}) doesn't match n_parties ({})",
             server_addrs.len(),
             n
         );
+        exit(2);
     }
 
     let curve_config = if let Some(name) = mpc_curve {
@@ -7303,6 +7450,7 @@ async fn main() {
     }
 
     let raw_args = env::args().skip(1).collect::<Vec<_>>();
+    exit_on_cli_configuration_error(validate_cli_option_values(&raw_args));
     let positional_client_program = client_program_from_arguments(&raw_args);
 
     if let Some(index) = raw_args.iter().position(|arg| arg == "--print-program-id") {
@@ -7484,21 +7632,177 @@ async fn main() {
         }
     }
 
-    // collect positional args (non-flags)
-    let mut positional = raw_args
-        .into_iter()
-        .filter(|a| !a.starts_with("--"))
-        .collect::<Vec<_>>();
+    let has_party_id = is_flag_present(&raw_args, "--party-id");
+    let has_bootstrap = is_flag_present(&raw_args, "--bootstrap");
+    let has_offchain_coordinator = is_flag_present(&raw_args, "--off-chain-coord");
+    let has_onchain_coordinator = is_flag_present(&raw_args, "--on-chain-coord");
+    let has_coordinator = has_offchain_coordinator || has_onchain_coordinator;
+    let party_mode_requested = has_party_id || has_bootstrap;
+
+    exit_on_cli_configuration_error(validate_cli_mode_flags(
+        as_client,
+        as_bootnode,
+        as_leader,
+        has_party_id,
+        has_bootstrap,
+    ));
+
+    if as_client {
+        exit_on_cli_configuration_error(validate_required_cli_parameters(
+            "client mode",
+            &[
+                (
+                    "a positional program or --program (or explicit --raw-client-io)",
+                    client_program.is_some() || raw_client_io,
+                ),
+                ("--n-parties", is_flag_present(&raw_args, "--n-parties")),
+                ("--servers", is_flag_present(&raw_args, "--servers")),
+                (
+                    "--execution-id",
+                    is_flag_present(&raw_args, "--execution-id"),
+                ),
+            ],
+        ));
+        if has_coordinator {
+            exit_on_cli_configuration_error(validate_required_cli_parameters(
+                "coordinator client mode",
+                &[
+                    ("--cert", is_flag_present(&raw_args, "--cert")),
+                    ("--key", is_flag_present(&raw_args, "--key")),
+                ],
+            ));
+        } else if is_flag_present(&raw_args, "--cert") != is_flag_present(&raw_args, "--key") {
+            exit_on_cli_configuration_error(Err(
+                "direct client mode requires --cert and --key to be provided together".to_owned(),
+            ));
+        } else {
+            exit_on_cli_configuration_error(validate_forbidden_cli_parameters(
+                "direct client mode",
+                &[
+                    (
+                        "--client-index",
+                        is_flag_present(&raw_args, "--client-index"),
+                    ),
+                    (
+                        "--client-transport-servers",
+                        is_flag_present(&raw_args, "--client-transport-servers"),
+                    ),
+                ],
+            ));
+        }
+        exit_on_cli_configuration_error(validate_forbidden_cli_parameters(
+            "client mode",
+            &[
+                ("--bind", is_flag_present(&raw_args, "--bind")),
+                ("--advertise", is_flag_present(&raw_args, "--advertise")),
+                ("--rpc-bind", is_flag_present(&raw_args, "--rpc-bind")),
+                (
+                    "--expected-clients",
+                    is_flag_present(&raw_args, "--expected-clients"),
+                ),
+                (
+                    "--wait-for-clients",
+                    is_flag_present(&raw_args, "--wait-for-clients"),
+                ),
+            ],
+        ));
+    } else if as_bootnode {
+        exit_on_cli_configuration_error(validate_required_cli_parameters(
+            "bootnode mode",
+            &[
+                ("--bind", is_flag_present(&raw_args, "--bind")),
+                ("--n-parties", is_flag_present(&raw_args, "--n-parties")),
+            ],
+        ));
+    } else if as_leader || party_mode_requested {
+        let mode = if as_leader {
+            "leader mode"
+        } else {
+            "party mode"
+        };
+        exit_on_cli_configuration_error(validate_required_cli_parameters(
+            mode,
+            &[
+                ("a positional program", client_program.is_some()),
+                ("--bind", is_flag_present(&raw_args, "--bind")),
+                ("--n-parties", is_flag_present(&raw_args, "--n-parties")),
+                (
+                    "--execution-id",
+                    is_flag_present(&raw_args, "--execution-id"),
+                ),
+            ],
+        ));
+        if has_coordinator {
+            exit_on_cli_configuration_error(validate_required_cli_parameters(
+                "coordinator server mode",
+                &[
+                    ("--rpc-bind", is_flag_present(&raw_args, "--rpc-bind")),
+                    ("--cert", is_flag_present(&raw_args, "--cert")),
+                    ("--key", is_flag_present(&raw_args, "--key")),
+                ],
+            ));
+        } else {
+            exit_on_cli_configuration_error(validate_forbidden_cli_parameters(
+                mode,
+                &[("--rpc-bind", is_flag_present(&raw_args, "--rpc-bind"))],
+            ));
+            if is_flag_present(&raw_args, "--cert") != is_flag_present(&raw_args, "--key") {
+                exit_on_cli_configuration_error(Err(format!(
+                    "{mode} requires --cert and --key to be provided together"
+                )));
+            }
+        }
+    } else {
+        exit_on_cli_configuration_error(validate_forbidden_cli_parameters(
+            "local mode",
+            &[
+                ("--bind", is_flag_present(&raw_args, "--bind")),
+                ("--n-parties", is_flag_present(&raw_args, "--n-parties")),
+                ("--threshold", is_flag_present(&raw_args, "--threshold")),
+                ("--advertise", is_flag_present(&raw_args, "--advertise")),
+                (
+                    "--execution-id",
+                    is_flag_present(&raw_args, "--execution-id"),
+                ),
+                ("--servers", is_flag_present(&raw_args, "--servers")),
+                ("--rpc-bind", is_flag_present(&raw_args, "--rpc-bind")),
+                ("--off-chain-coord", has_offchain_coordinator),
+                ("--on-chain-coord", has_onchain_coordinator),
+                (
+                    "--expected-clients",
+                    is_flag_present(&raw_args, "--expected-clients"),
+                ),
+                ("--one-off", one_off),
+                ("--inputs", is_flag_present(&raw_args, "--inputs")),
+                ("--outputs", is_flag_present(&raw_args, "--outputs")),
+                ("--program", is_flag_present(&raw_args, "--program")),
+                ("--client-slot", is_flag_present(&raw_args, "--client-slot")),
+                ("--raw-client-io", raw_client_io),
+                (
+                    "--client-index",
+                    is_flag_present(&raw_args, "--client-index"),
+                ),
+                (
+                    "--client-transport-servers",
+                    is_flag_present(&raw_args, "--client-transport-servers"),
+                ),
+            ],
+        ));
+    }
+
+    let mut positional = cli_positional_arguments(&raw_args);
 
     if positional.is_empty() {
-        // Allow bootnode-only mode without program path
-        if !as_bootnode {
+        // Bootnode and client modes do not require a positional program. Client
+        // mode accepts --program, and raw mode intentionally has no artifact.
+        if !as_bootnode && !as_client {
             print_usage_and_exit();
         }
     }
 
     // Parse key-value style flags
-    let mut args_iter = env::args().skip(1).peekable();
+    let normalized_args = normalized_cli_arguments(&raw_args);
+    let mut args_iter = normalized_args.into_iter().peekable();
     while let Some(a) = args_iter.next() {
         match a.as_str() {
             "--bind" => {
@@ -7725,6 +8029,63 @@ async fn main() {
         }
     }
 
+    if as_client {
+        exit_on_cli_configuration_error(validate_required_cli_parameters(
+            "client mode",
+            &[
+                (
+                    "a positional program or --program (or explicit --raw-client-io)",
+                    client_program.is_some() || raw_client_io,
+                ),
+                ("--n-parties", n_parties.is_some()),
+                ("--servers", !server_addrs.is_empty()),
+                ("--execution-id", execution_id.is_some()),
+            ],
+        ));
+        exit_on_cli_configuration_error(validate_client_server_count(
+            n_parties.expect("client requirements checked above"),
+            server_addrs.len(),
+        ));
+        if raw_client_io && client_manifest_slot.is_some() {
+            exit_on_cli_configuration_error(Err(
+                "--client-slot cannot be combined with --raw-client-io".to_owned(),
+            ));
+        }
+    } else if as_bootnode {
+        exit_on_cli_configuration_error(validate_required_cli_parameters(
+            "bootnode mode",
+            &[
+                ("--bind", bind_addr.is_some()),
+                ("--n-parties", n_parties.is_some()),
+            ],
+        ));
+    } else if as_leader || party_mode_requested {
+        let mode = if as_leader {
+            "leader mode"
+        } else {
+            "party mode"
+        };
+        exit_on_cli_configuration_error(validate_required_cli_parameters(
+            mode,
+            &[
+                ("a positional program", client_program.is_some()),
+                ("--bind", bind_addr.is_some()),
+                ("--n-parties", n_parties.is_some()),
+                ("--execution-id", execution_id.is_some()),
+            ],
+        ));
+        if has_coordinator {
+            exit_on_cli_configuration_error(validate_required_cli_parameters(
+                "coordinator server mode",
+                &[
+                    ("--rpc-bind", rpc_addr.is_some()),
+                    ("--cert", cert_der.is_some()),
+                    ("--key", key_der.is_some()),
+                ],
+            ));
+        }
+    }
+
     let mut coordinator_output_format = match output_fixed_point_fractional_bits {
         Some(bits) => {
             if bits > 62 {
@@ -7778,7 +8139,7 @@ async fn main() {
             eprintln!("Error: {error}");
             exit(2);
         }
-        let bind = bind_addr.unwrap_or_else(|| "127.0.0.1:9000".parse().unwrap());
+        let bind = bind_addr.expect("bootnode CLI requirements validated");
         eprintln!("Starting bootnode on {}", bind);
         // Install crypto provider for quinn/rustls
         rustls::crypto::ring::default_provider()
@@ -7824,6 +8185,36 @@ async fn main() {
                 program_path.display(),
                 semantics.client_slot
             );
+        }
+
+        let input_count = semantic_client_input_count(client_inputs.as_deref());
+        let output_count = client_outputs.unwrap_or(input_count);
+        if input_count == 0 && output_count == 0 {
+            exit_on_cli_configuration_error(Err(
+                "client mode requires at least one input or requested output".to_owned(),
+            ));
+        }
+        if has_coordinator && input_count > 0 {
+            exit_on_cli_configuration_error(validate_required_cli_parameters(
+                "coordinator input client mode",
+                &[("--client-index", coordinator_client_index.is_some())],
+            ));
+        }
+        if has_coordinator && input_count == 0 && output_count > 0 {
+            exit_on_cli_configuration_error(validate_required_cli_parameters(
+                "coordinator output-only client mode",
+                &[(
+                    "--client-transport-servers",
+                    !client_transport_addrs.is_empty(),
+                )],
+            ));
+            if client_transport_addrs.len() != server_addrs.len() {
+                exit_on_cli_configuration_error(Err(format!(
+                    "coordinator output-only client mode requires exactly one --client-transport-servers address per --servers address (got {}, expected {})",
+                    client_transport_addrs.len(),
+                    server_addrs.len()
+                )));
+            }
         }
 
         if coord_addr.is_some()
@@ -8043,8 +8434,8 @@ async fn main() {
 
     // Leader mode: this party also runs the bootnode
     if as_leader {
-        let bind = bind_addr.unwrap_or_else(|| "127.0.0.1:9000".parse().unwrap());
-        let my_id = party_id.unwrap_or(0usize);
+        let bind = bind_addr.expect("leader CLI requirements validated");
+        let my_id = 0usize;
 
         // Install crypto provider for quinn/rustls
         rustls::crypto::ring::default_provider()
@@ -8160,8 +8551,8 @@ async fn main() {
         net_opt = Some(net.clone());
     } else if let Some(bootnode) = bootstrap_addr {
         // Regular party mode: connect to external bootnode
-        let bind = bind_addr.unwrap_or_else(|| "127.0.0.1:0".parse().unwrap());
-        let my_id = party_id.unwrap_or(0usize);
+        let bind = bind_addr.expect("party CLI requirements validated");
+        let my_id = party_id.expect("party CLI requirements validated");
         rustls::crypto::ring::default_provider()
             .install_default()
             .expect("install rustls crypto");
@@ -9135,10 +9526,10 @@ Flags:
   --one-off               After confirming the off-chain coordinator's ProgramFinished
                           round, tell it to shut down (leader only; coordinator must
                           have been started with --one-off itself)
-  --bind <addr:port>      Bind address for bootnode or party listen
+  --bind <addr:port>      Bind address (required in bootnode/leader/party mode)
   --party-id <usize>      Party id (party mode, 0-indexed)
-  --bootstrap <addr:port> Bootnode address (party mode or client mode)
-  --n-parties <usize>     Number of parties for MPC (required in party/leader/client mode)
+  --bootstrap <addr:port> Bootnode address (required in party mode)
+  --n-parties <usize>     Number of parties for MPC (required in every network mode)
   --threshold <usize>     Threshold t (default: 1)
   --mpc-backend <name>    MPC backend: honeybadger (default) or avss
   --mpc-curve <name>      MPC curve: bls12-381 (default), bn254, curve25519, ed25519;
@@ -9147,6 +9538,7 @@ Flags:
   --program <path>        Compiled program used to translate client inputs and outputs
                           according to its client-I/O manifest (client mode).
                           The first positional program path has the same semantics.
+                          Required in client mode unless --raw-client-io is explicit.
   --client-slot <u64>     Manifest client slot. Usually inferred from --client-index
                           and the manifest's per-client input ranges
   --raw-client-io         Treat --inputs and reconstructed outputs as raw field values,
@@ -9155,7 +9547,7 @@ Flags:
   --output-fixed-point-fractional-bits <n>
                           Decode coordinator client outputs as fixed-point values
                           with n fractional bits instead of raw field integers
-  --servers <addrs>       Comma-separated server addresses (client mode)
+  --servers <addrs>       Exactly one comma-separated server address per MPC party
   --client-transport-servers <addrs>
                           Coordinator-mode QUIC addresses used to authenticate
                           output-only clients with each standing execution
@@ -9171,13 +9563,13 @@ Flags:
                           Temporarily unavailable in the crates.io-ready build
   --eth-node <url>        Reserved for future on-chain coordinator support
   --wallet-sk <hex>       Reserved for future on-chain coordinator support
-  --rpc-bind <addr:port>  Node mask-RPC bind address (required in standing mode)
+  --rpc-bind <addr:port>  Node mask-RPC bind address (required with a coordinator)
   --cert <path>           Path to DER-encoded X.509 certificate
   --key <path>            Path to DER-encoded private key
   --client-index <u64>    Reserved coordinator input index (coordinator client mode)
   --preproc-store <path>  Persistent MPC preprocessing store directory
   --local-store <path>    Persistent VM local storage database
-  --execution-id <hex>    Nonzero 256-bit execution ID shared by all MPC parties
+  --execution-id <hex>    Nonzero 256-bit execution ID (required in client/leader/party mode)
   --expected-clients <cert-paths>
                           Comma-separated client cert paths for off-chain coordinator mode
   -h, --help              Show this help
@@ -9185,6 +9577,15 @@ Flags:
 Required environment:
   STOFFEL_AUTH_TOKEN      Shared secret required by bootnode and all parties for
                           authenticated discovery registration
+
+Mode contracts:
+  Client:    --client, program (or --raw-client-io), --servers, --n-parties,
+             and --execution-id. Coordinator clients additionally require --cert/--key;
+             input clients require --client-index.
+  Party:     program, --party-id, --bootstrap, --bind, --n-parties, and --execution-id.
+  Leader:    program, --leader, --bind, --n-parties, and --execution-id.
+  Bootnode:  --bootnode, --bind, and --n-parties.
+  Coordinator parties additionally require --off-chain-coord, --rpc-bind, --cert, and --key.
 
 Multi-Party Execution:
   In party mode, all parties register with the bootnode and wait until
@@ -9254,20 +9655,21 @@ Examples:
 mod tests {
     use super::{
         band_pow2, bind_admitted_client_slots, canonical_mask_reservation_runs,
-        checked_client_input_total, client_input_completion_quorum, client_input_setup_plan,
-        client_output_slot_map, client_program_from_arguments, client_schema_for_reserved_index,
-        client_transport_recipient, coordinator_execution_already_retired,
-        decode_preprocessing_exchange, direct_client_inbound_message,
-        encode_manifest_client_inputs, encode_preprocessing_exchange, field_outputs_to_hex,
-        format_coordinator_outputs, format_vm_result, group_output_shares_by_client,
-        hb_input_only_completion_proven, input_client_ids_from_output_ids,
-        input_client_slot_map_from_output_ids, load_client_manifest_semantics,
-        manifest_client_input_slots, manifest_client_input_types, mpc_input_protocol_ids,
-        plan_preprocessing, preprocessing_transcript_ack_if_complete,
+        checked_client_input_total, cli_positional_arguments, client_input_completion_quorum,
+        client_input_setup_plan, client_output_slot_map, client_program_from_arguments,
+        client_schema_for_reserved_index, client_transport_recipient,
+        coordinator_execution_already_retired, decode_preprocessing_exchange,
+        direct_client_inbound_message, encode_manifest_client_inputs,
+        encode_preprocessing_exchange, field_outputs_to_hex, format_coordinator_outputs,
+        format_vm_result, group_output_shares_by_client, hb_input_only_completion_proven,
+        input_client_ids_from_output_ids, input_client_slot_map_from_output_ids,
+        load_client_manifest_semantics, manifest_client_input_slots, manifest_client_input_types,
+        mpc_input_protocol_ids, plan_preprocessing, preprocessing_transcript_ack_if_complete,
         preprocessing_transcript_digest, record_preprocessing_exchange_value,
         render_fixed_point_i64, resolve_client_protocol_bindings, standing_preproc_pool_program_id,
-        standing_reservoir_plan, standing_reservoir_refill_execution_id,
-        validate_preprocessing_proposals, validate_reservoir_allocation_admission,
+        standing_reservoir_plan, standing_reservoir_refill_execution_id, validate_cli_mode_flags,
+        validate_cli_option_values, validate_client_server_count, validate_preprocessing_proposals,
+        validate_required_cli_parameters, validate_reservoir_allocation_admission,
         CoordinatorOutputFormat, ExecutionTaskGroup, PreprocessingExchangeFrame,
         PreprocessingExchangeMessage, PreprocessingExchangePhase, ReservoirAllocationSnapshot,
         StandingPreprocessingProposal,
@@ -9336,6 +9738,78 @@ mod tests {
                 "127.0.0.1:9000",
             ])),
             None
+        );
+    }
+
+    #[test]
+    fn cli_positionals_exclude_option_values() {
+        let arguments = [
+            "--leader",
+            "--bind",
+            "127.0.0.1:9000",
+            "program.stflb",
+            "main",
+            "--n-parties=5",
+            "--execution-id",
+            "01",
+        ]
+        .map(str::to_owned);
+
+        assert_eq!(
+            cli_positional_arguments(&arguments),
+            vec!["program.stflb".to_owned(), "main".to_owned()]
+        );
+    }
+
+    #[test]
+    fn cli_value_options_reject_missing_values() {
+        let missing = ["--client".to_owned(), "--servers".to_owned()];
+        assert_eq!(
+            validate_cli_option_values(&missing),
+            Err("--servers requires a value".to_owned())
+        );
+
+        let empty = ["--n-parties=".to_owned()];
+        assert_eq!(
+            validate_cli_option_values(&empty),
+            Err("--n-parties requires a value".to_owned())
+        );
+    }
+
+    #[test]
+    fn cli_modes_reject_ambiguous_or_partial_server_roles() {
+        assert!(validate_cli_mode_flags(true, false, true, false, false).is_err());
+        assert_eq!(
+            validate_cli_mode_flags(false, false, false, true, false),
+            Err("party mode requires both --party-id and --bootstrap".to_owned())
+        );
+        assert!(validate_cli_mode_flags(false, false, false, true, true).is_ok());
+    }
+
+    #[test]
+    fn cli_required_parameters_report_every_missing_value() {
+        assert_eq!(
+            validate_required_cli_parameters(
+                "party mode",
+                &[
+                    ("--bind", false),
+                    ("--n-parties", true),
+                    ("--execution-id", false)
+                ],
+            ),
+            Err("party mode requires --bind, --execution-id".to_owned())
+        );
+    }
+
+    #[test]
+    fn client_server_roster_must_match_party_count() {
+        assert!(validate_client_server_count(5, 5).is_ok());
+        assert_eq!(
+            validate_client_server_count(5, 4),
+            Err(
+                "client mode requires exactly one --servers address per party (got 4, expected 5)"
+                    .to_owned()
+            )
         );
     }
 
