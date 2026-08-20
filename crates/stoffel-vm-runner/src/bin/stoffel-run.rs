@@ -2223,6 +2223,83 @@ fn is_flag_present(raw_args: &[String], flag: &str) -> bool {
         .any(|arg| arg == flag || arg.starts_with(&format!("{flag}=")))
 }
 
+fn client_option_takes_value(argument: &str) -> bool {
+    matches!(
+        argument,
+        "--advertise"
+            | "--bind"
+            | "--bootstrap"
+            | "--cert"
+            | "--client-index"
+            | "--client-input-count"
+            | "--client-input-slots"
+            | "--client-input-total"
+            | "--client-roster"
+            | "--client-slot"
+            | "--client-transport-servers"
+            | "--eth-node"
+            | "--execution-id"
+            | "--expected-clients"
+            | "--inputs"
+            | "--key"
+            | "--local-store"
+            | "--mpc-backend"
+            | "--mpc-curve"
+            | "--n-parties"
+            | "--off-chain-coord"
+            | "--on-chain-coord"
+            | "--output-fixed-point-fractional-bits"
+            | "--outputs"
+            | "--party-id"
+            | "--preproc-store"
+            | "--program"
+            | "--rpc-bind"
+            | "--servers"
+            | "--stun-servers"
+            | "--threshold"
+            | "--timestamp"
+            | "--wait-for-clients"
+            | "--wallet-sk"
+    )
+}
+
+/// Resolve the compiled artifact used for semantic client I/O.
+///
+/// Client mode historically accepted options before the positional program
+/// path (`stoffel-run --client program.stflb ...`), but semantic I/O only
+/// inspected argv[1]. Walk the arguments with their arity so option values are
+/// not mistaken for the program. An explicit `--program` remains authoritative.
+fn client_program_from_arguments(raw_args: &[String]) -> Option<PathBuf> {
+    let mut positional_program = None;
+    let mut explicit_program = None;
+    let mut index = 0;
+
+    while let Some(argument) = raw_args.get(index) {
+        if argument == "--program" {
+            explicit_program = raw_args.get(index + 1).map(PathBuf::from);
+            index += 2;
+            continue;
+        }
+        if let Some(program) = argument.strip_prefix("--program=") {
+            if !program.is_empty() {
+                explicit_program = Some(PathBuf::from(program));
+            }
+            index += 1;
+            continue;
+        }
+        if client_option_takes_value(argument) {
+            index += 2;
+            continue;
+        }
+        if !argument.starts_with("--") && positional_program.is_none() {
+            positional_program = Some(PathBuf::from(argument));
+        }
+        index += 1;
+    }
+
+    explicit_program.or(positional_program)
+}
+
 fn print_vm_result(vm: &mut VirtualMachine, result: Value) {
     println!("Program returned: {}", format_vm_result(vm, &result));
 }
@@ -7209,10 +7286,7 @@ async fn main() {
     }
 
     let raw_args = env::args().skip(1).collect::<Vec<_>>();
-    let leading_program_path = raw_args
-        .first()
-        .filter(|argument| !argument.starts_with("--"))
-        .map(PathBuf::from);
+    let positional_client_program = client_program_from_arguments(&raw_args);
 
     if let Some(index) = raw_args.iter().position(|arg| arg == "--print-program-id") {
         let path = raw_args.get(index + 1).unwrap_or_else(|| {
@@ -7302,7 +7376,7 @@ async fn main() {
     let mut threshold: Option<usize> = None;
     let mut client_inputs: Option<String> = None;
     let mut client_outputs: Option<usize> = None;
-    let mut client_program = leading_program_path;
+    let mut client_program = positional_client_program;
     let mut client_manifest_slot: Option<u64> = None;
     let mut raw_client_io = false;
     let mut output_fixed_point_fractional_bits: Option<usize> = None;
@@ -7703,7 +7777,9 @@ async fn main() {
     // Client mode: connect to MPC servers and provide inputs
     if as_client {
         if client_manifest_slot.is_some() && client_program.is_none() {
-            eprintln!("Error: --client-slot requires --program <compiled.stflb>");
+            eprintln!(
+                "Error: --client-slot requires a positional program or --program <compiled.stflb>"
+            );
             exit(2);
         }
         if let Some(program_path) = client_program.as_deref().filter(|_| !raw_client_io) {
@@ -9052,7 +9128,8 @@ Flags:
                           AVSS also supports secp256k1 and p-256
   --inputs <values>       Comma-separated input values (client mode)
   --program <path>        Compiled program used to translate client inputs and outputs
-                          according to its client-I/O manifest (client mode)
+                          according to its client-I/O manifest (client mode).
+                          The first positional program path has the same semantics.
   --client-slot <u64>     Manifest client slot. Usually inferred from --client-index
                           and the manifest's per-client input ranges
   --raw-client-io         Treat --inputs and reconstructed outputs as raw field values,
@@ -9161,14 +9238,15 @@ mod tests {
     use super::{
         band_pow2, bind_admitted_client_slots, canonical_mask_reservation_runs,
         checked_client_input_total, client_input_completion_quorum, client_input_setup_plan,
-        client_output_slot_map, client_schema_for_reserved_index, client_transport_recipient,
-        coordinator_execution_already_retired, decode_preprocessing_exchange,
-        direct_client_inbound_message, encode_manifest_client_inputs,
-        encode_preprocessing_exchange, field_outputs_to_hex, format_coordinator_outputs,
-        format_vm_result, group_output_shares_by_client, hb_input_only_completion_proven,
-        input_client_ids_from_output_ids, input_client_slot_map_from_output_ids,
-        load_client_manifest_semantics, manifest_client_input_slots, manifest_client_input_types,
-        mpc_input_protocol_ids, plan_preprocessing, preprocessing_transcript_ack_if_complete,
+        client_output_slot_map, client_program_from_arguments, client_schema_for_reserved_index,
+        client_transport_recipient, coordinator_execution_already_retired,
+        decode_preprocessing_exchange, direct_client_inbound_message,
+        encode_manifest_client_inputs, encode_preprocessing_exchange, field_outputs_to_hex,
+        format_coordinator_outputs, format_vm_result, group_output_shares_by_client,
+        hb_input_only_completion_proven, input_client_ids_from_output_ids,
+        input_client_slot_map_from_output_ids, load_client_manifest_semantics,
+        manifest_client_input_slots, manifest_client_input_types, mpc_input_protocol_ids,
+        plan_preprocessing, preprocessing_transcript_ack_if_complete,
         preprocessing_transcript_digest, record_preprocessing_exchange_value,
         render_fixed_point_i64, resolve_client_protocol_bindings, standing_preproc_pool_program_id,
         standing_reservoir_plan, standing_reservoir_refill_execution_id,
@@ -9195,6 +9273,54 @@ mod tests {
     use stoffel_vm_types::core_types::{
         ClearShareInput, ClearShareValue, ShareData, ShareType, Value,
     };
+
+    #[test]
+    fn resolves_positional_client_program_independent_of_option_order() {
+        let arguments = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect::<Vec<_>>()
+        };
+
+        for values in [
+            vec!["program.stflb", "main", "--client"],
+            vec!["--client", "program.stflb", "main"],
+            vec!["--client", "--client-slot", "3", "program.stflb", "main"],
+        ] {
+            assert_eq!(
+                client_program_from_arguments(&arguments(&values)),
+                Some(std::path::PathBuf::from("program.stflb"))
+            );
+        }
+
+        assert_eq!(
+            client_program_from_arguments(&arguments(&[
+                "positional.stflb",
+                "--program",
+                "explicit.stflb",
+            ])),
+            Some(std::path::PathBuf::from("explicit.stflb"))
+        );
+        assert_eq!(
+            client_program_from_arguments(&arguments(&[
+                "--client",
+                "--program=explicit.stflb",
+                "main",
+            ])),
+            Some(std::path::PathBuf::from("explicit.stflb"))
+        );
+        assert_eq!(
+            client_program_from_arguments(&arguments(&[
+                "--client",
+                "--inputs",
+                "1,2",
+                "--servers",
+                "127.0.0.1:9000",
+            ])),
+            None
+        );
+    }
 
     struct OpenCountingEngine {
         opens: Arc<AtomicUsize>,
