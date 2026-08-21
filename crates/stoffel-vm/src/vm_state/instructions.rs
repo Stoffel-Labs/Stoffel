@@ -5,16 +5,16 @@ use super::{
 use crate::error::{VmError, VmResult};
 use crate::runtime_hooks::HookEvent;
 use crate::runtime_instruction::{
-    FetchedInstruction, JumpTarget, RuntimeJumpCondition, RuntimeOpcode, RuntimeRegister,
-    StackOffset,
+    FetchedInstruction, JumpTarget, RuntimeInstructionTable, RuntimeJumpCondition, RuntimeOpcode,
+    RuntimeRegister, StackOffset,
 };
 use crate::runtime_value_ops;
-use stoffel_vm_types::activations::{CompareFlag, InstructionPointer};
+use stoffel_vm_types::activations::{ActivationRecord, CompareFlag, InstructionPointer};
 use stoffel_vm_types::core_types::Value;
 use stoffel_vm_types::instructions::Instruction;
 use stoffel_vm_types::registers::{
     ClearRegisterCompareResult, ClearRegisterCopyResult, ClearRegisterOperationResult,
-    RegisterMoveKind, SecretRegisterCopyResult,
+    FastClearBinaryOp, RegisterMoveKind, SecretRegisterCopyResult,
 };
 
 #[cfg(test)]
@@ -327,6 +327,183 @@ impl InstructionRuntime for VMState {
 }
 
 impl VMState {
+    #[inline(never)]
+    pub(super) fn execute_clear_instruction_run_on_frame_without_hooks<
+        'function,
+        const BUDGETED: bool,
+    >(
+        frame: &mut ActivationRecord,
+        first: FetchedInstruction<'function>,
+        instruction_table: RuntimeInstructionTable<'function>,
+        mut instruction_pointer: InstructionPointer,
+        clear_fast_paths_enabled: bool,
+        max_instructions: usize,
+    ) -> (usize, InstructionPointer) {
+        let mut fetched = first;
+        let mut executed = 0;
+        let first_next_instruction_pointer = instruction_pointer;
+        // The caller has already advanced past `first`. Start at its index so
+        // every successful instruction can use the same branch-free cursor
+        // update. A fetched index cannot be usize::MAX: it indexes a live
+        // allocation and the instruction table has an additional sentinel.
+        instruction_pointer = InstructionPointer::new(instruction_pointer.index().wrapping_sub(1));
+
+        loop {
+            let opcode = fetched.opcode();
+            let handled = match opcode {
+                RuntimeOpcode::Noop => true,
+                opcode @ (RuntimeOpcode::Jump
+                | RuntimeOpcode::JumpEqual
+                | RuntimeOpcode::JumpNotEqual
+                | RuntimeOpcode::JumpLess
+                | RuntimeOpcode::JumpGreater) => {
+                    let condition = match opcode {
+                        RuntimeOpcode::Jump => RuntimeJumpCondition::Always,
+                        RuntimeOpcode::JumpEqual => RuntimeJumpCondition::Equal,
+                        RuntimeOpcode::JumpNotEqual => RuntimeJumpCondition::NotEqual,
+                        RuntimeOpcode::JumpLess => RuntimeJumpCondition::Less,
+                        RuntimeOpcode::JumpGreater => RuntimeJumpCondition::Greater,
+                        _ => unreachable!("matched jump runtime opcode"),
+                    };
+                    if condition.should_jump(frame.compare_flag()) {
+                        // The common success update below advances this to the
+                        // exact target, preserving one cursor path for every
+                        // opcode in the run.
+                        instruction_pointer = InstructionPointer::new(
+                            fetched.jump_target_a().index().wrapping_sub(1),
+                        );
+                    }
+                    true
+                }
+                _ if !clear_fast_paths_enabled => false,
+                RuntimeOpcode::Add => frame.try_add_clear_primitive(
+                    fetched.register_a().register_index(),
+                    fetched.register_b().register_index(),
+                    fetched.register_c().register_index(),
+                ),
+                RuntimeOpcode::LoadStack => {
+                    fetched
+                        .stack_offset_b()
+                        .resolve_index(frame.stack_len())
+                        .ok()
+                        .and_then(|stack_index| {
+                            frame.copy_stack_value_to_clear_register(
+                                fetched.register_a().register_index(),
+                                stack_index,
+                            )
+                        })
+                        == Some(ClearRegisterCopyResult::Copied)
+                }
+                RuntimeOpcode::LoadImmediate => {
+                    frame.write_clear_register_value_from_ref(
+                        fetched.register_a().register_index(),
+                        fetched.validated_load_immediate_value(),
+                    ) == ClearRegisterCopyResult::Copied
+                }
+                RuntimeOpcode::Move => {
+                    frame.copy_clear_register_value(
+                        fetched.register_a().register_index(),
+                        fetched.register_b().register_index(),
+                    ) == ClearRegisterCopyResult::Copied
+                }
+                RuntimeOpcode::BitNot => frame.try_bit_not_clear_primitive(
+                    fetched.register_a().register_index(),
+                    fetched.register_b().register_index(),
+                ),
+                RuntimeOpcode::PushArg => {
+                    frame.push_clear_register_value(fetched.register_a().register_index())
+                        == ClearRegisterCopyResult::Copied
+                }
+                RuntimeOpcode::SpillLoad => frame.spill_load_into_register(
+                    fetched.register_a().register_index(),
+                    fetched.operand_b_usize(),
+                ),
+                RuntimeOpcode::SpillStore => {
+                    frame.spill_store_clear_register(
+                        fetched.operand_a_usize(),
+                        fetched.register_b().register_index(),
+                    ) == ClearRegisterCopyResult::Copied
+                }
+                RuntimeOpcode::Subtract
+                | RuntimeOpcode::Multiply
+                | RuntimeOpcode::Divide
+                | RuntimeOpcode::Modulo
+                | RuntimeOpcode::BitAnd
+                | RuntimeOpcode::BitOr
+                | RuntimeOpcode::BitXor
+                | RuntimeOpcode::ShiftLeft
+                | RuntimeOpcode::ShiftRight => {
+                    macro_rules! apply {
+                        ($op:ident) => {{
+                            const OP: u8 = FastClearBinaryOp::$op as u8;
+                            let dest = fetched.register_a().register_index();
+                            let lhs = fetched.register_b().register_index();
+                            let rhs = fetched.register_c().register_index();
+                            frame.try_apply_clear_binary_primitive::<OP>(dest, lhs, rhs)
+                        }};
+                    }
+                    match opcode {
+                        RuntimeOpcode::Subtract => apply!(Subtract),
+                        RuntimeOpcode::Multiply => apply!(Multiply),
+                        RuntimeOpcode::Divide => apply!(Divide),
+                        RuntimeOpcode::Modulo => apply!(Modulo),
+                        RuntimeOpcode::BitAnd => apply!(BitAnd),
+                        RuntimeOpcode::BitOr => apply!(BitOr),
+                        RuntimeOpcode::BitXor => apply!(BitXor),
+                        RuntimeOpcode::ShiftLeft => apply!(ShiftLeft),
+                        RuntimeOpcode::ShiftRight => apply!(ShiftRight),
+                        _ => unreachable!("matched clear binary runtime opcode"),
+                    }
+                }
+                RuntimeOpcode::Compare => {
+                    if let Some(ordering) = frame.try_compare_clear_primitive(
+                        fetched.register_a().register_index(),
+                        fetched.register_b().register_index(),
+                    ) {
+                        frame.set_compare_flag(CompareFlag::from_ordering(ordering));
+                        true
+                    } else {
+                        false
+                    }
+                }
+                _ => false,
+            };
+
+            if !handled {
+                return (
+                    executed,
+                    if executed == 0 {
+                        first_next_instruction_pointer
+                    } else {
+                        instruction_pointer
+                    },
+                );
+            }
+
+            instruction_pointer =
+                InstructionPointer::new(instruction_pointer.index().wrapping_add(1));
+            if BUDGETED {
+                executed += 1;
+                if executed >= max_instructions {
+                    return (executed, instruction_pointer);
+                }
+            } else {
+                // The unbounded executor needs only the zero/non-zero result;
+                // keeping this boolean-shaped value lets LLVM remove the
+                // cooperative counter and limit branch from its hot loop.
+                executed = 1;
+            }
+
+            // Leave the cursor unchanged until this look-ahead instruction has
+            // completed. If it is unsupported (or DIV/MOD fails), the caller
+            // fetches and executes that same instruction through the generic
+            // path without rewinding anything.
+            // SAFETY: the table has an appended return sentinel and the cursor
+            // is advanced only after a successfully executed instruction.
+            fetched = unsafe { instruction_table.get_instruction_unchecked(instruction_pointer) };
+        }
+    }
+
     pub(super) fn execute_effect_fetched_instruction_without_hooks(
         &mut self,
         fetched: FetchedInstruction<'_>,
@@ -421,28 +598,22 @@ impl VMState {
             RuntimeOpcode::Move => {
                 self.execute_mov(fetched.register_a(), fetched.register_b(), HOOKS_ENABLED)?;
             }
-            opcode @ (RuntimeOpcode::Add
-            | RuntimeOpcode::Subtract
+            RuntimeOpcode::Add => {
+                self.execute_add(
+                    fetched.register_a(),
+                    fetched.register_b(),
+                    fetched.register_c(),
+                    HOOKS_ENABLED,
+                )?;
+            }
+            opcode @ (RuntimeOpcode::Subtract
             | RuntimeOpcode::Multiply
             | RuntimeOpcode::Divide
             | RuntimeOpcode::Modulo
             | RuntimeOpcode::BitAnd
             | RuntimeOpcode::BitOr
             | RuntimeOpcode::BitXor) => {
-                let dest = fetched.register_a();
-                let lhs = fetched.register_b();
-                let rhs = fetched.register_c();
-                match opcode {
-                    RuntimeOpcode::Add => self.execute_add(dest, lhs, rhs, HOOKS_ENABLED)?,
-                    RuntimeOpcode::Subtract => self.execute_sub(dest, lhs, rhs, HOOKS_ENABLED)?,
-                    RuntimeOpcode::Multiply => self.execute_mul(dest, lhs, rhs, HOOKS_ENABLED)?,
-                    RuntimeOpcode::Divide => self.execute_div(dest, lhs, rhs, HOOKS_ENABLED)?,
-                    RuntimeOpcode::Modulo => self.execute_mod(dest, lhs, rhs, HOOKS_ENABLED)?,
-                    RuntimeOpcode::BitAnd => self.execute_and(dest, lhs, rhs, HOOKS_ENABLED)?,
-                    RuntimeOpcode::BitOr => self.execute_or(dest, lhs, rhs, HOOKS_ENABLED)?,
-                    RuntimeOpcode::BitXor => self.execute_xor(dest, lhs, rhs, HOOKS_ENABLED)?,
-                    _ => unreachable!("matched binary runtime opcode"),
-                }
+                self.execute_other_clear_binary::<HOOKS_ENABLED>(fetched, opcode)?;
             }
             RuntimeOpcode::BitNot => {
                 self.execute_not(fetched.register_a(), fetched.register_b(), HOOKS_ENABLED)?;
@@ -513,6 +684,27 @@ impl VMState {
         }
 
         Ok(InstructionOutcome::Continue)
+    }
+
+    #[inline(never)]
+    fn execute_other_clear_binary<const HOOKS_ENABLED: bool>(
+        &mut self,
+        fetched: FetchedInstruction<'_>,
+        opcode: RuntimeOpcode,
+    ) -> VmResult<()> {
+        let dest = fetched.register_a();
+        let lhs = fetched.register_b();
+        let rhs = fetched.register_c();
+        match opcode {
+            RuntimeOpcode::Subtract => self.execute_sub(dest, lhs, rhs, HOOKS_ENABLED),
+            RuntimeOpcode::Multiply => self.execute_mul(dest, lhs, rhs, HOOKS_ENABLED),
+            RuntimeOpcode::Divide => self.execute_div(dest, lhs, rhs, HOOKS_ENABLED),
+            RuntimeOpcode::Modulo => self.execute_mod(dest, lhs, rhs, HOOKS_ENABLED),
+            RuntimeOpcode::BitAnd => self.execute_and(dest, lhs, rhs, HOOKS_ENABLED),
+            RuntimeOpcode::BitOr => self.execute_or(dest, lhs, rhs, HOOKS_ENABLED),
+            RuntimeOpcode::BitXor => self.execute_xor(dest, lhs, rhs, HOOKS_ENABLED),
+            _ => unreachable!("matched binary runtime opcode"),
+        }
     }
 
     #[cfg(test)]

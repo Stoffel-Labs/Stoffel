@@ -102,6 +102,104 @@ fn vm_with_loop(iterations: usize) -> VirtualMachine {
     vm
 }
 
+fn i64_value(value: i64) -> Value {
+    Value::I64(value)
+}
+
+fn i32_value(value: i64) -> Value {
+    Value::I32(value as i32)
+}
+
+fn all_primitives_loop(name: &str, iterations: usize, typed_value: fn(i64) -> Value) -> VMFunction {
+    let mut labels = HashMap::new();
+    labels.insert("loop".to_owned(), 5);
+
+    VMFunction::new(
+        name.to_owned(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        5,
+        vec![
+            Instruction::LDI(0, typed_value(0)),
+            Instruction::LDI(1, typed_value(1)),
+            Instruction::LDI(2, typed_value(iterations as i64)),
+            Instruction::LDI(3, typed_value(7)),
+            Instruction::LDI(4, typed_value(7)),
+            Instruction::MOV(4, 3),
+            Instruction::ADD(4, 4, 1),
+            Instruction::SUB(4, 4, 1),
+            Instruction::MUL(4, 4, 1),
+            Instruction::DIV(4, 4, 1),
+            Instruction::MOD(4, 4, 2),
+            Instruction::AND(4, 4, 3),
+            Instruction::OR(4, 4, 1),
+            Instruction::XOR(4, 4, 1),
+            Instruction::NOT(4, 4),
+            Instruction::SHL(4, 4, 1),
+            Instruction::SHR(4, 4, 1),
+            Instruction::ADD(0, 0, 1),
+            Instruction::CMP(0, 2),
+            Instruction::JMPLT("loop".to_owned()),
+            Instruction::RET(4),
+        ],
+        labels,
+    )
+}
+
+fn vm_with_all_primitives(
+    function_name: &str,
+    iterations: usize,
+    typed_value: fn(i64) -> Value,
+) -> VirtualMachine {
+    let mut vm = VirtualMachine::builder()
+        .with_standard_library(false)
+        .with_mpc_builtins(false)
+        .build();
+    vm.register_function(all_primitives_loop(function_name, iterations, typed_value));
+    vm
+}
+
+fn vm_with_call_loop(iterations: usize) -> VirtualMachine {
+    let mut labels = HashMap::new();
+    labels.insert("loop".to_owned(), 4);
+    let caller = VMFunction::new(
+        "profile_call_loop".to_owned(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        4,
+        vec![
+            Instruction::LDI(0, Value::I64(0)),
+            Instruction::LDI(1, Value::I64(0)),
+            Instruction::LDI(2, Value::I64(iterations as i64)),
+            Instruction::LDI(3, Value::I64(1)),
+            Instruction::CALL("profile_leaf".to_owned()),
+            Instruction::ADD(1, 1, 3),
+            Instruction::CMP(1, 2),
+            Instruction::JMPLT("loop".to_owned()),
+            Instruction::RET(1),
+        ],
+        labels,
+    );
+    let leaf = VMFunction::new(
+        "profile_leaf".to_owned(),
+        Vec::new(),
+        Vec::new(),
+        None,
+        1,
+        vec![Instruction::LDI(0, Value::I64(7)), Instruction::RET(0)],
+        HashMap::new(),
+    );
+    let mut vm = VirtualMachine::builder()
+        .with_standard_library(false)
+        .with_mpc_builtins(false)
+        .build();
+    vm.register_function(caller);
+    vm.register_function(leaf);
+    vm
+}
+
 fn run_serial(duration: Duration) -> Result<(), Box<dyn std::error::Error>> {
     let mut vm = vm_with_loop(SERIAL_LOOP_ITERATIONS);
     let expected = Value::I64(SERIAL_LOOP_ITERATIONS as i64);
@@ -122,6 +220,94 @@ fn run_serial(duration: Duration) -> Result<(), Box<dyn std::error::Error>> {
         started.elapsed(),
         runs,
         SERIAL_LOOP_ITERATIONS,
+        4,
+        5,
+    );
+    Ok(())
+}
+
+fn run_all_primitives(duration: Duration) -> Result<(), Box<dyn std::error::Error>> {
+    let mut vm = vm_with_all_primitives(
+        "profile_all_primitives",
+        CONCURRENT_LOOP_ITERATIONS,
+        i64_value,
+    );
+    let expected = Value::I64(-7);
+    let started = Instant::now();
+    let mut runs = 0u64;
+
+    while runs == 0 || started.elapsed() < duration {
+        let result = vm.execute_for_benchmark("profile_all_primitives")?;
+        if result != expected {
+            return Err(format!("unexpected all-primitives result: {result:?}").into());
+        }
+        black_box(result);
+        runs += 1;
+    }
+
+    report(
+        "all-primitives-local",
+        started.elapsed(),
+        runs,
+        CONCURRENT_LOOP_ITERATIONS,
+        15,
+        6,
+    );
+    Ok(())
+}
+
+fn run_all_primitives_i32(duration: Duration) -> Result<(), Box<dyn std::error::Error>> {
+    let mut vm = vm_with_all_primitives(
+        "profile_all_primitives_i32",
+        CONCURRENT_LOOP_ITERATIONS,
+        i32_value,
+    );
+    let expected = Value::I32(-7);
+    let started = Instant::now();
+    let mut runs = 0u64;
+
+    while runs == 0 || started.elapsed() < duration {
+        let result = vm.execute_for_benchmark("profile_all_primitives_i32")?;
+        if result != expected {
+            return Err(format!("unexpected i32 all-primitives result: {result:?}").into());
+        }
+        black_box(result);
+        runs += 1;
+    }
+
+    report(
+        "all-primitives-i32-local",
+        started.elapsed(),
+        runs,
+        CONCURRENT_LOOP_ITERATIONS,
+        15,
+        6,
+    );
+    Ok(())
+}
+
+fn run_call_loop(duration: Duration) -> Result<(), Box<dyn std::error::Error>> {
+    let mut vm = vm_with_call_loop(CONCURRENT_LOOP_ITERATIONS);
+    let expected = Value::I64(CONCURRENT_LOOP_ITERATIONS as i64);
+    let started = Instant::now();
+    let mut runs = 0u64;
+
+    while runs == 0 || started.elapsed() < duration {
+        let result = vm.execute_for_benchmark("profile_call_loop")?;
+        if result != expected {
+            return Err(format!("unexpected call-loop result: {result:?}").into());
+        }
+        black_box(result);
+        runs += 1;
+    }
+
+    report(
+        "call-local",
+        started.elapsed(),
+        runs,
+        CONCURRENT_LOOP_ITERATIONS,
+        6,
+        5,
     );
     Ok(())
 }
@@ -153,13 +339,23 @@ fn run_concurrent(duration: Duration) -> Result<(), Box<dyn std::error::Error>> 
         started.elapsed(),
         batches * CONCURRENT_INVOCATIONS as u64,
         CONCURRENT_LOOP_ITERATIONS,
+        4,
+        5,
     );
     Ok(())
 }
 
-fn report(name: &str, elapsed: Duration, executions: u64, loop_iterations: usize) {
+fn report(
+    name: &str,
+    elapsed: Duration,
+    executions: u64,
+    loop_iterations: usize,
+    instructions_per_iteration: usize,
+    fixed_instructions: usize,
+) {
     let loop_iterations = executions as f64 * loop_iterations as f64;
-    let vm_instructions = loop_iterations * 4.0 + executions as f64 * 5.0;
+    let vm_instructions = loop_iterations * instructions_per_iteration as f64
+        + executions as f64 * fixed_instructions as f64;
     println!(
         "workload={name} elapsed_seconds={:.6} executions={executions} loop_iterations_per_second={:.3} vm_instructions_per_second={:.3}",
         elapsed.as_secs_f64(),
@@ -180,9 +376,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     match workload.as_str() {
         "serial" | "serial-local" => run_serial(duration),
+        "all-primitives" | "all-primitives-local" => run_all_primitives(duration),
+        "all-primitives-i32" | "all-primitives-i32-local" => {
+            run_all_primitives_i32(duration)
+        }
+        "call" | "call-local" => run_call_loop(duration),
         "concurrent" | "concurrent-local" => run_concurrent(duration),
         _ => Err(format!(
-            "unknown workload {workload:?}; expected serial-local or concurrent-local"
+            "unknown workload {workload:?}; expected serial-local, all-primitives-local, all-primitives-i32-local, call-local, or concurrent-local"
         )
         .into()),
     }

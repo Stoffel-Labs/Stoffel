@@ -220,6 +220,19 @@ struct RuntimeInstructionEntry {
     instruction: PackedRuntimeInstruction,
 }
 
+const IMPLICIT_RETURN_MARKER: u32 = u32::MAX;
+
+fn push_implicit_return_sentinel(instructions: &mut Vec<RuntimeInstructionEntry>) {
+    instructions.push(RuntimeInstructionEntry {
+        instruction: PackedRuntimeInstruction::new(
+            RuntimeOpcode::Return,
+            RETURN_REGISTER_INDEX as u32,
+            IMPLICIT_RETURN_MARKER,
+            0,
+        ),
+    });
+}
+
 #[allow(dead_code)]
 #[derive(Debug, Clone)]
 pub(crate) enum RuntimeInstruction {
@@ -390,7 +403,11 @@ impl PackedRuntimeInstruction {
 
     #[inline]
     fn opcode(self) -> RuntimeOpcode {
-        RuntimeOpcode::from_u8(self.0[0])
+        // The packed instruction is private and is only constructed by `new`,
+        // which writes a valid repr(u8) RuntimeOpcode. Avoid a checked
+        // conversion on every interpreter dispatch while retaining 13-byte
+        // instruction density.
+        unsafe { std::mem::transmute(self.0[0]) }
     }
 
     #[inline]
@@ -409,40 +426,6 @@ impl std::fmt::Debug for PackedRuntimeInstruction {
         f.debug_tuple("PackedRuntimeInstruction")
             .field(&self.decode())
             .finish()
-    }
-}
-
-impl RuntimeOpcode {
-    fn from_u8(value: u8) -> Self {
-        match value {
-            0 => Self::Noop,
-            1 => Self::LoadStack,
-            2 => Self::LoadImmediate,
-            3 => Self::Move,
-            4 => Self::Add,
-            5 => Self::Subtract,
-            6 => Self::Multiply,
-            7 => Self::Divide,
-            8 => Self::Modulo,
-            9 => Self::BitAnd,
-            10 => Self::BitOr,
-            11 => Self::BitXor,
-            12 => Self::BitNot,
-            13 => Self::ShiftLeft,
-            14 => Self::ShiftRight,
-            15 => Self::Jump,
-            16 => Self::JumpEqual,
-            17 => Self::JumpNotEqual,
-            18 => Self::JumpLess,
-            19 => Self::JumpGreater,
-            20 => Self::Call,
-            21 => Self::Return,
-            22 => Self::PushArg,
-            23 => Self::Compare,
-            24 => Self::SpillLoad,
-            25 => Self::SpillStore,
-            _ => unreachable!("runtime opcode is only created by RuntimeOpcode"),
-        }
     }
 }
 
@@ -504,7 +487,7 @@ impl RuntimeFunction {
 
         let mut constants = RuntimeConstantInterner::default();
         let mut call_targets = RuntimeCallTargetInterner::default();
-        let mut instructions = Vec::with_capacity(resolved_instructions.len());
+        let mut instructions = Vec::with_capacity(resolved_instructions.len().saturating_add(1));
         for resolved in resolved_instructions {
             instructions.push(RuntimeInstructionEntry {
                 instruction: lower_instruction_from_parts(
@@ -518,10 +501,12 @@ impl RuntimeFunction {
                 )?,
             });
         }
+        let constants = constants.into_values();
+        push_implicit_return_sentinel(&mut instructions);
 
         Ok(Self {
             instructions,
-            constants: constants.into_values(),
+            constants,
             call_targets: call_targets.into_values(),
         })
     }
@@ -546,7 +531,7 @@ impl RuntimeFunction {
 
         let mut constants = RuntimeConstantInterner::default();
         let mut call_targets = RuntimeCallTargetInterner::default();
-        let mut instructions = Vec::with_capacity(instruction_count);
+        let mut instructions = Vec::with_capacity(instruction_count.saturating_add(1));
         for resolved in resolved_instructions.iter() {
             instructions.push(RuntimeInstructionEntry {
                 instruction: lower_instruction_from_parts(
@@ -560,10 +545,12 @@ impl RuntimeFunction {
                 )?,
             });
         }
+        let constants = constants.into_values();
+        push_implicit_return_sentinel(&mut instructions);
 
         Ok(Self {
             instructions,
-            constants: constants.into_values(),
+            constants,
             call_targets: call_targets.into_values(),
         })
     }
@@ -574,7 +561,7 @@ impl RuntimeFunction {
     ) -> VmResult<(Self, usize)> {
         let mut constants = RuntimeConstantInterner::default();
         let mut call_targets = RuntimeCallTargetInterner::default();
-        let mut instructions = Vec::with_capacity(header.instruction_count);
+        let mut instructions = Vec::with_capacity(header.instruction_count.saturating_add(1));
         let mut max_register = header
             .parameters
             .len()
@@ -605,15 +592,16 @@ impl RuntimeFunction {
                 source_instruction_count: header.instruction_count,
             });
         }
-
         let frame_register_count = header
             .register_count
             .max(max_register.map_or(0, |register| register as usize + 1));
+        let constants = constants.into_values();
+        push_implicit_return_sentinel(&mut instructions);
 
         Ok((
             Self {
                 instructions,
-                constants: constants.into_values(),
+                constants,
                 call_targets: call_targets.into_values(),
             },
             frame_register_count,
@@ -622,7 +610,7 @@ impl RuntimeFunction {
 
     #[cfg(test)]
     pub(crate) fn len(&self) -> usize {
-        self.instructions.len()
+        self.instructions.len() - 1
     }
 
     #[inline]
@@ -632,10 +620,22 @@ impl RuntimeFunction {
     ) -> Option<FetchedInstruction<'_>> {
         self.instructions
             .get(instruction_pointer.index())
+            .filter(|entry| {
+                entry.instruction.opcode() != RuntimeOpcode::Return
+                    || entry.instruction.operand(5) != IMPLICIT_RETURN_MARKER
+            })
             .map(|entry| FetchedInstruction {
                 function: self,
                 entry,
             })
+    }
+
+    #[inline]
+    pub(crate) fn instruction_table(&self) -> RuntimeInstructionTable<'_> {
+        RuntimeInstructionTable {
+            function: self,
+            entries: self.instructions.as_slice(),
+        }
     }
 
     #[cfg(test)]
@@ -667,6 +667,30 @@ impl RuntimeFunction {
     }
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct RuntimeInstructionTable<'function> {
+    function: &'function RuntimeFunction,
+    entries: &'function [RuntimeInstructionEntry],
+}
+
+impl<'function> RuntimeInstructionTable<'function> {
+    #[inline(always)]
+    pub(crate) unsafe fn get_instruction_unchecked(
+        self,
+        instruction_pointer: InstructionPointer,
+    ) -> FetchedInstruction<'function> {
+        debug_assert!(instruction_pointer.index() < self.entries.len());
+        FetchedInstruction {
+            function: self.function,
+            // SAFETY: callers maintain the lowered-code cursor invariant: every
+            // sequential fetch is bounded by the appended return sentinel and
+            // every jump target was validated against the logical instruction
+            // count before this table was constructed.
+            entry: unsafe { self.entries.get_unchecked(instruction_pointer.index()) },
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FetchedInstruction<'function> {
     function: &'function RuntimeFunction,
@@ -692,6 +716,12 @@ impl<'function> FetchedInstruction<'function> {
     #[inline]
     pub(crate) fn opcode(self) -> RuntimeOpcode {
         self.entry.instruction.opcode()
+    }
+
+    #[inline]
+    pub(crate) fn is_implicit_return(self) -> bool {
+        self.opcode() == RuntimeOpcode::Return
+            && self.entry.instruction.operand(5) == IMPLICIT_RETURN_MARKER
     }
 
     #[inline]
@@ -733,6 +763,14 @@ impl<'function> FetchedInstruction<'function> {
     pub(crate) fn direct_load_immediate_value(self) -> VmResult<&'function Value> {
         self.function
             .constant(RuntimeConstant(self.entry.instruction.operand(5)))
+    }
+
+    #[inline]
+    pub(crate) fn validated_load_immediate_value(self) -> &'function Value {
+        self.function
+            .constants
+            .get(self.entry.instruction.operand(5) as usize)
+            .expect("lowered load-immediate constants are validated")
     }
 
     #[inline]

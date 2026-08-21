@@ -10,6 +10,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     pkg-config \
     && rm -rf /var/lib/apt/lists/*
 
+# Keep profiling builds on the toolchain already present in the base image.
+# Otherwise an unpinned `nightly` repository override downloads a new compiler
+# during every later-day rebuild and can change code generation between samples.
+ENV RUSTUP_TOOLCHAIN=nightly-2026-08-19
+
 WORKDIR /build
 COPY . .
 COPY --from=networking . /build/stoffelnet
