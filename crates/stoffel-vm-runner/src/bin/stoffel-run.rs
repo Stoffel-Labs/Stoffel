@@ -17,7 +17,8 @@ use stoffel_mpc_coordinator_off_chain::node_rpc::{
     NodeRPCClient as OffChainNodeRPCClient, NodeRPCServer as OffChainNodeRPCServer,
 };
 use stoffel_mpc_coordinator_off_chain::{
-    ExecutionRegistration, InputAssignment, InputClientRange, OffChainCoordinatorClient,
+    AssignedMaskReservation, ExecutionRegistration, InputAssignment, InputSlotAssignment,
+    OffChainCoordinatorClient,
 };
 use stoffel_mpc_coordinator_shared::{
     Coordinator, ExecutionId as CoordinatorExecutionId, NodeRPCError, Round,
@@ -76,7 +77,7 @@ use stoffelmpc_mpc::honeybadger::{HoneyBadgerMPCClient, HoneyBadgerMPCNode};
 use stoffelnet::network_utils::Network;
 use stoffelnet::network_utils::{ClientId, NetworkError, NodePublicKey};
 use stoffelnet::transports::quic::{NetworkManager, PeerConnection, QuicNetworkManager};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use x509_parser::prelude::*;
@@ -534,12 +535,16 @@ enum PreprocessingExchangePhase {
     AvssReady,
     ReservoirAllocationSnapshot,
     ReservoirAllocationCommit,
+    HoneyBadgerTransportReady,
+    AvssTransportReady,
 }
 
 impl PreprocessingExchangePhase {
     fn domain(self) -> &'static [u8] {
         match self {
             Self::AvssEcdh => b"stoffel-avss-ecdh-transcript-v2",
+            Self::HoneyBadgerTransportReady => b"stoffel-hb-transport-ready-v1",
+            Self::AvssTransportReady => b"stoffel-avss-transport-ready-v1",
             Self::HoneyBadgerInventory => b"stoffel-hb-preprocessing-inventory-v2",
             Self::HoneyBadgerReady => b"stoffel-hb-preprocessing-ready-v2",
             Self::AvssInventory => b"stoffel-avss-preprocessing-inventory-v2",
@@ -855,6 +860,63 @@ where
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok((values, digest))
+}
+
+/// Wait until the local protocol inbox processor is running, then prove that
+/// every party has reached the same point over the execution-scoped transport.
+/// Receiving the complete transcript also proves that each peer's physical
+/// receive loop and execution inbox are routing control frames bidirectionally.
+#[allow(clippy::too_many_arguments)]
+async fn synchronize_preprocessing_transport(
+    network: &ExecutionScopedNetwork,
+    receiver: &mut mpsc::Receiver<ExecutionInboundMessage>,
+    execution_id: ExecutionId,
+    party_id: usize,
+    parties: usize,
+    instance_id: u64,
+    cancellation: &CancellationToken,
+    timeout: Duration,
+    phase: PreprocessingExchangePhase,
+    backend: &str,
+    processor_ready: oneshot::Receiver<()>,
+) -> Result<(), String> {
+    tokio::time::timeout(timeout, async {
+        tokio::select! {
+            result = processor_ready => result.map_err(|_| {
+                format!("{backend} execution inbox processor stopped before signaling readiness")
+            }),
+            _ = cancellation.cancelled() => {
+                Err(format!("{backend} execution inbox readiness was cancelled"))
+            }
+        }
+    })
+    .await
+    .map_err(|_| {
+        format!("timed out waiting for the local {backend} execution inbox processor")
+    })??;
+
+    if parties > 1 {
+        let (ready_instances, _) = preprocessing_transcript_exchange(
+            network,
+            receiver,
+            execution_id,
+            party_id,
+            parties,
+            cancellation,
+            timeout,
+            phase,
+            &instance_id,
+        )
+        .await?;
+        if ready_instances.iter().any(|ready| *ready != instance_id) {
+            return Err(format!(
+                "parties reported divergent {backend} protocol instances during transport readiness"
+            ));
+        }
+    }
+
+    eprintln!("[party {party_id}] {backend} execution transport ready for preprocessing");
+    Ok(())
 }
 
 const STANDING_PREPROC_CONTROL_RETRY_INTERVAL: Duration = Duration::from_millis(250);
@@ -1489,6 +1551,22 @@ where
         .collect()
 }
 
+fn sorted_assigned_mask_reservations(
+    client_to_indices: &std::collections::HashMap<Vec<u8>, Vec<u64>>,
+) -> Vec<AssignedMaskReservation> {
+    let reservation_count = client_to_indices.values().map(Vec::len).sum();
+    let mut reservations = Vec::with_capacity(reservation_count);
+    for (client, indices) in client_to_indices {
+        reservations.extend(indices.iter().map(|index| AssignedMaskReservation {
+            client: client.clone(),
+            reserved_index: *index,
+            input_ordinal: *index,
+        }));
+    }
+    reservations.sort_unstable_by_key(|reservation| reservation.reserved_index);
+    reservations
+}
+
 fn store_reserved_client_inputs<F, I>(
     vm: &mut VirtualMachine,
     client_to_indices: &std::collections::HashMap<I, Vec<u64>>,
@@ -1926,20 +2004,32 @@ where
         total_input_count,
     );
 
-    for (cid, indices) in &client_to_indices {
-        node_rpc
-            .add_reserved_indices_for_execution(execution_id, cid.clone(), indices.clone())
-            .await
-            .or_else(|e| match e {
-                NodeRPCError::JSONError => {
-                    eprintln!(
-                        "[party {my_id}] add_reserved_indices observed a stale client sink for client {cid:?}; continuing"
-                    );
-                    Ok(())
-                }
-                other => Err(format!("add_reserved_indices: {:?}", other)),
-            })?;
+    let mut assigned_reservations = Vec::with_capacity(reserved_mask_indices.len());
+    for (index, client_position) in &reserved_masks {
+        let client_position = (*client_position).ok_or_else(|| {
+            format!("reserved index {index} belongs to an unexpected client identity")
+        })?;
+        let client = input_ids.get(client_position).ok_or_else(|| {
+            format!("reserved index {index} references missing client slot {client_position}")
+        })?;
+        assigned_reservations.push(AssignedMaskReservation {
+            client: client.clone(),
+            reserved_index: *index,
+            input_ordinal: *index,
+        });
     }
+    node_rpc
+        .add_assigned_reserved_indices_for_execution(execution_id, assigned_reservations)
+        .await
+        .or_else(|error| match error {
+            NodeRPCError::JSONError => {
+                eprintln!(
+                    "[party {my_id}] reserved-index batch observed a stale client sink; continuing"
+                );
+                Ok(())
+            }
+            other => Err(format!("add reserved-index batch: {other:?}")),
+        })?;
     mark_input_path_phase(
         InputPathPhase::MaskShareBatchBuild,
         profile_clients,
@@ -4673,7 +4763,9 @@ where
     let preprocessing_cancellation = execution_tasks
         .map(ExecutionTaskGroup::cancellation_token)
         .unwrap_or_default();
+    let (processor_ready_tx, processor_ready_rx) = oneshot::channel();
     spawn_execution_task(execution_tasks, async move {
+        let _ = processor_ready_tx.send(());
         loop {
             tokio::select! {
                 Some(message) = server_rx.recv() => {
@@ -4751,9 +4843,21 @@ where
         }
     });
 
-    // Brief delay to let receive loops discover connections
     if preallocated_bundle.is_none() {
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        synchronize_preprocessing_transport(
+            &control_network,
+            &mut preprocessing_exchange_rx,
+            execution_id,
+            my_id,
+            n,
+            instance_id,
+            &preprocessing_cancellation,
+            honeybadger_protocol_timeout(),
+            PreprocessingExchangePhase::HoneyBadgerTransportReady,
+            "HoneyBadger",
+            processor_ready_rx,
+        )
+        .await?;
     }
     let mut standing_preprocessing_action = None;
     if engine.is_standing() && n > 1 && preallocated_bundle.is_none() {
@@ -5156,7 +5260,9 @@ where
         .collect();
     let processing_engine = engine.clone();
     let open_message_router = engine.open_message_router();
+    let (processor_ready_tx, processor_ready_rx) = oneshot::channel();
     spawn_execution_task(execution_tasks, async move {
+        let _ = processor_ready_tx.send(());
         loop {
             tokio::select! {
                 Some(message) = party_rx.recv() => {
@@ -5222,7 +5328,20 @@ where
 
     // ---- Phase 5: Preprocessing ----
     if preallocated_bundle.is_none() {
-        tokio::time::sleep(Duration::from_secs(2)).await;
+        synchronize_preprocessing_transport(
+            &control_network,
+            &mut preprocessing_exchange_rx,
+            execution_id,
+            my_id,
+            n,
+            instance_id,
+            &preprocessing_cancellation,
+            execution_coordination_timeout(),
+            PreprocessingExchangePhase::AvssTransportReady,
+            "AVSS",
+            processor_ready_rx,
+        )
+        .await?;
     }
     let mut standing_preprocessing_action = None;
     if engine.is_standing() && n > 1 && preallocated_bundle.is_none() {
@@ -5587,21 +5706,21 @@ where
                 .map_err(|e| e.to_string())?,
         );
 
-        for (cid, indices) in &client_to_indices {
-            node_rpc
-                .add_reserved_indices_for_execution(coordinator_execution_id, cid.clone(), indices.clone())
-                .await
-                .or_else(|e| match e {
-                    NodeRPCError::JSONError => {
-                        eprintln!(
-                            "[party {}] add_reserved_indices observed a stale client sink for client {:?}; continuing",
-                            my_id, cid
-                        );
-                        Ok(())
-                    }
-                    other => Err(format!("add_reserved_indices: {:?}", other)),
-                })?;
-        }
+        node_rpc
+            .add_assigned_reserved_indices_for_execution(
+                coordinator_execution_id,
+                sorted_assigned_mask_reservations(&client_to_indices),
+            )
+            .await
+            .or_else(|error| match error {
+                NodeRPCError::JSONError => {
+                    eprintln!(
+                        "[party {my_id}] AVSS reserved-index batch observed a stale client sink; continuing"
+                    );
+                    Ok(())
+                }
+                other => Err(format!("add AVSS reserved-index batch: {other:?}")),
+            })?;
 
         eprintln!("[party {my_id}] proposing InputCollection");
         coord.collect_inputs().await.map_err(|e| e.to_string())?;
@@ -5972,13 +6091,10 @@ impl StandingRunnerExecutionHandler {
             .iter()
             .map(|schema| (schema.client_slot, schema))
             .collect::<BTreeMap<_, _>>();
-        // `InputClientRange` references its owning client by index into `input_clients`, and
-        // covers that client's whole contiguous block of inputs in one entry — a client with
-        // many inputs (e.g. a federated-learning model vector) would otherwise need one wire
-        // entry per input instead of one per client, which for a wide roster is enough on its
-        // own to blow past the RPC transport's request-size cap.
-        let mut input_clients = Vec::new();
-        let mut input_ranges = Vec::new();
+        // The coordinator branch used by this runner still accepts the flat input-slot wire
+        // representation. Keep registration generation aligned with that concrete API; changing
+        // it to client ranges requires the matching coordinator schema to land first.
+        let mut input_slots = Vec::new();
         let mut n_inputs: u64 = 0;
         let mut output_clients = Vec::new();
         for (client, public_key) in admission
@@ -6000,18 +6116,17 @@ impl StandingRunnerExecutionHandler {
             if schema.inputs.is_empty() {
                 continue;
             }
-            let client_index = u32::try_from(input_clients.len())
-                .map_err(|_| "too many distinct input clients".to_owned())?;
-            input_clients.push(public_key.clone());
             let count = u64::try_from(schema.inputs.len())
                 .map_err(|_| "client input count exceeds u64".to_owned())?;
             n_inputs = n_inputs
                 .checked_add(count)
                 .ok_or_else(|| "coordinator input count exceeds u64".to_owned())?;
-            input_ranges.push(InputClientRange {
-                client_index,
-                count,
-            });
+            for label in 0..count {
+                input_slots.push(InputSlotAssignment {
+                    client: public_key.clone(),
+                    label,
+                });
+            }
         }
         let min_output_shares = match program.backend {
             MpcBackendKind::HoneyBadger => self
@@ -6027,10 +6142,7 @@ impl StandingRunnerExecutionHandler {
             program_hash: admission.program_id,
             n_inputs,
             output_clients,
-            input_assignment: InputAssignment {
-                clients: input_clients,
-                ranges: input_ranges,
-            },
+            input_assignment: InputAssignment { input_slots },
             min_output_shares,
         })
     }
@@ -6809,16 +6921,13 @@ impl StandingRunnerExecutionHandler {
                     .await
                     .map_err(|error| error.to_string())?,
             );
-            for (client, indices) in &client_to_indices {
-                self.node_rpc
-                    .add_reserved_indices_for_execution(
-                        execution_id,
-                        client.clone(),
-                        indices.clone(),
-                    )
-                    .await
-                    .map_err(|error| format!("add AVSS reserved indices: {error:?}"))?;
-            }
+            self.node_rpc
+                .add_assigned_reserved_indices_for_execution(
+                    execution_id,
+                    sorted_assigned_mask_reservations(&client_to_indices),
+                )
+                .await
+                .map_err(|error| format!("add AVSS reserved-index batch: {error:?}"))?;
             let mask_share_pairs: Vec<(u64, &_)> = mask_shares
                 .iter()
                 .enumerate()

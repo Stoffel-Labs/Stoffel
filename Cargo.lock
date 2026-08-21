@@ -6047,7 +6047,7 @@ dependencies = [
 [[package]]
 name = "stoffelnet"
 version = "0.1.0"
-source = "git+https://github.com/Stoffel-Labs/stoffel-networking.git?branch=fixes%2Fconcurrent-execution-transport#d317d894b58c570b58e7b6e5159e3af1194ad706"
+source = "git+https://github.com/Stoffel-Labs/stoffel-networking.git?branch=main#8ec8efa0b17840fa1a9d32cfba1609dfbeddaaf2"
 dependencies = [
  "ark-ff 0.5.0",
  "async-trait",
