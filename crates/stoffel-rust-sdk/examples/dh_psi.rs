@@ -45,7 +45,9 @@ fn pack_point(point: G1Affine) -> AppResult<[Value; 2]> {
     let mut encoded = Vec::with_capacity(POINT_BYTES);
     point.serialize_compressed(&mut encoded)?;
     let limbs = encoded
-        .chunks_exact(LIMB_BYTES)
+        .as_chunks::<LIMB_BYTES>()
+        .0
+        .iter()
         .map(|chunk| {
             let scalar = Fr::from_le_bytes_mod_order(chunk);
             Value::Bytes(canonical_be_bytes(scalar))
@@ -131,12 +133,16 @@ async fn main() -> AppResult<()> {
     }
 
     let tags_a = response[..a.len() * POINT_BYTES]
-        .chunks_exact(POINT_BYTES)
+        .as_chunks::<POINT_BYTES>()
+        .0
+        .iter()
         .zip(&a)
         .map(|(point, input)| unblind(point, input.inverse_blind))
         .collect::<AppResult<HashSet<_>>>()?;
     let tags_b = response[a.len() * POINT_BYTES..]
-        .chunks_exact(POINT_BYTES)
+        .as_chunks::<POINT_BYTES>()
+        .0
+        .iter()
         .zip(&b)
         .map(|(point, input)| unblind(point, input.inverse_blind))
         .collect::<AppResult<HashSet<_>>>()?;

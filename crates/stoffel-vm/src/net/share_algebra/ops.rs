@@ -78,6 +78,9 @@ where
     F: FftField + PrimeField,
     G: CurveGroup<ScalarField = F>,
 {
+    // Keep the uniform two-parameter curve dispatch signature used by the
+    // surrounding share-algebra helpers even though robust shares only store F.
+    let _curve = std::marker::PhantomData::<G>;
     let first = shares.first().ok_or(ShareAlgebraError::ShareSumEmpty)?;
     let first =
         super::codec::decode_exact_typed::<RobustShare<F>>(first.as_bytes(), "RobustShare")?;
