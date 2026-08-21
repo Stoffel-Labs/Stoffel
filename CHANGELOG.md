@@ -2,7 +2,7 @@
 
 All notable changes to the Stoffel crates are tracked here.
 
-## [0.1.1]
+## [0.1.1] - 2026-07-03
 
 ### PR #67 - runner release and install updates
 

@@ -1,6 +1,6 @@
 [package]
 name = "stoffel-vm-runner"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 description = "Local runner and CLI binary for executing Stoffel VM programs"
 license = "Apache-2.0"
@@ -15,8 +15,8 @@ name = "stoffel-run"
 path = "src/bin/stoffel-run.rs"
 
 [dependencies]
-stoffel-vm = { version = "0.1.0", path = "../stoffel-vm" }
-stoffel-vm-types = { version = "0.1.0", path = "../stoffel-vm-types" }
+stoffel-vm = { version = "0.1.1", path = "../stoffel-vm" }
+stoffel-vm-types = { version = "0.1.1", path = "../stoffel-vm-types" }
 stoffel-mpc-coordinator-shared = { git = "https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git", branch = "fixes/concurrent-execution-coordinator" }
 stoffel-mpc-coordinator-off-chain = { git = "https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git", branch = "fixes/concurrent-execution-coordinator" }
 stoffelmpc-mpc = { package = "stoffelcrypto", version = "0.1.0", features = ["statistics"] }
@@ -53,7 +53,7 @@ statistics = ["stoffelmpc-mpc/statistics"]
 
 [dev-dependencies]
 rcgen = "0.14.2"
-stoffel-vm-types = { version = "0.1.0", path = "../stoffel-vm-types" }
-stoffellang = { version = "0.1.0", path = "../stoffel-lang" }
+stoffel-vm-types = { version = "0.1.1", path = "../stoffel-vm-types" }
+stoffellang = { version = "0.1.1", path = "../stoffel-lang" }
 tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
