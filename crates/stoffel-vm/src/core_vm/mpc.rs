@@ -155,7 +155,7 @@ impl VirtualMachine {
                 Option<Vec<ShareType>>,
             ),
         >,
-    {
+{
         Ok(self.state.try_replace_client_input_with_types(inputs)?)
     }
 

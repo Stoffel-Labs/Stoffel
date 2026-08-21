@@ -886,9 +886,10 @@ fn hex_decode(encoded: &str) -> Result<Vec<u8>> {
             "runner byte-array result contains odd-length hex".to_owned(),
         ));
     }
-    encoded
-        .as_bytes()
-        .chunks_exact(2)
+    let (pairs, remainder) = encoded.as_bytes().as_chunks::<2>();
+    debug_assert!(remainder.is_empty());
+    pairs
+        .iter()
         .map(|pair| {
             let high = hex_nibble(pair[0])?;
             let low = hex_nibble(pair[1])?;

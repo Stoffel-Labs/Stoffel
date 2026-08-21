@@ -40,12 +40,13 @@ fn canonical_be_bytes(value: Fr) -> Vec<u8> {
 fn pack_point(point: G1Affine) -> AppResult<[Value; 2]> {
     let mut encoded = Vec::with_capacity(POINT_BYTES);
     point.serialize_compressed(&mut encoded)?;
-    let mut chunks = encoded.chunks_exact(LIMB_BYTES);
-    let first = chunks.next().ok_or("missing first point limb")?;
-    let second = chunks.next().ok_or("missing second point limb")?;
-    if chunks.next().is_some() || !chunks.remainder().is_empty() {
+    let (chunks, remainder) = encoded.as_chunks::<LIMB_BYTES>();
+    if !remainder.is_empty() {
         return Err("unexpected compressed BLS12-381 G1 length".into());
     }
+    let [first, second] = chunks else {
+        return Err("unexpected compressed BLS12-381 G1 length".into());
+    };
     Ok([first, second]
         .map(|chunk| Value::Bytes(canonical_be_bytes(Fr::from_le_bytes_mod_order(chunk)))))
 }
@@ -137,7 +138,9 @@ async fn main() -> AppResult<()> {
     }
 
     let tags = response
-        .chunks_exact(POINT_BYTES)
+        .as_chunks::<POINT_BYTES>()
+        .0
+        .iter()
         .zip(messages.iter().zip(&blinded))
         .map(|(point, (message, input))| unblind_and_finalize(message, point, input.inverse_blind))
         .collect::<AppResult<Vec<_>>>()?;
