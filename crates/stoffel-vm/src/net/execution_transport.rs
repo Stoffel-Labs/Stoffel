@@ -17,6 +17,7 @@ use crate::net::session::ExecutionId;
 use async_trait::async_trait;
 use parking_lot::{Mutex, RwLock};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant};
 use stoffelnet::network_utils::{
@@ -71,8 +72,9 @@ const CONNECTION_SCAN_INTERVAL: Duration = Duration::from_millis(50);
 /// one transport and Tokio schedules a burst of protocol frames before their
 /// VM tasks. Dropping the already-consumed frame would permanently corrupt the
 /// affected transcript, so preserve ordering and let the physical stream
-/// backpressure briefly. A genuinely abandoned inbox is still retired after a
-/// bounded interval rather than blocking sibling executions forever.
+/// backpressure briefly. A genuinely abandoned route is isolated after a
+/// bounded interval rather than blocking sibling executions forever. The
+/// execution itself remains owned by its explicit registration guard.
 const EXECUTION_INGRESS_BACKPRESSURE_TIMEOUT: Duration = Duration::from_secs(30);
 const EXECUTION_INGRESS_RETRY_INTERVAL: Duration = Duration::from_millis(2);
 
@@ -438,7 +440,7 @@ struct ExecutionIngressLease {
     _global: OwnedSemaphorePermit,
 }
 
-/// The two bounded ingress queues owned by one execution.
+/// The three bounded ingress queues owned by one execution.
 pub struct ExecutionInbox {
     pub party: mpsc::Receiver<ExecutionInboundMessage>,
     pub control: mpsc::Receiver<ExecutionInboundMessage>,
@@ -449,9 +451,38 @@ struct ExecutionInboxSenders {
     party: mpsc::Sender<ExecutionInboundMessage>,
     control: mpsc::Sender<ExecutionInboundMessage>,
     client: mpsc::Sender<ExecutionInboundMessage>,
+    disabled_routes: AtomicU8,
     expected_client_identities: Option<Vec<CertificateIdentity>>,
     client_routes: Mutex<HashMap<ClientId, Weak<dyn PeerConnection>>>,
     execution_bytes: Arc<Semaphore>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ExecutionInboxRoute {
+    Party,
+    Control,
+    Client,
+}
+
+impl ExecutionInboxRoute {
+    const fn disabled_bit(self) -> u8 {
+        match self {
+            Self::Party => 1 << 0,
+            Self::Control => 1 << 1,
+            Self::Client => 1 << 2,
+        }
+    }
+}
+
+impl ExecutionInboxSenders {
+    fn route_is_disabled(&self, route: ExecutionInboxRoute) -> bool {
+        self.disabled_routes.load(Ordering::Acquire) & route.disabled_bit() != 0
+    }
+
+    fn disable_route(&self, route: ExecutionInboxRoute) {
+        self.disabled_routes
+            .fetch_or(route.disabled_bit(), Ordering::AcqRel);
+    }
 }
 
 /// Errors from registration, framing, or inbox routing.
@@ -621,6 +652,7 @@ impl ExecutionTransportMux {
                 party: party_tx,
                 control: control_tx,
                 client: client_tx,
+                disabled_routes: AtomicU8::new(0),
                 expected_client_identities,
                 client_routes: Mutex::new(HashMap::new()),
                 execution_bytes,
@@ -633,6 +665,11 @@ impl ExecutionTransportMux {
         })
     }
 
+    /// Explicitly retire every route for an execution.
+    ///
+    /// Individual route closure or saturation never calls this method: the
+    /// owner which created the registration is solely responsible for ending
+    /// its lifetime.
     pub fn unregister(&self, execution_id: ExecutionId) -> bool {
         self.entries.write().remove(&execution_id).is_some()
     }
@@ -739,6 +776,27 @@ impl ExecutionTransportMux {
         )
     }
 
+    fn inbox_route(
+        &self,
+        authenticated_source: ExecutionTransportSource,
+        kind: ExecutionMessageKind,
+        execution_id: ExecutionId,
+    ) -> Result<ExecutionInboxRoute, ExecutionTransportError> {
+        match (self.direct_client, authenticated_source, kind) {
+            (false, ExecutionTransportSource::Party(_), ExecutionMessageKind::Control) => {
+                Ok(ExecutionInboxRoute::Control)
+            }
+            (false, ExecutionTransportSource::Party(_), ExecutionMessageKind::Mpc) => {
+                Ok(ExecutionInboxRoute::Party)
+            }
+            (false, ExecutionTransportSource::Client(_), _)
+            | (true, ExecutionTransportSource::Party(_), _) => Ok(ExecutionInboxRoute::Client),
+            (true, ExecutionTransportSource::Client(_), _) => {
+                Err(ExecutionTransportError::ClientSourceOnClientEndpoint { execution_id })
+            }
+        }
+    }
+
     fn route_envelope(
         &self,
         authenticated_source: ExecutionTransportSource,
@@ -746,14 +804,7 @@ impl ExecutionTransportMux {
         envelope: ExecutionEnvelopeV1<'_>,
     ) -> Result<(), ExecutionTransportError> {
         let execution_id = envelope.execution_id();
-        let client_inbox = match (self.direct_client, authenticated_source) {
-            (false, ExecutionTransportSource::Party(_)) => false,
-            (false, ExecutionTransportSource::Client(_))
-            | (true, ExecutionTransportSource::Party(_)) => true,
-            (true, ExecutionTransportSource::Client(_)) => {
-                return Err(ExecutionTransportError::ClientSourceOnClientEndpoint { execution_id });
-            }
-        };
+        let route = self.inbox_route(authenticated_source, envelope.kind(), execution_id)?;
 
         // Keep the registry read lock through the non-blocking send so an
         // unregister cannot race a delivery into a completed execution.
@@ -762,6 +813,9 @@ impl ExecutionTransportMux {
         let Some(senders) = senders else {
             return Ok(());
         };
+        if senders.route_is_disabled(route) {
+            return Ok(());
+        }
 
         let kind = envelope.kind();
         let payload_bytes = envelope.payload().len();
@@ -775,12 +829,10 @@ impl ExecutionTransportMux {
             payload: envelope.payload().to_vec(),
             _ingress_lease: ingress_lease,
         };
-        let result = if client_inbox {
-            senders.client.try_send(message)
-        } else if kind == ExecutionMessageKind::Control {
-            senders.control.try_send(message)
-        } else {
-            senders.party.try_send(message)
+        let result = match route {
+            ExecutionInboxRoute::Party => senders.party.try_send(message),
+            ExecutionInboxRoute::Control => senders.control.try_send(message),
+            ExecutionInboxRoute::Client => senders.client.try_send(message),
         };
         match result {
             Ok(()) => Ok(()),
@@ -790,14 +842,11 @@ impl ExecutionTransportMux {
             }
             Err(mpsc::error::TrySendError::Closed(message)) => {
                 drop(message);
-                drop(entries);
-                let mut entries = self.entries.write();
-                if entries
-                    .get(&execution_id)
-                    .is_some_and(|current| Arc::ptr_eq(current, &senders))
-                {
-                    entries.remove(&execution_id);
-                }
+                // Receivers have deliberately different lifetimes. For
+                // example, preprocessing drops the control receiver while the
+                // party protocol route remains active. A closed sibling route
+                // must therefore never unregister the whole execution.
+                senders.disable_route(route);
                 Ok(())
             }
         }
@@ -810,12 +859,41 @@ impl ExecutionTransportMux {
         envelope: ExecutionEnvelopeV1<'_>,
         cancel: &CancellationToken,
     ) -> Result<(), ExecutionTransportError> {
-        let deadline = Instant::now() + EXECUTION_INGRESS_BACKPRESSURE_TIMEOUT;
+        self.route_envelope_with_backpressure_until(
+            authenticated_source,
+            source,
+            envelope,
+            cancel,
+            Instant::now() + EXECUTION_INGRESS_BACKPRESSURE_TIMEOUT,
+        )
+        .await
+    }
+
+    async fn route_envelope_with_backpressure_until(
+        &self,
+        authenticated_source: ExecutionTransportSource,
+        source: ExecutionTransportSource,
+        envelope: ExecutionEnvelopeV1<'_>,
+        cancel: &CancellationToken,
+        deadline: Instant,
+    ) -> Result<(), ExecutionTransportError> {
+        let route = self.inbox_route(
+            authenticated_source,
+            envelope.kind(),
+            envelope.execution_id(),
+        )?;
         loop {
             match self.route_envelope(authenticated_source, source, envelope) {
                 Err(error @ ExecutionTransportError::InboxFull { .. })
                 | Err(error @ ExecutionTransportError::InboxByteCapacityExceeded { .. }) => {
                     if Instant::now() >= deadline {
+                        if matches!(error, ExecutionTransportError::InboxFull { .. }) {
+                            if let Some(senders) =
+                                self.entries.read().get(&envelope.execution_id()).cloned()
+                            {
+                                senders.disable_route(route);
+                            }
+                        }
                         return Err(error);
                     }
                     tokio::select! {
@@ -1064,14 +1142,15 @@ async fn run_connection_receive_loop_with_owner(
                             ..
                         }) => {
                             // A full inbox is transient under a concurrent
-                            // burst, so only retire the lane after bounded
-                            // backpressure failed to let its consumer catch up.
+                            // burst. After bounded backpressure, a route-local
+                            // item overflow disables only that logical route;
+                            // byte-budget pressure drops only this frame. The
+                            // execution's sibling routes remain registered.
                             tracing::warn!(
                                 %execution_id,
                                 %error,
-                                "execution transport ingress remained saturated; retiring lane"
+                                "execution transport ingress remained saturated; dropping frame"
                             );
-                            mux.unregister(execution_id);
                         }
                         Err(_) => {}
                     }
@@ -1105,6 +1184,21 @@ mod tests {
 
     fn frame(execution_id: ExecutionId, kind: ExecutionMessageKind, payload: &[u8]) -> Vec<u8> {
         encode_execution_frame(execution_id, kind, payload).unwrap()
+    }
+
+    fn route_client_frame(
+        mux: &ExecutionTransportMux,
+        execution_id: ExecutionId,
+        kind: ExecutionMessageKind,
+        payload: &[u8],
+    ) -> Result<(), ExecutionTransportError> {
+        let encoded = frame(execution_id, kind, payload);
+        let envelope = ExecutionEnvelopeV1::decode(&encoded).unwrap();
+        mux.route_envelope(
+            ExecutionTransportSource::Client(7),
+            ExecutionTransportSource::Client(7),
+            envelope,
+        )
     }
 
     #[test]
@@ -1171,6 +1265,156 @@ mod tests {
         let second_message = second.party.recv().await.unwrap();
         assert_eq!(first_message.payload, b"first");
         assert_eq!(second_message.payload, b"second");
+    }
+
+    #[tokio::test]
+    async fn closing_one_inbox_route_preserves_the_execution_and_its_siblings() {
+        let limits = ExecutionIngressLimits {
+            inbox_capacity: 4,
+            execution_byte_capacity: 300_000,
+            global_byte_capacity: 1_000_000,
+        };
+        let mux = ExecutionTransportMux::new_with_limits(limits).unwrap();
+
+        let control_id = execution(10);
+        let mut control_closed = mux.register(control_id).unwrap();
+        drop(control_closed.control);
+        let late_preprocessing_value = [0_u8; 24];
+        mux.route_party_frame(
+            1,
+            &frame(
+                control_id,
+                ExecutionMessageKind::Control,
+                &late_preprocessing_value,
+            ),
+        )
+        .unwrap();
+        let batch_open = vec![0xAB; 229_439];
+        mux.route_party_frame(
+            1,
+            &frame(control_id, ExecutionMessageKind::Mpc, &batch_open),
+        )
+        .unwrap();
+        route_client_frame(
+            &mux,
+            control_id,
+            ExecutionMessageKind::Mpc,
+            b"client survives",
+        )
+        .unwrap();
+        assert_eq!(
+            control_closed.party.recv().await.unwrap().payload,
+            batch_open
+        );
+        assert_eq!(
+            control_closed.client.recv().await.unwrap().payload,
+            b"client survives"
+        );
+        assert!(mux.entries.read().contains_key(&control_id));
+
+        let party_id = execution(11);
+        let mut party_closed = mux.register(party_id).unwrap();
+        drop(party_closed.party);
+        mux.route_party_frame(
+            1,
+            &frame(party_id, ExecutionMessageKind::Mpc, b"late party"),
+        )
+        .unwrap();
+        mux.route_party_frame(
+            1,
+            &frame(party_id, ExecutionMessageKind::Control, b"control survives"),
+        )
+        .unwrap();
+        route_client_frame(
+            &mux,
+            party_id,
+            ExecutionMessageKind::Mpc,
+            b"client survives",
+        )
+        .unwrap();
+        assert_eq!(
+            party_closed.control.recv().await.unwrap().payload,
+            b"control survives"
+        );
+        assert_eq!(
+            party_closed.client.recv().await.unwrap().payload,
+            b"client survives"
+        );
+        assert!(mux.entries.read().contains_key(&party_id));
+
+        let client_id = execution(12);
+        let mut client_closed = mux.register(client_id).unwrap();
+        drop(client_closed.client);
+        route_client_frame(
+            &mux,
+            client_id,
+            ExecutionMessageKind::Control,
+            b"late client control",
+        )
+        .unwrap();
+        mux.route_party_frame(
+            1,
+            &frame(client_id, ExecutionMessageKind::Mpc, b"party survives"),
+        )
+        .unwrap();
+        mux.route_party_frame(
+            1,
+            &frame(
+                client_id,
+                ExecutionMessageKind::Control,
+                b"control survives",
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            client_closed.party.recv().await.unwrap().payload,
+            b"party survives"
+        );
+        assert_eq!(
+            client_closed.control.recv().await.unwrap().payload,
+            b"control survives"
+        );
+        assert!(mux.entries.read().contains_key(&client_id));
+        assert_eq!(mux.ingress.queued_bytes(), 0);
+    }
+
+    #[tokio::test]
+    async fn saturated_control_route_does_not_retire_party_route() {
+        let limits = ExecutionIngressLimits {
+            inbox_capacity: 1,
+            execution_byte_capacity: 64,
+            global_byte_capacity: 128,
+        };
+        let mux = ExecutionTransportMux::new_with_limits(limits).unwrap();
+        let execution_id = execution(13);
+        let mut inbox = mux.register(execution_id).unwrap();
+        mux.route_party_frame(
+            1,
+            &frame(execution_id, ExecutionMessageKind::Control, b"first"),
+        )
+        .unwrap();
+
+        let encoded = frame(execution_id, ExecutionMessageKind::Control, b"second");
+        let envelope = ExecutionEnvelopeV1::decode(&encoded).unwrap();
+        let error = mux
+            .route_envelope_with_backpressure_until(
+                ExecutionTransportSource::Party(1),
+                ExecutionTransportSource::Party(1),
+                envelope,
+                &CancellationToken::new(),
+                Instant::now() + Duration::from_millis(20),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ExecutionTransportError::InboxFull { .. }));
+
+        mux.route_party_frame(
+            1,
+            &frame(execution_id, ExecutionMessageKind::Mpc, b"party survives"),
+        )
+        .unwrap();
+        assert_eq!(inbox.party.recv().await.unwrap().payload, b"party survives");
+        assert!(mux.entries.read().contains_key(&execution_id));
     }
 
     #[tokio::test]
