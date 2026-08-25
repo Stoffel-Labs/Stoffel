@@ -5,7 +5,8 @@ use std::sync::{Arc, Weak};
 use super::instance::InstanceRegistry;
 use super::wire::{
     ExpOpenWireMessage, OpenRegistryWireMessage, AVSS_EXP_WIRE_PREFIX, AVSS_G2_EXP_WIRE_PREFIX,
-    HB_EXP_OPEN_WIRE_PREFIX, MAX_WIRE_MESSAGE_LEN, OPEN_REGISTRY_WIRE_PREFIX, UNKNOWN_SENDER_ID,
+    HB_EXP_OPEN_WIRE_PREFIX, MAX_BATCH_ELEMENTS, MAX_TYPE_KEY_LEN, MAX_WIRE_MESSAGE_LEN,
+    OPEN_REGISTRY_WIRE_PREFIX, UNKNOWN_SENDER_ID,
 };
 
 /// Session-local router for open-share and open-in-exponent wire messages.
@@ -101,6 +102,16 @@ impl OpenMessageRouter {
                 sender_party_id,
                 ..
             } => (*instance_id, *sender_party_id),
+            OpenRegistryWireMessage::RbcEcho {
+                instance_id,
+                sender_party_id,
+                ..
+            }
+            | OpenRegistryWireMessage::RbcReady {
+                instance_id,
+                sender_party_id,
+                ..
+            } => (*instance_id, *sender_party_id),
         };
 
         if authenticated_sender_id == UNKNOWN_SENDER_ID {
@@ -130,6 +141,13 @@ impl OpenMessageRouter {
                 share,
                 ..
             } => {
+                if type_key.len() > MAX_TYPE_KEY_LEN {
+                    return Err(format!(
+                        "open_share type key too large: {} bytes (max {})",
+                        type_key.len(),
+                        MAX_TYPE_KEY_LEN
+                    ));
+                }
                 let seq = usize::try_from(seq)
                     .map_err(|_| format!("open_share sequence {seq} exceeds local usize"))?;
                 registry.insert_single(seq, &type_key, sender_party_id, share)?
@@ -141,6 +159,20 @@ impl OpenMessageRouter {
                 shares,
                 ..
             } => {
+                if type_key.len() > MAX_TYPE_KEY_LEN {
+                    return Err(format!(
+                        "batch_open_shares type key too large: {} bytes (max {})",
+                        type_key.len(),
+                        MAX_TYPE_KEY_LEN
+                    ));
+                }
+                if shares.len() > MAX_BATCH_ELEMENTS {
+                    return Err(format!(
+                        "batch_open_shares has {} elements (max {})",
+                        shares.len(),
+                        MAX_BATCH_ELEMENTS
+                    ));
+                }
                 let seq = usize::try_from(seq)
                     .map_err(|_| format!("batch_open_shares sequence {seq} exceeds local usize"))?;
                 registry.insert_batch(seq, &type_key, sender_party_id, shares)?
@@ -151,6 +183,35 @@ impl OpenMessageRouter {
                 message,
                 ..
             } => registry.insert_rbc_broadcast(session_id, sender_party_id, message)?,
+            OpenRegistryWireMessage::RbcEcho {
+                session_id,
+                broadcaster_party_id,
+                sender_party_id,
+                digest,
+                message,
+                ..
+            } => registry.insert_rbc_relay(
+                false,
+                session_id,
+                broadcaster_party_id,
+                sender_party_id,
+                digest,
+                Some(message),
+            )?,
+            OpenRegistryWireMessage::RbcReady {
+                session_id,
+                broadcaster_party_id,
+                sender_party_id,
+                digest,
+                ..
+            } => registry.insert_rbc_relay(
+                true,
+                session_id,
+                broadcaster_party_id,
+                sender_party_id,
+                digest,
+                None,
+            )?,
         }
         Ok(true)
     }

@@ -856,8 +856,8 @@ async fn test_avss_e2e_distributed_key_generation() {
         nodes[0].simple_net.clone().unwrap(),
         engines[0].execution_id(),
     );
-    let share = engines[0]
-        .generate_random_share_with_network(key_name, simple_net_0)
+    let (session_id, share) = engines[0]
+        .generate_random_share_with_session_and_network(key_name, simple_net_0)
         .await
         .expect("Party 0 AVSS failed");
     info!(
@@ -878,7 +878,7 @@ async fn test_avss_e2e_distributed_key_generation() {
 
     for i in 1..n {
         let party_share = engines[i]
-            .await_received_share(key_name)
+            .await_received_share(key_name, session_id)
             .await
             .unwrap_or_else(|e| panic!("Party {} share not received: {}", i, e));
         let pk = party_share.commitments[0];
@@ -981,8 +981,8 @@ async fn test_avss_e2e_vm_public_key_extraction() {
         nodes[0].simple_net.clone().unwrap(),
         engines[0].execution_id(),
     );
-    let share_party0 = engines[0]
-        .generate_random_share_with_network(key_name, simple_net_0)
+    let (session_id, share_party0) = engines[0]
+        .generate_random_share_with_session_and_network(key_name, simple_net_0)
         .await
         .expect("Party 0 AVSS failed");
 
@@ -997,7 +997,7 @@ async fn test_avss_e2e_vm_public_key_extraction() {
     let mut party_shares = vec![share_party0];
     for i in 1..n {
         let s = engines[i]
-            .await_received_share(key_name)
+            .await_received_share(key_name, session_id)
             .await
             .unwrap_or_else(|e| panic!("Party {} share not received: {}", i, e));
         party_shares.push(s);
@@ -1152,8 +1152,8 @@ async fn test_avss_e2e_multiple_keys() {
         nodes[0].simple_net.clone().unwrap(),
         engines[0].execution_id(),
     );
-    let share1 = engines[0]
-        .generate_random_share_with_network(key1, simple_net_0.clone())
+    let (session1, share1) = engines[0]
+        .generate_random_share_with_session_and_network(key1, simple_net_0.clone())
         .await
         .expect("Key 1 AVSS failed");
     let mut pk1_bytes = Vec::new();
@@ -1164,15 +1164,15 @@ async fn test_avss_e2e_multiple_keys() {
     // Wait for all parties to receive key1
     for i in 1..n {
         engines[i]
-            .await_received_share(key1)
+            .await_received_share(key1, session1)
             .await
             .unwrap_or_else(|e| panic!("Party {} didn't receive key1: {}", i, e));
     }
 
     // Generate second key
     let key2 = "key_beta";
-    let share2 = engines[0]
-        .generate_random_share_with_network(key2, simple_net_0)
+    let (session2, share2) = engines[0]
+        .generate_random_share_with_session_and_network(key2, simple_net_0)
         .await
         .expect("Key 2 AVSS failed");
     let mut pk2_bytes = Vec::new();
@@ -1183,7 +1183,7 @@ async fn test_avss_e2e_multiple_keys() {
     // Wait for all parties to receive key2
     for i in 1..n {
         engines[i]
-            .await_received_share(key2)
+            .await_received_share(key2, session2)
             .await
             .unwrap_or_else(|e| panic!("Party {} didn't receive key2: {}", i, e));
     }

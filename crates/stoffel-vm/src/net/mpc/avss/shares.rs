@@ -4,6 +4,7 @@ use ark_ff::{FftField, PrimeField, UniformRand};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use ark_std::rand::{Rng, SeedableRng};
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::sync::Arc;
 use stoffel_vm_types::core_types::{ClearShareValue, ShareData, ShareType};
 use stoffelmpc_mpc::avss_mpc::AvssSessionId;
@@ -46,6 +47,16 @@ where
     ) -> Result<FeldmanShamirShare<F, G>, String> {
         self.generate_random_share_using_network(key_name, self.protocol_net.clone())
             .await
+            .map(|(_, share)| share)
+    }
+
+    /// Generate a random share and return the exact AVSS session identifier recipients must use.
+    pub async fn generate_random_share_with_session(
+        &self,
+        key_name: &str,
+    ) -> Result<(u128, FeldmanShamirShare<F, G>), String> {
+        self.generate_random_share_using_network(key_name, self.protocol_net.clone())
+            .await
     }
 
     /// Like `generate_random_share`, but uses a custom execution-scoped network.
@@ -61,6 +72,19 @@ where
     ) -> Result<FeldmanShamirShare<F, G>, String> {
         self.generate_random_share_using_network(key_name, net)
             .await
+            .map(|(_, share)| share)
+    }
+
+    /// Network-customized random generation that also returns the AVSS session identifier.
+    pub async fn generate_random_share_with_session_and_network<
+        N: stoffelnet::network_utils::Network + Clone + Send + Sync + 'static,
+    >(
+        &self,
+        key_name: &str,
+        net: Arc<crate::net::ExecutionScopedNetwork<N>>,
+    ) -> Result<(u128, FeldmanShamirShare<F, G>), String> {
+        self.generate_random_share_using_network(key_name, net)
+            .await
     }
 
     async fn generate_random_share_using_network<
@@ -69,7 +93,7 @@ where
         &self,
         key_name: &str,
         net: Arc<N>,
-    ) -> Result<FeldmanShamirShare<F, G>, String> {
+    ) -> Result<(u128, FeldmanShamirShare<F, G>), String> {
         if !self.ready.load(std::sync::atomic::Ordering::SeqCst) {
             return Err("AVSS engine not ready".into());
         }
@@ -92,6 +116,17 @@ where
     ) -> Result<FeldmanShamirShare<F, G>, String> {
         self.generate_share_with_secret_using_network(key_name, secret, self.protocol_net.clone())
             .await
+            .map(|(_, share)| share)
+    }
+
+    /// Generate a chosen-secret share and return its exact AVSS session identifier.
+    pub async fn generate_share_with_secret_and_session(
+        &self,
+        key_name: &str,
+        secret: F,
+    ) -> Result<(u128, FeldmanShamirShare<F, G>), String> {
+        self.generate_share_with_secret_using_network(key_name, secret, self.protocol_net.clone())
+            .await
     }
 
     /// Like `generate_share_with_secret`, but uses a custom execution-scoped network.
@@ -105,6 +140,20 @@ where
     ) -> Result<FeldmanShamirShare<F, G>, String> {
         self.generate_share_with_secret_using_network(key_name, secret, net)
             .await
+            .map(|(_, share)| share)
+    }
+
+    /// Network-customized chosen-secret generation that also returns the AVSS session id.
+    pub async fn generate_share_with_secret_and_session_and_network<
+        N: stoffelnet::network_utils::Network + Clone + Send + Sync + 'static,
+    >(
+        &self,
+        key_name: &str,
+        secret: F,
+        net: Arc<crate::net::ExecutionScopedNetwork<N>>,
+    ) -> Result<(u128, FeldmanShamirShare<F, G>), String> {
+        self.generate_share_with_secret_using_network(key_name, secret, net)
+            .await
     }
 
     async fn generate_share_with_secret_using_network<
@@ -114,7 +163,7 @@ where
         key_name: &str,
         secret: F,
         net: Arc<N>,
-    ) -> Result<FeldmanShamirShare<F, G>, String> {
+    ) -> Result<(u128, FeldmanShamirShare<F, G>), String> {
         if !self.ready.load(std::sync::atomic::Ordering::SeqCst) {
             return Err("AVSS engine not ready".into());
         }
@@ -143,7 +192,7 @@ where
             shares.insert(key_name.to_string(), share.clone());
         }
 
-        Ok(share)
+        Ok((session_id.as_u128(), share))
     }
 
     /// Wait for a share from a specific session.
@@ -189,15 +238,15 @@ where
         }
     }
 
-    /// Wait for a received share (non-dealer path) and store it under the given key name.
+    /// Wait for a received share from an exact AVSS session and store it under the given key name.
     ///
     /// Non-dealer parties receive shares via `process_wrapped_message`, which stores them
-    /// in the inner AVSS shares store. This method waits (via `share_notify`) for any
-    /// completed share not yet stored in `stored_shares`, stores it under `key_name`,
-    /// and returns it.
+    /// in the inner AVSS shares store. The exact session identifier is returned by the dealer's
+    /// `generate_*_with_session` method and must be agreed out of band with the logical key name.
     pub async fn await_received_share(
         &self,
         key_name: &str,
+        expected_session_id: u128,
     ) -> Result<FeldmanShamirShare<F, G>, String> {
         let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(30);
 
@@ -207,26 +256,22 @@ where
             {
                 let node = self.clone_avss_node().await;
                 let shares = node.share_gen_avss.avss.shares.lock().await;
-                let stored = self.stored_shares.lock().await;
 
-                for share_vec in shares
-                    .values()
-                    .filter_map(|(_, share_vec)| share_vec.as_ref())
-                {
-                    if let Some(share) = share_vec.first() {
-                        let already_stored = stored
-                            .values()
-                            .any(|s| s.feldmanshare.share == share.feldmanshare.share);
-                        if !already_stored {
-                            let share = share.clone();
-                            drop(stored);
-                            drop(shares);
-                            drop(node);
-                            let mut stored = self.stored_shares.lock().await;
-                            stored.insert(key_name.to_string(), share.clone());
-                            return Ok(share);
-                        }
+                let share = shares
+                    .iter()
+                    .find(|(session_id, _)| session_id.as_u128() == expected_session_id)
+                    .and_then(|(_, (_, share_vec))| share_vec.as_ref())
+                    .and_then(|share_vec| share_vec.first())
+                    .cloned();
+                if let Some(share) = share {
+                    drop(shares);
+                    drop(node);
+                    let mut stored = self.stored_shares.lock().await;
+                    if stored.contains_key(key_name) {
+                        return Err(format!("AVSS key '{key_name}' is already bound"));
                     }
+                    stored.insert(key_name.to_string(), share.clone());
+                    return Ok(share);
                 }
             }
 
@@ -234,8 +279,8 @@ where
                 _ = notified => {}
                 _ = tokio::time::sleep_until(deadline) => {
                     return Err(format!(
-                        "Timeout waiting for received share for key '{}'",
-                        key_name
+                        "Timeout waiting for received share for key '{}' from session {}",
+                        key_name, expected_session_id
                     ));
                 }
             }
@@ -754,16 +799,23 @@ where
         }
 
         let mut verified = Vec::with_capacity(required_valid);
+        let mut seen_ids = HashSet::with_capacity(required_valid);
         for share_bytes in collected {
             let Ok(share) = Self::decode_feldman_share(share_bytes) else {
                 continue;
             };
 
+            let share_id = share.feldmanshare.id;
+            if !(1..=n).contains(&share_id) || seen_ids.contains(&share_id) {
+                continue;
+            }
+
             if share.commitments != expected_share.commitments {
                 continue;
             }
 
-            if verify_feldman(share.clone(), share.feldmanshare.id) {
+            if verify_feldman(share.clone(), share_id) {
+                seen_ids.insert(share_id);
                 verified.push(share);
                 if verified.len() == required_valid {
                     break;
@@ -773,7 +825,7 @@ where
 
         if verified.len() < required_valid {
             return Err(format!(
-                "{context}: collected {} contributions but only {} valid Feldman shares matched the local commitments; need {}",
+                "{context}: collected {} contributions but only {} valid Feldman shares with unique IDs matched the local commitments; need {}",
                 collected.len(),
                 verified.len(),
                 required_valid

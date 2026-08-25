@@ -15,6 +15,7 @@ use std::sync::Arc;
 use stoffel_vm_types::core_types::{ClearShareValue, ShareType, F64};
 use stoffelmpc_mpc::avss_mpc::triple_gen::BeaverTriple;
 use stoffelmpc_mpc::common::share::avss::verify_feldman;
+use stoffelmpc_mpc::common::ProtocolSessionId;
 use stoffelnet::transports::quic::QuicNetworkManager;
 
 #[tokio::test]
@@ -36,6 +37,52 @@ async fn avss_named_config_installs_execution_scoped_protocol_network() {
     .unwrap();
 
     assert_eq!(engine.protocol_net().execution_id(), execution_id);
+}
+
+#[tokio::test]
+async fn await_received_share_selects_the_exact_session_from_the_same_dealer() {
+    let n = 4;
+    let t = 1;
+    let instance_id = 0x1122_4455;
+    let session =
+        MpcSessionConfig::try_new(instance_id, 3, n, t, Arc::new(QuicNetworkManager::new()))
+            .unwrap();
+    let engine = AvssMpcEngine::<Fr, G1>::from_config(AvssEngineConfig::new(
+        session,
+        Fr::from(9u64),
+        Arc::new(vec![G1::generator(); n]),
+    ))
+    .await
+    .unwrap();
+
+    let wrong_dealer_share = generate_feldman_shares(Fr::from(111u64), n, t)[3].clone();
+    let expected_dealer_share = generate_feldman_shares(Fr::from(222u64), n, t)[3].clone();
+    let dealer_sessions = AvssSessionIds::new(instance_id, 2, n);
+    let wrong_session = dealer_sessions.next_dealer_session().unwrap();
+    let expected_session = dealer_sessions.next_dealer_session().unwrap();
+    let node = engine.clone_avss_node().await;
+    let mut received = node.share_gen_avss.avss.shares.lock().await;
+    received.insert(
+        wrong_session,
+        (std::time::Instant::now(), Some(vec![wrong_dealer_share])),
+    );
+    received.insert(
+        expected_session,
+        (
+            std::time::Instant::now(),
+            Some(vec![expected_dealer_share.clone()]),
+        ),
+    );
+    drop(received);
+
+    let selected = engine
+        .await_received_share("expected-key", expected_session.as_u128())
+        .await
+        .expect("the requested dealer share is already available");
+    assert_eq!(
+        selected.feldmanshare.share,
+        expected_dealer_share.feldmanshare.share
+    );
 }
 
 #[test]
@@ -1100,6 +1147,31 @@ fn avss_open_reconstruction_filters_byzantine_feldman_contributions() {
         err.contains("only 1 valid Feldman shares") && err.contains("need 2"),
         "unexpected error: {err}"
     );
+}
+
+#[test]
+fn avss_open_reconstruction_skips_replayed_feldman_ids() {
+    let n = 4;
+    let t = 1;
+    let secret = Fr::from(12345u64);
+    let honest_shares = generate_feldman_shares(secret, n, t);
+
+    let local_share =
+        Bls12381AvssMpcEngine::encode_feldman_share(&honest_shares[0]).expect("encode local");
+    let replayed = local_share.clone();
+    let second_valid =
+        Bls12381AvssMpcEngine::encode_feldman_share(&honest_shares[1]).expect("encode valid");
+
+    let recovered = Bls12381AvssMpcEngine::reconstruct_verified_secret(
+        &local_share,
+        &[local_share.clone(), replayed, second_valid],
+        n,
+        t,
+        "replayed AVSS open",
+    )
+    .expect("a replayed ID must not prevent later unique honest shares from reconstructing");
+
+    assert_eq!(recovered, secret);
 }
 
 #[test]

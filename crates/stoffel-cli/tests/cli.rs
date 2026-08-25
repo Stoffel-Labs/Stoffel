@@ -111,6 +111,36 @@ fn init_creates_default_project() {
     assert!(readme.contains("cargo run"));
 }
 
+#[cfg(unix)]
+#[test]
+fn init_force_rejects_symlink_project_root() {
+    use std::os::unix::fs::symlink;
+
+    let temp = TempDir::new().unwrap();
+    let outside = temp.path().join("outside");
+    let linked_project = temp.path().join("linked-project");
+    fs::create_dir_all(&outside).unwrap();
+    fs::write(outside.join("keep.txt"), "keep").unwrap();
+    symlink(&outside, &linked_project).unwrap();
+
+    Command::cargo_bin("stoffel")
+        .unwrap()
+        .arg("init")
+        .arg(&linked_project)
+        .arg("--force")
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "cannot initialize project through symlink",
+        ));
+
+    assert_eq!(
+        fs::read_to_string(outside.join("keep.txt")).unwrap(),
+        "keep"
+    );
+    assert!(!outside.join("Stoffel.toml").exists());
+}
+
 #[test]
 fn init_default_project_builds_with_cargo_and_sdk_bindings() {
     let temp = TempDir::new().unwrap();
@@ -2996,6 +3026,38 @@ fn build_rejects_unsafe_configured_target_dir() {
         .stderr(predicate::str::contains("os error").not());
 }
 
+#[cfg(unix)]
+#[test]
+fn build_rejects_configured_target_through_intermediate_symlink() {
+    let temp = TempDir::new().unwrap();
+    let project = temp.path().join("project");
+    let outside = temp.path().join("outside");
+    fs::create_dir_all(&outside).unwrap();
+    Command::cargo_bin("stoffel")
+        .unwrap()
+        .arg("init")
+        .arg(&project)
+        .assert()
+        .success();
+
+    std::os::unix::fs::symlink(&outside, project.join("escape")).unwrap();
+    let config = fs::read_to_string(project.join("Stoffel.toml")).unwrap();
+    fs::write(
+        project.join("Stoffel.toml"),
+        config.replace("target_dir = \"target\"", "target_dir = \"escape/target\""),
+    )
+    .unwrap();
+
+    Command::cargo_bin("stoffel")
+        .unwrap()
+        .arg("build")
+        .arg(&project)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("symlink"));
+    assert!(!outside.join("target").exists());
+}
+
 #[test]
 fn build_rejects_configured_optimization_levels_outside_cli_range() {
     let temp = TempDir::new().unwrap();
@@ -4785,6 +4847,38 @@ fn clean_removes_stale_artifact_files_and_symlinks() {
 
     assert!(!temp.path().join("target").exists());
     assert!(outside.join("keep.txt").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn clean_rejects_configured_target_through_intermediate_symlink() {
+    let temp = TempDir::new().unwrap();
+    let project = temp.path().join("project");
+    let outside = temp.path().join("outside");
+    Command::cargo_bin("stoffel")
+        .unwrap()
+        .arg("init")
+        .arg(&project)
+        .assert()
+        .success();
+    fs::create_dir_all(outside.join("target")).unwrap();
+    fs::write(outside.join("target/keep.txt"), "keep").unwrap();
+    std::os::unix::fs::symlink(&outside, project.join("escape")).unwrap();
+    let config = fs::read_to_string(project.join("Stoffel.toml")).unwrap();
+    fs::write(
+        project.join("Stoffel.toml"),
+        config.replace("target_dir = \"target\"", "target_dir = \"escape/target\""),
+    )
+    .unwrap();
+
+    Command::cargo_bin("stoffel")
+        .unwrap()
+        .arg("clean")
+        .arg(&project)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("symlink"));
+    assert!(outside.join("target/keep.txt").exists());
 }
 
 #[test]
