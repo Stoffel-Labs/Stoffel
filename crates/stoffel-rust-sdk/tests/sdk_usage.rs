@@ -4081,11 +4081,21 @@ async fn avss_engine_surface_does_not_fake_protocol_operations() -> stoffel::Res
     let err = engine.generate_random_share("key").await.unwrap_err();
     assert!(matches!(err, stoffel::Error::Unsupported(_)));
     let err = engine
+        .generate_random_share_with_session("key")
+        .await
+        .unwrap_err();
+    assert!(matches!(err, stoffel::Error::Unsupported(_)));
+    let err = engine
         .generate_share_with_secret("key", FieldElement::from_bytes([1, 2, 3]))
         .await
         .unwrap_err();
     assert!(matches!(err, stoffel::Error::Unsupported(_)));
-    let err = engine.await_received_share("key").await.unwrap_err();
+    let err = engine
+        .generate_share_with_secret_and_session("key", FieldElement::from_bytes([1, 2, 3]))
+        .await
+        .unwrap_err();
+    assert!(matches!(err, stoffel::Error::Unsupported(_)));
+    let err = engine.await_received_share("key", 0).await.unwrap_err();
     assert!(matches!(err, stoffel::Error::Unsupported(_)));
     let err = engine.get_share("key").await.unwrap_err();
     assert!(matches!(err, stoffel::Error::Unsupported(_)));

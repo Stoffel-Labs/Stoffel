@@ -653,6 +653,7 @@ where
         if shares.is_empty() {
             return Ok(Vec::new());
         }
+        self.require_verifiable_exponent_open()?;
         if group != MpcExponentGroup::native_for_curve(self.curve_config()) {
             return Err(group.unsupported_error(self.protocol_name()));
         }
@@ -783,6 +784,7 @@ where
         share_bytes: &[u8],
         generator_bytes: &[u8],
     ) -> Result<Vec<u8>, String> {
+        self.require_verifiable_exponent_open()?;
         let share = Self::decode_share(share_bytes)?;
         let generator = G::deserialize_compressed(generator_bytes)
             .map_err(|e| format!("deserialize generator: {}", e))?;
@@ -842,6 +844,7 @@ where
         share_bytes: &[u8],
         generator_bytes: &[u8],
     ) -> Result<Vec<u8>, String> {
+        self.require_verifiable_exponent_open()?;
         let share = Self::decode_share(share_bytes)?;
         let generator = G::deserialize_compressed(generator_bytes)
             .map_err(|e| format!("deserialize generator: {}", e))?;
@@ -902,6 +905,7 @@ where
         share_bytes: &[u8],
         generator_g2_bytes: &[u8],
     ) -> Result<Vec<u8>, String> {
+        self.require_verifiable_exponent_open()?;
         use ark_bls12_381::{Fr, G2Projective};
 
         if TypeId::of::<F>() != TypeId::of::<Fr>() {
@@ -981,6 +985,7 @@ where
         share_bytes: &[u8],
         generator_g2_bytes: &[u8],
     ) -> Result<Vec<u8>, String> {
+        self.require_verifiable_exponent_open()?;
         use ark_bls12_381::{Fr, G2Projective};
 
         if TypeId::of::<F>() != TypeId::of::<Fr>() {
@@ -1063,6 +1068,19 @@ where
         secret: F,
     ) -> Result<ClearShareValue, String> {
         crate::net::curve::field_to_clear_share_value(ty, secret).map_err(Into::into)
+    }
+
+    fn require_verifiable_exponent_open(&self) -> Result<(), String> {
+        if self.topology.threshold() > 0 {
+            return Err(
+                "HoneyBadger open-in-exponent is disabled for Byzantine-threshold sessions: \
+                 RobustShare carries no authenticated polynomial commitment, so peer partial \
+                 points cannot be verified without revealing the scalar; use the AVSS backend \
+                 for verifiable exponent openings"
+                    .to_string(),
+            );
+        }
+        Ok(())
     }
 
     pub(super) fn encode_share(share: &RobustShare<F>) -> Result<Vec<u8>, String> {

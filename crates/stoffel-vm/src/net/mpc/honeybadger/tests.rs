@@ -1,6 +1,8 @@
 use super::{HoneyBadgerEngineConfig, HoneyBadgerMpcEngine, HoneyBadgerPreprocessingConfig};
 use crate::net::engine_config::{DeploymentMode, MpcSessionConfig};
-use crate::net::mpc_engine::{DurableIdentityDigest, MpcEngine, MpcEngineConsensus, MpcPartyId};
+use crate::net::mpc_engine::{
+    AsyncMpcEngineConsensus, DurableIdentityDigest, MpcEngine, MpcEngineConsensus, MpcPartyId,
+};
 use crate::net::reservation::ReservationRegistry;
 use crate::net::session::ExecutionId;
 use crate::storage::preproc::{
@@ -1009,33 +1011,42 @@ async fn consume_masked_inputs_evicts_fully_used_persistent_masks() {
     );
 }
 
-#[test]
-fn rbc_receive_delivers_new_broadcast_each_call_in_order() {
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rbc_receive_delivers_new_broadcast_each_call_in_order() {
     let instance_id = next_instance_id();
     let n = 5;
     let t = 1;
     let router = Arc::new(crate::net::open_registry::OpenMessageRouter::new());
     let sender = test_engine(router.clone(), instance_id, 0, n, t);
-    let receiver = test_engine(router, instance_id, 1, n, t);
+    let receiver1 = test_engine(router.clone(), instance_id, 1, n, t);
+    let receiver2 = test_engine(router.clone(), instance_id, 2, n, t);
+    let receiver3 = test_engine(router.clone(), instance_id, 3, n, t);
+    let receiver4 = test_engine(router, instance_id, 4, n, t);
 
     sender.rbc_broadcast(b"first").expect("broadcast first");
+    let receive_first = async {
+        tokio::join!(
+            receiver1.rbc_receive_async(MpcPartyId::new(0), 500),
+            receiver2.rbc_receive_async(MpcPartyId::new(0), 500),
+            receiver3.rbc_receive_async(MpcPartyId::new(0), 500),
+            receiver4.rbc_receive_async(MpcPartyId::new(0), 500),
+        )
+    };
+    let first = receive_first.await;
+    for result in [first.0, first.1, first.2, first.3] {
+        assert_eq!(result.expect("receive first"), b"first");
+    }
+
     sender.rbc_broadcast(b"second").expect("broadcast second");
-
-    let first = receiver
-        .rbc_receive(MpcPartyId::new(0), 50)
-        .expect("receive first");
-    let second = receiver
-        .rbc_receive(MpcPartyId::new(0), 50)
-        .expect("receive second");
-
-    assert_eq!(
-        first, b"first",
-        "first receive should return first broadcast"
+    let second = tokio::join!(
+        receiver1.rbc_receive_async(MpcPartyId::new(0), 500),
+        receiver2.rbc_receive_async(MpcPartyId::new(0), 500),
+        receiver3.rbc_receive_async(MpcPartyId::new(0), 500),
+        receiver4.rbc_receive_async(MpcPartyId::new(0), 500),
     );
-    assert_eq!(
-        second, b"second",
-        "second receive should return second broadcast"
-    );
+    for result in [second.0, second.1, second.2, second.3] {
+        assert_eq!(result.expect("receive second"), b"second");
+    }
 }
 
 #[test]
@@ -1077,4 +1088,25 @@ fn open_exp_wire_accepts_matching_share_id() {
         .expect("entry should be inserted for valid payload");
     assert_eq!(entry.party_ids, vec![1]);
     assert_eq!(entry.partial_points, vec![(1, vec![9, 8, 7, 6])]);
+}
+
+#[test]
+fn honeybadger_exponent_open_fails_closed_without_verifiable_shares() {
+    let engine = test_engine(
+        Arc::new(crate::net::open_registry::OpenMessageRouter::new()),
+        next_instance_id(),
+        0,
+        5,
+        1,
+    );
+
+    let error = engine
+        .open_share_in_exp_impl(
+            stoffel_vm_types::core_types::ShareType::default_secret_int(),
+            b"untrusted share bytes",
+            b"untrusted generator bytes",
+        )
+        .expect_err("unverifiable HoneyBadger exponent opening must fail closed");
+    assert!(error.contains("disabled for Byzantine-threshold sessions"));
+    assert!(error.contains("AVSS backend"));
 }

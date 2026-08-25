@@ -55,13 +55,28 @@ type AvssOperation<'a, T> = Pin<Box<dyn Future<Output = Result<T>> + Send + 'a>>
 trait ErasedAvssEngine: Send + Sync {
     fn generate_random_share<'a>(&'a self, key_name: &'a str) -> AvssOperation<'a, ()>;
 
+    fn generate_random_share_with_session<'a>(
+        &'a self,
+        key_name: &'a str,
+    ) -> AvssOperation<'a, u128>;
+
     fn generate_share_with_secret<'a>(
         &'a self,
         key_name: &'a str,
         secret: &'a FieldElement,
     ) -> AvssOperation<'a, ()>;
 
-    fn await_received_share<'a>(&'a self, key_name: &'a str) -> AvssOperation<'a, ()>;
+    fn generate_share_with_secret_and_session<'a>(
+        &'a self,
+        key_name: &'a str,
+        secret: &'a FieldElement,
+    ) -> AvssOperation<'a, u128>;
+
+    fn await_received_share<'a>(
+        &'a self,
+        key_name: &'a str,
+        expected_session_id: u128,
+    ) -> AvssOperation<'a, ()>;
 
     fn get_share<'a>(&'a self, key_name: &'a str) -> AvssOperation<'a, Share>;
 
@@ -121,6 +136,13 @@ impl AvssEngine {
             .await
     }
 
+    /// Generate a share and return the exact session id recipients must bind to this key.
+    pub async fn generate_random_share_with_session(&self, key_name: &str) -> Result<u128> {
+        self.live_engine(format!("generate_random_share_with_session('{key_name}')"))?
+            .generate_random_share_with_session(key_name)
+            .await
+    }
+
     #[tracing::instrument(skip_all, fields(curve = ?self.curve, key_name = key_name))]
     pub async fn generate_share_with_secret(
         &self,
@@ -132,11 +154,30 @@ impl AvssEngine {
             .await
     }
 
+    /// Generate a chosen-secret share and return its exact AVSS session id.
+    pub async fn generate_share_with_secret_and_session(
+        &self,
+        key_name: &str,
+        secret: FieldElement,
+    ) -> Result<u128> {
+        self.live_engine(format!(
+            "generate_share_with_secret_and_session('{key_name}', ...)"
+        ))?
+        .generate_share_with_secret_and_session(key_name, &secret)
+        .await
+    }
+
     #[tracing::instrument(skip_all, fields(curve = ?self.curve, key_name = key_name))]
-    pub async fn await_received_share(&self, key_name: &str) -> Result<()> {
-        self.live_engine(format!("await_received_share('{key_name}')"))?
-            .await_received_share(key_name)
-            .await
+    pub async fn await_received_share(
+        &self,
+        key_name: &str,
+        expected_session_id: u128,
+    ) -> Result<()> {
+        self.live_engine(format!(
+            "await_received_share('{key_name}', session={expected_session_id})"
+        ))?
+        .await_received_share(key_name, expected_session_id)
+        .await
     }
 
     pub async fn get_share(&self, key_name: &str) -> Result<Share> {
@@ -185,6 +226,13 @@ where
         Box::pin(engine_generate_random_share(self, key_name))
     }
 
+    fn generate_random_share_with_session<'a>(
+        &'a self,
+        key_name: &'a str,
+    ) -> AvssOperation<'a, u128> {
+        Box::pin(engine_generate_random_share_with_session(self, key_name))
+    }
+
     fn generate_share_with_secret<'a>(
         &'a self,
         key_name: &'a str,
@@ -193,8 +241,26 @@ where
         Box::pin(engine_generate_share_with_secret(self, key_name, secret))
     }
 
-    fn await_received_share<'a>(&'a self, key_name: &'a str) -> AvssOperation<'a, ()> {
-        Box::pin(engine_await_received_share(self, key_name))
+    fn generate_share_with_secret_and_session<'a>(
+        &'a self,
+        key_name: &'a str,
+        secret: &'a FieldElement,
+    ) -> AvssOperation<'a, u128> {
+        Box::pin(engine_generate_share_with_secret_and_session(
+            self, key_name, secret,
+        ))
+    }
+
+    fn await_received_share<'a>(
+        &'a self,
+        key_name: &'a str,
+        expected_session_id: u128,
+    ) -> AvssOperation<'a, ()> {
+        Box::pin(engine_await_received_share(
+            self,
+            key_name,
+            expected_session_id,
+        ))
     }
 
     fn get_share<'a>(&'a self, key_name: &'a str) -> AvssOperation<'a, Share> {
@@ -240,6 +306,21 @@ where
         .map_err(Error::Computation)
 }
 
+async fn engine_generate_random_share_with_session<F, G>(
+    engine: &AvssMpcEngine<F, G>,
+    key_name: &str,
+) -> Result<u128>
+where
+    F: SupportedMpcField,
+    G: CurveGroup<ScalarField = F> + Send + Sync + 'static,
+{
+    engine
+        .generate_random_share_with_session(key_name)
+        .await
+        .map(|(session_id, _)| session_id)
+        .map_err(Error::Computation)
+}
+
 async fn engine_generate_share_with_secret<F, G>(
     engine: &AvssMpcEngine<F, G>,
     key_name: &str,
@@ -262,16 +343,39 @@ where
         .map_err(Error::Computation)
 }
 
+async fn engine_generate_share_with_secret_and_session<F, G>(
+    engine: &AvssMpcEngine<F, G>,
+    key_name: &str,
+    secret: &FieldElement,
+) -> Result<u128>
+where
+    F: SupportedMpcField + ark_serialize::CanonicalDeserialize,
+    G: CurveGroup<ScalarField = F> + Send + Sync + 'static,
+{
+    if secret.as_bytes().is_empty() {
+        return Err(Error::InvalidInput(
+            "AVSS field element bytes cannot be empty".to_owned(),
+        ));
+    }
+    let secret = decode_avss_field::<F>(secret.as_bytes()).map_err(Error::Computation)?;
+    engine
+        .generate_share_with_secret_and_session(key_name, secret)
+        .await
+        .map(|(session_id, _)| session_id)
+        .map_err(Error::Computation)
+}
+
 async fn engine_await_received_share<F, G>(
     engine: &AvssMpcEngine<F, G>,
     key_name: &str,
+    expected_session_id: u128,
 ) -> Result<()>
 where
     F: SupportedMpcField,
     G: CurveGroup<ScalarField = F> + Send + Sync + 'static,
 {
     engine
-        .await_received_share(key_name)
+        .await_received_share(key_name, expected_session_id)
         .await
         .map(|_| ())
         .map_err(Error::Computation)
