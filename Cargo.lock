@@ -5705,8 +5705,9 @@ dependencies = [
 
 [[package]]
 name = "stoffel-mpc-coordinator-off-chain"
-version = "0.1.0"
-source = "git+https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git?branch=fixes%2Fconcurrent-execution-coordinator#4e65b55f64d735800240070f835b5f3c91676065"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b2d7e687991d21dacaa62d8494a057f9487d8b85a87689f7180b1c3a3c7460ad"
 dependencies = [
  "ark-bls12-381",
  "ark-ff 0.5.0",
@@ -5726,8 +5727,9 @@ dependencies = [
 
 [[package]]
 name = "stoffel-mpc-coordinator-shared"
-version = "0.1.0"
-source = "git+https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git?branch=fixes%2Fconcurrent-execution-coordinator#4e65b55f64d735800240070f835b5f3c91676065"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1fc394e4b33b2cd09c8add9bfab92e11075f6b6e2e95b26979e1c8ff38f620c1"
 dependencies = [
  "ark-bls12-381",
  "ark-ec",
@@ -5917,8 +5919,9 @@ dependencies = [
 
 [[package]]
 name = "stoffelcrypto"
-version = "0.1.0"
-source = "git+https://github.com/Stoffel-Labs/mpc-protocols.git?branch=fixes-concurrent-execution-protocols#e86b5b258c27fcf67fc3de6b092134fa73f3643a"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a66dfe8e28c5d20fb9f4864b68f67aeb6e37c5f00d72790ca988b33e61d3d203"
 dependencies = [
  "ark-bls12-381",
  "ark-bn254",
@@ -5965,8 +5968,9 @@ dependencies = [
 
 [[package]]
 name = "stoffelmpc-network"
-version = "0.1.0"
-source = "git+https://github.com/Stoffel-Labs/mpc-protocols.git?branch=fixes-concurrent-execution-protocols#e86b5b258c27fcf67fc3de6b092134fa73f3643a"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "da9d4e7f12f537074c782e44ac0ffd582e3272df2a7364ed7741970d7d7dff5d"
 dependencies = [
  "ark-ff 0.5.0",
  "ark-serialize 0.5.0",
@@ -5986,8 +5990,9 @@ dependencies = [
 
 [[package]]
 name = "stoffelnet"
-version = "0.1.0"
-source = "git+https://github.com/Stoffel-Labs/stoffel-networking.git?branch=main#8ec8efa0b17840fa1a9d32cfba1609dfbeddaaf2"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4008611ad5ca586b18792e99b24217219f3884a03ec3a69c1dbff6aec94d1f82"
 dependencies = [
  "ark-ff 0.5.0",
  "async-trait",
