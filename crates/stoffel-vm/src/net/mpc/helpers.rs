@@ -12,6 +12,8 @@ const DEFAULT_MIN_PARTIES: usize = 5;
 const DEFAULT_THRESHOLD: usize = 1;
 const DEFAULT_SECURITY_PARAMETER_K: usize = 8;
 const DEFAULT_PROTOCOL_TIMEOUT_SECONDS: u64 = 600;
+const GOLDILOCKS_FIELD_CAPACITY_BITS: usize = 64;
+const PRAND_PROTOCOL_MARGIN_BITS: usize = 2;
 #[allow(dead_code)]
 fn derive_prandbit_count(n_random_shares: usize) -> usize {
     std::cmp::max(n_random_shares, DEFAULT_FIXED_POINT_FRACTIONAL_BITS)
@@ -93,8 +95,27 @@ pub fn honeybadger_node_opts_with_truncation(
     validate_honeybadger_topology(n_parties, threshold)?;
 
     // Fixed-point division requires l >= 2 * total_bits - fractional_bits.
-    let l = 2 * DEFAULT_FIXED_POINT_TOTAL_BITS - DEFAULT_FIXED_POINT_FRACTIONAL_BITS;
+    let mut l = 2 * DEFAULT_FIXED_POINT_TOTAL_BITS - DEFAULT_FIXED_POINT_FRACTIONAL_BITS;
     let k = DEFAULT_SECURITY_PARAMETER_K;
+
+    if n_prandint > 0 && n_prandbit == 0 {
+        // FIXME(mpc-protocols): Remove this cap after the release that fixes PRandInt's
+        // field-capacity validation. In 0.1.1, PRandInt incorrectly checks `l + k`
+        // against the 64-bit Goldilocks field even though that path supplies no
+        // small-field bits, so the normal fixed-point width always fails with
+        // `PRandError::SurpassedFieldCapacity`.
+        let party_margin = n_parties
+            .checked_next_power_of_two()
+            .map_or(usize::BITS as usize, |power| {
+                power.trailing_zeros() as usize
+            });
+        let accepted_l = GOLDILOCKS_FIELD_CAPACITY_BITS
+            .saturating_sub(k)
+            .saturating_sub(PRAND_PROTOCOL_MARGIN_BITS)
+            .saturating_sub(party_margin)
+            .saturating_sub(1);
+        l = l.min(accepted_l);
+    }
 
     HoneyBadgerMPCNodeOpts::new(
         n_parties,
@@ -180,6 +201,28 @@ mod tests {
         assert_eq!(
             honeybadger_protocol_instance_id(instance_id),
             honeybadger_protocol_instance_id(instance_id)
+        );
+    }
+
+    #[test]
+    fn prandint_only_opts_temporarily_fit_upstream_goldilocks_check() {
+        let opts = honeybadger_node_opts_with_truncation(5, 1, 0, 2, 0, 3, 1).unwrap();
+        let party_margin = 3;
+
+        assert!(
+            opts.l + opts.k + PRAND_PROTOCOL_MARGIN_BITS + party_margin
+                < GOLDILOCKS_FIELD_CAPACITY_BITS
+        );
+        assert_eq!(opts.l, 50);
+    }
+
+    #[test]
+    fn prandbit_opts_keep_fixed_point_width() {
+        let opts = honeybadger_node_opts_with_truncation(5, 1, 16, 18, 16, 1, 1).unwrap();
+
+        assert_eq!(
+            opts.l,
+            2 * DEFAULT_FIXED_POINT_TOTAL_BITS - DEFAULT_FIXED_POINT_FRACTIONAL_BITS
         );
     }
 }
