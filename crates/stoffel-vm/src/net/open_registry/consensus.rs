@@ -60,10 +60,10 @@ fn admit_rbc_candidate(
     source_sender: usize,
     message_len: usize,
 ) -> Result<(), String> {
-    reclaim_delivered_rbc_state(registry);
     if registry.candidates.contains_key(key) {
         return Ok(());
     }
+    reclaim_delivered_rbc_state(registry);
     if message_len > MAX_RBC_PAYLOAD_LEN {
         return Err(format!(
             "RBC payload is {message_len} bytes (max {MAX_RBC_PAYLOAD_LEN})"
