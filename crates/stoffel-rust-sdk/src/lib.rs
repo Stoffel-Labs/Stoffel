@@ -718,7 +718,7 @@ impl Stoffel {
                     .to_owned(),
             ));
         }
-        let parameter_types = local_source_parameter_types(&self.source, name)?;
+        let source_parameter_types = local_source_parameter_types(&self.source, name)?;
         let mut probe = self.clone();
         probe.inputs.clear();
         let probe_runtime = probe.build()?;
@@ -740,14 +740,21 @@ impl Stoffel {
             .iter()
             .enumerate()
             .map(|(index, value)| {
-                if parameter_types
+                let source_marks_secret = source_parameter_types
                     .as_ref()
                     .and_then(|types| types.get(index))
-                    .is_some_and(|ty| !local_parameter_type_is_secret(ty))
+                    .map(|ty| local_parameter_type_is_secret(ty));
+                let bytecode_marks_secret = function
+                    .parameter_types()
+                    .get(index)
+                    .map(function_type_is_secret);
+                if source_marks_secret
+                    .or(bytecode_marks_secret)
+                    .unwrap_or(true)
                 {
-                    crate::program::LocalInputShape::clear_from_value(value)
-                } else {
                     crate::program::LocalInputShape::secret_from_value(value)
+                } else {
+                    crate::program::LocalInputShape::clear_from_value(value)
                 }
             })
             .collect::<Vec<_>>();
@@ -889,6 +896,20 @@ fn local_parameter_type_is_secret(ty: &str) -> bool {
             || character == ']')
     })
     .any(|token| token == "secret" || token == "Share" || token.contains("secret"))
+}
+
+fn function_type_is_secret(ty: &stoffel_vm_types::compiled_binary::FunctionType) -> bool {
+    use stoffel_vm_types::compiled_binary::FunctionType;
+
+    match ty {
+        FunctionType::Secret(_) => true,
+        FunctionType::List(element) => function_type_is_secret(element),
+        FunctionType::Dict(key, value) => {
+            function_type_is_secret(key) || function_type_is_secret(value)
+        }
+        FunctionType::Generic(_, arguments) => arguments.iter().any(function_type_is_secret),
+        _ => false,
+    }
 }
 
 fn ordered_inputs_for_parameters(
