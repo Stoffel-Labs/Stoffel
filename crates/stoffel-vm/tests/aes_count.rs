@@ -763,7 +763,9 @@ fn optimized_aes_full_unroll_minimizes_rounds() {
         );
         let (scalar, batch_calls, batch_items) = engine.counts();
         assert_eq!(scalar, 0);
-        assert_eq!(batch_items, 33_952);
+        // Full flattening changes the communication schedule, not the optimized
+        // circuit's interactive product count.
+        assert_eq!(batch_items, 33_280);
         assert!(
             batch_calls < 1_000,
             "fully-flattened AES should reach a few hundred multiply rounds; got {batch_calls}"

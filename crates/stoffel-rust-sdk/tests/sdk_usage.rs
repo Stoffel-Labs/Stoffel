@@ -3576,10 +3576,16 @@ async fn execute_local_adapts_prd_secret_int_quickstart() -> stoffel::Result<()>
         .parties(5)
         .threshold(1)
         .with_inputs(&[("a", 42_i64), ("b", 58_i64)])
-        .execute_local()
+        .execute_local_returning_party_shares()
         .await?;
 
-    assert_eq!(result, vec![Value::I64(100)]);
+    assert!(result.client_outputs.is_empty());
+    assert_eq!(result.shares().len(), 5);
+    assert!(result.shares().all(|share| {
+        share.share_type == ShareType::secret_int(64)
+            && share.backend_format == ShareDataFormat::Opaque
+            && !share.as_bytes().is_empty()
+    }));
     Ok(())
 }
 
@@ -3595,10 +3601,16 @@ async fn execute_local_adapts_loaded_secret_int_bytecode() -> stoffel::Result<()
         .parties(5)
         .threshold(1)
         .with_inputs(&[("a", 42_i64), ("b", 58_i64)])
-        .execute_local()
+        .execute_local_returning_party_shares()
         .await?;
 
-    assert_eq!(result, vec![Value::I64(100)]);
+    assert!(result.client_outputs.is_empty());
+    assert_eq!(result.shares().len(), 5);
+    assert!(result.shares().all(|share| {
+        share.share_type == ShareType::secret_int(64)
+            && share.backend_format == ShareDataFormat::Opaque
+            && !share.as_bytes().is_empty()
+    }));
     Ok(())
 }
 

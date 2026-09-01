@@ -26,7 +26,7 @@ where
     G: CurveGroup<ScalarField = F> + Send + Sync + 'static,
 {
     #[cfg(all(test, feature = "avss_itest"))]
-    pub(crate) async fn multiplication_session_count(&self) -> usize {
+    pub(crate) async fn active_multiplication_session_count(&self) -> usize {
         let node = self.avss_node.lock().await;
         let count = node.mul_node.mult_storage.lock().await.len();
         count
