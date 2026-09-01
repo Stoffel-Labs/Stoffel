@@ -757,7 +757,10 @@ fn spawn_avss_message_processors(
                     }
                 };
                 let payload = envelope.payload();
-                match open_message_router.try_handle_wire_message(sender_id, payload) {
+                match open_message_router
+                    .handle_wire_message(sender_id, payload)
+                    .await
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         error!(

@@ -97,7 +97,10 @@ async fn test_open_share_in_exp_known_value() {
                 else {
                     continue;
                 };
-                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                match open_message_router
+                    .handle_wire_message(sender_id, &raw_msg)
+                    .await
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -295,7 +298,10 @@ async fn test_simulated_dkg_flow() {
                 else {
                     continue;
                 };
-                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                match open_message_router
+                    .handle_wire_message(sender_id, &raw_msg)
+                    .await
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
