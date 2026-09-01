@@ -6,7 +6,7 @@ use clap::Parser;
 use jsonrpsee::{core::RpcResult, server::RpcModule};
 use stoffel_mpc_coordinator_off_chain::{
     ClientIdentity, CoordinatorRPCBaseServer, CoordinatorRPCServerConnectionBase,
-    CoordinatorRPCServerSharedBase, ExecutionRegistration, InputAssignment,
+    CoordinatorRPCServerSharedBase, ExecutionRegistration, InputAssignment, InputClientRange,
     OffChainCoordinatorServer, StoffelCoordinatorRPCServer,
 };
 use stoffel_mpc_coordinator_shared::rpc::RPCServerConnection;
@@ -50,6 +50,10 @@ struct Args {
     #[arg(long, value_delimiter = ',', num_args = 0..)]
     output_clients: Vec<String>,
 
+    /// Client certificates assigned to input indices, in global index order.
+    #[arg(long, value_delimiter = ',', num_args = 0..)]
+    input_clients: Vec<String>,
+
     #[arg(long, default_value = "honeybadger")]
     mpc_backend: String,
 
@@ -58,6 +62,10 @@ struct Args {
 
     #[arg(long, default_value_t = 31415)]
     port: u16,
+
+    /// Optional ordinary WebSocket bind address for signed browser-client RPC.
+    #[arg(long)]
+    browser_bind_addr: Option<String>,
 }
 
 fn parse_nonzero_execution_id(value: &str) -> Result<ExecutionId, String> {
@@ -137,6 +145,18 @@ async fn main() {
 
     let args = Args::parse();
     let public_keys = parse_public_keys(&args.initial_mpc_nodes);
+    let input_assignment = parse_input_assignment(&args.input_clients);
+    let assigned_inputs = input_assignment
+        .ranges
+        .iter()
+        .map(|range| range.count)
+        .sum::<u64>();
+    if !input_assignment.ranges.is_empty() && assigned_inputs != args.n_inputs {
+        panic!(
+            "--input-clients supplied {} identities for --n-inputs {}",
+            assigned_inputs, args.n_inputs
+        );
+    }
     let mut state = CoordinatorRPCServerSharedBase::new(args.n, args.t, public_keys)
         .expect("invalid coordinator roster");
     if let Some(execution_id) = args.execution_id {
@@ -159,24 +179,41 @@ async fn main() {
                 program_hash,
                 n_inputs: args.n_inputs,
                 output_clients: parse_public_keys(&args.output_clients),
-                input_assignment: InputAssignment::default(),
+                input_assignment,
                 min_output_shares,
             })
             .expect("invalid initial execution");
     }
 
-    let coord = OffChainCoordinatorServer::<CoordinatorConnection>::start_coord(
-        state,
-        &args.bind_addr,
-        args.port,
-        args.t,
-        fs::read(&args.server_cert).expect("could not read server cert"),
-        fs::read(&args.server_key).expect("could not read server key"),
-    )
-    .await
+    let cert = fs::read(&args.server_cert).expect("could not read server cert");
+    let key = fs::read(&args.server_key).expect("could not read server key");
+    let coord = if let Some(browser_bind_addr) = args.browser_bind_addr.as_deref() {
+        OffChainCoordinatorServer::<CoordinatorConnection>::start_coord_with_browser(
+            state,
+            &args.bind_addr,
+            args.port,
+            cert,
+            key,
+            browser_bind_addr,
+        )
+        .await
+    } else {
+        OffChainCoordinatorServer::<CoordinatorConnection>::start_coord(
+            state,
+            &args.bind_addr,
+            args.port,
+            args.t,
+            cert,
+            key,
+        )
+        .await
+    }
     .expect("failed to start coordinator");
 
     println!("Listening on {}:{}", args.bind_addr, args.port);
+    if let Some(browser_bind_addr) = args.browser_bind_addr {
+        println!("Browser RPC listening on {browser_bind_addr}");
+    }
     wait_for_shutdown_signal().await;
     coord.shutdown().await;
 }
@@ -210,4 +247,34 @@ fn parse_public_keys(cert_files: &[String]) -> Vec<Vec<u8>> {
             parsed_cert.public_key().subject_public_key.data.to_vec()
         })
         .collect()
+}
+
+fn parse_input_assignment(cert_files: &[String]) -> InputAssignment {
+    let mut clients = Vec::<ClientIdentity>::new();
+    let mut client_indices = std::collections::HashMap::<ClientIdentity, u32>::new();
+    let mut ranges = Vec::<InputClientRange>::new();
+    for client in parse_public_keys(cert_files) {
+        let client_index = match client_indices.get(&client) {
+            Some(index) => *index,
+            None => {
+                let index = u32::try_from(clients.len())
+                    .expect("input client count exceeds the coordinator wire format");
+                clients.push(client.clone());
+                client_indices.insert(client, index);
+                index
+            }
+        };
+        if let Some(range) = ranges
+            .last_mut()
+            .filter(|range| range.client_index == client_index)
+        {
+            range.count += 1;
+        } else {
+            ranges.push(InputClientRange {
+                client_index,
+                count: 1,
+            });
+        }
+    }
+    InputAssignment { clients, ranges }
 }
