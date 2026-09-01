@@ -6,9 +6,20 @@ use stoffel_vm_runner::{
     LocalClientInput, LocalCoordinatorRunOutput, LocalCoordinatorRunner, LocalPartyOutput,
 };
 use stoffel_vm_types::compiled_binary::{ClientIoManifest, ClientIoSchema, CompiledBinary};
-use stoffel_vm_types::core_types::{ShareType, Value};
+use stoffel_vm_types::core_types::{ShareDataFormat, ShareType, Value};
 use stoffel_vm_types::functions::VMFunction;
 use stoffel_vm_types::instructions::Instruction;
+
+fn assert_all_parties_proposed(output: &LocalCoordinatorRunOutput, round: &str) {
+    let needle = format!("proposing {round}");
+    let proposals = output.combined_output.matches(&needle).count();
+    let expected = output.party_outputs.len();
+    assert!(
+        proposals >= expected,
+        "expected all {expected} parties to propose {round}, saw {proposals}; output:\n{}",
+        output.combined_output
+    );
+}
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts a real localhost coordinator and MPC party mesh"]
@@ -36,13 +47,10 @@ async fn local_offchain_coordinator_runs_networked_vm_without_docker_compose() {
 
     assert_eq!(output.returned_values(), vec!["7", "7", "7", "7", "7"]);
     assert_eq!(output.consistent_returned_values().unwrap(), vec!["7"]);
-    assert!(
-        output
-            .combined_output
-            .contains("coordinator -> MPCExecution"),
-        "expected leader to drive the off-chain coordinator into MPCExecution; output:\n{}",
-        output.combined_output
-    );
+    assert_all_parties_proposed(&output, "Preprocessing");
+    assert_all_parties_proposed(&output, "MPCExecution");
+    assert_all_parties_proposed(&output, "OutputDistribution");
+    assert_all_parties_proposed(&output, "ProgramFinished");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -74,6 +82,10 @@ async fn local_offchain_coordinator_runs_avss_networked_vm_without_docker_compos
 
     assert_eq!(output.returned_values(), vec!["7", "7", "7", "7", "7"]);
     assert_eq!(output.consistent_returned_values().unwrap(), vec!["7"]);
+    assert_all_parties_proposed(&output, "Preprocessing");
+    assert_all_parties_proposed(&output, "MPCExecution");
+    assert_all_parties_proposed(&output, "OutputDistribution");
+    assert_all_parties_proposed(&output, "ProgramFinished");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -113,12 +125,14 @@ async fn local_offchain_coordinator_runs_compiled_avss_networked_vm_without_dock
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts a real localhost coordinator, AVSS MPC party mesh, and coordinator client"]
-async fn local_offchain_coordinator_submits_avss_clientstore_inputs_without_docker_compose() {
+async fn local_offchain_coordinator_submits_multiple_avss_clientstore_inputs_without_docker_compose(
+) {
     let source = r#"
 def main() -> int64:
-  var share = ClientStore.take_share(0, 0)
-  var opened: int64 = share.open()
-  return opened + 5
+  var first = ClientStore.take_share(0, 0)
+  var second = ClientStore.take_share(0, 1)
+  var third = ClientStore.take_share(0, 2)
+  return first.open() + second.open() + third.open()
 "#;
     let options = stoffellang::CompilerOptions {
         mpc_backend: stoffel_vm_types::compiled_binary::MpcBackend::Avss,
@@ -134,15 +148,17 @@ def main() -> int64:
         .parties(5)
         .threshold(1)
         .timeout(Duration::from_secs(180))
-        .client_inputs([LocalClientInput::raw(0, ["42"])])
+        .client_inputs([LocalClientInput::raw(0, ["42", "11", "7"])])
         .build()
         .expect("local runner config")
         .run()
         .await
         .expect("local AVSS coordinator client input run");
 
-    assert_eq!(output.returned_values(), vec!["47", "47", "47", "47", "47"]);
-    assert_eq!(output.consistent_returned_values().unwrap(), vec!["47"]);
+    assert_eq!(output.returned_values(), vec!["60", "60", "60", "60", "60"]);
+    assert_eq!(output.consistent_returned_values().unwrap(), vec!["60"]);
+    assert_all_parties_proposed(&output, "InputMaskReservation");
+    assert_all_parties_proposed(&output, "InputCollection");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -175,13 +191,11 @@ def main() -> int64:
 
     assert_eq!(output.returned_values(), vec!["47", "47", "47", "47", "47"]);
     assert_eq!(output.consistent_returned_values().unwrap(), vec!["47"]);
-    assert!(
-        output
-            .combined_output
-            .contains("coordinator -> MPCExecution"),
-        "expected leader to drive the off-chain coordinator into MPCExecution; output:\n{}",
-        output.combined_output
-    );
+    assert_all_parties_proposed(&output, "InputMaskReservation");
+    assert_all_parties_proposed(&output, "InputCollection");
+    assert_all_parties_proposed(&output, "MPCExecution");
+    assert_all_parties_proposed(&output, "OutputDistribution");
+    assert_all_parties_proposed(&output, "ProgramFinished");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -289,6 +303,34 @@ fn local_run_output_rejects_inconsistent_party_return_values() {
     );
 }
 
+#[test]
+fn local_run_output_exposes_each_party_share_without_requiring_consistency() {
+    let party0 = "Program returned: share:v1[secret-int:64;opaque;3] 0x000102\n";
+    let party1 = "Program returned: share:v1[secret-int:64;opaque;3] 0x030405\n";
+    let output = LocalCoordinatorRunOutput {
+        combined_output: format!("{party0}{party1}"),
+        party_outputs: vec![
+            party_output("party0", party0),
+            party_output("party1", party1),
+        ],
+        client_outputs: Vec::new(),
+    };
+
+    let shares = output.returned_shares().unwrap();
+    assert_eq!(shares.len(), 2);
+    assert_eq!(shares[0].share_type, ShareType::secret_int(64));
+    assert_eq!(shares[0].format, ShareDataFormat::Opaque);
+    assert_eq!(shares[0].as_bytes(), &[0x00, 0x01, 0x02]);
+    assert_eq!(shares[1].as_bytes(), &[0x03, 0x04, 0x05]);
+
+    assert_eq!(
+        output.party_outputs[0].returned_shares().unwrap()[0].as_bytes(),
+        &[0x00, 0x01, 0x02]
+    );
+    let error = output.consistent_returned_values().unwrap_err();
+    assert!(error.contains("party-local"), "unexpected error: {error}");
+}
+
 fn party_output(name: &str, combined: &str) -> LocalPartyOutput {
     LocalPartyOutput {
         name: name.to_owned(),
@@ -318,6 +360,7 @@ fn local_runner_rejects_missing_clientstore_inputs_before_spawning_parties() {
             outputs: Vec::new(),
         }],
         preprocessing_demand: stoffel_vm_types::compiled_binary::PreprocessingDemand::default(),
+        dynamic_client_inputs: Vec::new(),
     };
 
     let err = LocalCoordinatorRunner::builder(env!("CARGO_BIN_EXE_stoffel-run"), binary)
@@ -350,6 +393,7 @@ fn local_runner_accepts_static_output_only_clients_without_inputs() {
             outputs: vec![ShareType::default_secret_int()],
         }],
         preprocessing_demand: stoffel_vm_types::compiled_binary::PreprocessingDemand::default(),
+        dynamic_client_inputs: Vec::new(),
     };
 
     LocalCoordinatorRunner::builder(env!("CARGO_BIN_EXE_stoffel-run"), binary)
@@ -377,6 +421,7 @@ fn local_runner_rejects_expected_output_clients_below_static_manifest_slots() {
             outputs: vec![ShareType::default_secret_int()],
         }],
         preprocessing_demand: stoffel_vm_types::compiled_binary::PreprocessingDemand::default(),
+        dynamic_client_inputs: Vec::new(),
     };
 
     let err = LocalCoordinatorRunner::builder(env!("CARGO_BIN_EXE_stoffel-run"), binary)
@@ -410,6 +455,7 @@ fn local_runner_rejects_duplicate_client_input_slots() {
             outputs: Vec::new(),
         }],
         preprocessing_demand: stoffel_vm_types::compiled_binary::PreprocessingDemand::default(),
+        dynamic_client_inputs: Vec::new(),
     };
 
     let err = LocalCoordinatorRunner::builder(env!("CARGO_BIN_EXE_stoffel-run"), binary)

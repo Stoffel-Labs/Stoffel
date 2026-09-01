@@ -2,7 +2,7 @@
 
 All notable changes to the Stoffel crates are tracked here.
 
-## [0.1.1]
+## [0.1.1] - 2026-07-03
 
 ### PR #67 - runner release and install updates
 
@@ -46,5 +46,5 @@ All notable changes to the Stoffel crates are tracked here.
 
 ### Notes
 
-- `stoffel-bindgen` is currently marked `publish = false`; `stoffel-cli` is released as a GitHub binary artifact rather than a crates.io package.
-- Publish order for the initial crate release is `stoffel-vm-types`, `stoffellang`, `stoffel-vm`, `stoffel-vm-runner`, `stoffel-rust-sdk`, then downstream binary artifacts such as `stoffel-cli`.
+- `stoffel-bindgen` is currently marked `publish = false`; the `stoffel` CLI crate is published for `cargo install stoffel` and also released as a GitHub binary artifact.
+- Publish order for the initial crate release is `stoffel-vm-types`, `stoffellang`, `stoffel-vm`, `stoffel-vm-runner`, `stoffel-rust-sdk`, then downstream binary artifacts such as the `stoffel` CLI.

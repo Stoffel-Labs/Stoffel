@@ -22,9 +22,10 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Install Rust nightly
-        uses: dtolnay/rust-toolchain@nightly
+      - name: Install pinned Rust nightly
+        uses: dtolnay/rust-toolchain@master
         with:
+          toolchain: nightly-2026-08-21
           components: rustfmt, clippy
 
       - name: Cache cargo registry
@@ -34,16 +35,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-nightly-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-cargo-${{ hashFiles('rust-toolchain.toml', '**/Cargo.lock') }}
           restore-keys: |
-            ${{ runner.os }}-cargo-nightly-
+            ${{ runner.os }}-cargo-
 
       - name: Check formatting
         run: cargo fmt --all -- --check
 
       - name: Run clippy
         run: cargo clippy --workspace --all-targets -- -D warnings
-        continue-on-error: true  # Don't fail on clippy warnings initially
 
       - name: Build release runner
         run: cargo build --release --package stoffel-vm-runner --bin stoffel-run
@@ -106,6 +106,9 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          build-contexts: |
+            coordinator=https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#4e65b55f64d735800240070f835b5f3c91676065
+            networking=https://github.com/Stoffel-Labs/stoffel-networking.git#8ec8efa0b17840fa1a9d32cfba1609dfbeddaaf2
           push: false
           tags: stoffelvm:test
           cache-from: type=gha
@@ -124,6 +127,9 @@ jobs:
         uses: docker/build-push-action@v5
         with:
           context: .
+          build-contexts: |
+            coordinator=https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#4e65b55f64d735800240070f835b5f3c91676065
+            networking=https://github.com/Stoffel-Labs/stoffel-networking.git#8ec8efa0b17840fa1a9d32cfba1609dfbeddaaf2
           push: true
           tags: |
             ghcr.io/stoffel-labs/stoffelvm:latest

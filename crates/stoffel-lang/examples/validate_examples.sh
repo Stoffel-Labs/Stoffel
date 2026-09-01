@@ -5,7 +5,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 EXAMPLES_DIR="${ROOT_DIR}/examples"
 WORKSPACE_DIR="$(cd "${ROOT_DIR}/../.." && pwd)"
 VM_DIR="${STOFFEL_VM_DIR:-${WORKSPACE_DIR}}"
-COORDINATOR_CONTEXT="${STOFFEL_COORDINATOR_CONTEXT:-${STOFFEL_COORDINATOR_DIR:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#feature/no-feature-gates-and-multi-type-awareness}}"
+COORDINATOR_CONTEXT="${STOFFEL_COORDINATOR_CONTEXT:-${STOFFEL_COORDINATOR_DIR:-https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#dev}}"
 NETWORK_CONTEXT="${STOFFEL_NETWORK_CONTEXT:-${STOFFEL_NETWORK_DIR:-https://github.com/Stoffel-Labs/stoffel-networking.git#feature/robust-identity-based-on-cert}}"
 OUT_DIR="${STOFFEL_EXAMPLES_OUT:-${EXAMPLES_DIR}/dist}"
 RUN_DOCKER_MPC=0
@@ -223,7 +223,7 @@ if [ "$RUN_LOCAL_MPC" -eq 1 ]; then
   CLI="${WORKSPACE_DIR}/target/debug/stoffel"
   if [ ! -x "$CLI" ]; then
     echo "Building stoffel CLI..."
-    cargo build --quiet --manifest-path "${WORKSPACE_DIR}/Cargo.toml" -p stoffel-cli
+    cargo build --quiet --manifest-path "${WORKSPACE_DIR}/Cargo.toml" -p stoffel
   fi
   CAP="${STOFFEL_LOCAL_MPC_TIMEOUT:-120}"
   lm_pass=0
