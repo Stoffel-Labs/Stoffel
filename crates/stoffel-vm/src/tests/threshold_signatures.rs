@@ -599,7 +599,10 @@ fn spawn_message_processors<F, G>(
                 };
                 let payload = envelope.payload();
                 // 1. Check open registry (Share.open, Share.open_field, Share.batch_open)
-                match open_message_router.try_handle_wire_message(sender_id, payload) {
+                match open_message_router
+                    .handle_wire_message(sender_id, payload)
+                    .await
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         error!(

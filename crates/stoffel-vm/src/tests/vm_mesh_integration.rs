@@ -169,7 +169,10 @@ async fn test_vm_mesh_full_integration() {
                 else {
                     continue;
                 };
-                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                match open_message_router
+                    .handle_wire_message(sender_id, &raw_msg)
+                    .await
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -535,7 +538,10 @@ async fn test_vm_mesh_average_salary_integration() {
                 else {
                     continue;
                 };
-                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                match open_message_router
+                    .handle_wire_message(sender_id, &raw_msg)
+                    .await
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -1004,7 +1010,10 @@ async fn test_vm_mesh_large_preprocessing() {
                 else {
                     continue;
                 };
-                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                match open_message_router
+                    .handle_wire_message(sender_id, &raw_msg)
+                    .await
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -1298,7 +1307,10 @@ async fn test_vm_mesh_output_client_integration() {
                 else {
                     continue;
                 };
-                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                match open_message_router
+                    .handle_wire_message(sender_id, &raw_msg)
+                    .await
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -1781,7 +1793,10 @@ async fn test_vm_mesh_matrix_average_integration() {
                 else {
                     continue;
                 };
-                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                match open_message_router
+                    .handle_wire_message(sender_id, &raw_msg)
+                    .await
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -2374,7 +2389,10 @@ async fn test_vm_mesh_matrix_average_fixed_point_integration() {
                 else {
                     continue;
                 };
-                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                match open_message_router
+                    .handle_wire_message(sender_id, &raw_msg)
+                    .await
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -3517,7 +3535,10 @@ async fn test_vm_mesh_bytecode_fixed_point_integration() {
                 else {
                     continue;
                 };
-                match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                match open_message_router
+                    .handle_wire_message(sender_id, &raw_msg)
+                    .await
+                {
                     Ok(true) => continue,
                     Err(e) => {
                         tracing::warn!("Node {i} failed to handle open wire message: {e}");

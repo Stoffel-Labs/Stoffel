@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::time::Duration;
 
 use stoffel_vm_types::core_types::ClearShareValue;
 
@@ -518,6 +519,83 @@ fn batch_retention_quota_is_isolated_by_authenticated_sender() {
             vec![vec![0x22]],
         )
         .expect("one sender exhausting its quota must not block another sender");
+}
+
+#[tokio::test]
+async fn authenticated_batch_frame_waits_for_retention_capacity_instead_of_being_dropped() {
+    let router = OpenMessageRouter::new();
+    let registry = router.register_instance(21044);
+    for sequence in 0..MAX_PENDING_BATCH_ENTRIES_PER_SENDER {
+        registry
+            .insert_batch(
+                sequence,
+                "backpressured-batch",
+                1,
+                vec![vec![sequence as u8]],
+            )
+            .unwrap();
+    }
+
+    let next_sequence = MAX_PENDING_BATCH_ENTRIES_PER_SENDER;
+    let next_message = encode_batch_share_wire_message(
+        21044,
+        next_sequence,
+        "backpressured-batch",
+        1,
+        &[vec![0xff]],
+    )
+    .unwrap();
+
+    let handle_next = router.handle_wire_message(1, &next_message);
+    let release_capacity = async {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        registry
+            .batch_open_at_async(
+                0,
+                "backpressured-batch".to_string(),
+                Some(0),
+                &[vec![0x00]],
+                2,
+                |shares, _| Ok(ClearShareValue::Integer(shares[0][0] as i64)),
+            )
+            .await
+            .unwrap();
+    };
+
+    let (handled, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+        tokio::join!(handle_next, release_capacity)
+    })
+    .await
+    .expect("the retained frame should resume after capacity is reclaimed");
+    assert!(handled.unwrap());
+    assert!(registry.batch.lock().contains_key(&(
+        next_sequence,
+        "backpressured-batch".to_string(),
+        1,
+    )));
+}
+
+#[tokio::test]
+async fn batch_frame_too_large_for_an_empty_retention_window_is_not_retried() {
+    let router = OpenMessageRouter::new();
+    let _registry = router.register_instance(21045);
+    let message = encode_batch_share_wire_message(
+        21045,
+        0,
+        "intrinsically-oversized-batch",
+        1,
+        &[vec![0x5a; 300 * 1024]],
+    )
+    .unwrap();
+
+    let error = tokio::time::timeout(
+        Duration::from_millis(100),
+        router.handle_wire_message(1, &message),
+    )
+    .await
+    .expect("an intrinsically oversized frame must fail without waiting")
+    .expect_err("the per-sender retained-byte limit must still be enforced");
+    assert!(error.contains("retained byte budget exceeded"));
 }
 
 #[test]

@@ -213,9 +213,10 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                                             Ok(data) => {
                                                 let sender_id =
                                                     connection.remote_party_id().unwrap_or(crate::net::open_registry::UNKNOWN_SENDER_ID);
-                                                match open_message_router.try_handle_wire_message(
-                                                    sender_id, &data,
-                                                ) {
+                                                match open_message_router
+                                                    .handle_wire_message(sender_id, &data)
+                                                    .await
+                                                {
                                                     Ok(true) => continue,
                                                     Err(e) => {
                                                         warn!(
@@ -318,7 +319,8 @@ impl<F: FftField + PrimeField + 'static> HoneyBadgerQuicServer<F> {
                                 match connection.receive().await {
                                     Ok(data) => {
                                         match open_message_router
-                                            .try_handle_wire_message(pid_for_task, &data)
+                                            .handle_wire_message(pid_for_task, &data)
+                                            .await
                                         {
                                             Ok(true) => continue,
                                             Err(e) => {
@@ -463,7 +465,9 @@ pub async fn spawn_receive_loops(
                     loop {
                         match connection.receive().await {
                             Ok(data) => {
-                                match open_message_router.try_handle_wire_message(sender_id, &data)
+                                match open_message_router
+                                    .handle_wire_message(sender_id, &data)
+                                    .await
                                 {
                                     Ok(true) => continue,
                                     Err(e) => {
@@ -613,7 +617,10 @@ pub async fn spawn_receive_loops_split(
 
                 tokio::spawn(async move {
                     while let Ok(data) = connection.receive().await {
-                        match open_message_router.try_handle_wire_message(sender_id, &data) {
+                        match open_message_router
+                            .handle_wire_message(sender_id, &data)
+                            .await
+                        {
                             Ok(true) => continue,
                             Err(_) => continue,
                             Ok(false) => {}

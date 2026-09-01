@@ -1288,7 +1288,10 @@ mod tests {
                     ) else {
                         continue;
                     };
-                    match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                    match open_message_router
+                        .handle_wire_message(sender_id, &raw_msg)
+                        .await
+                    {
                         Ok(true) => continue,
                         Err(e) => {
                             tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -1667,7 +1670,10 @@ mod tests {
                     ) else {
                         continue;
                     };
-                    match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                    match open_message_router
+                        .handle_wire_message(sender_id, &raw_msg)
+                        .await
+                    {
                         Ok(true) => continue,
                         Err(e) => {
                             tracing::warn!("Node {i} failed to handle open wire message: {e}");
@@ -1921,7 +1927,10 @@ mod tests {
                     ) else {
                         continue;
                     };
-                    match open_message_router.try_handle_wire_message(sender_id, &raw_msg) {
+                    match open_message_router
+                        .handle_wire_message(sender_id, &raw_msg)
+                        .await
+                    {
                         Ok(true) => continue,
                         Err(e) => {
                             tracing::warn!("Node {i} failed to handle open wire message: {e}");

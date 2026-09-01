@@ -709,7 +709,10 @@ where
                                         }
                                     };
                                     let payload = envelope.payload();
-                                    match router.try_handle_wire_message(authenticated_sender_id, payload) {
+                                    match router
+                                        .handle_wire_message(authenticated_sender_id, payload)
+                                        .await
+                                    {
                                         Ok(true) => {
                                             continue;
                                         }
@@ -835,7 +838,10 @@ where
                                         }
                                     };
                                     let payload = envelope.payload();
-                                    if let Ok(true) = router.try_handle_wire_message(authenticated_sender_id, payload) {
+                                    if let Ok(true) = router
+                                        .handle_wire_message(authenticated_sender_id, payload)
+                                        .await
+                                    {
                                         continue;
                                     }
                                     if let Ok(true) = router.try_handle_avss_open_exp_wire_message(authenticated_sender_id, payload) {

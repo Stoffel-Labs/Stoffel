@@ -16,8 +16,8 @@ const DEFAULT_OPEN_REGISTRY_WAIT_TIMEOUT: Duration = Duration::from_secs(600);
 // retains the previous batch. Keep a bounded window for that legitimate skew;
 // the position and byte budgets below continue to cap retained payload data.
 pub(super) const MAX_PENDING_BATCH_ENTRIES_PER_SENDER: usize = 8;
-const MAX_PENDING_BATCH_POSITIONS_PER_SENDER: usize = MAX_BATCH_ELEMENTS;
-const MAX_PENDING_BATCH_BYTES_PER_SENDER: usize = MAX_WIRE_MESSAGE_LEN / 4;
+pub(super) const MAX_PENDING_BATCH_POSITIONS_PER_SENDER: usize = MAX_BATCH_ELEMENTS;
+pub(super) const MAX_PENDING_BATCH_BYTES_PER_SENDER: usize = MAX_WIRE_MESSAGE_LEN / 4;
 const MAX_PENDING_BATCH_ENTRIES: usize = 256;
 const MAX_PENDING_BATCH_POSITIONS: usize = 256 * MAX_BATCH_ELEMENTS;
 const MAX_PENDING_BATCH_BYTES: usize = 64 * MAX_WIRE_MESSAGE_LEN;
@@ -159,7 +159,7 @@ fn compact_completed_batch_entry(entry: &mut BatchOpenAccumulator) {
     }
 }
 
-fn open_registry_wait_timeout() -> Duration {
+pub(super) fn open_registry_wait_timeout() -> Duration {
     std::env::var("STOFFEL_MPC_PROTOCOL_TIMEOUT_SECONDS")
         .ok()
         .and_then(|value| value.parse::<u64>().ok())
