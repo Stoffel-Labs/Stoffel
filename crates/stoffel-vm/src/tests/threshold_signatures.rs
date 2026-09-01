@@ -714,6 +714,7 @@ struct EcdsaStageMarks {
     gamma_random: Duration,
     nonce_random: Duration,
     batch_mul: Duration,
+    batch_mul_calls: usize,
     delta_open: Duration,
     nonce_commitment: Duration,
     point_x: Duration,
@@ -726,6 +727,7 @@ struct EcdsaStageDurations {
     gamma_random: Duration,
     nonce_random: Duration,
     batch_mul: Duration,
+    batch_mul_calls: usize,
     delta_open: Duration,
     nonce_commitment: Duration,
     point_x: Duration,
@@ -792,7 +794,10 @@ where
                                         marks.nonce_random = elapsed;
                                     }
                                 }
-                                "Share.batch_mul" => marks.batch_mul = elapsed,
+                                "Share.batch_mul" => {
+                                    marks.batch_mul = elapsed;
+                                    marks.batch_mul_calls += 1;
+                                }
                                 "open_field" | "Share.open_field"
                                     if marks.offline_end.is_none() =>
                                 {
@@ -838,6 +843,7 @@ where
                     gamma_random: marks.gamma_random,
                     nonce_random: marks.nonce_random,
                     batch_mul: marks.batch_mul,
+                    batch_mul_calls: marks.batch_mul_calls,
                     delta_open: marks.delta_open,
                     nonce_commitment: marks.nonce_commitment,
                     point_x: marks.point_x,
@@ -1172,6 +1178,13 @@ async fn benchmark_optimized_threshold_ecdsa_secp256k1() {
         let run_nonce_commitment = critical_timing.nonce_commitment;
         let run_point_x = critical_timing.point_x;
 
+        assert!(
+            party_timings
+                .iter()
+                .all(|timing| timing.batch_mul_calls == 1),
+            "each party must issue one vectorized Share.batch_mul call per signature"
+        );
+
         // Validate the measured execution, not a separate hand-built fixture.
         let (vm, value) = &mut results[0];
         let bytes = extract_vm_byte_array(vm, value);
@@ -1204,9 +1217,9 @@ async fn benchmark_optimized_threshold_ecdsa_secp256k1() {
 
     for engine in &engines {
         assert_eq!(
-            engine.multiplication_session_count().await,
-            RUNS,
-            "each two-product Share.batch_mul must use one AVSS multiplication session"
+            engine.active_multiplication_session_count().await,
+            0,
+            "completed AVSS multiplication sessions must be retired"
         );
     }
 

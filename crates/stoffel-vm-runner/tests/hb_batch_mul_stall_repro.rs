@@ -111,7 +111,16 @@ def main() -> int64:
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts a real localhost coordinator and MPC party mesh; loops to catch a rare stall"]
 async fn honeybadger_first_batch_multiply_does_not_stall() {
-    let program = std::env::var("STOFFEL_REPRO_PROGRAM").unwrap_or_else(|_| "aes".to_owned());
+    // The faithful AES workload is suitable for release builds, but its 36,864
+    // triples cannot finish inside the debug runner watchdog. The proxy reaches
+    // the same first batch-multiply wire shape with 160 triples.
+    let default_program = if cfg!(debug_assertions) {
+        "batchmul"
+    } else {
+        "aes"
+    };
+    let program =
+        std::env::var("STOFFEL_REPRO_PROGRAM").unwrap_or_else(|_| default_program.to_owned());
     // AES: the FIPS-197 known-answer ciphertext for the example's fixed
     // key/plaintext (69c4e0d8 6a7b0430 d8cdb780 70b4c55a). Proxy: the opened
     // product of the last pair, which is always 1 because `pairs` is even.
