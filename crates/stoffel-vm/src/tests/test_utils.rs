@@ -161,6 +161,15 @@ pub(crate) fn read_vm_table_number(
 pub(crate) fn decode_one_shot_party_message(instance_id: u64, frame: &[u8]) -> Option<Vec<u8>> {
     let envelope = match crate::net::ExecutionEnvelopeV1::decode(frame) {
         Ok(envelope) => envelope,
+        Err(
+            crate::net::ExecutionEnvelopeError::TooShort { .. }
+            | crate::net::ExecutionEnvelopeError::InvalidMagic,
+        ) => {
+            // Preprocessing still runs directly on the legacy HoneyBadger network and
+            // therefore emits raw protocol frames. Online operations use execution
+            // envelopes; once a frame has envelope magic, keep validating it strictly.
+            return Some(frame.to_vec());
+        }
         Err(error) => {
             tracing::error!(%error, "discarding invalid one-shot execution frame");
             return None;

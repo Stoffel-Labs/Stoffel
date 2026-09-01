@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use stoffel_vm_types::core_types::ClearShareValue;
 
+use super::instance::MAX_PENDING_BATCH_ENTRIES_PER_SENDER;
 use super::wire::{
     AVSS_EXP_WIRE_PREFIX, AVSS_G2_EXP_WIRE_PREFIX, HB_EXP_OPEN_WIRE_PREFIX, MAX_BATCH_ELEMENTS,
     MAX_WIRE_MESSAGE_LEN, OPEN_REGISTRY_WIRE_PREFIX,
@@ -494,18 +495,28 @@ fn repeated_batch_frames_are_bounded_by_retained_byte_budget() {
 fn batch_retention_quota_is_isolated_by_authenticated_sender() {
     let router = OpenMessageRouter::new();
     let registry = router.register_instance(21037);
-    for sequence in 0..1 {
+    for sequence in 0..MAX_PENDING_BATCH_ENTRIES_PER_SENDER {
         registry
             .insert_batch(sequence, "sender-quota", 1, vec![vec![sequence as u8]])
             .unwrap();
     }
     let error = registry
-        .insert_batch(1, "sender-quota", 1, vec![vec![0xff]])
+        .insert_batch(
+            MAX_PENDING_BATCH_ENTRIES_PER_SENDER,
+            "sender-quota",
+            1,
+            vec![vec![0xff]],
+        )
         .expect_err("one sender must not retain unlimited batch entries");
     assert!(error.contains("sender 1 entry quota"));
 
     registry
-        .insert_batch(2, "sender-quota", 2, vec![vec![0x22]])
+        .insert_batch(
+            MAX_PENDING_BATCH_ENTRIES_PER_SENDER + 1,
+            "sender-quota",
+            2,
+            vec![vec![0x22]],
+        )
         .expect("one sender exhausting its quota must not block another sender");
 }
 
