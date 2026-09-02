@@ -66,19 +66,25 @@ struct BrowserExecutionStatus {
 
 #[derive(Default)]
 struct NonceBook {
-    latest: HashMap<ClientIdentity, u64>,
+    latest: HashMap<(ExecutionId, ClientIdentity), u64>,
 }
 
 impl NonceBook {
-    fn accept(&mut self, identity: &ClientIdentity, nonce: u64) -> RpcResult<()> {
+    fn accept(
+        &mut self,
+        execution_id: ExecutionId,
+        identity: &ClientIdentity,
+        nonce: u64,
+    ) -> RpcResult<()> {
+        let key = (execution_id, identity.clone());
         if self
             .latest
-            .get(identity)
+            .get(&key)
             .is_some_and(|latest| nonce <= *latest)
         {
             return Err(auth_error("request nonce was already used"));
         }
-        self.latest.insert(identity.clone(), nonce);
+        self.latest.insert(key, nonce);
         Ok(())
     }
 }
@@ -360,7 +366,11 @@ async fn authenticate(
     nonces
         .lock()
         .await
-        .accept(&call.request.public_key, call.request.nonce)?;
+        .accept(
+            call.execution_id,
+            &call.request.public_key,
+            call.request.nonce,
+        )?;
     Ok(call.request.public_key.clone())
 }
 
@@ -445,6 +455,21 @@ mod tests {
             .expect("execution")
             .round = Round::InputMaskReservation;
         coordinator
+    }
+
+    #[test]
+    fn request_nonces_are_independent_between_executions() {
+        let identity = vec![20];
+        let first = ExecutionId::from_bytes([1; 32]);
+        let second = ExecutionId::from_bytes([2; 32]);
+        let mut nonces = NonceBook::default();
+
+        nonces.accept(first, &identity, 1).expect("first request");
+        nonces
+            .accept(second, &identity, 1)
+            .expect("same nonce in a different execution");
+        assert!(nonces.accept(first, &identity, 1).is_err());
+        nonces.accept(first, &identity, 2).expect("next request");
     }
 
     #[tokio::test]

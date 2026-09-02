@@ -6,7 +6,7 @@
 //! shares, and reconstructing the final result.
 
 use ark_bls12_381::Fr;
-use ark_ff::{FftField, PrimeField, Zero};
+use ark_ff::{BigInteger, FftField, PrimeField, Zero};
 use ark_poly::{EvaluationDomain, Radix2EvaluationDomain};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use hpke::{
@@ -23,8 +23,14 @@ use p256::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::marker::PhantomData;
+use std::rc::Rc;
+use stoffel_vm_types::core_types::{FixedPointPrecision, ShareType};
+use stoffel_vm_types::fixed_point_codec::{
+    decode_fixed_point_float, encode_fixed_point_float, encode_fixed_point_integer,
+};
 use wasm_bindgen::prelude::*;
 
 const AUTH_DOMAIN: &[u8] = b"stoffel-browser-rpc-auth-v1";
@@ -35,6 +41,49 @@ const MAX_THRESHOLD: usize = 8;
 type KemImpl = DhP256HkdfSha256;
 type KdfImpl = HkdfSha256;
 type AeadImpl = AesGcm256;
+
+#[wasm_bindgen(typescript_custom_section)]
+const TYPESCRIPT_TYPES: &'static str = r#"
+export type ClientScalarType =
+  | { kind: "boolean" }
+  | { kind: "signed_integer"; bit_length: number }
+  | { kind: "unsigned_integer"; bit_length: number }
+  | { kind: "fixed_point"; total_bits: number; fractional_bits: number };
+
+export type ClientScalarValue =
+  | { kind: "boolean"; value: boolean }
+  | { kind: "signed_integer"; value: bigint }
+  | { kind: "unsigned_integer"; value: bigint }
+  | { kind: "fixed_point"; value: number }
+  | { kind: "field"; value: Uint8Array };
+
+export interface TypedClientInput {
+  share_type: ClientScalarType;
+  value: ClientScalarValue;
+}
+
+export interface AssignedMaskShare {
+  reserved_index: number | bigint;
+  share_bytes: Uint8Array;
+}
+
+export interface MaskedInput {
+  reserved_index: number;
+  masked_input: Uint8Array;
+}
+
+export interface EncryptedOutputShare {
+  encapped_key: Uint8Array;
+  ciphertext: Uint8Array;
+}
+
+export interface SignedBrowserRequest {
+  public_key: Uint8Array;
+  nonce: number;
+  signature: Uint8Array;
+  body: Uint8Array;
+}
+"#;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ClientError {
@@ -56,6 +105,12 @@ pub enum ClientError {
     OutputArity { expected: usize, actual: usize },
     #[error("field value is outside the signed 64-bit client range")]
     OutputRange,
+    #[error("invalid client scalar type: {0}")]
+    InvalidScalarType(String),
+    #[error("client value is incompatible with its scalar type: {0}")]
+    InvalidScalarValue(String),
+    #[error("request nonce overflowed for this execution")]
+    NonceOverflow,
     #[error("JavaScript value conversion failed: {0}")]
     Js(String),
 }
@@ -92,6 +147,43 @@ pub struct EncryptedOutputShare {
     pub ciphertext: Vec<u8>,
 }
 
+/// Browser-friendly form of the scalar share types in a compiled client I/O
+/// manifest. Integer values are transferred as JavaScript `BigInt`s so all 64
+/// bits survive the JavaScript/WASM boundary.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ClientScalarType {
+    Boolean,
+    SignedInteger {
+        bit_length: usize,
+    },
+    UnsignedInteger {
+        bit_length: usize,
+    },
+    FixedPoint {
+        total_bits: usize,
+        fractional_bits: usize,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", content = "value", rename_all = "snake_case")]
+pub enum ClientScalarValue {
+    Boolean(bool),
+    SignedInteger(i64),
+    UnsignedInteger(u64),
+    FixedPoint(f64),
+    /// Exactly one canonical, big-endian scalar-field element. This mirrors
+    /// the native client's `Value::Bytes` input path.
+    Field(Vec<u8>),
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TypedClientInput {
+    pub share_type: ClientScalarType,
+    pub value: ClientScalarValue,
+}
+
 /// Canonical-serialization-compatible projection of HoneyBadger's
 /// `RobustShare<F>`. The marker is zero-sized on the wire.
 #[derive(Clone, Debug, PartialEq, CanonicalSerialize, CanonicalDeserialize)]
@@ -114,14 +206,29 @@ impl<F: FftField> RobustShare<F> {
     }
 }
 
-/// Stateful identity and topology used by one browser client.
-#[wasm_bindgen]
-pub struct StoffelWasmClient {
+struct ClientCore {
     signing_key: SigningKey,
     secret_key: SecretKey,
     public_key: Vec<u8>,
     parties: usize,
     threshold: usize,
+}
+
+/// Long-lived browser identity. It can open any number of simultaneous
+/// execution handles while reusing the same key and topology.
+#[wasm_bindgen]
+pub struct StoffelWasmClient {
+    core: Rc<ClientCore>,
+    nonces: Rc<RefCell<HashMap<[u8; 32], u64>>>,
+}
+
+/// State belonging to one execution. Multiple handles from a client can be
+/// active concurrently; nonces advance independently for each execution.
+#[wasm_bindgen]
+pub struct StoffelWasmExecution {
+    core: Rc<ClientCore>,
+    nonces: Rc<RefCell<HashMap<[u8; 32], u64>>>,
+    execution_id: [u8; 32],
 }
 
 #[wasm_bindgen]
@@ -139,65 +246,134 @@ impl StoffelWasmClient {
     /// SEC1 uncompressed P-256 public key. This is the same byte string stored
     /// in the subjectPublicKey field of the existing demo client certificate.
     pub fn public_key(&self) -> Vec<u8> {
-        self.public_key.clone()
+        self.core.public_key.clone()
     }
 
-    /// Produce the signed envelope expected by the browser RPC endpoints.
-    pub fn sign_request(
+    /// Open (or resume) an execution. Opening two different IDs creates
+    /// independent request streams; reopening the same ID continues its nonce.
+    pub fn open_execution(&self, execution_id: &str) -> Result<StoffelWasmExecution, JsValue> {
+        Ok(self.execution_handle(parse_execution_id(execution_id)?))
+    }
+
+    /// Resume an execution after a browser reload. `last_nonce` is the last
+    /// successfully created request saved by the caller. An already-open local
+    /// counter is never moved backward.
+    pub fn resume_execution(
         &self,
-        method: &str,
         execution_id: &str,
-        nonce: u64,
-        body: &[u8],
-    ) -> Result<JsValue, JsValue> {
+        last_nonce: u64,
+    ) -> Result<StoffelWasmExecution, JsValue> {
         let execution_id = parse_execution_id(execution_id)?;
-        let message = authentication_message(method, &execution_id, nonce, body);
-        let signature: Signature = self.signing_key.sign(&message);
-        let request = SignedBrowserRequest {
-            public_key: self.public_key.clone(),
+        self.nonces
+            .borrow_mut()
+            .entry(execution_id)
+            .and_modify(|current| *current = (*current).max(last_nonce))
+            .or_insert(last_nonce);
+        Ok(self.execution_handle(execution_id))
+    }
+
+    /// Release the local nonce counter after an execution is permanently
+    /// retired. Existing handles for that ID must not be used afterward.
+    pub fn forget_execution(&self, execution_id: &str) -> Result<(), JsValue> {
+        self.nonces
+            .borrow_mut()
+            .remove(&parse_execution_id(execution_id)?);
+        Ok(())
+    }
+}
+
+#[wasm_bindgen]
+impl StoffelWasmExecution {
+    pub fn execution_id(&self) -> String {
+        hex::encode(self.execution_id)
+    }
+
+    /// Last nonce allocated for this execution. Save this after signing when
+    /// an in-progress execution must survive a page reload.
+    pub fn current_nonce(&self) -> u64 {
+        self.nonces
+            .borrow()
+            .get(&self.execution_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Sign with the next nonce for this execution. The counter is shared with
+    /// other handles for the same execution and independent across IDs.
+    #[wasm_bindgen(unchecked_return_type = "SignedBrowserRequest")]
+    pub fn sign_request(&self, method: &str, body: &[u8]) -> Result<JsValue, JsValue> {
+        let nonce = next_nonce(&self.nonces, self.execution_id)?;
+        let message = authentication_message(method, &self.execution_id, nonce, body);
+        let signature: Signature = self.core.signing_key.sign(&message);
+        serde_wasm_bindgen::to_value(&SignedBrowserRequest {
+            public_key: self.core.public_key.clone(),
             nonce,
             signature: signature.to_bytes().to_vec(),
             body: body.to_vec(),
-        };
-        serde_wasm_bindgen::to_value(&request)
-            .map_err(|error| ClientError::Js(error.to_string()).into())
+        })
+        .map_err(|error| ClientError::Js(error.to_string()).into())
     }
 
-    /// Reconstruct one mask per input from independently fetched node shares,
-    /// then return the serialized masked field values accepted by the coordinator.
+    /// Reconstruct and apply one mask per typed input.
+    #[wasm_bindgen(unchecked_return_type = "MaskedInput[]")]
     pub fn mask_inputs(
         &self,
         first_reserved_index: u64,
-        clear_inputs: Box<[i64]>,
-        node_responses: JsValue,
+        #[wasm_bindgen(unchecked_param_type = "TypedClientInput[]")] clear_inputs: JsValue,
+        #[wasm_bindgen(unchecked_param_type = "AssignedMaskShare[][]")] node_responses: JsValue,
     ) -> Result<JsValue, JsValue> {
+        let inputs: Vec<TypedClientInput> = serde_wasm_bindgen::from_value(clear_inputs)
+            .map_err(|error| ClientError::Js(error.to_string()))?;
         let responses: Vec<Vec<AssignedMaskShare>> = serde_wasm_bindgen::from_value(node_responses)
             .map_err(|error| ClientError::Js(error.to_string()))?;
-        let masked = self
-            .mask_inputs_core(first_reserved_index, &clear_inputs, &responses)
-            .map_err(JsValue::from)?;
-        serde_wasm_bindgen::to_value(&masked)
-            .map_err(|error| ClientError::Js(error.to_string()).into())
+        let fields = inputs
+            .iter()
+            .map(typed_input_to_field)
+            .collect::<Result<Vec<_>, _>>()?;
+        serde_wasm_bindgen::to_value(&mask_fields_core(
+            self.core.parties,
+            self.core.threshold,
+            first_reserved_index,
+            &fields,
+            &responses,
+        )?)
+        .map_err(|error| ClientError::Js(error.to_string()).into())
     }
 
-    /// Decrypt and robustly reconstruct HoneyBadger output shares returned by
-    /// the coordinator. Clear outputs exist only inside this WASM instance.
+    /// Decrypt and robustly reconstruct outputs using their manifest types.
+    #[wasm_bindgen(unchecked_return_type = "ClientScalarValue[]")]
     pub fn decrypt_outputs(
         &self,
-        execution_id: &str,
-        output_count: usize,
-        encrypted_shares: JsValue,
-    ) -> Result<Box<[i64]>, JsValue> {
-        let execution_id = parse_execution_id(execution_id)?;
+        #[wasm_bindgen(unchecked_param_type = "ClientScalarType[]")] output_types: JsValue,
+        #[wasm_bindgen(unchecked_param_type = "EncryptedOutputShare[]")] encrypted_shares: JsValue,
+    ) -> Result<JsValue, JsValue> {
+        let output_types: Vec<ClientScalarType> = serde_wasm_bindgen::from_value(output_types)
+            .map_err(|error| ClientError::Js(error.to_string()))?;
         let encrypted: Vec<EncryptedOutputShare> = serde_wasm_bindgen::from_value(encrypted_shares)
             .map_err(|error| ClientError::Js(error.to_string()))?;
-        self.decrypt_outputs_core(&execution_id, output_count, &encrypted)
-            .map(Vec::into_boxed_slice)
-            .map_err(Into::into)
+        let values = decrypt_fields_core(
+            &self.core,
+            &self.execution_id,
+            output_types.len(),
+            &encrypted,
+        )?
+        .into_iter()
+        .zip(output_types)
+        .map(|(value, share_type)| field_to_typed_value(value, share_type))
+        .collect::<Result<Vec<_>, _>>()?;
+        to_js_value_with_bigints(&values)
     }
 }
 
 impl StoffelWasmClient {
+    fn execution_handle(&self, execution_id: [u8; 32]) -> StoffelWasmExecution {
+        StoffelWasmExecution {
+            core: self.core.clone(),
+            nonces: self.nonces.clone(),
+            execution_id,
+        }
+    }
+
     pub fn from_pkcs8(
         private_key_pkcs8: &[u8],
         parties: usize,
@@ -222,100 +398,277 @@ impl StoffelWasmClient {
             .as_bytes()
             .to_vec();
         Ok(Self {
-            signing_key,
-            secret_key,
-            public_key,
-            parties,
-            threshold,
+            core: Rc::new(ClientCore {
+                signing_key,
+                secret_key,
+                public_key,
+                parties,
+                threshold,
+            }),
+            nonces: Rc::new(RefCell::new(HashMap::new())),
         })
     }
+}
 
-    fn mask_inputs_core(
-        &self,
-        first_reserved_index: u64,
-        clear_inputs: &[i64],
-        node_responses: &[Vec<AssignedMaskShare>],
-    ) -> Result<Vec<MaskedInput>, ClientError> {
-        let mut shares_by_index: BTreeMap<u64, Vec<RobustShare<Fr>>> = BTreeMap::new();
-        for response in node_responses {
-            for assigned in response {
-                let share =
-                    RobustShare::<Fr>::deserialize_compressed(assigned.share_bytes.as_slice())
-                        .map_err(|_| ClientError::InvalidShare)?;
-                shares_by_index
-                    .entry(assigned.reserved_index)
-                    .or_default()
-                    .push(share);
-            }
-        }
-
-        clear_inputs
-            .iter()
-            .enumerate()
-            .map(|(offset, clear)| {
-                let reserved_index = first_reserved_index
-                    .checked_add(offset as u64)
-                    .ok_or(ClientError::OutputRange)?;
-                let shares = shares_by_index
-                    .get(&reserved_index)
-                    .ok_or(ClientError::InsufficientShares)?;
-                let mask = recover_robust_secret(shares, self.parties, self.threshold)?;
-                let value = field_from_i64(*clear) + mask;
-                let mut masked_input = Vec::new();
-                value
-                    .serialize_compressed(&mut masked_input)
-                    .map_err(|_| ClientError::InvalidShare)?;
-                Ok(MaskedInput {
-                    reserved_index,
-                    masked_input,
-                })
-            })
-            .collect()
-    }
-
-    fn decrypt_outputs_core(
-        &self,
-        execution_id: &[u8; 32],
-        output_count: usize,
-        encrypted_shares: &[EncryptedOutputShare],
-    ) -> Result<Vec<i64>, ClientError> {
-        let raw_secret = self.secret_key.to_bytes();
-        let hpke_secret = <KemImpl as Kem>::PrivateKey::from_bytes(&raw_secret)
-            .map_err(|_| ClientError::InvalidPrivateKey)?;
-        let info = output_encryption_info(execution_id);
-        let mut by_output = vec![Vec::<RobustShare<Fr>>::new(); output_count];
-
-        for encrypted in encrypted_shares {
-            let encapped = <KemImpl as Kem>::EncappedKey::from_bytes(&encrypted.encapped_key)
-                .map_err(|_| ClientError::OutputDecryption)?;
-            let plaintext = single_shot_open::<AeadImpl, KdfImpl, KemImpl>(
-                &OpModeR::Base,
-                &hpke_secret,
-                &encapped,
-                &info,
-                &encrypted.ciphertext,
-                b"",
-            )
-            .map_err(|_| ClientError::OutputDecryption)?;
-            let shares = Vec::<RobustShare<Fr>>::deserialize_compressed(plaintext.as_slice())
+fn mask_fields_core(
+    parties: usize,
+    threshold: usize,
+    first_reserved_index: u64,
+    clear_inputs: &[Fr],
+    node_responses: &[Vec<AssignedMaskShare>],
+) -> Result<Vec<MaskedInput>, ClientError> {
+    let mut shares_by_index: BTreeMap<u64, Vec<RobustShare<Fr>>> = BTreeMap::new();
+    for response in node_responses {
+        for assigned in response {
+            let share = RobustShare::<Fr>::deserialize_compressed(assigned.share_bytes.as_slice())
                 .map_err(|_| ClientError::InvalidShare)?;
-            if shares.len() != output_count {
-                return Err(ClientError::OutputArity {
-                    expected: output_count,
-                    actual: shares.len(),
-                });
-            }
-            for (index, share) in shares.into_iter().enumerate() {
-                by_output[index].push(share);
-            }
+            shares_by_index
+                .entry(assigned.reserved_index)
+                .or_default()
+                .push(share);
         }
-
-        by_output
-            .iter()
-            .map(|shares| recover_robust_secret(shares, self.parties, self.threshold))
-            .map(|result| result.and_then(field_to_i64))
-            .collect()
     }
+
+    clear_inputs
+        .iter()
+        .enumerate()
+        .map(|(offset, clear)| {
+            let reserved_index = first_reserved_index
+                .checked_add(offset as u64)
+                .ok_or(ClientError::OutputRange)?;
+            let shares = shares_by_index
+                .get(&reserved_index)
+                .ok_or(ClientError::InsufficientShares)?;
+            let mask = recover_robust_secret(shares, parties, threshold)?;
+            let value = *clear + mask;
+            let mut masked_input = Vec::new();
+            value
+                .serialize_compressed(&mut masked_input)
+                .map_err(|_| ClientError::InvalidShare)?;
+            Ok(MaskedInput {
+                reserved_index,
+                masked_input,
+            })
+        })
+        .collect()
+}
+
+fn decrypt_fields_core(
+    core: &ClientCore,
+    execution_id: &[u8; 32],
+    output_count: usize,
+    encrypted_shares: &[EncryptedOutputShare],
+) -> Result<Vec<Fr>, ClientError> {
+    let raw_secret = core.secret_key.to_bytes();
+    let hpke_secret = <KemImpl as Kem>::PrivateKey::from_bytes(&raw_secret)
+        .map_err(|_| ClientError::InvalidPrivateKey)?;
+    let info = output_encryption_info(execution_id);
+    let mut by_output = vec![Vec::<RobustShare<Fr>>::new(); output_count];
+
+    for encrypted in encrypted_shares {
+        let encapped = <KemImpl as Kem>::EncappedKey::from_bytes(&encrypted.encapped_key)
+            .map_err(|_| ClientError::OutputDecryption)?;
+        let plaintext = single_shot_open::<AeadImpl, KdfImpl, KemImpl>(
+            &OpModeR::Base,
+            &hpke_secret,
+            &encapped,
+            &info,
+            &encrypted.ciphertext,
+            b"",
+        )
+        .map_err(|_| ClientError::OutputDecryption)?;
+        let shares = Vec::<RobustShare<Fr>>::deserialize_compressed(plaintext.as_slice())
+            .map_err(|_| ClientError::InvalidShare)?;
+        if shares.len() != output_count {
+            return Err(ClientError::OutputArity {
+                expected: output_count,
+                actual: shares.len(),
+            });
+        }
+        for (index, share) in shares.into_iter().enumerate() {
+            by_output[index].push(share);
+        }
+    }
+
+    by_output
+        .iter()
+        .map(|shares| recover_robust_secret(shares, core.parties, core.threshold))
+        .collect()
+}
+
+fn next_nonce(
+    nonces: &RefCell<HashMap<[u8; 32], u64>>,
+    execution_id: [u8; 32],
+) -> Result<u64, ClientError> {
+    let mut nonces = nonces.borrow_mut();
+    let next = nonces
+        .get(&execution_id)
+        .copied()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or(ClientError::NonceOverflow)?;
+    nonces.insert(execution_id, next);
+    Ok(next)
+}
+
+fn scalar_share_type(value: ClientScalarType) -> Result<ShareType, ClientError> {
+    match value {
+        ClientScalarType::Boolean => Ok(ShareType::boolean()),
+        ClientScalarType::SignedInteger { bit_length: 1 } => Err(ClientError::InvalidScalarType(
+            "use the boolean type for one-bit secrets".to_owned(),
+        )),
+        ClientScalarType::SignedInteger { bit_length } => ShareType::try_secret_int(bit_length)
+            .map_err(|error| ClientError::InvalidScalarType(error.to_string())),
+        ClientScalarType::UnsignedInteger { bit_length } => ShareType::try_secret_uint(bit_length)
+            .map_err(|error| ClientError::InvalidScalarType(error.to_string())),
+        ClientScalarType::FixedPoint {
+            total_bits,
+            fractional_bits,
+        } => ShareType::try_secret_fixed_point_from_bits(total_bits, fractional_bits)
+            .map_err(|error| ClientError::InvalidScalarType(error.to_string())),
+    }
+}
+
+fn typed_input_to_field(input: &TypedClientInput) -> Result<Fr, ClientError> {
+    let share_type = scalar_share_type(input.share_type)?;
+    match (share_type, &input.value) {
+        (ShareType::SecretInt { bit_length: 1 }, ClientScalarValue::Boolean(value)) => {
+            Ok(Fr::from(*value as u64))
+        }
+        (ShareType::SecretInt { bit_length: 1 }, ClientScalarValue::SignedInteger(value)) => {
+            Ok(Fr::from((*value != 0) as u64))
+        }
+        (ShareType::SecretInt { .. }, ClientScalarValue::SignedInteger(value)) => {
+            Ok(field_from_i64(*value))
+        }
+        (ShareType::SecretInt { .. }, ClientScalarValue::UnsignedInteger(value)) => {
+            let value = i64::try_from(*value).map_err(|_| {
+                ClientError::InvalidScalarValue(
+                    "unsigned secret integer input exceeds the signed 64-bit range".to_owned(),
+                )
+            })?;
+            Ok(field_from_i64(value))
+        }
+        (ShareType::SecretInt { bit_length, .. }, ClientScalarValue::Field(bytes))
+            if bit_length > 1 =>
+        {
+            canonical_field_from_be_bytes(bytes)
+        }
+        (ShareType::SecretUInt { .. }, ClientScalarValue::Field(bytes)) => {
+            canonical_field_from_be_bytes(bytes)
+        }
+        (ShareType::SecretUInt { bit_length }, ClientScalarValue::UnsignedInteger(value)) => {
+            validate_secret_uint_range(*value, bit_length)?;
+            Ok(Fr::from(*value))
+        }
+        (ShareType::SecretUInt { bit_length }, ClientScalarValue::SignedInteger(value)) => {
+            let value = u64::try_from(*value).map_err(|_| {
+                ClientError::InvalidScalarValue(
+                    "signed input for a secret unsigned integer must be non-negative".to_owned(),
+                )
+            })?;
+            validate_secret_uint_range(value, bit_length)?;
+            Ok(Fr::from(value))
+        }
+        (ShareType::SecretFixedPoint { precision }, ClientScalarValue::SignedInteger(value)) => {
+            fixed_point_integer_to_field(i128::from(*value), precision)
+        }
+        (ShareType::SecretFixedPoint { precision }, ClientScalarValue::UnsignedInteger(value)) => {
+            fixed_point_integer_to_field(i128::from(*value), precision)
+        }
+        (ShareType::SecretFixedPoint { precision }, ClientScalarValue::FixedPoint(value)) => {
+            encode_fixed_point_float(*value, precision)
+                .map(field_from_i64)
+                .map_err(|error| ClientError::InvalidScalarValue(error.to_string()))
+        }
+        (share_type, value) => Err(ClientError::InvalidScalarValue(format!(
+            "value {value:?} is not compatible with {share_type:?}"
+        ))),
+    }
+}
+
+fn field_to_typed_value(
+    value: Fr,
+    share_type: ClientScalarType,
+) -> Result<ClientScalarValue, ClientError> {
+    match scalar_share_type(share_type)? {
+        ShareType::SecretInt { bit_length: 1 } => Ok(ClientScalarValue::Boolean(!value.is_zero())),
+        ShareType::SecretInt { .. } => field_to_i64(value).map(ClientScalarValue::SignedInteger),
+        ShareType::SecretUInt { bit_length } => {
+            field_to_u64(value, bit_length).map(ClientScalarValue::UnsignedInteger)
+        }
+        ShareType::SecretFixedPoint { precision } => {
+            let encoded = field_to_i64(value)?;
+            decode_fixed_point_float(encoded, precision)
+                .map(ClientScalarValue::FixedPoint)
+                .map_err(|error| ClientError::InvalidScalarValue(error.to_string()))
+        }
+    }
+}
+
+fn fixed_point_integer_to_field(
+    value: i128,
+    precision: FixedPointPrecision,
+) -> Result<Fr, ClientError> {
+    encode_fixed_point_integer(value, precision)
+        .map(field_from_i64)
+        .map_err(|error| ClientError::InvalidScalarValue(error.to_string()))
+}
+
+fn validate_secret_uint_range(value: u64, bit_length: usize) -> Result<(), ClientError> {
+    if bit_length >= 64 || value < (1u64 << bit_length) {
+        Ok(())
+    } else {
+        Err(ClientError::InvalidScalarValue(format!(
+            "secret unsigned integer input {value} does not fit in {bit_length} bit(s)"
+        )))
+    }
+}
+
+fn field_to_u64(value: Fr, bit_length: usize) -> Result<u64, ClientError> {
+    let bigint = value.into_bigint();
+    let limbs = bigint.as_ref();
+    if limbs.iter().skip(1).all(|limb| *limb == 0) {
+        let value = limbs.first().copied().unwrap_or(0);
+        validate_secret_uint_range(value, bit_length)?;
+        Ok(value)
+    } else {
+        Err(ClientError::InvalidScalarValue(
+            "field output cannot be represented as an unsigned 64-bit integer".to_owned(),
+        ))
+    }
+}
+
+fn canonical_field_from_be_bytes(bytes: &[u8]) -> Result<Fr, ClientError> {
+    let field_bytes = Fr::MODULUS_BIT_SIZE.div_ceil(8) as usize;
+    if bytes.len() != field_bytes {
+        return Err(ClientError::InvalidScalarValue(format!(
+            "BLS12-381 field input must be exactly {field_bytes} canonical big-endian bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let value = Fr::from_be_bytes_mod_order(bytes);
+    let encoded = value.into_bigint().to_bytes_be();
+    let mut canonical = vec![0u8; field_bytes];
+    let start = field_bytes.checked_sub(encoded.len()).ok_or_else(|| {
+        ClientError::InvalidScalarValue("field input is not canonical".to_owned())
+    })?;
+    canonical[start..].copy_from_slice(&encoded);
+    if canonical == bytes {
+        Ok(value)
+    } else {
+        Err(ClientError::InvalidScalarValue(
+            "field input must be less than the scalar-field modulus".to_owned(),
+        ))
+    }
+}
+
+fn to_js_value_with_bigints<T: Serialize>(value: &T) -> Result<JsValue, JsValue> {
+    value
+        .serialize(
+            &serde_wasm_bindgen::Serializer::new().serialize_large_number_types_as_bigints(true),
+        )
+        .map_err(|error| ClientError::Js(error.to_string()).into())
 }
 
 pub fn authentication_message(
@@ -546,7 +899,7 @@ mod tests {
         let secret_key = SecretKey::from_slice(&[7u8; 32]).unwrap();
         let client = StoffelWasmClient::from_secret_key(secret_key, 5, 1).unwrap();
         let execution_id = [0x42; 32];
-        let hpke_public = <KemImpl as Kem>::PublicKey::from_bytes(&client.public_key).unwrap();
+        let hpke_public = <KemImpl as Kem>::PublicKey::from_bytes(&client.core.public_key).unwrap();
         let domain = Radix2EvaluationDomain::<Fr>::new(5).unwrap();
         let expected = [17i64, -9, 120, 3];
         let mut encrypted = Vec::new();
@@ -580,10 +933,8 @@ mod tests {
         }
 
         assert_eq!(
-            client
-                .decrypt_outputs_core(&execution_id, expected.len(), &encrypted)
-                .unwrap(),
-            expected
+            decrypt_fields_core(&client.core, &execution_id, expected.len(), &encrypted).unwrap(),
+            expected.map(field_from_i64)
         );
     }
 
@@ -593,8 +944,8 @@ mod tests {
         let client = StoffelWasmClient::from_secret_key(secret, 5, 1).unwrap();
         let execution = [3u8; 32];
         let message = authentication_message("browser_round", &execution, 4, b"body");
-        let signature: Signature = client.signing_key.sign(&message);
-        let verifier = VerifyingKey::from_sec1_bytes(&client.public_key).unwrap();
+        let signature: Signature = client.core.signing_key.sign(&message);
+        let verifier = VerifyingKey::from_sec1_bytes(&client.core.public_key).unwrap();
         verifier.verify(&message, &signature).unwrap();
     }
 
@@ -603,5 +954,170 @@ mod tests {
         for expected in [i64::MIN, -100, -1, 0, 1, 100, i64::MAX] {
             assert_eq!(field_to_i64(field_from_i64(expected)).unwrap(), expected);
         }
+    }
+
+    #[test]
+    fn typed_inputs_cover_native_scalar_client_values() {
+        let cases = [
+            (
+                TypedClientInput {
+                    share_type: ClientScalarType::Boolean,
+                    value: ClientScalarValue::Boolean(true),
+                },
+                Fr::from(1u64),
+            ),
+            (
+                TypedClientInput {
+                    share_type: ClientScalarType::Boolean,
+                    value: ClientScalarValue::SignedInteger(0),
+                },
+                Fr::from(0u64),
+            ),
+            (
+                TypedClientInput {
+                    share_type: ClientScalarType::SignedInteger { bit_length: 64 },
+                    value: ClientScalarValue::SignedInteger(-91),
+                },
+                field_from_i64(-91),
+            ),
+            (
+                TypedClientInput {
+                    share_type: ClientScalarType::UnsignedInteger { bit_length: 16 },
+                    value: ClientScalarValue::UnsignedInteger(65_535),
+                },
+                Fr::from(65_535u64),
+            ),
+            (
+                TypedClientInput {
+                    share_type: ClientScalarType::FixedPoint {
+                        total_bits: 64,
+                        fractional_bits: 16,
+                    },
+                    value: ClientScalarValue::FixedPoint(1.5),
+                },
+                field_from_i64(98_304),
+            ),
+            (
+                TypedClientInput {
+                    share_type: ClientScalarType::FixedPoint {
+                        total_bits: 32,
+                        fractional_bits: 8,
+                    },
+                    value: ClientScalarValue::SignedInteger(-2),
+                },
+                field_from_i64(-512),
+            ),
+        ];
+
+        for (input, expected) in cases {
+            assert_eq!(typed_input_to_field(&input).unwrap(), expected);
+        }
+    }
+
+    #[test]
+    fn typed_outputs_preserve_semantic_types() {
+        assert_eq!(
+            field_to_typed_value(Fr::from(2u64), ClientScalarType::Boolean).unwrap(),
+            ClientScalarValue::Boolean(true)
+        );
+        assert_eq!(
+            field_to_typed_value(
+                field_from_i64(i64::MIN),
+                ClientScalarType::SignedInteger { bit_length: 64 }
+            )
+            .unwrap(),
+            ClientScalarValue::SignedInteger(i64::MIN)
+        );
+        assert_eq!(
+            field_to_typed_value(
+                Fr::from(u64::MAX),
+                ClientScalarType::UnsignedInteger { bit_length: 64 }
+            )
+            .unwrap(),
+            ClientScalarValue::UnsignedInteger(u64::MAX)
+        );
+        assert_eq!(
+            field_to_typed_value(
+                field_from_i64(-32_768),
+                ClientScalarType::FixedPoint {
+                    total_bits: 64,
+                    fractional_bits: 16,
+                }
+            )
+            .unwrap(),
+            ClientScalarValue::FixedPoint(-0.5)
+        );
+    }
+
+    #[test]
+    fn typed_inputs_reject_range_and_kind_mismatches() {
+        let too_wide = TypedClientInput {
+            share_type: ClientScalarType::UnsignedInteger { bit_length: 8 },
+            value: ClientScalarValue::UnsignedInteger(256),
+        };
+        assert!(typed_input_to_field(&too_wide).is_err());
+
+        let negative_unsigned = TypedClientInput {
+            share_type: ClientScalarType::UnsignedInteger { bit_length: 64 },
+            value: ClientScalarValue::SignedInteger(-1),
+        };
+        assert!(typed_input_to_field(&negative_unsigned).is_err());
+
+        // This intentionally mirrors the native client's compatibility path:
+        // unsigned values supplied for a signed share are accepted when they
+        // fit in i64, including the one-bit representation used for booleans.
+        let bool_as_unsigned = TypedClientInput {
+            share_type: ClientScalarType::Boolean,
+            value: ClientScalarValue::UnsignedInteger(1),
+        };
+        assert_eq!(
+            typed_input_to_field(&bool_as_unsigned).unwrap(),
+            Fr::from(1u64)
+        );
+
+        assert!(scalar_share_type(ClientScalarType::SignedInteger { bit_length: 1 }).is_err());
+        assert!(scalar_share_type(ClientScalarType::UnsignedInteger { bit_length: 0 }).is_err());
+    }
+
+    #[test]
+    fn canonical_field_input_accepts_the_full_scalar_range_only() {
+        let field_bytes = Fr::MODULUS_BIT_SIZE.div_ceil(8) as usize;
+        let value = Fr::from(123u64);
+        let encoded = value.into_bigint().to_bytes_be();
+        let mut canonical = vec![0u8; field_bytes];
+        canonical[field_bytes - encoded.len()..].copy_from_slice(&encoded);
+        assert_eq!(canonical_field_from_be_bytes(&canonical).unwrap(), value);
+
+        let modulus = Fr::MODULUS.to_bytes_be();
+        let mut non_canonical = vec![0u8; field_bytes];
+        non_canonical[field_bytes - modulus.len()..].copy_from_slice(&modulus);
+        assert!(canonical_field_from_be_bytes(&non_canonical).is_err());
+        assert!(canonical_field_from_be_bytes(&canonical[1..]).is_err());
+    }
+
+    #[test]
+    fn nonce_sequences_are_shared_per_execution_and_concurrent_between_them() {
+        let counters = RefCell::new(HashMap::new());
+        let first = [1u8; 32];
+        let second = [2u8; 32];
+
+        assert_eq!(next_nonce(&counters, first).unwrap(), 1);
+        assert_eq!(next_nonce(&counters, second).unwrap(), 1);
+        assert_eq!(next_nonce(&counters, first).unwrap(), 2);
+        assert_eq!(next_nonce(&counters, second).unwrap(), 2);
+    }
+
+    #[test]
+    fn resumed_execution_never_rolls_a_nonce_backward() {
+        let secret = SecretKey::from_slice(&[7u8; 32]).unwrap();
+        let client = StoffelWasmClient::from_secret_key(secret, 5, 1).unwrap();
+        let id = "03".repeat(32);
+
+        let handle = client.resume_execution(&id, 41).unwrap();
+        assert_eq!(handle.current_nonce(), 41);
+        assert_eq!(next_nonce(&client.nonces, handle.execution_id).unwrap(), 42);
+
+        let resumed_with_stale_storage = client.resume_execution(&id, 10).unwrap();
+        assert_eq!(resumed_with_stale_storage.current_nonce(), 42);
     }
 }
