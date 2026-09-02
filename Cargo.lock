@@ -1768,6 +1768,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "console_error_panic_hook"
+version = "0.1.7"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a06aeb73f470f66dcdbf7223caeebb85984942f22f1adb2a088cf9668146bbbc"
+dependencies = [
+ "cfg-if",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "const-hex"
 version = "1.19.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5474,6 +5484,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "serde-wasm-bindgen"
+version = "0.6.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "8302e169f0eddcc139c70f139d19d6467353af16f9fce27e8c30158036a1e16b"
+dependencies = [
+ "js-sys",
+ "serde",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "serde_core"
 version = "1.0.229"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5767,8 +5788,6 @@ dependencies = [
 [[package]]
 name = "stoffel-mpc-coordinator-off-chain"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b2d7e687991d21dacaa62d8494a057f9487d8b85a87689f7180b1c3a3c7460ad"
 dependencies = [
  "ark-bls12-381",
  "ark-ff 0.5.0",
@@ -5781,6 +5800,8 @@ dependencies = [
  "rand 0.9.5",
  "rcgen",
  "serde",
+ "serde_json",
+ "sha2",
  "stoffel-mpc-coordinator-shared",
  "tokio",
  "tracing",
@@ -5789,8 +5810,6 @@ dependencies = [
 [[package]]
 name = "stoffel-mpc-coordinator-shared"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1fc394e4b33b2cd09c8add9bfab92e11075f6b6e2e95b26979e1c8ff38f620c1"
 dependencies = [
  "ark-bls12-381",
  "ark-ec",
@@ -5975,6 +5994,29 @@ dependencies = [
  "rustc-hash",
  "serde",
  "smallvec",
+]
+
+[[package]]
+name = "stoffel-wasm-client"
+version = "0.1.0"
+dependencies = [
+ "ark-bls12-381",
+ "ark-ff 0.5.0",
+ "ark-poly",
+ "ark-serialize 0.5.0",
+ "console_error_panic_hook",
+ "getrandom 0.2.17",
+ "hex",
+ "hpke",
+ "js-sys",
+ "p256",
+ "rand 0.9.5",
+ "serde",
+ "serde-wasm-bindgen",
+ "sha2",
+ "stoffelcrypto",
+ "thiserror 2.0.20",
+ "wasm-bindgen",
 ]
 
 [[package]]
