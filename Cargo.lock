@@ -5954,6 +5954,7 @@ dependencies = [
  "serde",
  "serde-wasm-bindgen",
  "sha2",
+ "stoffel-vm-types",
  "stoffelcrypto",
  "thiserror 2.0.20",
  "wasm-bindgen",
