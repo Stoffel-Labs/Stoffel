@@ -2,6 +2,18 @@
 
 All notable changes to the Stoffel crates are tracked here.
 
+## [0.1.2] - 2026-09-03
+
+### Added
+
+- Added tag-driven crates.io release automation for `stoffel-bindgen`.
+
+### Changed
+
+- Bumped the release-scoped Stoffel workspace crates to `0.1.2` and updated their internal path dependency requirements to the same exact version.
+- Exact-pinned direct normal, development, and build dependencies across the workspace and coordinator wrapper for reproducible resolution.
+- Kept independently released Stoffel dependencies on their published `0.1.0` versions: `stoffelcrypto`, `stoffelnet`, `stoffel-mpc-coordinator-shared`, and `stoffel-mpc-coordinator-off-chain`.
+
 ## [0.1.1] - 2026-07-03
 
 ### PR #67 - runner release and install updates
