@@ -150,6 +150,7 @@ fn init_default_project_builds_with_cargo_and_sdk_bindings() {
 
     StdCommand::new("cargo")
         .arg("build")
+        .arg("--offline")
         .current_dir(&project)
         .status()
         .expect("cargo build should run")
