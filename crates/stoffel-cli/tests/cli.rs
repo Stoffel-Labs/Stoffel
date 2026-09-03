@@ -161,28 +161,22 @@ fn init_default_project_builds_with_cargo_and_sdk_bindings() {
     let crates_dir = sdk_path.parent().expect("SDK crate lives under crates/");
     let bindgen_path = crates_dir.join("stoffel-bindgen");
     let cargo_toml_path = project.join("Cargo.toml");
-    let mut cargo_toml = fs::read_to_string(&cargo_toml_path)
+    let cargo_toml = fs::read_to_string(&cargo_toml_path)
         .unwrap()
         .replace(
-            "stoffel = { package = \"stoffel-rust-sdk\", version = \"=0.1.2\" }",
+            "stoffel = { package = \"stoffel-rust-sdk\", version = \"=0.2.0\" }",
             &format!(
                 "stoffel = {{ package = \"stoffel-rust-sdk\", path = \"{}\" }}",
                 sdk_path.display()
             ),
         )
         .replace(
-            "stoffel-bindgen = \"=0.1.2\"",
+            "stoffel-bindgen = \"=0.2.0\"",
             &format!(
                 "stoffel-bindgen = {{ path = \"{}\" }}",
                 bindgen_path.display()
             ),
         );
-    cargo_toml.push_str(
-        "\n[patch.crates-io]\n\
-         stoffelcrypto = { git = \"https://github.com/Stoffel-Labs/mpc-protocols.git\", branch = \"fixes-concurrent-execution-protocols\" }\n\
-         stoffelmpc-network = { git = \"https://github.com/Stoffel-Labs/mpc-protocols.git\", branch = \"fixes-concurrent-execution-protocols\" }\n\
-         stoffelnet = { git = \"https://github.com/Stoffel-Labs/stoffel-networking.git\", branch = \"fixes/concurrent-execution-transport\" }\n",
-    );
     fs::write(&cargo_toml_path, cargo_toml).unwrap();
 
     StdCommand::new("cargo")

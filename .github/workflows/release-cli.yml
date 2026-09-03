@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: "CLI release tag, e.g. cli-v0.1.0"
+        description: "CLI release tag, e.g. cli-v0.2.0"
         required: true
         type: string
 

@@ -5713,8 +5713,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
-name = "stoffel"
-version = "0.1.2"
+name = "stoffel-bindgen"
+version = "0.2.0"
+dependencies = [
+ "stoffellang",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "stoffel-cli"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -5791,7 +5799,7 @@ dependencies = [
 
 [[package]]
 name = "stoffel-rust-sdk"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "aes",
  "ark-bls12-381",
@@ -5834,7 +5842,7 @@ dependencies = [
 
 [[package]]
 name = "stoffel-vm"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "alloy",
  "alloy-primitives",
@@ -5895,7 +5903,7 @@ dependencies = [
 
 [[package]]
 name = "stoffel-vm-runner"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "ark-bls12-381",
  "ark-bn254",
@@ -5936,7 +5944,7 @@ dependencies = [
 
 [[package]]
 name = "stoffel-vm-types"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "num-bigint 0.4.6",
  "num-integer",
@@ -5949,7 +5957,7 @@ dependencies = [
 
 [[package]]
 name = "stoffel-wasm-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "ark-bls12-381",
  "ark-ff 0.5.0",
@@ -6011,7 +6019,7 @@ dependencies = [
 
 [[package]]
 name = "stoffellang"
-version = "0.1.2"
+version = "0.2.0"
 dependencies = [
  "clap",
  "colored",

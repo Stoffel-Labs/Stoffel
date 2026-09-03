@@ -242,8 +242,8 @@ Docker examples default to git build contexts for the coordinator and
 networking repos:
 
 ```sh
-STOFFEL_COORDINATOR_CONTEXT='https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#dev'
-STOFFEL_NETWORK_CONTEXT='https://github.com/Stoffel-Labs/stoffel-networking.git#feature/robust-identity-based-on-cert'
+STOFFEL_COORDINATOR_CONTEXT='https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git#v0.2.0'
+STOFFEL_NETWORK_CONTEXT='https://github.com/Stoffel-Labs/stoffel-networking.git#v0.1.1'
 ```
 
 To test local uncommitted changes, point those contexts at local checkouts:
