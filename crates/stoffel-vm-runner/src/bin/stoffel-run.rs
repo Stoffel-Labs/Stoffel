@@ -1,6 +1,7 @@
 use ark_ec::{CurveGroup, PrimeGroup};
-use ark_ff::{BigInteger, PrimeField};
+use ark_ff::{BigInteger, FftField, PrimeField};
 use ark_std::rand::{rngs::OsRng, RngCore};
+use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use std::env;
@@ -21,7 +22,8 @@ use stoffel_mpc_coordinator_off_chain::{
     OffChainCoordinatorClient,
 };
 use stoffel_mpc_coordinator_shared::{
-    Coordinator, ExecutionId as CoordinatorExecutionId, NodeRPCError, Round,
+    Coordinator, CoordinatorError, ExecutionId as CoordinatorExecutionId, NodeRPCError, Round,
+    ShareBound,
 };
 use stoffel_vm::core_vm::{VirtualMachine, VmCooperativeExecutionMetrics};
 use stoffel_vm::net::curve::{
@@ -82,6 +84,54 @@ use tokio_util::sync::CancellationToken;
 use tokio_util::task::TaskTracker;
 use x509_parser::prelude::*;
 type HbCoordinatorShare<F> = RobustShare<F>;
+
+// Each submission can contain a large encrypted output vector. Keep the default pipeline shallow:
+// it overlaps one coordinator round trip without allowing every client payload to queue at once.
+const DEFAULT_OUTPUT_SHARE_SUBMISSION_CONCURRENCY: usize = 2;
+
+fn output_share_submission_concurrency() -> usize {
+    env::var("STOFFEL_OUTPUT_SHARE_SUBMISSION_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .filter(|concurrency| *concurrency > 0)
+        .unwrap_or(DEFAULT_OUTPUT_SHARE_SUBMISSION_CONCURRENCY)
+}
+
+async fn collect_bounded<I, F, Fut, T>(items: I, concurrency: usize, operation: F) -> Vec<T>
+where
+    I: IntoIterator,
+    F: FnMut(I::Item) -> Fut,
+    Fut: std::future::Future<Output = T>,
+{
+    assert!(concurrency > 0, "bounded concurrency must be non-zero");
+    stream::iter(items)
+        .map(operation)
+        .buffer_unordered(concurrency)
+        .collect()
+        .await
+}
+
+async fn send_output_shares_bounded<F, S>(
+    coordinator: &OffChainCoordinatorClient<F, S>,
+    submissions: Vec<(Vec<u8>, Vec<S>)>,
+) -> Vec<(Vec<u8>, Result<(), CoordinatorError>)>
+where
+    F: FftField,
+    S: ShareBound<F>,
+{
+    collect_bounded(
+        submissions,
+        output_share_submission_concurrency(),
+        |(client_key, shares)| async move {
+            let client_id = client_key.clone();
+            let result = coordinator
+                .send_output_shares(client_key.clone(), client_key, shares)
+                .await;
+            (client_id, result)
+        },
+    )
+    .await
+}
 
 fn group_output_shares_by_client<T>(
     records: impl IntoIterator<Item = (ClientId, Vec<T>)>,
@@ -5774,6 +5824,7 @@ where
                 .into_iter()
                 .map(|record| (record.client_id, record.shares)),
         );
+        let mut submissions = Vec::with_capacity(outputs_by_client.len());
         for (client_id, shares) in outputs_by_client {
             let client_key = input_ids.get(client_id).ok_or_else(|| {
                 format!(
@@ -5781,10 +5832,10 @@ where
                     client_id
                 )
             })?;
-            coord
-                .send_output_shares(client_key.clone(), client_key.clone(), shares)
-                .await
-                .map_err(|e| format!("send_output_shares: {e}"))?;
+            submissions.push((client_key.clone(), shares));
+        }
+        for (_, result) in send_output_shares_bounded(&coord, submissions).await {
+            result.map_err(|e| format!("send_output_shares: {e}"))?;
         }
     }
 
@@ -6803,6 +6854,7 @@ impl StandingRunnerExecutionHandler {
                 .into_iter()
                 .map(|record| (record.client_id, record.shares)),
         );
+        let mut submissions = Vec::with_capacity(outputs_by_client.len());
         for (client_id, shares) in outputs_by_client {
             let client_key = standing_client_key(admission, client_id).ok_or_else(|| {
                 format!(
@@ -6810,10 +6862,10 @@ impl StandingRunnerExecutionHandler {
                     client_id
                 )
             })?;
-            lifecycle_coord
-                .send_output_shares(client_key.clone(), client_key.clone(), shares)
-                .await
-                .map_err(|error| format!("send HoneyBadger output shares: {error}"))?;
+            submissions.push((client_key.clone(), shares));
+        }
+        for (_, result) in send_output_shares_bounded(&lifecycle_coord, submissions).await {
+            result.map_err(|error| format!("send HoneyBadger output shares: {error}"))?;
         }
         eprintln!("[party {}] proposing ProgramFinished", self.party_id);
         finish_hb_standing_execution(&lifecycle_coord).await?;
@@ -6991,6 +7043,7 @@ impl StandingRunnerExecutionHandler {
                 .into_iter()
                 .map(|record| (record.client_id, record.shares)),
         );
+        let mut submissions = Vec::with_capacity(outputs_by_client.len());
         for (client_id, shares) in outputs_by_client {
             let client_key = standing_client_key(admission, client_id).ok_or_else(|| {
                 format!(
@@ -6998,10 +7051,10 @@ impl StandingRunnerExecutionHandler {
                     client_id
                 )
             })?;
-            lifecycle_coord
-                .send_output_shares(client_key.clone(), client_key.clone(), shares)
-                .await
-                .map_err(|error| format!("send AVSS output shares: {error}"))?;
+            submissions.push((client_key.clone(), shares));
+        }
+        for (_, result) in send_output_shares_bounded(&lifecycle_coord, submissions).await {
+            result.map_err(|error| format!("send AVSS output shares: {error}"))?;
         }
         eprintln!("[party {}] proposing ProgramFinished", self.party_id);
         finish_avss_standing_execution(&lifecycle_coord).await?;
@@ -9529,16 +9582,17 @@ async fn main() {
                             shares.extend(record.shares);
                         }
 
+                        let mut submissions = Vec::with_capacity(output_ids.len());
                         for (cid, output_shares) in
                             output_ids.iter().zip(output_shares_by_client.into_iter())
                         {
                             if output_shares.is_empty() {
                                 continue;
                             }
-                            if let Err(e) = coord
-                                .send_output_shares(cid.clone(), cid.clone(), output_shares)
-                                .await
-                            {
+                            submissions.push((cid.clone(), output_shares));
+                        }
+                        for (cid, result) in send_output_shares_bounded(coord, submissions).await {
+                            if let Err(e) = result {
                                 eprintln!(
                                     "Warning: failed to submit output shares for client {:?}: {}",
                                     cid, e
@@ -9768,7 +9822,7 @@ mod tests {
         band_pow2, bind_admitted_client_slots, canonical_mask_reservation_runs,
         checked_client_input_total, cli_positional_arguments, client_input_completion_quorum,
         client_input_setup_plan, client_output_slot_map, client_program_from_arguments,
-        client_schema_for_reserved_index, client_transport_recipient,
+        client_schema_for_reserved_index, client_transport_recipient, collect_bounded,
         coordinator_execution_already_retired, decode_preprocessing_exchange,
         direct_client_inbound_message, encode_manifest_client_inputs,
         encode_preprocessing_exchange, field_outputs_to_hex, format_coordinator_outputs,
@@ -10009,6 +10063,29 @@ mod tests {
             group_output_shares_by_client([(1, vec![10]), (0, vec![20, 21]), (1, vec![11, 12])]);
         assert_eq!(grouped.get(&0), Some(&vec![20, 21]));
         assert_eq!(grouped.get(&1), Some(&vec![10, 11, 12]));
+    }
+
+    #[tokio::test]
+    async fn bounded_collection_pipelines_work_without_exceeding_its_limit() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let peak = Arc::new(AtomicUsize::new(0));
+        let mut completed = collect_bounded(0..32, 4, |item| {
+            let active = Arc::clone(&active);
+            let peak = Arc::clone(&peak);
+            async move {
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(current, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                item
+            }
+        })
+        .await;
+
+        completed.sort_unstable();
+        assert_eq!(completed, (0..32).collect::<Vec<_>>());
+        assert_eq!(peak.load(Ordering::SeqCst), 4);
+        assert_eq!(active.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

@@ -60,8 +60,9 @@ RUN mkdir -p ~/.ssh && \
 # Note: If using private repos with SSH, run with: docker build --ssh default .
 # If ENABLE_NAT is true, build with the nat feature
 RUN --mount=type=ssh \
+    export RUSTFLAGS="--cfg aes_armv8 --cfg polyval_armv8" && \
     if [ "$STOFFEL_VM_PROFILE" = "true" ]; then \
-        export RUSTFLAGS="-C debuginfo=2 -C force-frame-pointers=yes"; \
+        export RUSTFLAGS="$RUSTFLAGS -C debuginfo=2 -C force-frame-pointers=yes"; \
     fi && \
     if [ "$ENABLE_NAT" = "true" ]; then \
         echo "Building with NAT traversal support..."; \

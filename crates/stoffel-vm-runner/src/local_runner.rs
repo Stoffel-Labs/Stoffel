@@ -1002,14 +1002,20 @@ async fn run_honeybadger_offchain_client(
             .receive_assigned_masks(client.reserved_index_start, input_values.len() as u64)
             .await?;
 
-        for (offset, (input, mask)) in input_values.into_iter().zip(masks).enumerate() {
-            let index = client.reserved_index_start + offset as u64;
-            eprintln!(
-                "[local-client {}] submitting masked input {}",
-                client.client_slot, index
-            );
-            send_masked_input_when_ready(&coord, input + mask, index, timeout).await?;
-        }
+        let masked_inputs = input_values
+            .into_iter()
+            .zip(masks)
+            .enumerate()
+            .map(|(offset, (input, mask))| {
+                (client.reserved_index_start + offset as u64, input + mask)
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "[local-client {}] submitting {} masked inputs",
+            client.client_slot,
+            masked_inputs.len()
+        );
+        send_masked_inputs_when_ready(&coord, &masked_inputs, timeout).await?;
         eprintln!(
             "[local-client {}] input submission complete",
             client.client_slot
@@ -1138,14 +1144,20 @@ where
             .receive_assigned_masks(client.reserved_index_start, input_values.len() as u64)
             .await?;
 
-        for (offset, (input, mask)) in input_values.into_iter().zip(masks).enumerate() {
-            let index = client.reserved_index_start + offset as u64;
-            eprintln!(
-                "[local-client {}] submitting AVSS masked input {}",
-                client.client_slot, index
-            );
-            send_avss_masked_input_when_ready(&coord, input + mask, index, timeout).await?;
-        }
+        let masked_inputs = input_values
+            .into_iter()
+            .zip(masks)
+            .enumerate()
+            .map(|(offset, (input, mask))| {
+                (client.reserved_index_start + offset as u64, input + mask)
+            })
+            .collect::<Vec<_>>();
+        eprintln!(
+            "[local-client {}] submitting {} AVSS masked inputs",
+            client.client_slot,
+            masked_inputs.len()
+        );
+        send_avss_masked_inputs_when_ready(&coord, &masked_inputs, timeout).await?;
         eprintln!(
             "[local-client {}] AVSS input submission complete",
             client.client_slot
@@ -1240,15 +1252,14 @@ where
     }
 }
 
-async fn send_masked_input_when_ready(
+async fn send_masked_inputs_when_ready(
     coord: &OffChainCoordinatorClient<Fr, RobustShare<Fr>>,
-    masked_input: Fr,
-    index: u64,
+    masked_inputs: &[(u64, Fr)],
     timeout: Duration,
 ) -> LocalCoordinatorRunnerResult<()> {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        match coord.send_masked_input(masked_input, index).await {
+        match coord.send_masked_inputs(masked_inputs).await {
             Ok(()) => return Ok(()),
             Err(error) if coordinator_wrong_round(&error) => {
                 if tokio::time::Instant::now() >= deadline {
@@ -1261,10 +1272,9 @@ async fn send_masked_input_when_ready(
     }
 }
 
-async fn send_avss_masked_input_when_ready<F, G>(
+async fn send_avss_masked_inputs_when_ready<F, G>(
     coord: &OffChainCoordinatorClient<F, FeldmanShamirShare<F, G>>,
-    masked_input: F,
-    index: u64,
+    masked_inputs: &[(u64, F)],
     timeout: Duration,
 ) -> LocalCoordinatorRunnerResult<()>
 where
@@ -1273,7 +1283,7 @@ where
 {
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        match coord.send_masked_input(masked_input, index).await {
+        match coord.send_masked_inputs(masked_inputs).await {
             Ok(()) => return Ok(()),
             Err(error) if coordinator_wrong_round(&error) => {
                 if tokio::time::Instant::now() >= deadline {

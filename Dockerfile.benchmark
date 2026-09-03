@@ -49,10 +49,11 @@ RUN --mount=type=ssh \
     --mount=type=cache,id=stoffel-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=stoffel-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=stoffel-benchmark-target-${PROFILE_BUILD}-${ENABLE_NAT},target=/build/target,sharing=locked \
+    export RUSTFLAGS="--cfg aes_armv8 --cfg polyval_armv8"; \
     if [ "$PROFILE_BUILD" = "true" ]; then \
         export CARGO_PROFILE_RELEASE_DEBUG=2; \
         export CARGO_PROFILE_RELEASE_STRIP=none; \
-        export RUSTFLAGS="-C force-frame-pointers=yes"; \
+        export RUSTFLAGS="$RUSTFLAGS -C force-frame-pointers=yes"; \
     fi; \
     cargo chef cook --release --recipe-path recipe.json
 
@@ -74,10 +75,11 @@ RUN --mount=type=ssh \
     --mount=type=cache,id=stoffel-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=stoffel-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=stoffel-benchmark-target-${PROFILE_BUILD}-${ENABLE_NAT},target=/build/target,sharing=locked \
+    export RUSTFLAGS="--cfg aes_armv8 --cfg polyval_armv8"; \
     if [ "$PROFILE_BUILD" = "true" ]; then \
         export CARGO_PROFILE_RELEASE_DEBUG=2; \
         export CARGO_PROFILE_RELEASE_STRIP=none; \
-        export RUSTFLAGS="-C force-frame-pointers=yes"; \
+        export RUSTFLAGS="$RUSTFLAGS -C force-frame-pointers=yes"; \
     fi; \
     if [ "$ENABLE_NAT" = "true" ]; then \
         cargo build --release --package stoffel-vm-runner --bin stoffel-run --features nat,statistics; \
@@ -93,10 +95,11 @@ RUN --mount=type=ssh \
 RUN --mount=type=cache,id=stoffel-cargo-registry,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,id=stoffel-cargo-git,target=/usr/local/cargo/git,sharing=locked \
     --mount=type=cache,id=stoffel-benchmark-target-${PROFILE_BUILD}-${ENABLE_NAT},target=/build/target,sharing=locked \
+    export RUSTFLAGS="--cfg aes_armv8 --cfg polyval_armv8"; \
     if [ "$PROFILE_BUILD" = "true" ]; then \
         export CARGO_PROFILE_RELEASE_DEBUG=2; \
         export CARGO_PROFILE_RELEASE_STRIP=none; \
-        export RUSTFLAGS="-C force-frame-pointers=yes"; \
+        export RUSTFLAGS="$RUSTFLAGS -C force-frame-pointers=yes"; \
     fi; \
     cargo build --release --package stoffellang && \
     mkdir -p /build/programs && \

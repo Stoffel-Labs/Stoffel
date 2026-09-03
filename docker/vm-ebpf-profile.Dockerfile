@@ -28,7 +28,7 @@ RUN mkdir -p /build/.cargo && \
       'stoffelnet = { path = "/build/stoffelnet" }' \
       > /build/.cargo/config.toml
 
-ENV RUSTFLAGS="-C debuginfo=2 -C force-frame-pointers=yes"
+ENV RUSTFLAGS="--cfg aes_armv8 --cfg polyval_armv8 -C debuginfo=2 -C force-frame-pointers=yes"
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     --mount=type=cache,target=/build/target \

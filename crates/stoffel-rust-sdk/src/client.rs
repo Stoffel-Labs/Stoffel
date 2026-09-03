@@ -1246,21 +1246,23 @@ where
         let masks = node_rpc
             .receive_assigned_masks(config.input_start_index, inputs.len() as u64)
             .await?;
-        for (ordinal, (input, share_type)) in
-            inputs.iter().zip(config.input_types.iter()).enumerate()
-        {
-            let reserved_index = config.input_start_index + ordinal as u64;
-            let mask = masks.get(ordinal).ok_or_else(|| {
-                Error::Coordinator(stoffel_mpc_coordinator_shared::CoordinatorError::JSONError(
-                    format!("missing assigned mask for input ordinal {ordinal}"),
-                ))
-            })?;
-            let curve = config.backend.curve().unwrap_or(Curve::Bls12_381);
-            let field_input = value_to_field::<F>(input, *share_type, curve)?;
-            coord
-                .send_masked_input(field_input + mask, reserved_index)
-                .await?;
-        }
+        let curve = config.backend.curve().unwrap_or(Curve::Bls12_381);
+        let masked_inputs = inputs
+            .iter()
+            .zip(config.input_types.iter())
+            .enumerate()
+            .map(|(ordinal, (input, share_type))| {
+                let reserved_index = config.input_start_index + ordinal as u64;
+                let mask = masks.get(ordinal).ok_or_else(|| {
+                    Error::Coordinator(stoffel_mpc_coordinator_shared::CoordinatorError::JSONError(
+                        format!("missing assigned mask for input ordinal {ordinal}"),
+                    ))
+                })?;
+                let field_input = value_to_field::<F>(input, *share_type, curve)?;
+                Ok((reserved_index, field_input + mask))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        coord.send_masked_inputs(&masked_inputs).await?;
         outputs_to_values(coord.obtain_outputs().await?, &config.output_types)
     })
     .await
