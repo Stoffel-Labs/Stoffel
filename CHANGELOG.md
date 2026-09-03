@@ -12,7 +12,8 @@ All notable changes to the Stoffel crates are tracked here.
 
 - Bumped the release-scoped Stoffel workspace crates to `0.1.2` and updated their internal path dependency requirements to the same exact version.
 - Exact-pinned direct normal, development, and build dependencies across the workspace and coordinator wrapper for reproducible resolution.
-- Kept independently released Stoffel dependencies on their published `0.1.0` versions: `stoffelcrypto`, `stoffelnet`, `stoffel-mpc-coordinator-shared`, and `stoffel-mpc-coordinator-off-chain`.
+- Kept independently released Stoffel dependencies on their published `0.1.0` versions: `stoffelcrypto`, `stoffelnet`, `stoffelmpc-network`, `stoffel-mpc-coordinator-shared`, and `stoffel-mpc-coordinator-off-chain`.
+- Updated generated Rust project manifests to exact-pin `stoffel-rust-sdk` and `stoffel-bindgen` at `0.1.2`.
 
 ### Fixed
 
