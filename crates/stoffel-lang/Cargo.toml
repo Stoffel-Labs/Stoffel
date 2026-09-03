@@ -2,7 +2,7 @@
 name = "stoffellang"
 description = "Compiler for Stoffel programs targeting the Stoffel VM bytecode format"
 authors = ["Gabriel Arrouye"]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/Stoffel-Labs/stoffel"
