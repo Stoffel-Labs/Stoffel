@@ -14,6 +14,10 @@ All notable changes to the Stoffel crates are tracked here.
 - Exact-pinned direct normal, development, and build dependencies across the workspace and coordinator wrapper for reproducible resolution.
 - Kept independently released Stoffel dependencies on their published `0.1.0` versions: `stoffelcrypto`, `stoffelnet`, `stoffel-mpc-coordinator-shared`, and `stoffel-mpc-coordinator-off-chain`.
 
+### Fixed
+
+- Pinned `num-bigint` to the non-yanked `0.4.6` release so new package resolutions remain publishable.
+
 ## [0.1.1] - 2026-07-03
 
 ### PR #67 - runner release and install updates
