@@ -981,7 +981,10 @@ fn summary_flag_is_not_part_of_general_build_help() {
             .stdout(predicate::str::contains(
                 "Write bytecode to this .stflb file",
             ))
-            .stdout(predicate::str::contains("alias: --out"))
+            .stdout(
+                predicate::str::contains("alias: --out")
+                    .or(predicate::str::contains("aliases: --out")),
+            )
             .stdout(predicate::str::contains("aliases: --prod, --production"));
     }
     Command::cargo_bin("stoffel")
@@ -1017,8 +1020,14 @@ fn summary_flag_is_not_part_of_general_build_help() {
         .stdout(predicate::str::contains(
             "aliases: --entrypoint, --function",
         ))
-        .stdout(predicate::str::contains("alias: --inputs"))
-        .stdout(predicate::str::contains("alias: --client-inputs"));
+        .stdout(
+            predicate::str::contains("alias: --inputs")
+                .or(predicate::str::contains("aliases: --inputs")),
+        )
+        .stdout(
+            predicate::str::contains("alias: --client-inputs")
+                .or(predicate::str::contains("aliases: --client-inputs")),
+        );
 
     Command::cargo_bin("stoffel")
         .unwrap()

@@ -5717,7 +5717,7 @@ name = "stoffel-bindgen"
 version = "0.2.0"
 dependencies = [
  "stoffellang",
- "thiserror 2.0.20",
+ "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -5733,14 +5733,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml 0.8.23",
-]
-
-[[package]]
-name = "stoffel-bindgen"
-version = "0.1.2"
-dependencies = [
- "stoffellang",
- "thiserror 2.0.18",
 ]
 
 [[package]]
@@ -5969,13 +5961,13 @@ dependencies = [
  "hpke",
  "js-sys",
  "p256",
- "rand 0.9.5",
+ "rand 0.9.4",
  "serde",
  "serde-wasm-bindgen",
  "sha2",
  "stoffel-vm-types",
  "stoffelcrypto",
- "thiserror 2.0.20",
+ "thiserror 2.0.18",
  "wasm-bindgen",
 ]
 
