@@ -35,8 +35,10 @@ RUN apt-get update && apt-get install -y \
 WORKDIR /build
 
 COPY . .
-COPY --from=coordinator . /build/coordinator
-COPY --from=networking . /build/stoffelnet
+# Keep external workspaces outside /build so Cargo does not attach their
+# workspace-inherited manifests to the Stoffel workspace.
+COPY --from=coordinator . /opt/stoffel-coordinator
+COPY --from=networking . /opt/stoffelnet
 
 RUN mkdir -p /build/.cargo && \
     printf '%s\n' \
@@ -44,9 +46,9 @@ RUN mkdir -p /build/.cargo && \
       'git-fetch-with-cli = true' \
       '' \
       '[patch.crates-io]' \
-      'stoffel-mpc-coordinator-off-chain = { path = "/build/coordinator/crates/off-chain" }' \
-      'stoffel-mpc-coordinator-shared = { path = "/build/coordinator/crates/coord-shared" }' \
-      'stoffelnet = { path = "/build/stoffelnet" }' \
+      'stoffel-mpc-coordinator-off-chain = { path = "/opt/stoffel-coordinator/crates/off-chain" }' \
+      'stoffel-mpc-coordinator-shared = { path = "/opt/stoffel-coordinator/crates/coord-shared" }' \
+      'stoffelnet = { path = "/opt/stoffelnet" }' \
       '' \
       > /build/.cargo/config.toml
 

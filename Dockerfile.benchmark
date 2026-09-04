@@ -18,7 +18,9 @@ WORKDIR /build
 FROM chef AS planner
 
 COPY . .
-COPY --from=coordinator . /build/coordinator
+# Keep the external workspace outside /build so Cargo does not attach its
+# workspace-inherited manifests to the Stoffel workspace.
+COPY --from=coordinator . /opt/stoffel-coordinator
 
 RUN mkdir -p /build/.cargo && \
     printf '%s\n' \
@@ -26,8 +28,8 @@ RUN mkdir -p /build/.cargo && \
       'git-fetch-with-cli = true' \
       '' \
       '[patch."https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git"]' \
-      'stoffel-mpc-coordinator-off-chain = { path = "/build/coordinator/crates/off-chain" }' \
-      'stoffel-mpc-coordinator-shared = { path = "/build/coordinator/crates/coord-shared" }' \
+      'stoffel-mpc-coordinator-off-chain = { path = "/opt/stoffel-coordinator/crates/off-chain" }' \
+      'stoffel-mpc-coordinator-shared = { path = "/opt/stoffel-coordinator/crates/coord-shared" }' \
       '' \
       > /build/.cargo/config.toml
 
@@ -40,7 +42,7 @@ ARG PROFILE_BUILD=false
 
 COPY --from=planner /build/recipe.json /build/recipe.json
 COPY --from=planner /build/.cargo /build/.cargo
-COPY --from=planner /build/coordinator /build/coordinator
+COPY --from=planner /opt/stoffel-coordinator /opt/stoffel-coordinator
 
 RUN mkdir -p ~/.ssh && \
     ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null || true
@@ -58,7 +60,7 @@ RUN --mount=type=ssh \
     cargo chef cook --release --recipe-path recipe.json
 
 COPY . .
-COPY --from=coordinator . /build/coordinator
+COPY --from=coordinator . /opt/stoffel-coordinator
 
 RUN mkdir -p /build/.cargo && \
     printf '%s\n' \
@@ -66,8 +68,8 @@ RUN mkdir -p /build/.cargo && \
       'git-fetch-with-cli = true' \
       '' \
       '[patch."https://github.com/Stoffel-Labs/stoffel-mpc-coordinator.git"]' \
-      'stoffel-mpc-coordinator-off-chain = { path = "/build/coordinator/crates/off-chain" }' \
-      'stoffel-mpc-coordinator-shared = { path = "/build/coordinator/crates/coord-shared" }' \
+      'stoffel-mpc-coordinator-off-chain = { path = "/opt/stoffel-coordinator/crates/off-chain" }' \
+      'stoffel-mpc-coordinator-shared = { path = "/opt/stoffel-coordinator/crates/coord-shared" }' \
       '' \
       > /build/.cargo/config.toml
 

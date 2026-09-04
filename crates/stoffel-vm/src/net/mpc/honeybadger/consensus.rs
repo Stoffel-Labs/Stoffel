@@ -28,6 +28,12 @@ where
                 self.topology.threshold(),
             )?;
 
+            // ECHO/READY contributions are recorded in the shared registry by
+            // rbc_progress. Wake peer receivers that may now have a quorum.
+            if !progress.relays.is_empty() {
+                registry.rbc_notify.notify_waiters();
+            }
+
             for relay in progress.relays {
                 let wire_message = crate::net::open_registry::encode_rbc_relay_wire_message(
                     self.current_instance_id(),
