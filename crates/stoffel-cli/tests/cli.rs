@@ -113,6 +113,7 @@ fn init_creates_default_project() {
 
 #[test]
 fn init_default_project_builds_with_cargo_and_sdk_bindings() {
+    let _guard = local_mpc_guard();
     let temp = TempDir::new().unwrap();
     let project = temp.path().join("hello");
     Command::cargo_bin("stoffel")
