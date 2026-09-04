@@ -1,6 +1,6 @@
 [package]
 name = "stoffel-cli"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 description = "Cargo-like command line tool for Stoffel projects"
 license = "Apache-2.0"
@@ -12,14 +12,14 @@ name = "stoffel"
 path = "src/main.rs"
 
 [dependencies]
-anyhow = "1"
-clap = { version = "4.5.4", features = ["derive"] }
-serde = { version = "1.0", features = ["derive"] }
-stoffel-rust-sdk = { version = "0.1.1", path = "../stoffel-rust-sdk" }
-tokio = { version = "1.47.1", features = ["macros", "rt-multi-thread"] }
-toml = "0.8"
+anyhow = "=1.0.103"
+clap = { version = "=4.6.1", features = ["derive"] }
+serde = { version = "=1.0.228", features = ["derive"] }
+stoffel-rust-sdk = { version = "=0.1.2", path = "../stoffel-rust-sdk" }
+tokio = { version = "=1.52.3", features = ["macros", "rt-multi-thread"] }
+toml = "=0.8.23"
 
 [dev-dependencies]
-assert_cmd = "2"
-predicates = "3"
-tempfile = "3"
+assert_cmd = "=2.2.2"
+predicates = "=3.1.4"
+tempfile = "=3.27.0"

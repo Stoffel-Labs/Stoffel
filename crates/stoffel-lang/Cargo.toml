@@ -2,7 +2,7 @@
 name = "stoffellang"
 description = "Compiler for Stoffel programs targeting the Stoffel VM bytecode format"
 authors = ["Gabriel Arrouye"]
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 license = "Apache-2.0"
 repository = "https://github.com/Stoffel-Labs/stoffel"
@@ -14,10 +14,10 @@ categories = ["compilers", "cryptography", "parser-implementations"]
 name = "stoffellang"
 
 [dependencies]
-stoffel-vm-types = { version = "0.1.1", path = "../stoffel-vm-types" }
-colored = "3.0.0"
-edit-distance = "2.1.0"
-clap = { version = "4.5.4", features = ["derive"] }
+stoffel-vm-types = { version = "=0.1.2", path = "../stoffel-vm-types" }
+colored = "=3.1.1"
+edit-distance = "=2.2.2"
+clap = { version = "=4.6.1", features = ["derive"] }
 
 # Test configurations for tests in the rust subdirectory
 [[test]]
@@ -49,4 +49,4 @@ name = "fixture_and_example_tests"
 path = "tests/rust/fixture_and_example_tests.rs"
 
 [dev-dependencies]
-tempfile = "3"
+tempfile = "=3.27.0"

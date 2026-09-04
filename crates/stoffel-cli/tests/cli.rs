@@ -113,6 +113,7 @@ fn init_creates_default_project() {
 
 #[test]
 fn init_default_project_builds_with_cargo_and_sdk_bindings() {
+    let _guard = local_mpc_guard();
     let temp = TempDir::new().unwrap();
     let project = temp.path().join("hello");
     Command::cargo_bin("stoffel")
@@ -133,14 +134,14 @@ fn init_default_project_builds_with_cargo_and_sdk_bindings() {
     let cargo_toml = fs::read_to_string(&cargo_toml_path)
         .unwrap()
         .replace(
-            "stoffel = { package = \"stoffel-rust-sdk\", version = \"0.1.0\" }",
+            "stoffel = { package = \"stoffel-rust-sdk\", version = \"=0.1.2\" }",
             &format!(
                 "stoffel = {{ package = \"stoffel-rust-sdk\", path = \"{}\" }}",
                 sdk_path.display()
             ),
         )
         .replace(
-            "stoffel-bindgen = \"0.1.0\"",
+            "stoffel-bindgen = \"=0.1.2\"",
             &format!(
                 "stoffel-bindgen = {{ path = \"{}\" }}",
                 bindgen_path.display()
@@ -150,6 +151,7 @@ fn init_default_project_builds_with_cargo_and_sdk_bindings() {
 
     StdCommand::new("cargo")
         .arg("build")
+        .arg("--offline")
         .current_dir(&project)
         .status()
         .expect("cargo build should run")

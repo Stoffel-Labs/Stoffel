@@ -2,6 +2,24 @@
 
 All notable changes to the Stoffel crates are tracked here.
 
+## [0.1.2] - 2026-09-03
+
+### Added
+
+- Added tag-driven crates.io release automation for `stoffel-bindgen`.
+
+### Changed
+
+- Bumped the release-scoped Stoffel workspace crates to `0.1.2` and updated their internal path dependency requirements to the same exact version.
+- Exact-pinned direct normal, development, and build dependencies across the workspace and coordinator wrapper for reproducible resolution.
+- Kept independently released Stoffel dependencies on their published `0.1.0` versions: `stoffelcrypto`, `stoffelnet`, `stoffelmpc-network`, `stoffel-mpc-coordinator-shared`, and `stoffel-mpc-coordinator-off-chain`.
+- Updated generated Rust project manifests to exact-pin `stoffel-rust-sdk` and `stoffel-bindgen` at `0.1.2`.
+
+### Fixed
+
+- Pinned `num-bigint` to the non-yanked `0.4.6` release so new package resolutions remain publishable.
+- Pinned `tinyvec` to `1.11.0` so generated Rust projects avoid the broken `1.13.0` alloc-only build selected through `quinn-proto`.
+
 ## [0.1.1] - 2026-07-03
 
 ### PR #67 - runner release and install updates

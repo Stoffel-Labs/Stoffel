@@ -132,7 +132,7 @@ impl VirtualMachine {
                 >,
             ),
         >,
-    {
+{
         Ok(self.state.try_replace_client_input(inputs)?)
     }
 
