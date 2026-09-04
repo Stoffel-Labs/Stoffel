@@ -44,7 +44,7 @@ use stoffel_vm::net::{
 };
 use stoffel_vm::net::{
     program_id_from_bytes, register_and_wait_for_session, run_bootnode_with_config,
-    SessionRegistrationConfig,
+    run_bootnode_with_config_ready, SessionRegistrationConfig,
 };
 use stoffel_vm::net::{MpcBackendKind, MpcCurveConfig};
 use stoffel_vm::runtime_hooks::{HookContext, HookEvent};
@@ -152,11 +152,58 @@ fn read_trimmed_u64(path: &str) -> Option<u64> {
         .and_then(|value| value.trim().parse::<u64>().ok())
 }
 
+/// Publish a process-local lifecycle acknowledgement for
+/// `LocalCoordinatorRunner`. The marker is written through a sibling temporary
+/// file and renamed so the supervisor never observes a partial acknowledgement.
+fn write_local_runner_marker_or_exit(variable: &str, phase: &str) {
+    let Ok(path) = std::env::var(variable) else {
+        return;
+    };
+    let path = PathBuf::from(path);
+    let temporary = path.with_extension("tmp");
+    if let Err(error) =
+        fs::write(&temporary, phase.as_bytes()).and_then(|()| fs::rename(&temporary, &path))
+    {
+        eprintln!(
+            "Failed to acknowledge {phase} to the local runner at '{}': {error}",
+            path.display()
+        );
+        exit(13);
+    }
+    eprintln!("[party] local runner acknowledged {phase}");
+}
+
+async fn local_bind_handoff(variable: &str) {
+    let Ok(path) = std::env::var(variable) else {
+        return;
+    };
+    let grant = PathBuf::from(format!("{path}.granted"));
+    if let Err(error) = fs::write(&path, b"ready to bind") {
+        eprintln!("Local listener handoff failed: {error}");
+        exit(13);
+    }
+    // The parent retains the actual TCP/UDP sockets until this request. The
+    // dependency APIs bind their own sockets, so release immediately before
+    // that bind; inheriting sockets would require changing those APIs.
+    let wait = async {
+        while !grant.exists() {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    };
+    if tokio::time::timeout(session_registration_timeout(), wait)
+        .await
+        .is_err()
+    {
+        eprintln!("Local listener handoff timed out: {variable}");
+        exit(13);
+    }
+}
+
 fn coordinator_execution_already_retired(error: &str) -> bool {
     error.contains(" is not registered")
 }
 
-async fn finish_hb_standing_execution<F: PrimeField>(
+async fn finish_hb_execution<F: PrimeField>(
     coordinator: &HbOffChainCoordinator<F>,
 ) -> Result<(), String> {
     if let Err(error) = coordinator.finalize().await {
@@ -176,7 +223,7 @@ async fn finish_hb_standing_execution<F: PrimeField>(
     Ok(())
 }
 
-async fn finish_avss_standing_execution<F, G>(
+async fn finish_avss_execution<F, G>(
     coordinator: &AvssOffChainCoordinator<F, G>,
 ) -> Result<(), String>
 where
@@ -5655,6 +5702,7 @@ where
         .await
         .map_err(|error| format!("Failed to connect to AVSS off-chain coordinator: {error}"))?;
 
+    local_bind_handoff("STOFFEL_LOCAL_RPC_HANDOFF").await;
     let node_rpc: OffChainNodeRPCServer = OffChainNodeRPCServer::start_for_execution(
         &rpc_addr.0,
         rpc_addr.1,
@@ -5664,6 +5712,10 @@ where
     )
     .await
     .map_err(|error| format!("Failed to start AVSS node RPC server: {error}"))?;
+    write_local_runner_marker_or_exit(
+        "STOFFEL_LOCAL_RPC_READY_FILE",
+        "party RPC listener readiness",
+    );
 
     eprintln!("[party {my_id}] proposing Preprocessing");
     coord
@@ -5699,21 +5751,21 @@ where
     .await?;
     engine.enable_client_output_capture().await;
 
-    if input_ids.is_empty() {
-        if client_input_total != 0 {
-            return Err(format!(
-                "AVSS coordinator declared {client_input_total} inputs without any client identities"
-            ));
+    // expected_clients includes output-only identities. Use the declared
+    // input bindings, not the output roster, to decide whether to collect masks.
+    if client_input_total == 0 {
+        if !client_input_slots_by_id.is_empty() {
+            return Err("AVSS coordinator has input clients but no declared inputs".to_string());
         }
         eprintln!(
             "[party {}] AVSS coordinator mode has no client inputs; preprocessing complete, skipping input collection",
             my_id
         );
     } else {
-        if client_input_total == 0 {
-            return Err(
-                "AVSS coordinator has client identities but no declared inputs".to_string(),
-            );
+        if client_input_slots_by_id.is_empty() {
+            return Err(format!(
+                "AVSS coordinator declared {client_input_total} inputs without any input client identities"
+            ));
         }
         let mask_shares = {
             let node = engine.node_handle().lock().await;
@@ -5840,11 +5892,8 @@ where
     }
 
     eprintln!("[party {my_id}] proposing ProgramFinished");
-    coord.finalize().await.map_err(|e| e.to_string())?;
-    coord
-        .wait_for_round(Round::ProgramFinished)
-        .await
-        .map_err(|e| e.to_string())?;
+    eprintln!("[party {my_id}] finalizing coordinated execution");
+    finish_avss_execution(&coord).await?;
 
     // Arm one-off shutdown before this party retires. The coordinator keeps serving terminal
     // round replays until every party retires, then exits immediately; a bounded server-side grace
@@ -5871,6 +5920,10 @@ where
     }
 
     print_vm_result(vm, result);
+    write_local_runner_marker_or_exit(
+        "STOFFEL_LOCAL_COMPLETION_FILE",
+        "coordinated execution completion",
+    );
     Ok(())
 }
 #[allow(clippy::too_many_arguments)]
@@ -6868,7 +6921,7 @@ impl StandingRunnerExecutionHandler {
             result.map_err(|error| format!("send HoneyBadger output shares: {error}"))?;
         }
         eprintln!("[party {}] proposing ProgramFinished", self.party_id);
-        finish_hb_standing_execution(&lifecycle_coord).await?;
+        finish_hb_execution(&lifecycle_coord).await?;
         print_vm_result(vm, result);
         Ok(metrics)
     }
@@ -7057,7 +7110,7 @@ impl StandingRunnerExecutionHandler {
             result.map_err(|error| format!("send AVSS output shares: {error}"))?;
         }
         eprintln!("[party {}] proposing ProgramFinished", self.party_id);
-        finish_avss_standing_execution(&lifecycle_coord).await?;
+        finish_avss_execution(&lifecycle_coord).await?;
         print_vm_result(vm, result);
         Ok(metrics)
     }
@@ -8628,16 +8681,26 @@ async fn main() {
         );
 
         // Spawn bootnode in background
+        local_bind_handoff("STOFFEL_LOCAL_NETWORK_HANDOFF").await;
         let bootnode_bind = bind;
         let bootnode_n = n;
+        let (bootnode_ready_tx, bootnode_ready_rx) = tokio::sync::oneshot::channel();
         tokio::spawn(async move {
-            if let Err(e) = run_bootnode_with_config(bootnode_bind, bootnode_n).await {
+            if let Err(e) =
+                run_bootnode_with_config_ready(bootnode_bind, bootnode_n, Some(bootnode_ready_tx))
+                    .await
+            {
                 eprintln!("Bootnode error: {}", e);
             }
         });
-
-        // Give bootnode a moment to start
-        tokio::time::sleep(Duration::from_millis(100)).await;
+        if bootnode_ready_rx.await.is_err() {
+            eprintln!("Bootnode stopped before its listener became ready");
+            exit(11);
+        }
+        write_local_runner_marker_or_exit(
+            "STOFFEL_LOCAL_BOOTNODE_READY_FILE",
+            "bootnode listener readiness",
+        );
 
         // Now connect to ourselves as the bootnode
         let mut mgr = QuicNetworkManager::with_node_id(my_id);
@@ -8746,6 +8809,7 @@ async fn main() {
             }
         }
         // Listen so peers can connect back directly
+        local_bind_handoff("STOFFEL_LOCAL_NETWORK_HANDOFF").await;
         if let Err(e) = mgr.listen(bind).await {
             eprintln!("Failed to listen on {}: {}", bind, e);
             exit(11);
@@ -9137,6 +9201,7 @@ async fn main() {
 
             if let Some(ref rpc) = rpc_addr {
                 let node_cert_der = cert_der.clone().unwrap();
+                local_bind_handoff("STOFFEL_LOCAL_RPC_HANDOFF").await;
                 let node_rpc = OffChainNodeRPCServer::start_for_execution(
                     &rpc.0,
                     rpc.1,
@@ -9150,6 +9215,10 @@ async fn main() {
                     exit(13);
                 });
                 node_rpc_opt = Some(node_rpc);
+                write_local_runner_marker_or_exit(
+                    "STOFFEL_LOCAL_RPC_READY_FILE",
+                    "party RPC listener readiness",
+                );
             }
         }
     }
@@ -9594,22 +9663,18 @@ async fn main() {
                         for (cid, result) in send_output_shares_bounded(coord, submissions).await {
                             if let Err(e) = result {
                                 eprintln!(
-                                    "Warning: failed to submit output shares for client {:?}: {}",
+                                    "Failed to submit output shares for client {:?}: {}",
                                     cid, e
                                 );
+                                exit(13);
                             }
                         }
                     }
 
                     eprintln!("[party] proposing ProgramFinished");
-                    if let Err(e) = coord.finalize().await {
-                        eprintln!(
-                            "Warning: failed to finalize off-chain coordinator round: {}",
-                            e
-                        );
-                    }
-                    if let Err(error) = coord.wait_for_round(Round::ProgramFinished).await {
-                        eprintln!("Failed waiting for coordinator ProgramFinished round: {error}");
+                    eprintln!("[party] finalizing coordinated execution");
+                    if let Err(error) = finish_hb_execution(coord).await {
+                        eprintln!("Failed to finalize coordinated execution: {error}");
                         exit(13);
                     }
 
@@ -9638,6 +9703,10 @@ async fn main() {
                     print_vm_result(&mut vm, result);
                 }
             }
+            write_local_runner_marker_or_exit(
+                "STOFFEL_LOCAL_COMPLETION_FILE",
+                "coordinated execution completion",
+            );
         }
         Err(err) => {
             eprintln!("Execution error in '{}': {}", agreed_entry, err);

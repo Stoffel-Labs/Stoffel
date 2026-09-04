@@ -618,8 +618,15 @@ Run the test suite:
 
 ```bash
 cargo test
-cargo test -- --ignored
+# Generated-Cargo and local-MPC CLI tests share one heavyweight serial group.
+cargo test -p stoffel-cli --test cli -- --ignored --test-threads=1
+# Run the coordinator lifecycle regressions as a separate serial step.
+cargo test -p stoffel-vm-runner --test local_coordinator_e2e -- --ignored --test-threads=1 --skip optimized_aes --skip batch_mul
 ```
+
+The ordinary suite remains parallel. Keep the heavyweight CLI group in its
+separate serial invocation so nested Cargo builds cannot contend with
+timeout-sensitive local MPC subprocesses; CI uses the same split.
 
 Build the runtime and CLI in release mode:
 

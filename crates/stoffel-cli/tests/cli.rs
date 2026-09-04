@@ -142,6 +142,7 @@ fn init_force_rejects_symlink_project_root() {
 }
 
 #[test]
+#[ignore = "heavy integration test; run with the serial heavy-test command"]
 fn init_default_project_builds_with_cargo_and_sdk_bindings() {
     let _guard = local_mpc_guard();
     let temp = TempDir::new().unwrap();
@@ -177,7 +178,34 @@ fn init_default_project_builds_with_cargo_and_sdk_bindings() {
                 bindgen_path.display()
             ),
         );
-    fs::write(&cargo_toml_path, cargo_toml).unwrap();
+    // This fixture builds the in-tree SDK. Cargo does not inherit workspace
+    // patches or its lockfile when that SDK is used from a separate project.
+    // Carry both over so --offline also works on a fresh CI dependency cache,
+    // rather than depending on unrelated registry versions cached locally.
+    let workspace = crates_dir
+        .parent()
+        .expect("crates live under the workspace");
+    let workspace_manifest: toml::Value =
+        toml::from_str(&fs::read_to_string(workspace.join("Cargo.toml")).unwrap()).unwrap();
+    let mut manifest: toml::Value = toml::from_str(&cargo_toml).unwrap();
+    if let Some(patches) = workspace_manifest.get("patch") {
+        let mut patches = patches.clone();
+        for (_, overrides) in patches.as_table_mut().unwrap().iter_mut() {
+            for (_, dependency) in overrides.as_table_mut().unwrap().iter_mut() {
+                if let Some(path) = dependency.get_mut("path") {
+                    *path = toml::Value::String(
+                        workspace.join(path.as_str().unwrap()).display().to_string(),
+                    );
+                }
+            }
+        }
+        manifest
+            .as_table_mut()
+            .unwrap()
+            .insert("patch".to_owned(), patches);
+    }
+    fs::write(&cargo_toml_path, toml::to_string(&manifest).unwrap()).unwrap();
+    fs::copy(workspace.join("Cargo.lock"), project.join("Cargo.lock")).unwrap();
 
     StdCommand::new("cargo")
         .arg("build")
@@ -191,6 +219,7 @@ fn init_default_project_builds_with_cargo_and_sdk_bindings() {
 }
 
 #[test]
+#[ignore = "heavy integration test; run with the serial heavy-test command"]
 fn common_command_aliases_work() {
     let _guard = local_mpc_guard();
     let temp = TempDir::new().unwrap();
@@ -249,6 +278,7 @@ fn init_help_names_supported_templates_and_aliases() {
 }
 
 #[test]
+#[ignore = "heavy integration test; run with the serial heavy-test command"]
 fn run_executes_default_secret_bool_circuit_project() {
     let _guard = local_mpc_guard();
     let temp = TempDir::new().unwrap();
@@ -260,36 +290,28 @@ fn run_executes_default_secret_bool_circuit_project() {
         .assert()
         .success();
 
-    let mut last_output = None;
-    for _ in 0..3 {
-        let output = Command::cargo_bin("stoffel")
-            .unwrap()
-            .current_dir(temp.path())
-            .args(["run", "--timeout-secs", LOCAL_MPC_TEST_TIMEOUT_SECS])
-            .output()
-            .expect("stoffel run should execute");
-        if output.status.success() {
-            let stdout = String::from_utf8_lossy(&output.stdout);
-            assert!(
-                stdout.contains("true") || stdout.contains("false"),
-                "expected boolean output, got stdout:\n{stdout}"
-            );
-            return;
-        }
-        last_output = Some(output);
-        thread::sleep(Duration::from_millis(250));
-    }
-
-    let output = last_output.expect("stoffel run should have been attempted");
-    panic!(
-        "default secret bool circuit did not run successfully after retries\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
+    let output = Command::cargo_bin("stoffel")
+        .unwrap()
+        .current_dir(temp.path())
+        .args(["run", "--timeout-secs", LOCAL_MPC_TEST_TIMEOUT_SECS])
+        .output()
+        .expect("stoffel run should execute");
+    assert!(
+        output.status.success(),
+        "default secret bool circuit failed\nstatus: {}\nstdout:\n{}\nstderr:\n{}",
         output.status,
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("true") || stdout.contains("false"),
+        "expected boolean output, got stdout:\n{stdout}"
+    );
 }
 
 #[test]
+#[ignore = "heavy integration test; run with the serial heavy-test command"]
 fn run_accepts_numeric_bits_for_secret_bool_list_inputs() {
     let _guard = local_mpc_guard();
     let temp = TempDir::new().unwrap();
@@ -391,6 +413,7 @@ fn build_writes_bytecode_to_target() {
 }
 
 #[test]
+#[ignore = "heavy integration test; run with the serial heavy-test command"]
 fn run_executes_bytecode_file() {
     let _guard = local_mpc_guard();
     let temp = TempDir::new().unwrap();
@@ -429,6 +452,7 @@ fn run_executes_bytecode_file() {
 }
 
 #[test]
+#[ignore = "heavy integration test; run with the serial heavy-test command"]
 fn run_auto_discovers_built_bytecode() {
     let _guard = local_mpc_guard();
     let temp = TempDir::new().unwrap();
@@ -466,6 +490,7 @@ fn run_auto_discovers_built_bytecode() {
 }
 
 #[test]
+#[ignore = "heavy integration test; run with the serial heavy-test command"]
 fn run_recompiles_when_project_source_is_newer_than_bytecode() {
     let _guard = local_mpc_guard();
     let temp = TempDir::new().unwrap();
@@ -515,6 +540,7 @@ fn run_recompiles_when_project_source_is_newer_than_bytecode() {
 }
 
 #[test]
+#[ignore = "heavy integration test; run with the serial heavy-test command"]
 fn run_ignores_stray_bytecode_when_project_source_is_newer() {
     let _guard = local_mpc_guard();
     let temp = TempDir::new().unwrap();
@@ -566,6 +592,7 @@ fn run_ignores_stray_bytecode_when_project_source_is_newer() {
 }
 
 #[test]
+#[ignore = "heavy integration test; run with the serial heavy-test command"]
 fn run_recompiles_when_project_config_is_newer_than_bytecode() {
     let _guard = local_mpc_guard();
     let temp = TempDir::new().unwrap();
@@ -611,6 +638,7 @@ fn run_recompiles_when_project_config_is_newer_than_bytecode() {
 }
 
 #[test]
+#[ignore = "heavy integration test; run with the serial heavy-test command"]
 fn run_folder_compiles_project_when_bytecode_is_missing() {
     let _guard = local_mpc_guard();
     let temp = TempDir::new().unwrap();
@@ -644,6 +672,7 @@ fn run_folder_compiles_project_when_bytecode_is_missing() {
 }
 
 #[test]
+#[ignore = "heavy integration test; run with the serial heavy-test command"]
 fn run_rejects_non_project_directories_inside_a_project() {
     let _guard = local_mpc_guard();
     let temp = TempDir::new().unwrap();
@@ -677,6 +706,7 @@ fn run_rejects_non_project_directories_inside_a_project() {
 }
 
 #[test]
+#[ignore = "heavy integration test; run with the serial heavy-test command"]
 fn dev_once_executes_default_secret_bool_circuit_project() {
     let _guard = local_mpc_guard();
     let temp = TempDir::new().unwrap();
@@ -699,6 +729,7 @@ fn dev_once_executes_default_secret_bool_circuit_project() {
 }
 
 #[test]
+#[ignore = "heavy integration test; run with the serial heavy-test command"]
 fn dev_once_explains_input_mistakes() {
     let _guard = local_mpc_guard();
     let temp = TempDir::new().unwrap();
@@ -804,6 +835,7 @@ fn dev_watch_explains_input_mistakes_before_starting() {
 }
 
 #[test]
+#[ignore = "heavy integration test; run with the serial heavy-test command"]
 fn dev_once_uses_explicit_source_file() {
     let _guard = local_mpc_guard();
     let temp = TempDir::new().unwrap();
@@ -1194,6 +1226,7 @@ fn typoed_commands_suggest_only_available_commands() {
 }
 
 #[test]
+#[ignore = "heavy integration test; run with the serial heavy-test command"]
 fn common_flag_aliases_work_or_explain_defaults() {
     let _guard = local_mpc_guard();
     let temp = TempDir::new().unwrap();
@@ -1429,6 +1462,7 @@ fn opt_level_help_matches_supported_spellings() {
 }
 
 #[test]
+#[ignore = "heavy integration test; run with the serial heavy-test command"]
 fn run_rejects_build_only_flags_and_honors_program_info() {
     let _guard = local_mpc_guard();
     let temp = TempDir::new().unwrap();
@@ -1479,6 +1513,7 @@ fn run_rejects_build_only_flags_and_honors_program_info() {
 }
 
 #[test]
+#[ignore = "heavy integration test; run with the serial heavy-test command"]
 fn run_validates_entry_and_inputs_before_timeout() {
     let _guard = local_mpc_guard();
     let temp = TempDir::new().unwrap();
@@ -2516,6 +2551,7 @@ fn build_compiles_all_project_sources() {
 }
 
 #[test]
+#[ignore = "heavy integration test; run with the serial heavy-test command"]
 fn source_and_bytecode_extensions_are_case_insensitive() {
     let _guard = local_mpc_guard();
     let temp = TempDir::new().unwrap();

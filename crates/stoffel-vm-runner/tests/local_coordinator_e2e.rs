@@ -21,6 +21,19 @@ fn assert_all_parties_proposed(output: &LocalCoordinatorRunOutput, round: &str) 
     );
 }
 
+fn assert_all_parties_acknowledged_completion(output: &LocalCoordinatorRunOutput) {
+    let acknowledgements = output
+        .combined_output
+        .matches("local runner acknowledged coordinated execution completion")
+        .count();
+    assert_eq!(
+        acknowledgements,
+        output.party_outputs.len(),
+        "every successful party must acknowledge lifecycle completion; output:\n{}",
+        output.combined_output
+    );
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "starts a real localhost coordinator and MPC party mesh"]
 async fn local_offchain_coordinator_runs_networked_vm_without_docker_compose() {
@@ -51,6 +64,7 @@ async fn local_offchain_coordinator_runs_networked_vm_without_docker_compose() {
     assert_all_parties_proposed(&output, "MPCExecution");
     assert_all_parties_proposed(&output, "OutputDistribution");
     assert_all_parties_proposed(&output, "ProgramFinished");
+    assert_all_parties_acknowledged_completion(&output);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -86,6 +100,7 @@ async fn local_offchain_coordinator_runs_avss_networked_vm_without_docker_compos
     assert_all_parties_proposed(&output, "MPCExecution");
     assert_all_parties_proposed(&output, "OutputDistribution");
     assert_all_parties_proposed(&output, "ProgramFinished");
+    assert_all_parties_acknowledged_completion(&output);
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -337,6 +352,100 @@ fn party_output(name: &str, combined: &str) -> LocalPartyOutput {
         stdout: combined.to_owned(),
         stderr: String::new(),
         combined: combined.to_owned(),
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts a local coordinator, five parties, and asymmetric clients"]
+async fn local_indexed_masks_cover_one_two_four_inputs_and_client_outputs() {
+    run_indexed_mask_and_client_output_case(
+        stoffel_vm_types::compiled_binary::MpcBackend::HoneyBadger,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts a local coordinator, five AVSS parties, and asymmetric clients"]
+async fn local_avss_indexed_masks_cover_one_two_four_inputs_and_client_outputs() {
+    run_indexed_mask_and_client_output_case(stoffel_vm_types::compiled_binary::MpcBackend::Avss)
+        .await;
+}
+
+async fn run_indexed_mask_and_client_output_case(
+    backend: stoffel_vm_types::compiled_binary::MpcBackend,
+) {
+    let source = r#"
+def main() -> int64:
+  var a = ClientStore.take_share(0, 0)
+  var b = ClientStore.take_share(1, 0)
+  var c = ClientStore.take_share(1, 1)
+  var d = ClientStore.take_share(2, 0)
+  var e = ClientStore.take_share(2, 1)
+  var f = ClientStore.take_share(2, 2)
+  var g = ClientStore.take_share(2, 3)
+  var sum = a.add(b).add(c).add(d).add(e).add(f).add(g)
+  sum.send_to_client(0)
+  sum.send_to_client(3)
+  return sum.open()
+"#;
+    let options = stoffellang::CompilerOptions {
+        mpc_backend: backend,
+        ..Default::default()
+    };
+    let compiled = stoffellang::compile(source, "<indexed-local-inputs>", &options)
+        .expect("compile asymmetric client inputs");
+    let output = LocalCoordinatorRunner::builder(
+        env!("CARGO_BIN_EXE_stoffel-run"),
+        stoffellang::convert_to_binary(&compiled),
+    )
+    .client_inputs([
+        LocalClientInput::new(0, [1]),
+        LocalClientInput::new(1, [2, 3]),
+        LocalClientInput::new(2, [4, 5, 6, 7]),
+    ])
+    .timeout(Duration::from_secs(120))
+    .build()
+    .unwrap()
+    .run()
+    .await
+    .expect("indexed asymmetric local run");
+    assert_eq!(output.consistent_returned_values().unwrap(), vec!["28"]);
+    assert_eq!(output.client_outputs.len(), 2);
+    assert_eq!(output.client_outputs[0].values, vec![28]);
+    assert_eq!(output.client_outputs[1].client_slot, 3);
+    assert_eq!(output.client_outputs[1].values, vec![28]);
+    assert_all_parties_acknowledged_completion(&output);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "starts local coordinator meshes with output-only clients on both backends"]
+async fn local_output_only_runs_finalize_without_client_inputs() {
+    use stoffel_vm_types::compiled_binary::MpcBackend;
+    for backend in [MpcBackend::HoneyBadger, MpcBackend::Avss] {
+        let options = stoffellang::CompilerOptions {
+            mpc_backend: backend,
+            ..Default::default()
+        };
+        let compiled = stoffellang::compile(
+            "def main() -> int64:\n  var share = Share.from_clear_int(7, 64)\n  MpcOutput.send_to_client(0, [share])\n  return 7",
+            "<output-only-local-run>",
+            &options,
+        )
+        .unwrap();
+        let output = LocalCoordinatorRunner::builder(
+            env!("CARGO_BIN_EXE_stoffel-run"),
+            stoffellang::convert_to_binary(&compiled),
+        )
+        .timeout(Duration::from_secs(120))
+        .build()
+        .unwrap()
+        .run()
+        .await
+        .expect("output-only run should not require any mask or party RPC connection");
+        assert_eq!(output.consistent_returned_values().unwrap(), vec!["7"]);
+        assert_eq!(output.client_outputs.len(), 1);
+        assert_eq!(output.client_outputs[0].values, vec![7]);
+        assert_all_parties_acknowledged_completion(&output);
     }
 }
 

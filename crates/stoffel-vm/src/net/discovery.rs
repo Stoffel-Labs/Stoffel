@@ -66,6 +66,7 @@ mod nat_stubs {
 
 #[cfg(not(feature = "nat"))]
 use nat_stubs::IceCandidate;
+use tokio::sync::oneshot;
 use tokio::time::sleep;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -143,15 +144,28 @@ pub async fn run_bootnode_with_config(
     bind: SocketAddr,
     expected_parties: usize,
 ) -> Result<(), String> {
+    run_bootnode_with_config_ready(bind, expected_parties, None).await
+}
+
+/// Run a bootnode and acknowledge once its UDP listener is bound.
+///
+/// The optional sender lets a supervisor wait for concrete listener readiness
+/// before it starts registering followers.
+pub async fn run_bootnode_with_config_ready(
+    bind: SocketAddr,
+    expected_parties: usize,
+    ready: Option<oneshot::Sender<()>>,
+) -> Result<(), String> {
     let required_auth_token = required_discovery_auth_token("bootnode discovery registration")?;
     eprintln!("[bootnode] Discovery registration authentication enabled");
-    run_bootnode_with_config_and_auth(bind, expected_parties, required_auth_token).await
+    run_bootnode_with_config_and_auth(bind, expected_parties, required_auth_token, ready).await
 }
 
 async fn run_bootnode_with_config_and_auth(
     bind: SocketAddr,
     expected_parties: usize,
     required_auth_token: String,
+    ready: Option<oneshot::Sender<()>>,
 ) -> Result<(), String> {
     let mut net = QuicNetworkManager::with_config(QuicNetworkConfig {
         use_tls: false,
@@ -159,6 +173,9 @@ async fn run_bootnode_with_config_and_auth(
     });
     net.listen(bind).await?;
     let state = BootnodeState::new(expected_parties);
+    if let Some(ready) = ready {
+        let _ = ready.send(());
+    }
 
     eprintln!("[bootnode] Listening on {}", bind);
 
@@ -904,7 +921,7 @@ mod tests {
         net::{Ipv4Addr, SocketAddrV4, UdpSocket},
         sync::Once,
     };
-    use tokio::time::{sleep, timeout};
+    use tokio::time::timeout;
 
     static INIT: Once = Once::new();
 
@@ -938,12 +955,17 @@ mod tests {
         init_crypto_provider();
         let bootnode_addr = reserve_local_addr();
         let auth_token = "session-secret".to_string();
+        let (ready_tx, ready_rx) = oneshot::channel();
         let bootnode = tokio::spawn(run_bootnode_with_config_and_auth(
             bootnode_addr,
             2,
             auth_token.clone(),
+            Some(ready_tx),
         ));
-        sleep(Duration::from_millis(100)).await;
+        tokio::time::timeout(Duration::from_secs(5), ready_rx)
+            .await
+            .expect("bootnode readiness deadline")
+            .expect("bootnode listener ready");
 
         let program_id = [9u8; 32];
         let execution_id = ExecutionId::from([7u8; 32]);
