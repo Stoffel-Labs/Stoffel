@@ -14,7 +14,10 @@ git grep -n -E "(git|branch|rev|tag)[[:space:]]*=[[:space:]]*\"" -- \
   ':!target' \
   ':!.git' \
   ':!.githooks/pre-commit' |
-  grep -E "$published_package_pattern|StoffelVM|Stoffel-Labs/stoffel" >>"$stale_package_refs" || true
+  # Restrict the package match to content after git grep's file:line prefix.
+  # Otherwise every match below crates/stoffel-* looks like a package reference.
+  grep -E ":[[:digit:]]+:.*(${published_package_pattern}|StoffelVM|Stoffel-Labs/stoffel)" \
+    >>"$stale_package_refs" || true
 
 git grep -n -E "(package[[:space:]]*=[[:space:]]*\"(${published_package_pattern})\"[^}]*path[[:space:]]*=|(${published_package_pattern})[[:space:]]*=[[:space:]]*\\{[^}]*path[[:space:]]*=)" -- \
   '*.toml' '*.rs' '*.sh' '*.yml' '*.yaml' \
