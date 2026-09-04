@@ -7,6 +7,7 @@ All notable changes to the Stoffel crates are tracked here.
 ### Added
 
 - Added tag-driven crates.io release automation for `stoffel-bindgen`.
+- Added keyless Sigstore signing, verification, checksums, and release bundles for published crates and CLI/runner archives.
 
 ### Changed
 
