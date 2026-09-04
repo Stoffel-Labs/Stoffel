@@ -18,6 +18,7 @@ All notable changes to the Stoffel crates are tracked here.
 ### Fixed
 
 - Pinned `num-bigint` to the non-yanked `0.4.6` release so new package resolutions remain publishable.
+- Pinned `tinyvec` to `1.11.0` so generated Rust projects avoid the broken `1.13.0` alloc-only build selected through `quinn-proto`.
 
 ## [0.1.1] - 2026-07-03
 

@@ -28,6 +28,9 @@ async-trait = "=0.1.89"
 redb = "=2.6.3"
 tokio = { version = "=1.52.3", features = ["full"] }
 quinn = { version = "=0.11.11", features = ["default", "rustls", "ring"] }
+# Keep quinn-proto's alloc-only build away from tinyvec 1.13.0, which
+# fails to import the `vec!` macro in generated-project builds.
+tinyvec = "=1.11.0"
 rustls = "=0.23.41"
 rustls-pemfile = "=2.2.0"
 rcgen = "=0.14.8"
