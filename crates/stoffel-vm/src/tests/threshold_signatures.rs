@@ -11,18 +11,18 @@
 //!
 //! ## Security properties
 //!
-//! **Threshold DKG**: `Share.random()` uses the multi-dealer RanSha protocol —
+//! **Threshold DKG**: `Share.random_field()` uses the multi-dealer RanSha protocol —
 //! ALL parties contribute randomness, so no single party knows the combined
 //! secret key. Compromising fewer than `t` parties reveals nothing.
 //!
-//! **Nonce safety**: Each `Share.random()` call runs a new RanSha round with a
+//! **Nonce safety**: Each `Share.random_field()` call runs a new RanSha round with a
 //! unique session ID derived from party-local entropy. The nonce `k` is:
 //! - Fresh per invocation (new session, new randomness from all parties)
 //! - Bound to the message via the challenge hash `e = H(R || pk || msg)`
 //! - Consumed by `Share.open_field(k + e*sk)` (share is destroyed after opening)
 //!
 //! Nonce reuse across messages is prevented by the protocol: a new
-//! `Share.random()` generates a new cooperative random value each time.
+//! `Share.random_field()` generates a new cooperative random value each time.
 //! Re-signing the same message produces a different (but equally valid)
 //! signature because the nonce is freshly random.
 
@@ -1862,14 +1862,14 @@ async fn test_threshold_bls_signature() {
 
     // Build the BLS signing program
     //
-    // 1. Share.random() -> sk shares (DKG)
+    // 1. Share.random_field() -> sk shares (DKG)
     // 2. Share.open_exp(sk, "bls12-381-g2") -> pk_g2 (96 bytes G2)
     // 3. Crypto.hash_to_g1(msg) -> H_msg (48 bytes G1)
     // 4. Share.open_exp_custom(sk, H_msg) -> sig = sk * H_msg (48 bytes G1)
     // 5. Result: sig(48) + pk_g2(96) + H_msg(48) = 192 bytes
     let program = vec![
-        // r0 = Share.random() -- sk share (DKG)
-        Instruction::CALL("Share.random".to_string()),
+        // r0 = Share.random_field() -- sk share (DKG)
+        Instruction::CALL("Share.random_field".to_string()),
         Instruction::MOV(1, 0), // r1 = sk share
         // r0 = Share.open_exp(sk, "bls12-381-g2") -- pk in G2
         Instruction::LDI(2, Value::String("bls12-381-g2".to_string())),
