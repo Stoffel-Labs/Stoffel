@@ -1487,6 +1487,7 @@ fn encode_manifest_client_inputs(
 
 fn encode_manifest_client_input(value: &str, share_type: ShareType) -> Result<String, String> {
     match share_type {
+        ShareType::SecretField => Err("field inputs require --raw-client-io".to_owned()),
         ShareType::SecretFixedPoint { precision } => {
             if value.starts_with("0x") || value.starts_with("0X") {
                 return Err(

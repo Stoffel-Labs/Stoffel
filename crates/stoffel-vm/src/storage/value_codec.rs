@@ -39,6 +39,7 @@ const TAG_SHARE: u8 = 12;
 const TAG_OBJECT: u8 = 13;
 const TAG_ARRAY: u8 = 14;
 
+const SHARE_TYPE_SECRET_FIELD: u8 = 3;
 const SHARE_TYPE_SECRET_INT: u8 = 0;
 const SHARE_TYPE_SECRET_FIXED_POINT: u8 = 1;
 const SHARE_TYPE_SECRET_UINT: u8 = 2;
@@ -342,6 +343,7 @@ impl Encoder<'_> {
 
     fn write_share_type(&mut self, share_type: ShareType) -> PersistentValueResult<()> {
         match share_type {
+            ShareType::SecretField => self.write_u8(SHARE_TYPE_SECRET_FIELD),
             ShareType::SecretInt { bit_length } => {
                 self.write_u8(SHARE_TYPE_SECRET_INT);
                 self.write_len(bit_length, "secret integer bit")?;
@@ -572,6 +574,7 @@ impl Reader<'_> {
 
     fn read_share_type(&mut self) -> PersistentValueResult<ShareType> {
         match self.read_u8()? {
+            SHARE_TYPE_SECRET_FIELD => Ok(ShareType::SecretField),
             SHARE_TYPE_SECRET_INT => {
                 let bit_length = self.read_len("secret integer bit")?;
                 ShareType::try_secret_int(bit_length)
@@ -874,6 +877,10 @@ mod tests {
         let mut memory = ObjectStore::new();
         let context = test_context(b"value");
         let values = [
+            Value::Share(
+                ShareType::SecretField,
+                ShareData::Opaque(vec![1, 2, 3].into()),
+            ),
             Value::Unit,
             Value::I64(-42),
             Value::I32(-32),

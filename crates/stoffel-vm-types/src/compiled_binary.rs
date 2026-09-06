@@ -28,7 +28,7 @@ use std::io::{self, Read, Write};
 pub const MAGIC_BYTES: &[u8; 4] = b"STFL";
 // Current bytecode format version
 // v10: added runtime-client input templates to the client-IO manifest
-pub const FORMAT_VERSION: u16 = 10;
+pub const FORMAT_VERSION: u16 = 11;
 pub const CLIENT_IO_MANIFEST_FORMAT_VERSION: u16 = 2;
 pub const MPC_BACKEND_MANIFEST_FORMAT_VERSION: u16 = 3;
 pub const MPC_CURVE_MANIFEST_FORMAT_VERSION: u16 = 4;
@@ -1289,6 +1289,7 @@ impl CompiledBinary {
 
     fn serialize_share_type<W: Write>(share_type: ShareType, writer: &mut W) -> BinaryResult<()> {
         match share_type {
+            ShareType::SecretField => writer.write_all(&[3u8])?,
             ShareType::SecretInt { bit_length } => {
                 writer.write_all(&[0u8])?;
                 write_usize_as_u32(writer, bit_length, "SecretInt bit length")?;
@@ -1999,6 +2000,7 @@ impl CompiledBinary {
                     ))
                 })
             }
+            3 => Ok(ShareType::SecretField),
             2 => {
                 let bit_length = read_usize_u32(reader, "SecretUInt bit length")?;
                 ShareType::try_secret_uint(bit_length).map_err(|error| {
@@ -3002,6 +3004,38 @@ mod tests {
             MpcBackend::HoneyBadger
         );
         assert!(deserialized.client_io_manifest.clients.is_empty());
+    }
+
+    #[test]
+    fn field_share_type_manifest_roundtrip_preserves_legacy_tags() {
+        for (ty, tag) in [
+            (ShareType::secret_int(64), 0),
+            (ShareType::secret_fixed_point_from_bits(64, 16), 1),
+            (ShareType::secret_uint(64), 2),
+            (ShareType::SecretField, 3),
+        ] {
+            let mut encoded = Vec::new();
+            CompiledBinary::serialize_share_type(ty, &mut encoded).unwrap();
+            assert_eq!(encoded[0], tag);
+            assert_eq!(
+                CompiledBinary::deserialize_share_type(&mut Cursor::new(encoded)).unwrap(),
+                ty
+            );
+        }
+        let mut binary = CompiledBinary::new();
+        binary.client_io_manifest.clients.push(ClientIoSchema {
+            client_slot: 0,
+            inputs: vec![],
+            outputs: vec![ShareType::SecretField],
+        });
+        let mut bytes = Vec::new();
+        binary.serialize(&mut bytes).unwrap();
+        let decoded = CompiledBinary::deserialize(&mut Cursor::new(bytes)).unwrap();
+        assert_eq!(decoded.version, 11);
+        assert_eq!(
+            decoded.client_io_manifest.clients[0].outputs,
+            vec![ShareType::SecretField]
+        );
     }
 
     #[test]

@@ -1345,7 +1345,7 @@ async fn test_threshold_schnorr_ed25519() {
     // Result layout: R(32) + s(32) + pk(32) = 96 bytes
     let program = vec![
         // DKG for secret key
-        Instruction::CALL("Share.random".to_string()),
+        Instruction::CALL("Share.random_field".to_string()),
         Instruction::MOV(1, 0), // r1 = sk share
         // pk = commitment[0]
         Instruction::LDI(2, Value::I64(0)),
@@ -1354,7 +1354,7 @@ async fn test_threshold_schnorr_ed25519() {
         Instruction::CALL("Share.get_commitment".to_string()),
         Instruction::MOV(3, 0), // r3 = pk bytes (32)
         // DKG for nonce
-        Instruction::CALL("Share.random".to_string()),
+        Instruction::CALL("Share.random_field".to_string()),
         Instruction::MOV(4, 0), // r4 = k share
         // R = commitment[0] of nonce
         Instruction::LDI(2, Value::I64(0)),
@@ -1553,8 +1553,8 @@ async fn test_threshold_eddsa_ed25519() {
     //
     // Result layout: R(32) + s(32) + pk(32) = 96 bytes
     let program = vec![
-        // r0 = Share.random() -- sk share (DKG)
-        Instruction::CALL("Share.random".to_string()),
+        // r0 = Share.random_field() -- sk share (DKG)
+        Instruction::CALL("Share.random_field".to_string()),
         Instruction::MOV(1, 0), // r1 = sk share
         // r0 = Share.get_commitment(sk, 0) -- pk from Feldman commitment
         Instruction::LDI(2, Value::I64(0)),
@@ -1562,8 +1562,8 @@ async fn test_threshold_eddsa_ed25519() {
         Instruction::PUSHARG(2),
         Instruction::CALL("Share.get_commitment".to_string()),
         Instruction::MOV(3, 0), // r3 = pk (byte array, 32 bytes compressed)
-        // r0 = Share.random() -- nonce share (DKG)
-        Instruction::CALL("Share.random".to_string()),
+        // r0 = Share.random_field() -- nonce share (DKG)
+        Instruction::CALL("Share.random_field".to_string()),
         Instruction::MOV(4, 0), // r4 = k share
         // r0 = Share.get_commitment(k, 0) -- R = g^k from Feldman commitment
         // Using commitment rather than open_exp ensures byte-level compatibility
